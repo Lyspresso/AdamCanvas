@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: Format, lint, test
+    # macOS runner required: the objc2-* dependencies only build on macOS.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format check
+        run: cargo fmt --check
+      # Advisory for now: 14 known style warnings inherited from the initial
+      # harness drop. Tighten to `-D warnings` once they are burned down.
+      - name: Clippy (advisory)
+        run: cargo clippy --all-targets
+      - name: Tests
+        run: cargo test
