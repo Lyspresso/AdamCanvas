@@ -1039,12 +1039,35 @@ impl AdamApp {
                 .last()
                 .is_some_and(|message| message.role == MessageRole::User)
             {
-                let _ = conversation.append_message(
+                let turn_id = Uuid::new_v4();
+                let message = "This turn was interrupted before the provider finished.";
+                let _ = conversation.append_message_with_activity(
                     Uuid::new_v4(),
                     MessageRole::Assistant,
                     "_This turn was interrupted before the provider finished._",
                     recovery_time,
                     Vec::new(),
+                    Vec::new(),
+                    vec![
+                        HarnessActivityEvent::new(
+                            Uuid::new_v4(),
+                            recovery_time,
+                            ActivityKind::TurnError {
+                                message: message.into(),
+                            },
+                        ),
+                        HarnessActivityEvent::new(
+                            Uuid::new_v4(),
+                            recovery_time,
+                            ActivityKind::TurnStatus {
+                                status: TurnStatus::ProviderError,
+                                message: Some(message.into()),
+                                tool: None,
+                                retry: Some(RetryHint::Retry),
+                            },
+                        ),
+                    ],
+                    Some(turn_id),
                 );
                 conversation.unread = true;
                 ai_recovery_changed = true;
@@ -6992,13 +7015,25 @@ impl AdamApp {
                 .unwrap_or_else(|| "the safe replay could not be started".into());
             let at = unix_now();
             let turn_id = Uuid::new_v4();
-            let activities = vec![HarnessActivityEvent::new(
-                Uuid::new_v4(),
-                at,
-                ActivityKind::TurnError {
-                    message: error.clone(),
-                },
-            )];
+            let activities = vec![
+                HarnessActivityEvent::new(
+                    Uuid::new_v4(),
+                    at,
+                    ActivityKind::TurnError {
+                        message: error.clone(),
+                    },
+                ),
+                HarnessActivityEvent::new(
+                    Uuid::new_v4(),
+                    at,
+                    ActivityKind::TurnStatus {
+                        status: TurnStatus::ProviderError,
+                        message: Some(error.clone()),
+                        tool: None,
+                        retry: Some(RetryHint::Retry),
+                    },
+                ),
+            ];
             if let Some(conversation) = self
                 .workspace
                 .domain
@@ -7150,6 +7185,12 @@ impl AdamApp {
                                 format!("Provider session {}", truncate(&session_id, 18)),
                             );
                         }
+                        ensure_terminal_status(
+                            &mut runtime.activity_trace,
+                            TurnStatus::Completed,
+                            None,
+                            None,
+                        );
                         push_ai_activity(runtime, "Completed".into());
                         if !provider_returned_text {
                             push_ai_activity(runtime, "No assistant text was returned".into());
@@ -7257,6 +7298,12 @@ impl AdamApp {
                                 message: message.clone(),
                             },
                         ));
+                        ensure_terminal_status(
+                            &mut runtime.activity_trace,
+                            turn_status_for_failure(kind),
+                            Some(message.clone()),
+                            Some(RetryHint::Retry),
+                        );
                         let terminal_label = match kind {
                             AiFailureKind::PermissionBlocked => "Permission needed",
                             AiFailureKind::TimedOut => "Turn timed out",
@@ -7333,6 +7380,12 @@ impl AdamApp {
                                 message: "Stopped by the user".into(),
                             },
                         ));
+                        ensure_terminal_status(
+                            &mut runtime.activity_trace,
+                            TurnStatus::UserCancelled,
+                            Some("Stopped by the user".into()),
+                            None,
+                        );
                         push_ai_activity(runtime, "Stopped".into());
                         let partial = std::mem::take(&mut runtime.streamed_text);
                         if assistant_flat_text(&runtime.activity_trace.events)
@@ -11986,6 +12039,36 @@ fn ai_trace_has_productive_activity(events: &[HarnessActivityEvent]) -> bool {
         | ActivityKind::PermissionPrompt { .. }
         | ActivityKind::Subagent { .. } => true,
     })
+}
+
+fn ensure_terminal_status(
+    trace: &mut ActivityAccumulator,
+    status: TurnStatus,
+    message: Option<String>,
+    retry: Option<RetryHint>,
+) {
+    if latest_turn_status(&trace.events).is_some_and(|terminal| terminal.status == status) {
+        return;
+    }
+    trace.ingest(HarnessActivityEvent::new(
+        Uuid::new_v4(),
+        unix_now(),
+        ActivityKind::TurnStatus {
+            status,
+            message,
+            tool: None,
+            retry,
+        },
+    ));
+}
+
+fn turn_status_for_failure(kind: AiFailureKind) -> TurnStatus {
+    match kind {
+        AiFailureKind::PermissionBlocked => TurnStatus::PermissionBlocked,
+        AiFailureKind::TimedOut => TurnStatus::TimedOut,
+        AiFailureKind::MaxTurnsReached => TurnStatus::MaxTurnsReached,
+        AiFailureKind::ProviderError => TurnStatus::ProviderError,
+    }
 }
 
 fn should_replay_failed_native_session(runtime: &AiChatRuntime) -> bool {
@@ -16695,6 +16778,40 @@ mod tests {
         assert!(ai_trace_has_productive_activity(&[text]));
         runtime.active_had_productive_activity = true;
         assert!(!should_replay_failed_native_session(&runtime));
+    }
+
+    #[test]
+    fn terminal_fallback_preserves_rich_status_and_corrects_mismatches() {
+        let mut trace = ActivityAccumulator::new();
+        trace.ingest(HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(1),
+            ActivityKind::TurnStatus {
+                status: TurnStatus::PermissionBlocked,
+                message: Some("Web access approval could not be answered".into()),
+                tool: Some("WebFetch".into()),
+                retry: Some(RetryHint::AllowWebAndRetry),
+            },
+        ));
+        ensure_terminal_status(
+            &mut trace,
+            TurnStatus::PermissionBlocked,
+            Some("generic fallback".into()),
+            Some(RetryHint::Retry),
+        );
+        let terminal = latest_turn_status(&trace.events).unwrap();
+        assert_eq!(terminal.tool.as_deref(), Some("WebFetch"));
+        assert_eq!(terminal.retry, Some(RetryHint::AllowWebAndRetry));
+
+        ensure_terminal_status(
+            &mut trace,
+            TurnStatus::ProviderError,
+            Some("provider failed".into()),
+            Some(RetryHint::Retry),
+        );
+        let terminal = latest_turn_status(&trace.events).unwrap();
+        assert_eq!(terminal.status, TurnStatus::ProviderError);
+        assert_eq!(terminal.retry, Some(RetryHint::Retry));
     }
 
     #[test]

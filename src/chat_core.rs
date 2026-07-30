@@ -346,7 +346,6 @@ pub enum ActivityKind {
         message: String,
     },
     TurnStatus {
-        #[serde(default)]
         status: TurnStatus,
         #[serde(default)]
         message: Option<String>,

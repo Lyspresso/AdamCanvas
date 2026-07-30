@@ -4216,14 +4216,20 @@ mod tests {
         encoded["settings"]["workspace_mode"] = json!("future_surface");
         encoded["kind"] = json!("future_kind");
         encoded["messages"][0]["role"] = json!("future_role");
-        encoded["messages"][0]["activities"]
-            .as_array_mut()
-            .unwrap()
-            .push(json!({
+        let activities = encoded["messages"][0]["activities"].as_array_mut().unwrap();
+        activities.push(json!({
                 "id": id(5),
                 "at": 2,
                 "kind": {"type": "futureActivity", "payload": "ignored"}
-            }));
+        }));
+        activities.push(json!({
+            "id": id(6),
+            "at": 3,
+            "kind": {
+                "type": "turnStatus",
+                "message": "status is required"
+            }
+        }));
 
         let decoded: AiConversation = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.permission_mode, PermissionMode::Ask);

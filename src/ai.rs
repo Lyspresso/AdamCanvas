@@ -1279,11 +1279,16 @@ fn run_outcome_status(outcome: &RunOutcome) -> Option<ActivityKind> {
                 AiFailureKind::MaxTurnsReached => TurnStatus::MaxTurnsReached,
                 AiFailureKind::ProviderError => TurnStatus::ProviderError,
             };
-            let retry = (*retry).or(Some(if *kind == AiFailureKind::PermissionBlocked {
-                RetryHint::AllowWebAndRetry
-            } else {
-                RetryHint::Retry
-            }));
+            let retry = Some(match kind {
+                AiFailureKind::PermissionBlocked if is_explicit_web_tool(tool.as_deref()) => {
+                    match retry {
+                        Some(RetryHint::Retry) => RetryHint::Retry,
+                        Some(RetryHint::AllowWebAndRetry) | None => RetryHint::AllowWebAndRetry,
+                    }
+                }
+                AiFailureKind::PermissionBlocked => RetryHint::Retry,
+                _ => retry.unwrap_or(RetryHint::Retry),
+            });
             return Some(ActivityKind::TurnStatus {
                 status,
                 message: Some(message.clone()),
@@ -1300,6 +1305,16 @@ fn run_outcome_status(outcome: &RunOutcome) -> Option<ActivityKind> {
         tool: None,
         retry,
     })
+}
+
+fn is_explicit_web_tool(tool: Option<&str>) -> bool {
+    let normalized = tool
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(normalized.as_str(), "websearch" | "webfetch")
 }
 
 fn run_process(
@@ -1978,6 +1993,11 @@ impl OutputDecoder {
         if let Some(suffix) = salvage.strip_prefix(&self.output) {
             self.record_assistant_text(suffix.to_owned(), false, false, emit);
         } else {
+            // A poisoned provider can replace, rather than extend, the bounded
+            // raw salvage window. Reset every projection before replaying the
+            // replacement so stale text cannot be double-appended.
+            self.stream_reset_emitted = true;
+            emit(Decoded::StreamReset);
             self.output.clear();
             self.saw_assistant_text = false;
             self.record_assistant_text(salvage, false, false, emit);
@@ -2748,6 +2768,10 @@ impl OutputDecoder {
                 {
                     let message = string_at(value, &["result"])
                         .unwrap_or_else(|| "the agent reported an error".into());
+                    let (kind, tool, retry) = classify_claude_result_failure(value);
+                    self.failure_kind = Some(kind);
+                    self.failure_tool = tool;
+                    self.failure_retry = Some(retry);
                     decoded.kinds.push(ActivityKind::TurnError {
                         message: message.clone(),
                     });
@@ -4101,6 +4125,47 @@ fn claude_subagent_status(status: Option<&str>) -> SubagentStatus {
         Some("completed" | "success" | "succeeded") | None => SubagentStatus::Completed,
         Some(_) => SubagentStatus::InProgress,
     }
+}
+
+fn classify_claude_result_failure(value: &Value) -> (AiFailureKind, Option<String>, RetryHint) {
+    let subtype = string_at(value, &["subtype"])
+        .map(|value| normalized_token(&value))
+        .unwrap_or_default();
+    let terminal_reason = string_at(value, &["terminal_reason", "terminalReason"])
+        .map(|value| normalized_token(&value))
+        .unwrap_or_default();
+    if matches!(
+        subtype.as_str(),
+        "errormaxturns" | "maxturns" | "maxturnsreached"
+    ) || matches!(
+        terminal_reason.as_str(),
+        "errormaxturns" | "maxturns" | "maxturnsreached" | "turnlimit"
+    ) {
+        return (AiFailureKind::MaxTurnsReached, None, RetryHint::Retry);
+    }
+
+    let permission_blocked = matches!(
+        subtype.as_str(),
+        "errorpermission"
+            | "errorpermissiondenied"
+            | "permissionblocked"
+            | "permissioncancelled"
+            | "permissiondenied"
+    ) || matches!(
+        terminal_reason.as_str(),
+        "permissionblocked" | "permissioncancelled" | "permissiondenied"
+    );
+    if permission_blocked {
+        let tool = string_at(value, &["tool", "tool_name", "toolName"]);
+        let retry = if is_explicit_web_tool(tool.as_deref()) {
+            RetryHint::AllowWebAndRetry
+        } else {
+            RetryHint::Retry
+        };
+        return (AiFailureKind::PermissionBlocked, tool, retry);
+    }
+
+    (AiFailureKind::ProviderError, None, RetryHint::Retry)
 }
 
 fn seconds_to_milliseconds(seconds: f64) -> Option<i64> {
@@ -6047,6 +6112,108 @@ mod tests {
     }
 
     #[test]
+    fn terminal_outcomes_keep_web_retry_narrow_and_type_every_failure() {
+        let permission = |tool: Option<&str>, retry| RunOutcome::Failed {
+            kind: AiFailureKind::PermissionBlocked,
+            message: "permission required".into(),
+            tool: tool.map(str::to_owned),
+            retry,
+        };
+        for (outcome, expected_status, expected_retry) in [
+            (
+                permission(None, None),
+                TurnStatus::PermissionBlocked,
+                Some(RetryHint::Retry),
+            ),
+            (
+                permission(Some("Bash"), Some(RetryHint::AllowWebAndRetry)),
+                TurnStatus::PermissionBlocked,
+                Some(RetryHint::Retry),
+            ),
+            (
+                permission(Some("WebFetch"), None),
+                TurnStatus::PermissionBlocked,
+                Some(RetryHint::AllowWebAndRetry),
+            ),
+            (
+                RunOutcome::timed_out("slow"),
+                TurnStatus::TimedOut,
+                Some(RetryHint::Retry),
+            ),
+            (
+                RunOutcome::Failed {
+                    kind: AiFailureKind::MaxTurnsReached,
+                    message: "limit".into(),
+                    tool: None,
+                    retry: None,
+                },
+                TurnStatus::MaxTurnsReached,
+                Some(RetryHint::Retry),
+            ),
+            (
+                RunOutcome::provider_error("broken"),
+                TurnStatus::ProviderError,
+                Some(RetryHint::Retry),
+            ),
+        ] {
+            let Some(ActivityKind::TurnStatus { status, retry, .. }) = run_outcome_status(&outcome)
+            else {
+                panic!("missing terminal status");
+            };
+            assert_eq!(status, expected_status);
+            assert_eq!(retry, expected_retry);
+        }
+
+        assert!(matches!(
+            run_outcome_status(&RunOutcome::Completed {
+                text: String::new(),
+                session_id: None,
+            }),
+            Some(ActivityKind::TurnStatus {
+                status: TurnStatus::Completed,
+                ..
+            })
+        ));
+        assert!(matches!(
+            run_outcome_status(&RunOutcome::Cancelled),
+            Some(ActivityKind::TurnStatus {
+                status: TurnStatus::UserCancelled,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn claude_structured_result_distinguishes_turn_limit_and_permissions() {
+        let max_turns = "{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"result\":\"Stopped\"}\n";
+        let (decoder, _) = decode_in_chunks("claude_cli", max_turns, 5);
+        assert_eq!(decoder.failure_kind, Some(AiFailureKind::MaxTurnsReached));
+        assert_eq!(decoder.failure_retry, Some(RetryHint::Retry));
+
+        let terminal_reason = concat!(
+            "{\"type\":\"result\",\"subtype\":\"error_during_execution\",",
+            "\"terminal_reason\":\"max_turns\",\"is_error\":true,\"result\":\"Stopped\"}\n"
+        );
+        let (decoder, _) = decode_in_chunks("claude_cli", terminal_reason, 6);
+        assert_eq!(decoder.failure_kind, Some(AiFailureKind::MaxTurnsReached));
+
+        let web_permission = concat!(
+            "{\"type\":\"result\",\"subtype\":\"error_permission_denied\",",
+            "\"terminal_reason\":\"permission_denied\",\"tool_name\":\"WebSearch\",",
+            "\"is_error\":true,\"result\":\"Denied\"}\n"
+        );
+        let (decoder, _) = decode_in_chunks("claude_cli", web_permission, 7);
+        assert_eq!(decoder.failure_kind, Some(AiFailureKind::PermissionBlocked));
+        assert_eq!(decoder.failure_tool.as_deref(), Some("WebSearch"));
+        assert_eq!(decoder.failure_retry, Some(RetryHint::AllowWebAndRetry));
+
+        let auth_error = include_str!("../tests/fixtures/ai/claude/2.1.128/auth-error.jsonl");
+        let (decoder, _) = decode_in_chunks("claude_cli", auth_error, 11);
+        assert_eq!(decoder.failure_kind, Some(AiFailureKind::ProviderError));
+        assert_eq!(decoder.failure_retry, Some(RetryHint::Retry));
+    }
+
+    #[test]
     fn grok_session_harvest_projects_native_plan_subagents_tools_and_permission_failure() {
         let temporary = tempfile::tempdir().unwrap();
         let session_id = "019fb2fe-9145-7522-adb1-81fa62d02ede";
@@ -6288,6 +6455,55 @@ mod tests {
                 conversation_id
             } if turn_id == run.turn_id && conversation_id == run.conversation_id
         ));
+    }
+
+    #[test]
+    fn poison_salvage_replacement_resets_before_replay() {
+        let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
+        decoder.poisoned = true;
+        decoder.stream_reset_emitted = true;
+        decoder.output = "stale projection".into();
+        decoder.saw_assistant_text = true;
+        decoder.raw_mirror = b"replacement output\n".to_vec();
+
+        let mut decoded = vec![Decoded::Delta("stale projection".into())];
+        decoder.refresh_poison_salvage(&mut |event| decoded.push(event));
+
+        let reset = decoded
+            .iter()
+            .position(|event| matches!(event, Decoded::StreamReset))
+            .expect("replacement reset");
+        let replacement_activity = decoded
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    Decoded::Activity(ActivityEvent {
+                        kind: ActivityKind::AssistantText { text },
+                        ..
+                    }) if text == "replacement output\n"
+                )
+            })
+            .expect("replacement activity");
+        let replacement_delta = decoded
+            .iter()
+            .position(
+                |event| matches!(event, Decoded::Delta(text) if text == "replacement output\n"),
+            )
+            .expect("replacement delta");
+        assert!(reset < replacement_activity);
+        assert!(replacement_activity < replacement_delta);
+
+        let mut projected = String::new();
+        for event in &decoded {
+            match event {
+                Decoded::StreamReset => projected.clear(),
+                Decoded::Delta(text) => projected.push_str(text),
+                Decoded::Activity(_) => {}
+            }
+        }
+        assert_eq!(projected, decoder.output);
+        assert_eq!(projected, "replacement output\n");
     }
 
     #[test]
