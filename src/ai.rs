@@ -5,27 +5,36 @@
 //! are never synthesized by this module.
 
 use crate::{
+    ai_task_bridge::TaskToolBridge,
+    ai_task_tools::{TaskToolOutcome, TaskToolRegistry},
     chat_core::{
         ActivityEvent, ActivityKind, ActivityStatus, CliVersion, FileChange, FileChangeKind,
-        PermissionResolution, PlanItem, PlanItemOrigin, PlanItemStatus, ProviderKind,
+        PermissionResolution, PlanChannel, PlanItem, PlanItemOrigin, PlanItemStatus, ProviderKind,
         ResumeStrategy, RetryHint, RuntimeTuningProfile, SubagentStatus, SystemPromptChannel,
         TaskMutationKind, TurnStatus, capability_profile, capability_profile_for_runtime,
         runtime_tuning_profile,
     },
     domain::{
         AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_THINKING,
-        AI_FEATURE_WEB_SEARCH, AiProviderPreferences, AiWorkspaceMode, PermissionMode, UnixMillis,
+        AI_FEATURE_WEB_SEARCH, AiPermissionClass, AiPermissionVerdict, AiProviderPreferences,
+        AiWorkspaceMode, PermissionMode, UnixMillis, ai_permission_verdict,
+    },
+    grok_acp::{
+        GrokAcpError, GrokAcpEvent, GrokAcpHttpMcpServer, GrokAcpLimits, GrokAcpPermissionDecision,
+        GrokAcpPermissionRequest, GrokAcpPermissionResolution, GrokAcpRequest, GrokAcpStopReason,
+        GrokAcpToolCall, GrokAcpToolKind, GrokAcpToolStatus, run_grok_acp,
     },
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use serde_json::{Map, Value, json};
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     env,
     ffi::{OsStr, OsString},
     fmt,
     fs::{self, OpenOptions},
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
@@ -46,7 +55,18 @@ const MAX_RAW_SALVAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ACTIVITY_OUTPUT_BYTES: usize = 4 * 1024;
 const MAX_GROK_SESSION_LINE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GROK_SESSION_UPDATES: usize = 2_048;
+const MAX_GROK_SESSION_POLL_LINES: usize = 256;
+const MAX_GROK_SESSION_POLL_BYTES: usize = 512 * 1024;
+const MAX_GROK_SESSION_SCAN_BYTES: u64 = 32 * 1024 * 1024;
+const GROK_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_GROK_SUBAGENTS: usize = 256;
+const MAX_HTTP_TOOL_ROUNDS: usize = 16;
+const MAX_HTTP_TOOL_CALLS_PER_ROUND: usize = 32;
+const MAX_HTTP_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
+const MAX_HTTP_SSE_LINE_BYTES: usize = 1024 * 1024;
+const MAX_HTTP_SSE_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_HTTP_CONTINUATION_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+const HTTP_TASK_TOOLS_REJECTED_PREFIX: &str = "adam-http-task-tools-rejected:";
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const CHAT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const TASK_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -74,6 +94,9 @@ pub struct AiRunRequest {
     pub api_key: Option<String>,
     pub custom_command: String,
     pub custom_arguments: Vec<String>,
+    /// Newest durable whole-list snapshot used to hydrate Adam-owned task
+    /// tools before this run. It contains no provider credentials.
+    pub initial_tasks: Vec<PlanItem>,
     pub prompt: String,
 }
 
@@ -102,6 +125,7 @@ impl fmt::Debug for AiRunRequest {
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("custom_command", &self.custom_command)
             .field("custom_arguments", &self.custom_arguments)
+            .field("initial_task_count", &self.initial_tasks.len())
             .field("prompt_bytes", &self.prompt.len())
             .finish()
     }
@@ -131,6 +155,14 @@ pub enum AiEvent {
         turn_id: Uuid,
         conversation_id: Uuid,
         event: ActivityEvent,
+    },
+    /// One indivisible provider-adapter transaction. TaskMutation and its
+    /// authoritative PlanUpdate travel together so a failed sink cannot make
+    /// only half of the task state visible.
+    ActivityBatch {
+        turn_id: Uuid,
+        conversation_id: Uuid,
+        events: Vec<ActivityEvent>,
     },
     /// The structured decoder discovered that this run is actually a raw
     /// text stream. Consumers must clear this turn's typed/live projection
@@ -163,6 +195,7 @@ impl AiEvent {
             Self::Started { turn_id, .. }
             | Self::Delta { turn_id, .. }
             | Self::Activity { turn_id, .. }
+            | Self::ActivityBatch { turn_id, .. }
             | Self::StreamReset { turn_id, .. }
             | Self::Completed { turn_id, .. }
             | Self::Failed { turn_id, .. }
@@ -179,6 +212,9 @@ impl AiEvent {
                 conversation_id, ..
             }
             | Self::Activity {
+                conversation_id, ..
+            }
+            | Self::ActivityBatch {
                 conversation_id, ..
             }
             | Self::StreamReset {
@@ -221,6 +257,7 @@ pub struct AiEngine {
     events: Receiver<AiEvent>,
     event_sender: Sender<AiEvent>,
     active: Arc<Mutex<HashMap<Uuid, ActiveRun>>>,
+    task_tools: Arc<Mutex<TaskToolRegistry>>,
 }
 
 impl Default for AiEngine {
@@ -236,6 +273,7 @@ impl AiEngine {
             events,
             event_sender,
             active: Arc::new(Mutex::new(HashMap::new())),
+            task_tools: Arc::new(Mutex::new(TaskToolRegistry::new())),
         }
     }
 
@@ -245,6 +283,7 @@ impl AiEngine {
         }
         let prepared = prepare_run(&request)?;
         let effective_provider = prepared.provider_id().to_owned();
+        let plan_channel = prepared.plan_channel();
         let control = Arc::new(RunControl::default());
 
         {
@@ -269,11 +308,21 @@ impl AiEngine {
                 },
             );
         }
+        if let Err(error) = lock_unpoison(&self.task_tools).register_run(
+            request.turn_id,
+            request.conversation_id,
+            plan_channel,
+            &request.initial_tasks,
+        ) {
+            lock_unpoison(&self.active).remove(&request.turn_id);
+            return Err(AiEngineError::InvalidConfiguration(error.to_string()));
+        }
 
         let turn_id = request.turn_id;
         let conversation_id = request.conversation_id;
         let events = self.event_sender.clone();
         let active = Arc::clone(&self.active);
+        let task_tools = Arc::clone(&self.task_tools);
         let spawn = thread::Builder::new()
             .name(format!("adam-ai-{}", short_uuid(turn_id)))
             .spawn(move || {
@@ -288,14 +337,24 @@ impl AiEngine {
                 } else {
                     match prepared {
                         PreparedRun::Process(specification) => {
-                            run_process(&request, specification, &control, &events)
+                            run_process(&request, specification, &control, &events, &task_tools)
                         }
+                        PreparedRun::GrokAcp(specification) => run_grok_acp_transport(
+                            &request,
+                            specification,
+                            &control,
+                            &events,
+                            &task_tools,
+                        ),
                         PreparedRun::Http { provider_id, url } => {
-                            run_http(&request, &provider_id, url, &control, &events)
+                            run_http(&request, &provider_id, url, &control, &events, &task_tools)
                         }
                     }
                 };
 
+                // Tool-list and tool-call gates fail closed before the
+                // terminal event becomes observable to consumers.
+                lock_unpoison(&task_tools).unregister_run(turn_id);
                 if let Some(status) = run_outcome_status(&outcome) {
                     let _ = events.send(AiEvent::Activity {
                         turn_id,
@@ -330,6 +389,7 @@ impl AiEngine {
 
         if let Err(error) = spawn {
             lock_unpoison(&self.active).remove(&turn_id);
+            lock_unpoison(&self.task_tools).unregister_run(turn_id);
             return Err(AiEngineError::WorkerStart(error));
         }
         Ok(())
@@ -348,7 +408,84 @@ impl AiEngine {
     }
 
     pub fn try_recv(&self) -> Option<AiEvent> {
-        self.events.try_recv().ok()
+        let event = self.events.try_recv().ok()?;
+        if let AiEvent::Activity {
+            conversation_id,
+            event: activity,
+            ..
+        } = &event
+        {
+            lock_unpoison(&self.task_tools).observe_activity(*conversation_id, activity);
+        } else if let AiEvent::ActivityBatch {
+            conversation_id,
+            events,
+            ..
+        } = &event
+        {
+            let mut task_tools = lock_unpoison(&self.task_tools);
+            for activity in events {
+                task_tools.observe_activity(*conversation_id, activity);
+            }
+        }
+        Some(event)
+    }
+
+    /// Tool-list-time exposure gate for provider adapters.
+    pub fn task_tool_descriptors(&self, turn_id: Uuid) -> Vec<Value> {
+        lock_unpoison(&self.task_tools).descriptors_for_run(turn_id)
+    }
+
+    /// Tool-call-time exposure gate plus normalized event emission.
+    ///
+    /// Task tools mutate only Adam's conversation checklist through a live
+    /// run gate. They deliberately do not consult canvas access or filesystem
+    /// permission stances.
+    pub fn call_task_tool(
+        &self,
+        turn_id: Uuid,
+        tool: &str,
+        arguments: &Value,
+        at: UnixMillis,
+    ) -> TaskToolOutcome {
+        let events = self.event_sender.clone();
+        self.call_task_tool_with_sink(
+            turn_id,
+            tool,
+            arguments,
+            at,
+            move |conversation_id, batch| {
+                let _ = events.send(AiEvent::ActivityBatch {
+                    turn_id,
+                    conversation_id,
+                    events: batch,
+                });
+            },
+        )
+    }
+
+    fn call_task_tool_with_sink(
+        &self,
+        turn_id: Uuid,
+        tool: &str,
+        arguments: &Value,
+        at: UnixMillis,
+        emit: impl FnOnce(Uuid, Vec<ActivityEvent>),
+    ) -> TaskToolOutcome {
+        let conversation_id = lock_unpoison(&self.active)
+            .get(&turn_id)
+            .map(|run| run.conversation_id);
+        // Keep the run registry locked through batch delivery. Completion and
+        // cancellation revoke the same run under this lock before publishing
+        // a terminal event, so the batch is always observed wholly before the
+        // terminal or wholly rejected after it.
+        let mut task_tools = lock_unpoison(&self.task_tools);
+        let outcome = task_tools.call_for_run(turn_id, tool, arguments, at);
+        if let Some(conversation_id) = conversation_id
+            && !outcome.events.is_empty()
+        {
+            emit(conversation_id, outcome.events.clone());
+        }
+        outcome
     }
 
     pub fn cancel_all(&self) {
@@ -386,6 +523,10 @@ impl Drop for AiEngine {
 struct RunControl {
     cancelled: AtomicBool,
     child: Mutex<Option<Child>>,
+    /// Serializes the transition to a terminal HTTP state against every model
+    /// event and task-tool dispatch. Once `cancelled` is set while this gate is
+    /// held, no later HTTP event or task mutation may begin.
+    http_event_gate: Mutex<()>,
     #[cfg(test)]
     http_read_in_progress: AtomicBool,
 }
@@ -396,8 +537,13 @@ struct ActiveRun {
 }
 
 impl RunControl {
-    fn cancel(&self) {
+    fn request_stop(&self) {
+        let _gate = lock_unpoison(&self.http_event_gate);
         self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn cancel(&self) {
+        self.request_stop();
         if let Some(child) = lock_unpoison(&self.child).as_mut() {
             terminate_child_tree(child);
         }
@@ -406,6 +552,7 @@ impl RunControl {
 
 enum PreparedRun {
     Process(ProcessSpec),
+    GrokAcp(GrokAcpSpec),
     Http { provider_id: String, url: Url },
 }
 
@@ -413,7 +560,33 @@ impl PreparedRun {
     fn provider_id(&self) -> &str {
         match self {
             Self::Process(specification) => &specification.provider_id,
+            Self::GrokAcp(_) => "grok_cli",
             Self::Http { provider_id, .. } => provider_id,
+        }
+    }
+
+    fn plan_channel(&self) -> PlanChannel {
+        match self {
+            Self::Process(specification) => {
+                if specification.provider_id == "grok_cli" {
+                    // The legacy streaming-json runner has no safe per-run
+                    // task-tool transport. Its live updates.jsonl follower is
+                    // therefore the sole, provider-native plan channel.
+                    return PlanChannel::NativeStream;
+                }
+                let arguments = specification
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                capability_profile(
+                    &specification.provider_id,
+                    &specification.program.to_string_lossy(),
+                    &arguments,
+                )
+                .plan_channel
+            }
+            Self::GrokAcp(_) | Self::Http { .. } => PlanChannel::AppTaskTools,
         }
     }
 }
@@ -439,6 +612,13 @@ struct ProcessSpec {
     cwd: Option<PathBuf>,
     prompt_input: PromptInput,
     output_mode: OutputMode,
+    grok_session_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct GrokAcpSpec {
+    program: PathBuf,
+    cwd: PathBuf,
 }
 
 fn built_in_cli_executable(provider_id: &str) -> Option<&'static str> {
@@ -569,11 +749,7 @@ fn prepare_run(request: &AiRunRequest) -> Result<PreparedRun, AiEngineError> {
                 ("kimi_cli", "kimi"),
             ] {
                 if let Some(program) = resolve_executable(executable, request.cwd.as_deref()) {
-                    return Ok(PreparedRun::Process(preset_process_spec(
-                        provider_id,
-                        program,
-                        request,
-                    )?));
+                    return prepare_resolved_cli(provider_id, program, request);
                 }
             }
             if !request.endpoint.trim().is_empty() {
@@ -614,6 +790,55 @@ fn prepare_run(request: &AiRunRequest) -> Result<PreparedRun, AiEngineError> {
     }
 }
 
+/// Resolve the provider family Adam's `auto` launch will select without
+/// starting a process. Prompt shaping uses this same order so a first auto
+/// turn receives task-tool guidance only when the selected adapter exposes
+/// the AppTools plan channel.
+pub fn resolve_effective_provider_id(
+    provider_id: &str,
+    cwd: Option<&Path>,
+    endpoint: &str,
+) -> Option<String> {
+    let provider = provider_id.trim().to_ascii_lowercase();
+    if provider != "auto" {
+        return (!provider.is_empty()).then_some(provider);
+    }
+    for (provider_id, executable) in [
+        ("claude_cli", "claude"),
+        ("codex_cli", "codex"),
+        ("grok_cli", "grok"),
+        ("kimi_cli", "kimi"),
+    ] {
+        if resolve_executable(executable, cwd).is_some() {
+            return Some(provider_id.into());
+        }
+    }
+    (!endpoint.trim().is_empty()).then(|| "openai_compatible".into())
+}
+
+/// Whether the concrete adapter selected for this launch can make Adam's
+/// task tools model-callable. This is intentionally stricter than the
+/// provider-family capability profile: an aspirational AppTools plan channel
+/// must not cause a prompt nudge unless a real transport is wired.
+pub fn provider_exposes_app_task_tools(
+    provider_id: &str,
+    cwd: Option<&Path>,
+    endpoint: &str,
+) -> bool {
+    let Some(provider_id) = resolve_effective_provider_id(provider_id, cwd, endpoint) else {
+        return false;
+    };
+    match provider_id.as_str() {
+        "openai_compatible" => !endpoint.trim().is_empty(),
+        "lm_studio" => !endpoint.trim().is_empty(),
+        "custom_cli" => true,
+        "grok_cli" => resolve_executable("grok", cwd)
+            .map(|program| runtime_tuning_for_program("grok_cli", &program, ""))
+            .is_some_and(|tuning| supports_grok_acp_task_bridge(tuning.version.as_ref())),
+        _ => false,
+    }
+}
+
 fn prepare_http(provider_id: &str, request: &AiRunRequest) -> Result<PreparedRun, AiEngineError> {
     if effective_model(request).is_empty() {
         return Err(AiEngineError::InvalidConfiguration(
@@ -633,11 +858,39 @@ fn prepare_cli(
 ) -> Result<PreparedRun, AiEngineError> {
     let program = resolve_executable(executable, request.cwd.as_deref())
         .ok_or_else(|| AiEngineError::ExecutableNotFound(executable.into()))?;
+    prepare_resolved_cli(provider_id, program, request)
+}
+
+fn prepare_resolved_cli(
+    provider_id: &str,
+    program: PathBuf,
+    request: &AiRunRequest,
+) -> Result<PreparedRun, AiEngineError> {
+    if provider_id == "grok_cli" {
+        let tuning = runtime_tuning_for_program(provider_id, &program, effective_model(request));
+        if supports_grok_acp_task_bridge(tuning.version.as_ref()) {
+            let cwd = match canonical_working_directory(request.cwd.as_deref())? {
+                Some(cwd) => cwd,
+                None => env::current_dir()
+                    .and_then(fs::canonicalize)
+                    .map_err(|error| {
+                        AiEngineError::InvalidConfiguration(format!(
+                            "could not resolve the Grok working directory: {error}"
+                        ))
+                    })?,
+            };
+            return Ok(PreparedRun::GrokAcp(GrokAcpSpec { program, cwd }));
+        }
+    }
     Ok(PreparedRun::Process(preset_process_spec(
         provider_id,
         program,
         request,
     )?))
+}
+
+fn supports_grok_acp_task_bridge(version: Option<&CliVersion>) -> bool {
+    version.is_some_and(|version| (version.major, version.minor, version.patch) == (0, 2, 114))
 }
 
 fn effective_model(request: &AiRunRequest) -> &str {
@@ -667,6 +920,12 @@ fn preset_process_spec_with_tuning(
     let cwd = canonical_working_directory(request.cwd.as_deref())?;
     let model = effective_model(request);
     let mut arguments = Vec::<OsString>::new();
+    let grok_session_id = (provider_id == "grok_cli").then(|| {
+        request
+            .resume_session_id
+            .clone()
+            .unwrap_or_else(|| request.turn_id.to_string())
+    });
     let (prompt_input, output_mode) = match provider_id {
         "claude_cli" => {
             push_args(
@@ -766,6 +1025,10 @@ fn preset_process_spec_with_tuning(
                     grok_permission(request),
                 ],
             );
+            if request.resume_session_id.is_none() {
+                let session_id = request.turn_id.to_string();
+                push_args(&mut arguments, &["--session-id", &session_id]);
+            }
             let sandbox = if matches!(
                 request.permission_mode,
                 PermissionMode::Auto | PermissionMode::Bypass
@@ -906,6 +1169,7 @@ fn preset_process_spec_with_tuning(
         cwd,
         prompt_input,
         output_mode,
+        grok_session_id,
     })
 }
 
@@ -1088,6 +1352,7 @@ fn custom_process_spec(
             PromptInput::Stdin
         },
         output_mode: OutputMode::PlainText,
+        grok_session_id: None,
     })
 }
 
@@ -1317,19 +1582,497 @@ fn is_explicit_web_tool(tool: Option<&str>) -> bool {
     matches!(normalized.as_str(), "websearch" | "webfetch")
 }
 
+#[derive(Clone, Debug)]
+struct GrokPermissionBlock {
+    tool: String,
+    tool_call_id: String,
+}
+
+#[derive(Debug, Default)]
+struct GrokPermissionBlockState {
+    pending: Option<GrokPermissionBlock>,
+}
+
+impl GrokPermissionBlockState {
+    fn observe_event(&mut self, event: &GrokAcpEvent) {
+        match event {
+            // These events are part of the permission exchange itself. A
+            // terminal refusal/cancellation immediately after them can still
+            // be attributed to the denied request.
+            GrokAcpEvent::PermissionRequested { .. }
+            | GrokAcpEvent::PermissionResolved { .. }
+            | GrokAcpEvent::Terminal { .. }
+            | GrokAcpEvent::SessionStarted { .. }
+            | GrokAcpEvent::AgentMessageChunk { .. }
+            | GrokAcpEvent::AgentThoughtChunk { .. } => {}
+            // Once the provider continues doing substantive work, an older
+            // denial is no longer evidence for a later terminal outcome.
+            GrokAcpEvent::ToolCall { tool_call, .. }
+            | GrokAcpEvent::ToolCallUpdate { tool_call, .. }
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|block| block.tool_call_id == tool_call.id)
+                    && tool_call.status != Some(GrokAcpToolStatus::Completed) => {}
+            GrokAcpEvent::ToolCall { .. }
+            | GrokAcpEvent::ToolCallUpdate { .. }
+            | GrokAcpEvent::PlanSnapshot { .. } => {
+                self.pending = None;
+            }
+        }
+    }
+}
+
+fn run_grok_acp_transport(
+    request: &AiRunRequest,
+    specification: GrokAcpSpec,
+    control: &Arc<RunControl>,
+    event_sender: &Sender<AiEvent>,
+    task_tools: &Arc<Mutex<TaskToolRegistry>>,
+) -> RunOutcome {
+    let bridge_events = event_sender.clone();
+    let turn_id = request.turn_id;
+    let conversation_id = request.conversation_id;
+    let mut bridge = match TaskToolBridge::start(
+        turn_id,
+        Arc::clone(task_tools),
+        Arc::new(move |events| {
+            bridge_events
+                .send(AiEvent::ActivityBatch {
+                    turn_id,
+                    conversation_id,
+                    events,
+                })
+                .expect("AI event receiver must remain available while task bridge is active");
+        }),
+    ) {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            return RunOutcome::provider_error(format!(
+                "could not start Adam's task-tool bridge: {error}"
+            ));
+        }
+    };
+
+    let tuning =
+        runtime_tuning_for_program("grok_cli", &specification.program, effective_model(request));
+    let model = (!effective_model(request).is_empty()).then(|| effective_model(request).to_owned());
+    let reasoning_effort = tuning
+        .normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
+        .map(str::to_owned);
+    let mut rules = request.system_prompt.clone().unwrap_or_default();
+    if !tuning.supports_scoped_child_text
+        || request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) == Some(false)
+    {
+        if !rules.is_empty() {
+            rules.push_str("\n\n");
+        }
+        rules.push_str(
+            "Do not spawn child agents in this run. Adam will enable them only through a provider channel that scopes every child's prose and task events.",
+        );
+    }
+    let acp_request = GrokAcpRequest {
+        executable: specification.program,
+        cwd: specification.cwd,
+        prompt: request.prompt.clone(),
+        rules,
+        sandbox: if matches!(
+            request.permission_mode,
+            PermissionMode::Auto | PermissionMode::Bypass
+        ) && request.workspace_mode != AiWorkspaceMode::Chat
+        {
+            "workspace".into()
+        } else {
+            "read-only".into()
+        },
+        permission_mode: grok_permission(request).into(),
+        web_enabled: request.provider_preferences.feature(AI_FEATURE_WEB_SEARCH) != Some(false),
+        max_turns: request
+            .provider_preferences
+            .max_turns
+            .map(|turns| turns.clamp(1, 100)),
+        // This run exposes Adam's task tools as its one planning channel.
+        // Grok's native planner must therefore stay off even when the general
+        // provider preference is enabled.
+        planning_enabled: false,
+        memory_enabled: request.provider_preferences.feature(AI_FEATURE_MEMORY),
+        model,
+        reasoning_effort,
+        resume_session_id: request.resume_session_id.clone(),
+        http_mcp_server: GrokAcpHttpMcpServer::bearer(
+            "adam_tasks",
+            bridge.endpoint(),
+            bridge.bearer_token(),
+        ),
+        limits: GrokAcpLimits {
+            wall_timeout: run_timeout(request.workspace_mode),
+            ..GrokAcpLimits::default()
+        },
+    };
+
+    let permission_block = RefCell::new(GrokPermissionBlockState::default());
+    let emitted_tool_calls = RefCell::new(HashSet::<String>::new());
+    let result = run_grok_acp(
+        &acp_request,
+        &control.cancelled,
+        |permission| {
+            grok_acp_permission_decision(
+                permission,
+                request.permission_mode,
+                request.workspace_mode,
+                &permission_block,
+            )
+        },
+        |event| {
+            permission_block.borrow_mut().observe_event(&event);
+            emit_grok_acp_event(request, event_sender, event, &emitted_tool_calls);
+        },
+    );
+    let bridge_stop = bridge.stop();
+
+    if control.cancelled.load(Ordering::Acquire) {
+        return RunOutcome::Cancelled;
+    }
+    if let Err(error) = bridge_stop {
+        return RunOutcome::provider_error(format!(
+            "Adam's task-tool bridge did not stop cleanly: {error}"
+        ));
+    }
+
+    let permission_block = permission_block.into_inner().pending;
+    match result {
+        Err(error) => grok_acp_error_outcome(error, permission_block),
+        Ok(outcome) => match outcome.stop_reason {
+            GrokAcpStopReason::EndTurn => RunOutcome::Completed {
+                text: outcome.response_text,
+                session_id: outcome.session_id,
+            },
+            GrokAcpStopReason::Cancelled | GrokAcpStopReason::Refusal
+                if permission_block.is_some() =>
+            {
+                let block = permission_block.expect("guarded by is_some");
+                grok_permission_blocked_outcome(block.tool)
+            }
+            GrokAcpStopReason::Cancelled => RunOutcome::Cancelled,
+            GrokAcpStopReason::MaxTokens | GrokAcpStopReason::MaxTurnRequests => {
+                RunOutcome::Failed {
+                    kind: AiFailureKind::MaxTurnsReached,
+                    message: "Grok reached its turn or token limit before completing.".into(),
+                    tool: None,
+                    retry: Some(RetryHint::Retry),
+                }
+            }
+            GrokAcpStopReason::Refusal => {
+                RunOutcome::provider_error("Grok refused the requested turn")
+            }
+            GrokAcpStopReason::Other(reason) => RunOutcome::provider_error(format!(
+                "Grok stopped with an unsupported terminal reason: {reason}"
+            )),
+        },
+    }
+}
+
+fn grok_acp_error_outcome(
+    error: GrokAcpError,
+    permission_block: Option<GrokPermissionBlock>,
+) -> RunOutcome {
+    match error {
+        GrokAcpError::TimedOut { seconds } => {
+            RunOutcome::timed_out(format!("Grok timed out after {seconds} seconds"))
+        }
+        GrokAcpError::WebAccessDisabled { tool } => {
+            grok_permission_blocked_outcome(tool.to_owned())
+        }
+        GrokAcpError::ProviderCancelled if permission_block.is_some() => {
+            grok_permission_blocked_outcome(permission_block.expect("guarded by is_some").tool)
+        }
+        error => RunOutcome::provider_error(format!("Grok ACP failed: {error}")),
+    }
+}
+
+fn grok_permission_blocked_outcome(tool: String) -> RunOutcome {
+    let retry = if is_explicit_web_tool(Some(&tool)) {
+        RetryHint::AllowWebAndRetry
+    } else {
+        RetryHint::Retry
+    };
+    RunOutcome::Failed {
+        kind: AiFailureKind::PermissionBlocked,
+        message: format!("Grok could not continue after permission to use {tool} was unavailable."),
+        tool: Some(tool),
+        retry: Some(retry),
+    }
+}
+
+fn grok_acp_permission_decision(
+    permission: &GrokAcpPermissionRequest,
+    mode: PermissionMode,
+    workspace_mode: AiWorkspaceMode,
+    blocked: &RefCell<GrokPermissionBlockState>,
+) -> GrokAcpPermissionDecision {
+    let tool = grok_acp_tool_label(&permission.tool_call);
+    let tool_call_id = permission.tool_call.id.clone();
+    let normalized = tool
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let canonical_normalized = permission
+        .tool_call
+        .canonical_mcp_tool_name
+        .as_deref()
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let is_residual_task_prompt = [&normalized, &canonical_normalized]
+        .into_iter()
+        .any(|name| {
+            matches!(
+                name.as_str(),
+                "taskcreate"
+                    | "taskupdate"
+                    | "tasklist"
+                    | "adamtaskstaskcreate"
+                    | "adamtaskstaskupdate"
+                    | "adamtaskstasklist"
+            )
+        });
+    let asks_for_child = [&normalized, &canonical_normalized]
+        .into_iter()
+        .any(|name| {
+            name.contains("subagent")
+                || name.contains("spawnagent")
+                || name.contains("delegateagent")
+        });
+
+    let class = match permission.tool_call.kind {
+        Some(
+            GrokAcpToolKind::Read
+            | GrokAcpToolKind::Search
+            | GrokAcpToolKind::Fetch
+            | GrokAcpToolKind::Think,
+        ) => AiPermissionClass::Read,
+        Some(GrokAcpToolKind::Delete | GrokAcpToolKind::SwitchMode | GrokAcpToolKind::Other(_))
+        | None => AiPermissionClass::Destructive,
+        _ => AiPermissionClass::Mutate,
+    };
+    // Exact task calls are pre-authorized by Grok's process-level MCPTool
+    // rules. Seeing one again on this callback means that boundary did not
+    // behave as negotiated; fail closed instead of trusting provider metadata
+    // as an authorization fact.
+    let verdict = if is_residual_task_prompt
+        || asks_for_child
+        || (workspace_mode == AiWorkspaceMode::Chat && class != AiPermissionClass::Read)
+    {
+        AiPermissionVerdict::Deny
+    } else {
+        ai_permission_verdict(mode, class)
+    };
+
+    match verdict {
+        AiPermissionVerdict::Allow => {
+            if let Some(option) = permission.first_allow_once_option() {
+                // A successful later approval is proof that an older denial
+                // no longer explains this turn's eventual terminal state.
+                blocked.borrow_mut().pending = None;
+                GrokAcpPermissionDecision::Allow {
+                    option_id: option.id.clone(),
+                }
+            } else {
+                blocked.borrow_mut().pending = Some(GrokPermissionBlock { tool, tool_call_id });
+                GrokAcpPermissionDecision::Cancel
+            }
+        }
+        AiPermissionVerdict::Prompt | AiPermissionVerdict::Deny => {
+            blocked.borrow_mut().pending = Some(GrokPermissionBlock { tool, tool_call_id });
+            permission
+                .first_reject_once_option()
+                .map(|option| GrokAcpPermissionDecision::Reject {
+                    option_id: option.id.clone(),
+                })
+                .unwrap_or(GrokAcpPermissionDecision::Cancel)
+        }
+    }
+}
+
+fn emit_grok_acp_event(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    event: GrokAcpEvent,
+    emitted_tool_calls: &RefCell<HashSet<String>>,
+) {
+    let send_activity = |kind| {
+        let _ = event_sender.send(AiEvent::Activity {
+            turn_id: request.turn_id,
+            conversation_id: request.conversation_id,
+            event: activity_event(kind),
+        });
+    };
+
+    match event {
+        GrokAcpEvent::SessionStarted { session_id, .. } => {
+            send_activity(ActivityKind::SessionInfo {
+                model: (!effective_model(request).is_empty())
+                    .then(|| effective_model(request).to_owned()),
+                session_id: Some(session_id),
+            });
+        }
+        GrokAcpEvent::AgentMessageChunk { text, .. } => {
+            send_activity(ActivityKind::AssistantText { text: text.clone() });
+            let _ = event_sender.send(AiEvent::Delta {
+                turn_id: request.turn_id,
+                conversation_id: request.conversation_id,
+                text,
+            });
+        }
+        GrokAcpEvent::AgentThoughtChunk { text, .. } => {
+            send_activity(ActivityKind::Thinking { text });
+        }
+        GrokAcpEvent::ToolCall { tool_call, .. } => {
+            emit_grok_acp_tool_call(&send_activity, &tool_call, emitted_tool_calls, false);
+        }
+        GrokAcpEvent::ToolCallUpdate { tool_call, .. } => {
+            emit_grok_acp_tool_call(&send_activity, &tool_call, emitted_tool_calls, true);
+        }
+        GrokAcpEvent::PlanSnapshot { .. } => {
+            // Exact native-XOR-tools contract: the ACP run exposes Adam's
+            // app-owned task tools, so a provider-native plan cannot also
+            // become the main Progress projection.
+        }
+        GrokAcpEvent::PermissionRequested {
+            request: permission,
+        } => {
+            send_activity(ActivityKind::PermissionPrompt {
+                id: permission.tool_call.id.clone(),
+                tool: grok_acp_tool_label(&permission.tool_call),
+                summary: format!(
+                    "Grok requested permission to use {}.",
+                    grok_acp_tool_label(&permission.tool_call)
+                ),
+                resolution: None,
+            });
+        }
+        GrokAcpEvent::PermissionResolved {
+            tool_call_id,
+            resolution,
+            ..
+        } => {
+            let resolution = match resolution {
+                GrokAcpPermissionResolution::Allowed { .. } => PermissionResolution::Allowed,
+                GrokAcpPermissionResolution::Rejected { .. }
+                | GrokAcpPermissionResolution::Cancelled => PermissionResolution::Denied,
+            };
+            send_activity(ActivityKind::PermissionPrompt {
+                id: tool_call_id,
+                tool: "Grok tool".into(),
+                summary: "Grok permission request resolved.".into(),
+                resolution: Some(resolution),
+            });
+        }
+        GrokAcpEvent::Terminal { .. } => {}
+    }
+}
+
+fn emit_grok_acp_tool_call(
+    send_activity: &impl Fn(ActivityKind),
+    tool_call: &GrokAcpToolCall,
+    emitted_tool_calls: &RefCell<HashSet<String>>,
+    is_update: bool,
+) {
+    let first = emitted_tool_calls.borrow_mut().insert(tool_call.id.clone());
+    if first {
+        send_activity(ActivityKind::ToolCall {
+            id: tool_call.id.clone(),
+            name: grok_acp_tool_label(tool_call),
+            server: Some("grok".into()),
+            input_summary: tool_call
+                .locations
+                .first()
+                .map(|location| location.path.clone()),
+        });
+    }
+    if is_update
+        && matches!(
+            tool_call.status,
+            Some(GrokAcpToolStatus::Completed | GrokAcpToolStatus::Failed)
+        )
+    {
+        send_activity(ActivityKind::ToolResult {
+            id: tool_call.id.clone(),
+            output: grok_acp_tool_output(tool_call),
+            is_error: tool_call.status == Some(GrokAcpToolStatus::Failed),
+        });
+    }
+}
+
+fn grok_acp_tool_label(tool_call: &GrokAcpToolCall) -> String {
+    tool_call
+        .title
+        .clone()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| match &tool_call.kind {
+            Some(kind) => format!("{kind:?}"),
+            None => "Grok tool".into(),
+        })
+}
+
+fn grok_acp_tool_output(tool_call: &GrokAcpToolCall) -> Option<String> {
+    let content = serde_json::to_string(&tool_call.content).ok()?;
+    tail_text(Some(&content))
+}
+
 fn run_process(
     request: &AiRunRequest,
     specification: ProcessSpec,
     control: &Arc<RunControl>,
     event_sender: &Sender<AiEvent>,
+    task_tools: &Arc<Mutex<TaskToolRegistry>>,
 ) -> RunOutcome {
-    run_process_with_timeout(
+    let mut task_bridge = if specification.provider_id == "custom_cli" {
+        let bridge_events = event_sender.clone();
+        let turn_id = request.turn_id;
+        let conversation_id = request.conversation_id;
+        match TaskToolBridge::start(
+            turn_id,
+            Arc::clone(task_tools),
+            Arc::new(move |events| {
+                bridge_events
+                    .send(AiEvent::ActivityBatch {
+                        turn_id,
+                        conversation_id,
+                        events,
+                    })
+                    .expect("AI event receiver must remain available while task bridge is active");
+            }),
+        ) {
+            Ok(bridge) => Some(bridge),
+            Err(error) => {
+                return RunOutcome::provider_error(format!(
+                    "could not start Adam's task-tool bridge: {error}"
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let outcome = run_process_with_timeout(
         request,
         specification,
         control,
         event_sender,
+        task_bridge.as_ref(),
         run_timeout(request.workspace_mode),
-    )
+    );
+    if let Some(bridge) = task_bridge.as_mut()
+        && let Err(error) = bridge.stop()
+    {
+        return RunOutcome::provider_error(format!(
+            "Adam's task-tool bridge did not stop cleanly: {error}"
+        ));
+    }
+    outcome
 }
 
 fn run_process_with_timeout(
@@ -1337,6 +2080,7 @@ fn run_process_with_timeout(
     mut specification: ProcessSpec,
     control: &Arc<RunControl>,
     event_sender: &Sender<AiEvent>,
+    task_bridge: Option<&TaskToolBridge>,
     timeout: Duration,
 ) -> RunOutcome {
     let temporary_prompt = if specification.prompt_input == PromptInput::SecureFile {
@@ -1358,6 +2102,20 @@ fn run_process_with_timeout(
     } else {
         None
     };
+    let follower_cwd = specification
+        .cwd
+        .clone()
+        .or_else(|| env::current_dir().ok());
+    let mut grok_follower = specification
+        .grok_session_id
+        .clone()
+        .and_then(|session_id| {
+            GrokSessionFollower::new(
+                session_id,
+                request.resume_session_id.is_some(),
+                follower_cwd.as_deref()?,
+            )
+        });
 
     let mut command = Command::new(&specification.program);
     command
@@ -1371,6 +2129,11 @@ fn run_process_with_timeout(
         .stderr(Stdio::piped())
         .env("NO_COLOR", "1")
         .env("CLICOLOR", "0");
+    if let Some(bridge) = task_bridge {
+        command
+            .env("ADAM_TASK_MCP_URL", bridge.endpoint())
+            .env("ADAM_TASK_MCP_AUTHORIZATION", bridge.authorization_header());
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -1438,6 +2201,14 @@ fn run_process_with_timeout(
         specification.output_mode,
         specification.cwd.clone(),
     );
+    if request.resume_session_id.is_some() && grok_follower.is_some() {
+        decoder.seed_grok_native_plan(&request.initial_tasks);
+    }
+    if let Some(follower) = grok_follower.as_mut() {
+        follower.bootstrap(&mut decoder, &mut |decoded| {
+            emit_decoded(request, event_sender, decoded)
+        });
+    }
     let mut process_error = None;
     let started_at = Instant::now();
     let mut timed_out = false;
@@ -1472,6 +2243,11 @@ fn run_process_with_timeout(
                 stderr_eof = true;
             }
         }
+        if let Some(follower) = grok_follower.as_mut() {
+            follower.poll(false, &mut decoder, &mut |decoded| {
+                emit_decoded(request, event_sender, decoded)
+            });
+        }
 
         if exit_status.is_none() {
             let status = lock_unpoison(&control.child).as_mut().map(Child::try_wait);
@@ -1497,12 +2273,21 @@ fn run_process_with_timeout(
     }
 
     decoder.finish(|decoded| emit_decoded(request, event_sender, decoded));
-    if decoder.provider_kind == ProviderKind::Grok
-        && let Some(session_id) = decoder.session_id.clone()
-    {
-        harvest_grok_session(&mut decoder, &session_id, &mut |decoded| {
+    if let Some(follower) = grok_follower.as_mut() {
+        follower.final_drain(&mut decoder, &mut |decoded| {
             emit_decoded(request, event_sender, decoded)
         });
+        if let Some(directory) = follower.directory().map(Path::to_path_buf) {
+            if decoder.session_id.is_none() {
+                decoder.session_id = Some(follower.session_id.clone());
+            }
+            harvest_grok_session_terminal_directory(
+                &mut decoder,
+                &follower.session_id,
+                &directory,
+                &mut |decoded| emit_decoded(request, event_sender, decoded),
+            );
+        }
     }
     let status = exit_status.or_else(|| {
         lock_unpoison(&control.child)
@@ -1695,6 +2480,7 @@ struct OutputDecoder {
     subagents: HashMap<String, KnownSubagent>,
     subagent_aliases: HashMap<String, String>,
     grok_tool_names: HashMap<String, String>,
+    grok_native_plan: Vec<PlanItem>,
     codex_streamed_items: HashSet<String>,
 }
 
@@ -1743,7 +2529,27 @@ impl OutputDecoder {
             subagents: HashMap::new(),
             subagent_aliases: HashMap::new(),
             grok_tool_names: HashMap::new(),
+            grok_native_plan: Vec::new(),
             codex_streamed_items: HashSet::new(),
+        }
+    }
+
+    fn seed_grok_native_plan(&mut self, tasks: &[PlanItem]) {
+        if self.provider_kind != ProviderKind::Grok {
+            return;
+        }
+        self.grok_native_plan = tasks
+            .iter()
+            .filter(|task| task.origin == PlanItemOrigin::Native)
+            .cloned()
+            .collect();
+        for task in &self.grok_native_plan {
+            if let Some(task_id) = task.task_id.as_deref()
+                && !task.content.trim().is_empty()
+            {
+                self.task_subjects
+                    .insert(task_id.to_owned(), task.content.clone());
+            }
         }
     }
 
@@ -2204,6 +3010,7 @@ impl OutputDecoder {
                     .collect();
                 decoded.kinds.push(ActivityKind::PlanUpdate {
                     tasks,
+                    authoritative: false,
                     compacted: false,
                     replaces_native: false,
                 });
@@ -2600,6 +3407,10 @@ impl OutputDecoder {
                     return decoded;
                 }
                 decoded.recognized = true;
+                if normalized == "todo_write" {
+                    decoded.kinds.push(self.reduce_grok_native_plan(&input));
+                    return decoded;
+                }
                 if let Some(kind) = self.map_tool_call(id, activity_tool_name(&normalized), input) {
                     decoded.kinds.push(kind);
                 }
@@ -2651,6 +3462,104 @@ impl OutputDecoder {
             _ => {}
         }
         decoded
+    }
+
+    fn reduce_grok_native_plan(&mut self, input: &Value) -> ActivityKind {
+        let merge = input.get("merge").and_then(Value::as_bool).unwrap_or(false);
+        let todos = input
+            .get("todos")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+
+        if !merge {
+            self.grok_native_plan.clear();
+            for todo in todos {
+                let content = string_at(todo, &["content"]).unwrap_or_default();
+                let task_id = string_at(todo, &["id", "taskId", "task_id"]);
+                if content.trim().is_empty() && task_id.is_none() {
+                    continue;
+                }
+                if let Some(task_id) = task_id.as_deref()
+                    && !content.trim().is_empty()
+                {
+                    self.task_subjects
+                        .insert(task_id.to_owned(), content.clone());
+                }
+                self.grok_native_plan.push(PlanItem {
+                    content,
+                    active_form: string_at(todo, &["activeForm", "active_form"]),
+                    status: plan_status(todo.get("status").and_then(Value::as_str)),
+                    task_id,
+                    origin: PlanItemOrigin::Native,
+                });
+            }
+        } else {
+            for todo in todos {
+                let task_id = string_at(todo, &["id", "taskId", "task_id"]);
+                let content =
+                    string_at(todo, &["content"]).filter(|content| !content.trim().is_empty());
+                let existing = task_id
+                    .as_deref()
+                    .and_then(|task_id| {
+                        self.grok_native_plan
+                            .iter()
+                            .position(|item| item.task_id.as_deref() == Some(task_id))
+                    })
+                    .or_else(|| {
+                        content.as_deref().and_then(|content| {
+                            self.grok_native_plan
+                                .iter()
+                                .position(|item| item.content == content)
+                        })
+                    });
+                if let Some(index) = existing {
+                    let item = &mut self.grok_native_plan[index];
+                    if let Some(content) = content {
+                        item.content = content.clone();
+                        if let Some(task_id) = item.task_id.as_deref() {
+                            self.task_subjects.insert(task_id.to_owned(), content);
+                        }
+                    }
+                    if let Some(task_id) = task_id {
+                        item.task_id = Some(task_id);
+                    }
+                    if let Some(status) =
+                        parsed_plan_status(todo.get("status").and_then(Value::as_str))
+                    {
+                        item.status = status;
+                    }
+                    if let Some(active_form) = string_at(todo, &["activeForm", "active_form"]) {
+                        item.active_form = Some(active_form);
+                    }
+                    continue;
+                }
+
+                let Some(content) = content else {
+                    // Grok's merge form commonly carries only id + status.
+                    // An unknown id has no displayable task to create.
+                    continue;
+                };
+                if let Some(task_id) = task_id.as_deref() {
+                    self.task_subjects
+                        .insert(task_id.to_owned(), content.clone());
+                }
+                self.grok_native_plan.push(PlanItem {
+                    content,
+                    active_form: string_at(todo, &["activeForm", "active_form"]),
+                    status: plan_status(todo.get("status").and_then(Value::as_str)),
+                    task_id,
+                    origin: PlanItemOrigin::Native,
+                });
+            }
+        }
+
+        ActivityKind::PlanUpdate {
+            tasks: self.grok_native_plan.clone(),
+            authoritative: false,
+            compacted: false,
+            replaces_native: true,
+        }
     }
 
     fn decode_claude(&mut self, value: &Value) -> JsonDecodeResult {
@@ -3276,6 +4185,7 @@ impl OutputDecoder {
                     .collect();
                 Some(ActivityKind::PlanUpdate {
                     tasks,
+                    authoritative: false,
                     compacted: false,
                     replaces_native: false,
                 })
@@ -3286,6 +4196,7 @@ impl OutputDecoder {
                 self.pending_task_creates.insert(id, content.clone());
                 Some(ActivityKind::TaskMutation {
                     kind: TaskMutationKind::Create,
+                    origin: PlanItemOrigin::Native,
                     content,
                     task_id: None,
                     status: Some(PlanItemStatus::Pending),
@@ -3324,6 +4235,7 @@ impl OutputDecoder {
                     }
                     Some(ActivityKind::TaskMutation {
                         kind: TaskMutationKind::Update,
+                        origin: PlanItemOrigin::Native,
                         content: update.content,
                         task_id: update.task_id,
                         status: update.status,
@@ -3453,6 +4365,7 @@ impl OutputDecoder {
             }
             return Some(ActivityKind::TaskMutation {
                 kind: TaskMutationKind::Update,
+                origin: PlanItemOrigin::Native,
                 content,
                 task_id,
                 status: update.status,
@@ -3464,6 +4377,7 @@ impl OutputDecoder {
             if is_error {
                 return Some(ActivityKind::TaskMutation {
                     kind: TaskMutationKind::Update,
+                    origin: PlanItemOrigin::Native,
                     content: created_subject,
                     task_id: None,
                     status: Some(PlanItemStatus::Cancelled),
@@ -3478,6 +4392,7 @@ impl OutputDecoder {
                 self.task_subjects.insert(task_id.clone(), known_subject);
                 return Some(ActivityKind::TaskMutation {
                     kind: TaskMutationKind::Update,
+                    origin: PlanItemOrigin::Native,
                     // Match the optimistic create by its original subject,
                     // then attach the provider's durable task id. Later
                     // updates match that id and use `task_subjects` when
@@ -3696,6 +4611,355 @@ fn grok_update_output(update: &Value) -> String {
         .unwrap_or_default()
 }
 
+enum GrokSessionLineRead {
+    Eof,
+    Complete { bytes: usize, oversized: bool },
+    Partial,
+    OversizedUnterminated,
+}
+
+fn read_bounded_grok_session_line(
+    reader: &mut impl BufRead,
+    line: &mut Vec<u8>,
+) -> io::Result<GrokSessionLineRead> {
+    line.clear();
+    let mut bounded = reader.take((MAX_GROK_SESSION_LINE_BYTES + 1) as u64);
+    let bytes = bounded.read_until(b'\n', line)?;
+    if bytes == 0 {
+        return Ok(GrokSessionLineRead::Eof);
+    }
+    let oversized = line.len() > MAX_GROK_SESSION_LINE_BYTES;
+    if line.ends_with(b"\n") {
+        return Ok(GrokSessionLineRead::Complete { bytes, oversized });
+    }
+    if oversized {
+        return Ok(GrokSessionLineRead::OversizedUnterminated);
+    }
+    Ok(GrokSessionLineRead::Partial)
+}
+
+struct GrokSessionFollower {
+    session_id: String,
+    grok_home: PathBuf,
+    workspace_key: Option<String>,
+    directory: Option<PathBuf>,
+    offset: u64,
+    bootstrap_end: Option<u64>,
+    bootstrap_pending: bool,
+    next_poll: Instant,
+    disabled: bool,
+}
+
+impl GrokSessionFollower {
+    fn new(session_id: String, resumed: bool, cwd: &Path) -> Option<Self> {
+        Uuid::parse_str(&session_id).ok()?;
+        let grok_home = grok_home_directory()?;
+        let workspace_key = grok_workspace_key(cwd)?;
+        Some(Self::under_home_and_workspace(
+            grok_home,
+            session_id,
+            resumed,
+            Some(workspace_key),
+        ))
+    }
+
+    #[cfg(test)]
+    fn under_home(grok_home: PathBuf, session_id: String, resumed: bool) -> Self {
+        Self::under_home_and_workspace(grok_home, session_id, resumed, None)
+    }
+
+    fn under_home_and_workspace(
+        grok_home: PathBuf,
+        session_id: String,
+        resumed: bool,
+        workspace_key: Option<String>,
+    ) -> Self {
+        let directory = workspace_key
+            .as_deref()
+            .and_then(|key| grok_session_directory_in_workspace(&grok_home, key, &session_id))
+            .or_else(|| {
+                workspace_key
+                    .is_none()
+                    .then(|| grok_session_directory_under(&grok_home, &session_id))
+                    .flatten()
+            });
+        let bootstrap_end = resumed
+            .then(|| {
+                directory
+                    .as_deref()
+                    .and_then(|directory| safe_grok_session_file(directory, "updates.jsonl"))
+                    .and_then(|path| fs::metadata(path).ok())
+                    .map(|metadata| metadata.len())
+            })
+            .flatten();
+        Self {
+            session_id,
+            grok_home,
+            workspace_key,
+            directory,
+            offset: 0,
+            bootstrap_end,
+            bootstrap_pending: resumed,
+            next_poll: Instant::now(),
+            disabled: false,
+        }
+    }
+
+    fn bootstrap(&mut self, decoder: &mut OutputDecoder, emit: &mut impl FnMut(Decoded)) {
+        if !self.bootstrap_pending || self.disabled {
+            return;
+        }
+        if !self.resolve_directory() {
+            return;
+        }
+        let directory = self
+            .directory
+            .as_deref()
+            .expect("resolved Grok session directory");
+        let Some(path) = safe_grok_session_file(directory, "updates.jsonl") else {
+            return;
+        };
+        let Ok(metadata) = fs::metadata(&path) else {
+            return;
+        };
+        let end = self.bootstrap_end.unwrap_or(metadata.len());
+        if metadata.len() < end {
+            self.disabled = true;
+            return;
+        }
+        let Some((mut reader, start)) = bounded_grok_session_reader(&path, end) else {
+            return;
+        };
+        let mut line = Vec::new();
+        let mut latest_plan = None;
+        let mut consumed = start;
+        if start > 0 {
+            match read_bounded_grok_session_line(&mut reader, &mut line) {
+                Ok(GrokSessionLineRead::Complete { bytes, .. }) => {
+                    consumed = consumed.saturating_add(bytes as u64);
+                }
+                Ok(GrokSessionLineRead::Eof | GrokSessionLineRead::Partial) => {
+                    self.offset = start;
+                    self.bootstrap_pending = false;
+                    return;
+                }
+                Ok(GrokSessionLineRead::OversizedUnterminated) => {
+                    self.offset = start;
+                    self.bootstrap_pending = false;
+                    self.disabled = true;
+                    return;
+                }
+                Err(_) => return,
+            }
+        }
+        loop {
+            let oversized = match read_bounded_grok_session_line(&mut reader, &mut line) {
+                Ok(GrokSessionLineRead::Complete { bytes, oversized }) => {
+                    consumed = consumed.saturating_add(bytes as u64);
+                    oversized
+                }
+                Ok(GrokSessionLineRead::Eof | GrokSessionLineRead::Partial) => break,
+                Ok(GrokSessionLineRead::OversizedUnterminated) => {
+                    self.offset = consumed;
+                    self.bootstrap_pending = false;
+                    self.disabled = true;
+                    return;
+                }
+                Err(_) => break,
+            };
+            if oversized {
+                continue;
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            if !is_grok_todo_write(&value) {
+                continue;
+            }
+            for event in decode_grok_session_activity_events(decoder, &value) {
+                if matches!(event.kind, ActivityKind::PlanUpdate { .. }) {
+                    latest_plan = Some(event);
+                }
+            }
+        }
+        self.offset = consumed;
+        self.bootstrap_pending = false;
+        if let Some(event) = latest_plan {
+            emit(Decoded::Activity(event));
+        }
+    }
+
+    fn poll(&mut self, force: bool, decoder: &mut OutputDecoder, emit: &mut impl FnMut(Decoded)) {
+        if self.disabled {
+            return;
+        }
+        let now = Instant::now();
+        if !force && now < self.next_poll {
+            return;
+        }
+        self.next_poll = now + GROK_SESSION_POLL_INTERVAL;
+        self.bootstrap(decoder, emit);
+        if self.bootstrap_pending || !self.resolve_directory() {
+            return;
+        }
+        let directory = self
+            .directory
+            .as_deref()
+            .expect("resolved Grok session directory");
+        let Some(path) = safe_grok_session_file(directory, "updates.jsonl") else {
+            return;
+        };
+        let Ok(metadata) = fs::metadata(&path) else {
+            return;
+        };
+        if metadata.len() < self.offset {
+            // Session update files are append-only. Rewinding here would replay
+            // old tool and plan events with new event ids.
+            self.disabled = true;
+            return;
+        }
+        let Ok(mut file) = fs::File::open(path) else {
+            return;
+        };
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return;
+        }
+        let mut reader = BufReader::new(file);
+        let mut line = Vec::new();
+        let mut lines_read = 0;
+        let mut bytes_read = 0;
+        while lines_read < MAX_GROK_SESSION_POLL_LINES && bytes_read < MAX_GROK_SESSION_POLL_BYTES {
+            let (read, oversized) = match read_bounded_grok_session_line(&mut reader, &mut line) {
+                Ok(GrokSessionLineRead::Complete { bytes, oversized }) => (bytes, oversized),
+                Ok(GrokSessionLineRead::Eof | GrokSessionLineRead::Partial) => break,
+                Ok(GrokSessionLineRead::OversizedUnterminated) => {
+                    // The record already exceeds the hard cap and has no
+                    // delimiter within the bounded read. Advancing would
+                    // land in its payload; retrying would repeat the same
+                    // work forever, so fail this follower closed.
+                    self.disabled = true;
+                    return;
+                }
+                Err(_) => break,
+            };
+            self.offset = self.offset.saturating_add(read as u64);
+            lines_read += 1;
+            bytes_read = bytes_read.saturating_add(read);
+            if oversized {
+                continue;
+            }
+            let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+                continue;
+            };
+            if is_grok_session_activity_update(&value) {
+                emit_grok_session_update(decoder, &value, emit);
+            }
+        }
+    }
+
+    fn final_drain(&mut self, decoder: &mut OutputDecoder, emit: &mut impl FnMut(Decoded)) {
+        let maximum_batches = MAX_GROK_SESSION_UPDATES.div_ceil(MAX_GROK_SESSION_POLL_LINES);
+        for _ in 0..maximum_batches {
+            let before = self.offset;
+            self.poll(true, decoder, emit);
+            if self.offset == before {
+                break;
+            }
+        }
+    }
+
+    fn resolve_directory(&mut self) -> bool {
+        if self.directory.is_none() {
+            self.directory = self
+                .workspace_key
+                .as_deref()
+                .and_then(|key| {
+                    grok_session_directory_in_workspace(&self.grok_home, key, &self.session_id)
+                })
+                .or_else(|| {
+                    self.workspace_key
+                        .is_none()
+                        .then(|| grok_session_directory_under(&self.grok_home, &self.session_id))
+                        .flatten()
+                });
+        }
+        self.directory.is_some()
+    }
+
+    fn directory(&self) -> Option<&Path> {
+        self.directory.as_deref()
+    }
+}
+
+fn grok_session_update(value: &Value) -> &Value {
+    value.pointer("/params/update").unwrap_or(value)
+}
+
+fn is_grok_todo_write(value: &Value) -> bool {
+    let update = grok_session_update(value);
+    update.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call")
+        && string_at(update, &["title"])
+            .is_some_and(|title| normalize_grok_tool_name(&title) == "todo_write")
+}
+
+fn is_grok_session_activity_update(value: &Value) -> bool {
+    matches!(
+        grok_session_update(value)
+            .get("sessionUpdate")
+            .and_then(Value::as_str),
+        Some("subagent_spawned" | "subagent_finished" | "tool_call" | "tool_call_update")
+    )
+}
+
+fn decode_grok_session_activity_events(
+    decoder: &mut OutputDecoder,
+    update: &Value,
+) -> Vec<ActivityEvent> {
+    let result = decoder.decode_grok_session_update(update);
+    let timestamp = grok_session_timestamp_ms(update);
+    let mut events = Vec::with_capacity(result.kinds.len());
+    for kind in result.kinds {
+        decoder.recognized_events = decoder.recognized_events.saturating_add(1);
+        let is_subagent = matches!(kind, ActivityKind::Subagent { .. });
+        let mut event = activity_event(kind);
+        if let Some(timestamp) = timestamp {
+            event.at = UnixMillis(timestamp);
+        }
+        if is_subagent {
+            event.duration_ms = grok_session_update(update)
+                .get("duration_ms")
+                .and_then(Value::as_i64);
+        }
+        events.push(event);
+    }
+    events
+}
+
+fn emit_grok_session_update(
+    decoder: &mut OutputDecoder,
+    update: &Value,
+    emit: &mut impl FnMut(Decoded),
+) {
+    for event in decode_grok_session_activity_events(decoder, update) {
+        emit(Decoded::Activity(event));
+    }
+}
+
+fn grok_session_timestamp_ms(value: &Value) -> Option<i64> {
+    value
+        .pointer("/_meta/agentTimestampMs")
+        .or_else(|| value.pointer("/params/update/_meta/agentTimestampMs"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            let timestamp = value.get("timestamp").and_then(Value::as_i64)?;
+            if timestamp.unsigned_abs() < 100_000_000_000 {
+                timestamp.checked_mul(1_000)
+            } else {
+                Some(timestamp)
+            }
+        })
+}
+
 #[derive(Default)]
 struct GrokTerminalDiagnostic {
     permission_tool: Option<String>,
@@ -3704,17 +4968,7 @@ struct GrokTerminalDiagnostic {
     cancellation_category: Option<String>,
 }
 
-fn harvest_grok_session(
-    decoder: &mut OutputDecoder,
-    session_id: &str,
-    emit: &mut impl FnMut(Decoded),
-) {
-    let Some(directory) = grok_session_directory(session_id) else {
-        return;
-    };
-    harvest_grok_session_directory(decoder, session_id, &directory, emit);
-}
-
+#[cfg(test)]
 fn harvest_grok_session_directory(
     decoder: &mut OutputDecoder,
     session_id: &str,
@@ -3722,29 +4976,22 @@ fn harvest_grok_session_directory(
     emit: &mut impl FnMut(Decoded),
 ) {
     for update in grok_current_turn_updates(&directory.join("updates.jsonl")) {
-        let result = decoder.decode_grok_session_update(&update);
-        for kind in result.kinds {
-            decoder.recognized_events = decoder.recognized_events.saturating_add(1);
-            let is_subagent = matches!(kind, ActivityKind::Subagent { .. });
-            let mut event = activity_event(kind);
-            if is_subagent {
-                event.duration_ms = update
-                    .pointer("/params/update/duration_ms")
-                    .or_else(|| update.get("duration_ms"))
-                    .and_then(Value::as_i64);
-                if let Some(at) = update
-                    .pointer("/_meta/agentTimestampMs")
-                    .and_then(Value::as_i64)
-                {
-                    event.at = UnixMillis(at);
-                }
-            }
-            emit(Decoded::Activity(event));
-        }
+        emit_grok_session_update(decoder, &update, emit);
     }
+    harvest_grok_session_terminal_directory(decoder, session_id, directory, emit);
+}
+
+fn harvest_grok_session_terminal_directory(
+    decoder: &mut OutputDecoder,
+    session_id: &str,
+    directory: &Path,
+    emit: &mut impl FnMut(Decoded),
+) {
     harvest_grok_subagent_metadata(decoder, session_id, directory, emit);
 
-    let diagnostic = grok_terminal_diagnostic(&directory.join("events.jsonl"));
+    let diagnostic = safe_grok_session_file(directory, "events.jsonl")
+        .map(|path| grok_terminal_diagnostic(&path))
+        .unwrap_or_default();
     if let (Some(tool), Some(resolution)) = (
         diagnostic.permission_tool.as_deref(),
         diagnostic.permission_resolution,
@@ -3800,11 +5047,41 @@ fn harvest_grok_subagent_metadata(
     parent_directory: &Path,
     emit: &mut impl FnMut(Decoded),
 ) {
-    let Ok(entries) = fs::read_dir(parent_directory.join("subagents")) else {
+    let subagents = parent_directory.join("subagents");
+    let Ok(subagents_metadata) = fs::symlink_metadata(&subagents) else {
+        return;
+    };
+    if !subagents_metadata.file_type().is_dir() || subagents_metadata.file_type().is_symlink() {
+        return;
+    }
+    let Ok(parent_directory) = fs::canonicalize(parent_directory) else {
+        return;
+    };
+    let Ok(subagents) = fs::canonicalize(subagents) else {
+        return;
+    };
+    if subagents.parent() != Some(parent_directory.as_path()) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(&subagents) else {
         return;
     };
     for entry in entries.flatten().take(MAX_GROK_SUBAGENTS) {
-        let meta_path = entry.path().join("meta.json");
+        let Ok(entry_type) = entry.file_type() else {
+            continue;
+        };
+        if !entry_type.is_dir() || entry_type.is_symlink() {
+            continue;
+        }
+        let Ok(entry_directory) = fs::canonicalize(entry.path()) else {
+            continue;
+        };
+        if entry_directory.parent() != Some(subagents.as_path()) {
+            continue;
+        }
+        let Some(meta_path) = safe_grok_session_file(&entry_directory, "meta.json") else {
+            continue;
+        };
         let Ok(metadata) = fs::metadata(&meta_path) else {
             continue;
         };
@@ -3820,8 +5097,8 @@ fn harvest_grok_subagent_metadata(
         if string_at(&meta, &["parent_session_id"]).as_deref() != Some(parent_session_id) {
             continue;
         }
-        let Some(id) =
-            string_at(&meta, &["subagent_id", "child_session_id"]).filter(|id| !id.is_empty())
+        let Some(id) = string_at(&meta, &["subagent_id", "child_session_id"])
+            .filter(|id| is_safe_grok_session_component(id))
         else {
             continue;
         };
@@ -3831,9 +5108,11 @@ fn harvest_grok_subagent_metadata(
 
         let child_diagnostic = parent_directory
             .parent()
-            .map(|workspace_sessions| {
-                grok_terminal_diagnostic(&workspace_sessions.join(&id).join("events.jsonl"))
+            .and_then(|workspace_sessions| {
+                safe_grok_child_session_directory(workspace_sessions, &id)
             })
+            .and_then(|directory| safe_grok_session_file(&directory, "events.jsonl"))
+            .map(|path| grok_terminal_diagnostic(&path))
             .unwrap_or_default();
         let permission_blocked = child_diagnostic
             .cancellation_category
@@ -3869,34 +5148,176 @@ fn harvest_grok_subagent_metadata(
     }
 }
 
-fn grok_session_directory(session_id: &str) -> Option<PathBuf> {
-    if Uuid::parse_str(session_id).is_err() {
-        return None;
-    }
-    let grok_home = env::var_os("GROK_HOME")
+fn grok_home_directory() -> Option<PathBuf> {
+    env::var_os("GROK_HOME")
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".grok")))?;
-    grok_session_directory_under(&grok_home, session_id)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".grok")))
 }
 
 fn grok_session_directory_under(grok_home: &Path, session_id: &str) -> Option<PathBuf> {
-    let roots = fs::read_dir(grok_home.join("sessions")).ok()?;
+    Uuid::parse_str(session_id).ok()?;
+    let sessions = canonical_grok_sessions_root(grok_home)?;
+    let roots = fs::read_dir(&sessions).ok()?;
     for root in roots.flatten() {
-        let candidate = root.path().join(session_id);
-        if candidate.is_dir() {
+        let Ok(root_type) = root.file_type() else {
+            continue;
+        };
+        if !root_type.is_dir() || root_type.is_symlink() {
+            continue;
+        }
+        let Ok(root) = fs::canonicalize(root.path()) else {
+            continue;
+        };
+        if !root.starts_with(&sessions) {
+            continue;
+        }
+        if let Some(candidate) = safe_grok_session_candidate(&root, session_id) {
             return Some(candidate);
         }
     }
     None
 }
 
+fn grok_workspace_key(cwd: &Path) -> Option<String> {
+    let cwd = fs::canonicalize(cwd).ok()?;
+    let encoded = url::form_urlencoded::byte_serialize(cwd.to_string_lossy().as_bytes())
+        .collect::<String>()
+        .replace('+', "%20");
+    Some(encoded)
+}
+
+fn grok_session_directory_in_workspace(
+    grok_home: &Path,
+    workspace_key: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    Uuid::parse_str(session_id).ok()?;
+    grok_session_directory_for_workspace_key(grok_home, workspace_key, session_id).or_else(|| {
+        // Grok's workspace encoder leaves apostrophes literal while
+        // form_urlencoded encodes them as `%27`. Keep lookup bound to the
+        // requested workspace by trying only that verified spelling variant.
+        let grok_key = workspace_key.replace("%27", "'");
+        (grok_key != workspace_key)
+            .then(|| grok_session_directory_for_workspace_key(grok_home, &grok_key, session_id))
+            .flatten()
+    })
+}
+
+fn grok_session_directory_for_workspace_key(
+    grok_home: &Path,
+    workspace_key: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
+    if workspace_key.is_empty()
+        || workspace_key.contains(['/', '\\'])
+        || workspace_key == "."
+        || workspace_key == ".."
+    {
+        return None;
+    }
+    let sessions = canonical_grok_sessions_root(grok_home)?;
+    let root = sessions.join(workspace_key);
+    let root_type = fs::symlink_metadata(&root).ok()?;
+    if !root_type.file_type().is_dir() || root_type.file_type().is_symlink() {
+        return None;
+    }
+    let root = fs::canonicalize(root).ok()?;
+    if root.parent() != Some(sessions.as_path()) || !root.starts_with(&sessions) {
+        return None;
+    }
+    safe_grok_session_candidate(&root, session_id)
+}
+
+fn safe_grok_session_candidate(root: &Path, session_id: &str) -> Option<PathBuf> {
+    let candidate = root.join(session_id);
+    let candidate_type = fs::symlink_metadata(&candidate).ok()?;
+    if !candidate_type.file_type().is_dir() || candidate_type.file_type().is_symlink() {
+        return None;
+    }
+    let candidate = fs::canonicalize(candidate).ok()?;
+    (candidate.parent() == Some(root) && candidate.starts_with(root)).then_some(candidate)
+}
+
+fn canonical_grok_sessions_root(grok_home: &Path) -> Option<PathBuf> {
+    let sessions = grok_home.join("sessions");
+    let metadata = fs::symlink_metadata(&sessions).ok()?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    fs::canonicalize(sessions).ok()
+}
+
+fn is_safe_grok_session_component(component: &str) -> bool {
+    !component.is_empty()
+        && component.len() <= 256
+        && Path::new(component)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        && Path::new(component).components().count() == 1
+}
+
+fn safe_grok_child_session_directory(workspace_sessions: &Path, id: &str) -> Option<PathBuf> {
+    if !is_safe_grok_session_component(id) {
+        return None;
+    }
+    let workspace_sessions = fs::canonicalize(workspace_sessions).ok()?;
+    let candidate = workspace_sessions.join(id);
+    let metadata = fs::symlink_metadata(&candidate).ok()?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let candidate = fs::canonicalize(candidate).ok()?;
+    (candidate.parent() == Some(workspace_sessions.as_path())).then_some(candidate)
+}
+
+fn safe_grok_session_file(directory: &Path, file_name: &str) -> Option<PathBuf> {
+    if !is_safe_grok_session_component(file_name) {
+        return None;
+    }
+    let directory_metadata = fs::symlink_metadata(directory).ok()?;
+    if !directory_metadata.file_type().is_dir() || directory_metadata.file_type().is_symlink() {
+        return None;
+    }
+    let directory = fs::canonicalize(directory).ok()?;
+    let path = directory.join(file_name);
+    let metadata = fs::symlink_metadata(&path).ok()?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let path = fs::canonicalize(path).ok()?;
+    (path.parent() == Some(directory.as_path())).then_some(path)
+}
+
+fn bounded_grok_session_reader(
+    path: &Path,
+    requested_end: u64,
+) -> Option<(BufReader<io::Take<fs::File>>, u64)> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let path = fs::canonicalize(path).ok()?;
+    let mut file = fs::File::open(path).ok()?;
+    let end = requested_end.min(file.metadata().ok()?.len());
+    let start = end.saturating_sub(MAX_GROK_SESSION_SCAN_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    Some((BufReader::new(file.take(end - start)), start))
+}
+
+#[cfg(test)]
 fn grok_current_turn_updates(path: &Path) -> Vec<Value> {
-    let Ok(file) = fs::File::open(path) else {
+    let Ok(metadata) = fs::metadata(path) else {
         return Vec::new();
     };
-    let mut reader = BufReader::new(file);
+    let Some((mut reader, start)) = bounded_grok_session_reader(path, metadata.len()) else {
+        return Vec::new();
+    };
     let mut line = Vec::new();
-    let mut updates = Vec::new();
+    if start > 0 && reader.read_until(b'\n', &mut line).is_err() {
+        return Vec::new();
+    }
+    let mut plan_updates = Vec::new();
+    let mut current_turn_updates = Vec::new();
     loop {
         line.clear();
         let Ok(read) = reader.read_until(b'\n', &mut line) else {
@@ -3911,34 +5332,59 @@ fn grok_current_turn_updates(path: &Path) -> Vec<Value> {
         let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
-        let update = value.pointer("/params/update").unwrap_or(&value);
+        let update = grok_session_update(&value);
         let Some(update_type) = update.get("sessionUpdate").and_then(Value::as_str) else {
             continue;
         };
         if update_type == "user_message_chunk" {
-            updates.clear();
+            current_turn_updates.clear();
             continue;
         }
-        if matches!(
-            update_type,
-            "subagent_spawned" | "subagent_finished" | "tool_call" | "tool_call_update"
-        ) {
-            if updates.len() == MAX_GROK_SESSION_UPDATES {
-                let remove = MAX_GROK_SESSION_UPDATES / 2;
-                updates.drain(..remove);
+        if !is_grok_session_activity_update(&value) {
+            continue;
+        }
+        if is_grok_todo_write(&value) {
+            let merge = update
+                .get("rawInput")
+                .and_then(|input| input.get("merge"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if !merge {
+                plan_updates.clear();
             }
-            updates.push(value);
+            if plan_updates.len() == MAX_GROK_SESSION_UPDATES {
+                // Preserve the latest full snapshot at index zero. A later
+                // merge is more useful than the oldest intermediate merge.
+                if plan_updates.len() > 1 {
+                    plan_updates.remove(1);
+                } else {
+                    continue;
+                }
+            }
+            plan_updates.push(value);
+        } else {
+            if current_turn_updates.len() == MAX_GROK_SESSION_UPDATES {
+                let remove = MAX_GROK_SESSION_UPDATES / 2;
+                current_turn_updates.drain(..remove);
+            }
+            current_turn_updates.push(value);
         }
     }
-    updates
+    plan_updates.extend(current_turn_updates);
+    plan_updates
 }
 
 fn grok_terminal_diagnostic(path: &Path) -> GrokTerminalDiagnostic {
-    let Ok(file) = fs::File::open(path) else {
+    let Ok(metadata) = fs::metadata(path) else {
         return GrokTerminalDiagnostic::default();
     };
-    let mut reader = BufReader::new(file);
+    let Some((mut reader, start)) = bounded_grok_session_reader(path, metadata.len()) else {
+        return GrokTerminalDiagnostic::default();
+    };
     let mut line = Vec::new();
+    if start > 0 && reader.read_until(b'\n', &mut line).is_err() {
+        return GrokTerminalDiagnostic::default();
+    }
     let mut diagnostic = GrokTerminalDiagnostic::default();
     loop {
         line.clear();
@@ -4413,6 +5859,7 @@ fn run_http(
     url: Url,
     control: &Arc<RunControl>,
     event_sender: &Sender<AiEvent>,
+    task_tools: &Arc<Mutex<TaskToolRegistry>>,
 ) -> RunOutcome {
     let (result_sender, result_receiver) = bounded(1);
     let timeout = run_timeout(request.workspace_mode);
@@ -4420,6 +5867,7 @@ fn run_http(
     let provider_id = provider_id.to_owned();
     let control_for_worker = Arc::clone(control);
     let events = event_sender.clone();
+    let worker_task_tools = Arc::clone(task_tools);
     let spawn = thread::Builder::new()
         .name(format!(
             "adam-ai-http-{}",
@@ -4432,6 +5880,7 @@ fn run_http(
                 url,
                 &control_for_worker,
                 &events,
+                &worker_task_tools,
             );
             let _ = result_sender.send(outcome);
         });
@@ -4445,41 +5894,53 @@ fn run_http(
     let started_at = Instant::now();
     loop {
         if control.cancelled.load(Ordering::Acquire) {
-            let _ = event_sender.send(AiEvent::Activity {
-                turn_id: request.turn_id,
-                conversation_id: request.conversation_id,
-                event: activity_event(ActivityKind::TurnStatus {
-                    status: TurnStatus::UserCancelled,
-                    message: None,
-                    tool: None,
-                    retry: None,
-                }),
-            });
-            let _ = event_sender.send(AiEvent::Cancelled {
-                turn_id: request.turn_id,
-                conversation_id: request.conversation_id,
-            });
+            {
+                let _event_gate = lock_unpoison(&control.http_event_gate);
+                lock_unpoison(task_tools).unregister_run(request.turn_id);
+                let _ = event_sender.send(AiEvent::Activity {
+                    turn_id: request.turn_id,
+                    conversation_id: request.conversation_id,
+                    event: activity_event(ActivityKind::TurnStatus {
+                        status: TurnStatus::UserCancelled,
+                        message: None,
+                        tool: None,
+                        retry: None,
+                    }),
+                });
+                let _ = event_sender.send(AiEvent::Cancelled {
+                    turn_id: request.turn_id,
+                    conversation_id: request.conversation_id,
+                });
+            }
             wait_for_http_worker(result_receiver, worker);
             return RunOutcome::TerminalAlreadyEmitted;
         }
         if started_at.elapsed() >= timeout {
+            // Win the task-dispatch gate before making the terminal event
+            // observable. A worker already executing one bounded task call
+            // finishes first; every later call sees `cancelled` and stops.
             let message = timeout_failure_message(timeout);
-            let _ = event_sender.send(AiEvent::Activity {
-                turn_id: request.turn_id,
-                conversation_id: request.conversation_id,
-                event: activity_event(ActivityKind::TurnStatus {
-                    status: TurnStatus::TimedOut,
-                    message: Some(message.clone()),
-                    tool: None,
-                    retry: Some(RetryHint::Retry),
-                }),
-            });
-            let _ = event_sender.send(AiEvent::Failed {
-                turn_id: request.turn_id,
-                conversation_id: request.conversation_id,
-                kind: AiFailureKind::TimedOut,
-                message,
-            });
+            {
+                let _event_gate = lock_unpoison(&control.http_event_gate);
+                control.cancelled.store(true, Ordering::Release);
+                lock_unpoison(task_tools).unregister_run(request.turn_id);
+                let _ = event_sender.send(AiEvent::Activity {
+                    turn_id: request.turn_id,
+                    conversation_id: request.conversation_id,
+                    event: activity_event(ActivityKind::TurnStatus {
+                        status: TurnStatus::TimedOut,
+                        message: Some(message.clone()),
+                        tool: None,
+                        retry: Some(RetryHint::Retry),
+                    }),
+                });
+                let _ = event_sender.send(AiEvent::Failed {
+                    turn_id: request.turn_id,
+                    conversation_id: request.conversation_id,
+                    kind: AiFailureKind::TimedOut,
+                    message,
+                });
+            }
             wait_for_http_worker(result_receiver, worker);
             return RunOutcome::TerminalAlreadyEmitted;
         }
@@ -4505,12 +5966,12 @@ fn wait_for_http_worker(result_receiver: Receiver<RunOutcome>, worker: thread::J
     let _ = worker.join();
 }
 
+#[cfg(test)]
 fn http_request_body(request: &AiRunRequest) -> Map<String, Value> {
-    let mut body = Map::new();
-    let model = effective_model(request);
-    if !model.is_empty() {
-        body.insert("model".into(), Value::String(model.into()));
-    }
+    http_request_body_with_context(request, initial_http_messages(request), &[])
+}
+
+fn initial_http_messages(request: &AiRunRequest) -> Vec<Value> {
     let mut messages = Vec::with_capacity(2);
     if let Some(system_prompt) = request
         .system_prompt
@@ -4520,9 +5981,182 @@ fn http_request_body(request: &AiRunRequest) -> Map<String, Value> {
         messages.push(json!({"role": "system", "content": system_prompt}));
     }
     messages.push(json!({"role": "user", "content": request.prompt}));
+    messages
+}
+
+#[derive(serde::Serialize)]
+struct HttpRequestBodyRef<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+    messages: &'a [Value],
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a [Value]>,
+}
+
+#[derive(Default)]
+struct SerializedByteCounter {
+    bytes: usize,
+}
+
+impl Write for SerializedByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len())
+            .ok_or_else(|| io::Error::other("serialized JSON byte count overflowed"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_bytes(value: &impl serde::Serialize) -> Result<usize, RunOutcome> {
+    let mut counter = SerializedByteCounter::default();
+    serde_json::to_writer(&mut counter, value).map_err(|error| {
+        RunOutcome::provider_error(format!(
+            "could not measure the AI API continuation request: {error}"
+        ))
+    })?;
+    Ok(counter.bytes)
+}
+
+struct HttpContinuationBudget {
+    sent_request_bytes: usize,
+    message_bytes: usize,
+    message_count: usize,
+    maximum_bytes: usize,
+}
+
+impl HttpContinuationBudget {
+    fn new(messages: &[Value]) -> Result<Self, RunOutcome> {
+        Self::with_limit(messages, MAX_HTTP_CONTINUATION_REQUEST_BYTES)
+    }
+
+    fn with_limit(messages: &[Value], maximum_bytes: usize) -> Result<Self, RunOutcome> {
+        let mut message_bytes = 2_usize;
+        for (index, message) in messages.iter().enumerate() {
+            let serialized = serialized_json_bytes(message)?;
+            message_bytes = message_bytes
+                .checked_add(serialized)
+                .and_then(|bytes| bytes.checked_add(usize::from(index > 0)))
+                .ok_or_else(|| http_continuation_budget_exceeded(maximum_bytes))?;
+        }
+        if message_bytes > maximum_bytes {
+            return Err(http_continuation_budget_exceeded(maximum_bytes));
+        }
+        Ok(Self {
+            sent_request_bytes: 0,
+            message_bytes,
+            message_count: messages.len(),
+            maximum_bytes,
+        })
+    }
+
+    fn append_message(
+        &mut self,
+        messages: &mut Vec<Value>,
+        message: Value,
+    ) -> Result<(), RunOutcome> {
+        let serialized = serialized_json_bytes(&message)?;
+        let projected = self
+            .message_bytes
+            .checked_add(serialized)
+            .and_then(|bytes| bytes.checked_add(usize::from(self.message_count > 0)))
+            .ok_or_else(|| http_continuation_budget_exceeded(self.maximum_bytes))?;
+        if projected > self.maximum_bytes {
+            return Err(http_continuation_budget_exceeded(self.maximum_bytes));
+        }
+        messages.push(message);
+        self.message_bytes = projected;
+        self.message_count += 1;
+        Ok(())
+    }
+
+    fn serialize_request(
+        &mut self,
+        request: &AiRunRequest,
+        messages: &[Value],
+        task_tools: &[Value],
+    ) -> Result<Vec<u8>, RunOutcome> {
+        let openai_tools = task_tools
+            .iter()
+            .filter_map(openai_function_tool)
+            .collect::<Vec<_>>();
+        let body = HttpRequestBodyRef {
+            model: (!effective_model(request).is_empty()).then(|| effective_model(request)),
+            messages,
+            stream: true,
+            tools: (!task_tools.is_empty()).then_some(openai_tools.as_slice()),
+        };
+        let request_bytes = serialized_json_bytes(&body)?;
+        let projected = self
+            .sent_request_bytes
+            .checked_add(request_bytes)
+            .ok_or_else(|| http_continuation_budget_exceeded(self.maximum_bytes))?;
+        if projected > self.maximum_bytes {
+            return Err(http_continuation_budget_exceeded(self.maximum_bytes));
+        }
+        let serialized = serde_json::to_vec(&body).map_err(|error| {
+            RunOutcome::provider_error(format!(
+                "could not serialize the AI API continuation request: {error}"
+            ))
+        })?;
+        if serialized.len() != request_bytes {
+            return Err(RunOutcome::provider_error(
+                "AI API continuation request size changed during serialization",
+            ));
+        }
+        self.sent_request_bytes = projected;
+        Ok(serialized)
+    }
+}
+
+fn http_continuation_budget_exceeded(maximum_bytes: usize) -> RunOutcome {
+    RunOutcome::Failed {
+        kind: AiFailureKind::MaxTurnsReached,
+        message: format!(
+            "AI API continuation requests exceeded Adam's {maximum_bytes}-byte cumulative request budget"
+        ),
+        tool: None,
+        retry: Some(RetryHint::Retry),
+    }
+}
+
+#[cfg(test)]
+fn http_request_body_with_context(
+    request: &AiRunRequest,
+    messages: Vec<Value>,
+    task_tools: &[Value],
+) -> Map<String, Value> {
+    let mut body = Map::new();
+    let model = effective_model(request);
+    if !model.is_empty() {
+        body.insert("model".into(), Value::String(model.into()));
+    }
     body.insert("messages".into(), Value::Array(messages));
     body.insert("stream".into(), Value::Bool(true));
+    if !task_tools.is_empty() {
+        body.insert(
+            "tools".into(),
+            Value::Array(task_tools.iter().filter_map(openai_function_tool).collect()),
+        );
+    }
     body
+}
+
+fn openai_function_tool(descriptor: &Value) -> Option<Value> {
+    let name = descriptor.get("name")?.as_str()?;
+    let input_schema = descriptor.get("inputSchema")?.clone();
+    let mut function = Map::new();
+    function.insert("name".into(), Value::String(name.into()));
+    if let Some(description) = descriptor.get("description").and_then(Value::as_str) {
+        function.insert("description".into(), Value::String(description.into()));
+    }
+    function.insert("parameters".into(), input_schema);
+    Some(json!({"type": "function", "function": function}))
 }
 
 fn run_http_blocking(
@@ -4531,132 +6165,190 @@ fn run_http_blocking(
     url: Url,
     control: &Arc<RunControl>,
     event_sender: &Sender<AiEvent>,
+    task_tools: &Arc<Mutex<TaskToolRegistry>>,
 ) -> RunOutcome {
     if control.cancelled.load(Ordering::Acquire) {
         return RunOutcome::Cancelled;
     }
 
-    let body = http_request_body(request);
-
     let key = resolved_http_key(provider_id, request);
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(run_timeout(request.workspace_mode)))
         .max_redirects(0)
+        .http_status_as_error(false)
         .build()
         .into();
-    let mut call = agent
-        .post(url.as_str())
-        .header("Accept", "text/event-stream")
-        .header("Content-Type", "application/json");
-    let authorization;
-    if let Some(key) = key.as_deref() {
-        authorization = format!("Bearer {key}");
-        call = call.header("Authorization", &authorization);
-    }
+    let mut messages = initial_http_messages(request);
+    let mut output = String::new();
+    let mut session_emitted = false;
+    let mut task_tools_enabled = true;
+    let mut continuation_budget = match HttpContinuationBudget::new(&messages) {
+        Ok(budget) => budget,
+        Err(outcome) => return outcome,
+    };
 
-    let mut response = match call.send_json(Value::Object(body)) {
-        Ok(response) => response,
-        Err(error) => {
+    for round_index in 0..=MAX_HTTP_TOOL_ROUNDS {
+        if control.cancelled.load(Ordering::Acquire) {
+            return RunOutcome::Cancelled;
+        }
+        let round = loop {
+            let descriptors = if task_tools_enabled {
+                lock_unpoison(task_tools).descriptors_for_run(request.turn_id)
+            } else {
+                Vec::new()
+            };
+            let body = match continuation_budget.serialize_request(
+                request,
+                messages.as_slice(),
+                descriptors.as_slice(),
+            ) {
+                Ok(body) => body,
+                Err(outcome) => return outcome,
+            };
+            match run_http_round(
+                request,
+                &url,
+                control,
+                event_sender,
+                &agent,
+                key.as_deref(),
+                body,
+                !descriptors.is_empty(),
+                &mut output,
+                &mut session_emitted,
+            ) {
+                Ok(round) => break round,
+                Err(outcome)
+                    if round_index == 0
+                        && task_tools_enabled
+                        && http_task_tools_were_rejected(&outcome) =>
+                {
+                    // Generic compatible endpoints have no reliable function
+                    // capability handshake. Retry their first request once
+                    // without tools so ordinary chat remains available.
+                    task_tools_enabled = false;
+                }
+                Err(outcome) => return outcome,
+            }
+        };
+        let tool_calls = match round.tool_calls.finish(request.turn_id, round_index) {
+            Ok(tool_calls) => tool_calls,
+            Err(error) => return RunOutcome::provider_error(error),
+        };
+        if matches!(
+            round.finish_reason.as_deref(),
+            Some("length" | "max_tokens" | "max_output_tokens")
+        ) {
+            return RunOutcome::Failed {
+                kind: AiFailureKind::MaxTurnsReached,
+                message: "AI API reached its output-token limit before completing.".into(),
+                tool: None,
+                retry: Some(RetryHint::Retry),
+            };
+        }
+        if matches!(
+            round.finish_reason.as_deref(),
+            Some("content_filter" | "content_filtered")
+        ) {
+            return RunOutcome::provider_error(
+                "AI API stopped because its content filter blocked the response",
+            );
+        }
+        if let Some(reason) = round.finish_reason.as_deref()
+            && !matches!(reason, "stop" | "tool_calls" | "function_call")
+        {
+            return RunOutcome::provider_error(format!(
+                "AI API stopped with unsupported finish reason {reason}"
+            ));
+        }
+        if tool_calls.is_empty() {
+            if matches!(
+                round.finish_reason.as_deref(),
+                Some("tool_calls" | "function_call")
+            ) {
+                return RunOutcome::provider_error(
+                    "AI API reported tool calls but did not provide a callable function",
+                );
+            }
+            return RunOutcome::Completed {
+                text: output,
+                session_id: None,
+            };
+        }
+        if round_index == MAX_HTTP_TOOL_ROUNDS {
+            return RunOutcome::Failed {
+                kind: AiFailureKind::MaxTurnsReached,
+                message: format!(
+                    "AI API exceeded Adam's {MAX_HTTP_TOOL_ROUNDS}-round task-tool limit"
+                ),
+                tool: None,
+                retry: Some(RetryHint::Retry),
+            };
+        }
+
+        if let Err(outcome) = continuation_budget.append_message(
+            &mut messages,
+            http_assistant_tool_message(&round.text, &tool_calls),
+        ) {
+            return outcome;
+        }
+        for tool_call in tool_calls {
+            let _event_gate = lock_unpoison(&control.http_event_gate);
             if control.cancelled.load(Ordering::Acquire) {
                 return RunOutcome::Cancelled;
             }
-            return RunOutcome::provider_error(format!("AI API request failed: {error}"));
-        }
-    };
-    if control.cancelled.load(Ordering::Acquire) {
-        return RunOutcome::Cancelled;
-    }
-    if !response.status().is_success() {
-        return RunOutcome::provider_error(format!(
-            "AI API returned HTTP status {}",
-            response.status()
-        ));
-    }
+            let arguments = serde_json::from_str::<Value>(&tool_call.arguments)
+                .unwrap_or_else(|_| Value::String(tool_call.arguments.clone()));
+            let call_event = activity_event(ActivityKind::ToolCall {
+                id: tool_call.id.clone(),
+                name: tool_call.name.clone(),
+                server: Some("adam".into()),
+                input_summary: compact_input_summary(&arguments),
+            });
+            let at = call_event.at;
+            let _ = event_sender.send(AiEvent::Activity {
+                turn_id: request.turn_id,
+                conversation_id: request.conversation_id,
+                event: call_event,
+            });
 
-    let response_body = response.body_mut();
-    let mut reader = BufReader::new(response_body.as_reader());
-    let mut line = String::new();
-    let mut data = Vec::<String>::new();
-    let mut output = String::new();
-    let mut protocol_error = None;
-    let mut done = false;
-    let mut session_emitted = false;
-
-    loop {
-        if control.cancelled.load(Ordering::Acquire) {
-            return RunOutcome::Cancelled;
-        }
-        line.clear();
-        #[cfg(test)]
-        control.http_read_in_progress.store(true, Ordering::Release);
-        let read = reader.read_line(&mut line);
-        #[cfg(test)]
-        control
-            .http_read_in_progress
-            .store(false, Ordering::Release);
-        if control.cancelled.load(Ordering::Acquire) {
-            return RunOutcome::Cancelled;
-        }
-        match read {
-            Ok(0) => {
-                dispatch_sse_data(
-                    &mut data,
-                    request,
-                    event_sender,
-                    &mut output,
-                    &mut protocol_error,
-                    &mut done,
-                    &mut session_emitted,
-                );
-                break;
+            let outcome = lock_unpoison(task_tools).call_for_run(
+                request.turn_id,
+                &tool_call.name,
+                &arguments,
+                at,
+            );
+            let is_error = outcome.is_error();
+            if !outcome.events.is_empty() {
+                let _ = event_sender.send(AiEvent::ActivityBatch {
+                    turn_id: request.turn_id,
+                    conversation_id: request.conversation_id,
+                    events: outcome.events,
+                });
             }
-            Ok(_) => {
-                let trimmed = line.trim_end_matches(['\r', '\n']);
-                if trimmed.is_empty() {
-                    dispatch_sse_data(
-                        &mut data,
-                        request,
-                        event_sender,
-                        &mut output,
-                        &mut protocol_error,
-                        &mut done,
-                        &mut session_emitted,
-                    );
-                    if done {
-                        break;
-                    }
-                } else if let Some(payload) = trimmed.strip_prefix("data:") {
-                    data.push(payload.trim_start().to_owned());
-                } else if trimmed.starts_with('{') {
-                    data.push(trimmed.to_owned());
-                    dispatch_sse_data(
-                        &mut data,
-                        request,
-                        event_sender,
-                        &mut output,
-                        &mut protocol_error,
-                        &mut done,
-                        &mut session_emitted,
-                    );
-                }
-            }
-            Err(error) => {
-                if control.cancelled.load(Ordering::Acquire) {
-                    return RunOutcome::Cancelled;
-                }
-                return RunOutcome::provider_error(format!("AI API stream failed: {error}"));
+            let result_content = http_tool_result_content(&outcome.response);
+            let _ = event_sender.send(AiEvent::Activity {
+                turn_id: request.turn_id,
+                conversation_id: request.conversation_id,
+                event: activity_event(ActivityKind::ToolResult {
+                    id: tool_call.id.clone(),
+                    output: tail_text(Some(&result_content)),
+                    is_error,
+                }),
+            });
+            let result_message = json!({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result_content
+            });
+            if let Err(outcome) = continuation_budget.append_message(&mut messages, result_message)
+            {
+                return outcome;
             }
         }
     }
 
-    if let Some(error) = protocol_error {
-        RunOutcome::provider_error(error)
-    } else {
-        RunOutcome::Completed {
-            text: output,
-            session_id: None,
-        }
-    }
+    unreachable!("bounded HTTP task-tool loop always returns")
 }
 
 fn resolved_http_key(provider_id: &str, request: &AiRunRequest) -> Option<String> {
@@ -4672,14 +6364,400 @@ fn resolved_http_key(provider_id: &str, request: &AiRunRequest) -> Option<String
     })
 }
 
-fn dispatch_sse_data(
+#[allow(clippy::too_many_arguments)]
+fn run_http_round(
+    request: &AiRunRequest,
+    url: &Url,
+    control: &Arc<RunControl>,
+    event_sender: &Sender<AiEvent>,
+    agent: &ureq::Agent,
+    key: Option<&str>,
+    body: Vec<u8>,
+    sent_task_tools: bool,
+    output: &mut String,
+    session_emitted: &mut bool,
+) -> Result<HttpRound, RunOutcome> {
+    let mut call = agent
+        .post(url.as_str())
+        .header("Accept", "text/event-stream, application/json")
+        .header("Content-Type", "application/json");
+    let authorization = key.map(|key| format!("Bearer {key}"));
+    if let Some(authorization) = authorization.as_deref() {
+        call = call.header("Authorization", authorization);
+    }
+
+    let mut response = match call.send(body.as_slice()) {
+        Ok(response) => response,
+        Err(error) => {
+            if control.cancelled.load(Ordering::Acquire) {
+                return Err(RunOutcome::Cancelled);
+            }
+            return Err(RunOutcome::provider_error(format!(
+                "AI API request failed: {error}"
+            )));
+        }
+    };
+    if control.cancelled.load(Ordering::Acquire) {
+        return Err(RunOutcome::Cancelled);
+    }
+    if !response.status().is_success() {
+        if sent_task_tools && matches!(response.status().as_u16(), 400 | 404 | 422) {
+            return Err(RunOutcome::provider_error(format!(
+                "{HTTP_TASK_TOOLS_REJECTED_PREFIX}{}",
+                response.status()
+            )));
+        }
+        return Err(RunOutcome::provider_error(format!(
+            "AI API returned HTTP status {}",
+            response.status()
+        )));
+    }
+
+    let is_json_response = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
+    let mut round = HttpRound::default();
+    let mut protocol_error = None;
+    let protocol_complete;
+
+    if is_json_response {
+        #[cfg(test)]
+        control.http_read_in_progress.store(true, Ordering::Release);
+        let response_bytes = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_CAPTURE_BYTES as u64)
+            .read_to_vec();
+        #[cfg(test)]
+        control
+            .http_read_in_progress
+            .store(false, Ordering::Release);
+        if control.cancelled.load(Ordering::Acquire) {
+            return Err(RunOutcome::Cancelled);
+        }
+        let response_bytes = response_bytes.map_err(|error| {
+            RunOutcome::provider_error(format!("AI API response failed: {error}"))
+        })?;
+        let value = serde_json::from_slice::<Value>(&response_bytes).map_err(|error| {
+            RunOutcome::provider_error(format!("AI API returned invalid JSON: {error}"))
+        })?;
+        dispatch_http_value(
+            &value,
+            request,
+            control,
+            event_sender,
+            output,
+            &mut round,
+            &mut protocol_error,
+            session_emitted,
+            sent_task_tools,
+        );
+        protocol_complete = round.finish_reason.is_some();
+    } else {
+        let response_body = response.body_mut();
+        let mut reader = BufReader::new(response_body.as_reader());
+        let mut line = Vec::new();
+        let mut data = Vec::<String>::new();
+        let mut done = false;
+        let mut response_bytes = 0_usize;
+
+        loop {
+            if control.cancelled.load(Ordering::Acquire) {
+                return Err(RunOutcome::Cancelled);
+            }
+            line.clear();
+            #[cfg(test)]
+            control.http_read_in_progress.store(true, Ordering::Release);
+            let read = reader
+                .by_ref()
+                .take((MAX_HTTP_SSE_LINE_BYTES + 1) as u64)
+                .read_until(b'\n', &mut line);
+            #[cfg(test)]
+            control
+                .http_read_in_progress
+                .store(false, Ordering::Release);
+            if control.cancelled.load(Ordering::Acquire) {
+                return Err(RunOutcome::Cancelled);
+            }
+            match read {
+                Ok(0) => {
+                    dispatch_http_sse_data(
+                        &mut data,
+                        request,
+                        control,
+                        event_sender,
+                        output,
+                        &mut round,
+                        &mut protocol_error,
+                        &mut done,
+                        session_emitted,
+                        sent_task_tools,
+                    );
+                    break;
+                }
+                Ok(_) => {
+                    if line.len() > MAX_HTTP_SSE_LINE_BYTES {
+                        return Err(RunOutcome::provider_error(format!(
+                            "AI API stream line exceeded {MAX_HTTP_SSE_LINE_BYTES} bytes"
+                        )));
+                    }
+                    response_bytes = response_bytes.saturating_add(line.len());
+                    if response_bytes > MAX_HTTP_SSE_RESPONSE_BYTES {
+                        return Err(RunOutcome::provider_error(format!(
+                            "AI API stream exceeded {MAX_HTTP_SSE_RESPONSE_BYTES} bytes"
+                        )));
+                    }
+                    let line = std::str::from_utf8(&line).map_err(|_| {
+                        RunOutcome::provider_error("AI API stream was not valid UTF-8")
+                    })?;
+                    let trimmed = line.trim_end_matches(['\r', '\n']);
+                    if trimmed.is_empty() {
+                        dispatch_http_sse_data(
+                            &mut data,
+                            request,
+                            control,
+                            event_sender,
+                            output,
+                            &mut round,
+                            &mut protocol_error,
+                            &mut done,
+                            session_emitted,
+                            sent_task_tools,
+                        );
+                        if done {
+                            break;
+                        }
+                    } else if let Some(payload) = trimmed.strip_prefix("data:") {
+                        data.push(payload.trim_start().to_owned());
+                    } else if trimmed.starts_with('{') {
+                        data.push(trimmed.to_owned());
+                        dispatch_http_sse_data(
+                            &mut data,
+                            request,
+                            control,
+                            event_sender,
+                            output,
+                            &mut round,
+                            &mut protocol_error,
+                            &mut done,
+                            session_emitted,
+                            sent_task_tools,
+                        );
+                    }
+                }
+                Err(error) => {
+                    if control.cancelled.load(Ordering::Acquire) {
+                        return Err(RunOutcome::Cancelled);
+                    }
+                    return Err(RunOutcome::provider_error(format!(
+                        "AI API stream failed: {error}"
+                    )));
+                }
+            }
+        }
+        protocol_complete = done || round.finish_reason.is_some();
+    }
+
+    if control.cancelled.load(Ordering::Acquire) {
+        return Err(RunOutcome::Cancelled);
+    }
+    if let Some(error) = protocol_error {
+        Err(RunOutcome::provider_error(error))
+    } else if !protocol_complete {
+        Err(RunOutcome::provider_error(
+            "AI API response ended before a terminal marker",
+        ))
+    } else {
+        Ok(round)
+    }
+}
+
+fn http_task_tools_were_rejected(outcome: &RunOutcome) -> bool {
+    matches!(
+        outcome,
+        RunOutcome::Failed {
+            kind: AiFailureKind::ProviderError,
+            message,
+            ..
+        } if message.starts_with(HTTP_TASK_TOOLS_REJECTED_PREFIX)
+    )
+}
+
+#[derive(Default)]
+struct HttpRound {
+    text: String,
+    tool_calls: HttpToolCallFragments,
+    finish_reason: Option<String>,
+}
+
+#[derive(Default)]
+struct HttpToolCallFragments {
+    calls: Vec<Option<HttpToolCallBuilder>>,
+}
+
+#[derive(Default)]
+struct HttpToolCallBuilder {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+struct HttpToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+impl HttpToolCallFragments {
+    fn push(&mut self, fragments: &[Value]) -> Result<(), String> {
+        for (position, fragment) in fragments.iter().enumerate() {
+            let index = fragment
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+                .unwrap_or(position);
+            if index >= MAX_HTTP_TOOL_CALLS_PER_ROUND {
+                return Err(format!(
+                    "AI API returned more than {MAX_HTTP_TOOL_CALLS_PER_ROUND} tool calls in one round"
+                ));
+            }
+            while self.calls.len() <= index {
+                self.calls.push(None);
+            }
+            let call = self.calls[index].get_or_insert_with(HttpToolCallBuilder::default);
+            if let Some(id) = fragment.get("id").and_then(Value::as_str) {
+                append_http_identity_fragment(&mut call.id, id);
+            }
+            let function = fragment.get("function").unwrap_or(fragment);
+            if let Some(name) = function.get("name").and_then(Value::as_str) {
+                append_http_identity_fragment(&mut call.name, name);
+            }
+            if let Some(arguments) = function.get("arguments") {
+                match arguments {
+                    Value::String(arguments) => call.arguments.push_str(arguments),
+                    Value::Null => {}
+                    arguments => {
+                        call.arguments.push_str(
+                            &serde_json::to_string(arguments).unwrap_or_else(|_| "null".to_owned()),
+                        );
+                    }
+                }
+            }
+            if call.arguments.len() > MAX_HTTP_TOOL_ARGUMENT_BYTES {
+                return Err(format!(
+                    "AI API tool arguments exceeded {MAX_HTTP_TOOL_ARGUMENT_BYTES} bytes"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(self, turn_id: Uuid, round_index: usize) -> Result<Vec<HttpToolCall>, String> {
+        let mut ids = HashSet::new();
+        let mut calls = Vec::new();
+        for (index, call) in self.calls.into_iter().enumerate() {
+            let Some(call) = call else {
+                continue;
+            };
+            let name = call.name.trim();
+            if name.is_empty() {
+                return Err("AI API returned a tool call without a function name".into());
+            }
+            let id = if call.id.trim().is_empty() {
+                format!(
+                    "call_{}_{}_{}",
+                    short_uuid(turn_id),
+                    round_index + 1,
+                    index + 1
+                )
+            } else {
+                call.id
+            };
+            if !ids.insert(id.clone()) {
+                return Err(format!("AI API returned duplicate tool call id {id}"));
+            }
+            calls.push(HttpToolCall {
+                id,
+                name: name.to_owned(),
+                arguments: if call.arguments.trim().is_empty() {
+                    "{}".into()
+                } else {
+                    call.arguments
+                },
+            });
+        }
+        Ok(calls)
+    }
+}
+
+fn append_http_identity_fragment(target: &mut String, fragment: &str) {
+    if fragment.is_empty() || target == fragment || target.ends_with(fragment) {
+        return;
+    }
+    if fragment.starts_with(target.as_str()) {
+        *target = fragment.to_owned();
+    } else {
+        target.push_str(fragment);
+    }
+}
+
+fn http_assistant_tool_message(text: &str, tool_calls: &[HttpToolCall]) -> Value {
+    let content = if text.is_empty() {
+        Value::Null
+    } else {
+        Value::String(text.into())
+    };
+    let tool_calls = tool_calls
+        .iter()
+        .map(|call| {
+            json!({
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": call.arguments
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "role": "assistant",
+        "content": content,
+        "tool_calls": tool_calls
+    })
+}
+
+fn http_tool_result_content(response: &Value) -> String {
+    if let Some(structured) = response.get("structuredContent") {
+        return serde_json::to_string(structured).unwrap_or_else(|_| "{}".into());
+    }
+    if let Some(text) = response
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.first())
+        .and_then(|content| content.get("text"))
+        .and_then(Value::as_str)
+    {
+        return text.to_owned();
+    }
+    serde_json::to_string(response).unwrap_or_else(|_| "Task tool returned no result.".into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_http_sse_data(
     data: &mut Vec<String>,
     request: &AiRunRequest,
+    control: &RunControl,
     event_sender: &Sender<AiEvent>,
     output: &mut String,
+    round: &mut HttpRound,
     protocol_error: &mut Option<String>,
     done: &mut bool,
     session_emitted: &mut bool,
+    task_tools_authorized: bool,
 ) {
     if data.is_empty() {
         return;
@@ -4691,8 +6769,38 @@ fn dispatch_sse_data(
         return;
     }
     let Ok(value) = serde_json::from_str::<Value>(&payload) else {
+        *protocol_error = Some("AI API stream returned malformed JSON".into());
         return;
     };
+    dispatch_http_value(
+        &value,
+        request,
+        control,
+        event_sender,
+        output,
+        round,
+        protocol_error,
+        session_emitted,
+        task_tools_authorized,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_http_value(
+    value: &Value,
+    request: &AiRunRequest,
+    control: &RunControl,
+    event_sender: &Sender<AiEvent>,
+    output: &mut String,
+    round: &mut HttpRound,
+    protocol_error: &mut Option<String>,
+    session_emitted: &mut bool,
+    task_tools_authorized: bool,
+) {
+    let _event_gate = lock_unpoison(&control.http_event_gate);
+    if control.cancelled.load(Ordering::Acquire) {
+        return;
+    }
     if let Some(message) = value
         .pointer("/error/message")
         .or_else(|| value.get("error").filter(|error| error.is_string()))
@@ -4707,6 +6815,43 @@ fn dispatch_sse_data(
         });
         *protocol_error = Some(message.to_owned());
         return;
+    }
+    if let Some(tool_calls) = value
+        .pointer("/choices/0/delta/tool_calls")
+        .or_else(|| value.pointer("/choices/0/message/tool_calls"))
+        .and_then(Value::as_array)
+    {
+        if !tool_calls.is_empty() && !task_tools_authorized {
+            *protocol_error =
+                Some("AI API called task tools that were not authorized for this request".into());
+            return;
+        }
+        if let Err(error) = round.tool_calls.push(tool_calls) {
+            *protocol_error = Some(error);
+            return;
+        }
+    }
+    if let Some(function_call) = value
+        .pointer("/choices/0/delta/function_call")
+        .or_else(|| value.pointer("/choices/0/message/function_call"))
+        .filter(|call| !call.is_null())
+    {
+        if !task_tools_authorized {
+            *protocol_error =
+                Some("AI API called task tools that were not authorized for this request".into());
+            return;
+        }
+        if let Err(error) = round.tool_calls.push(std::slice::from_ref(function_call)) {
+            *protocol_error = Some(error);
+            return;
+        }
+    }
+    if let Some(finish_reason) = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+    {
+        round.finish_reason = Some(finish_reason.to_ascii_lowercase());
     }
     if !*session_emitted {
         let model = value
@@ -4740,6 +6885,7 @@ fn dispatch_sse_data(
         let remaining = MAX_CAPTURE_BYTES - output.len();
         let text = truncate_utf8(text, remaining);
         output.push_str(text);
+        round.text.push_str(text);
         let _ = event_sender.send(AiEvent::Activity {
             turn_id: request.turn_id,
             conversation_id: request.conversation_id,
@@ -4904,6 +7050,7 @@ mod tests {
             api_key: Some("secret-value".into()),
             custom_command: String::new(),
             custom_arguments: Vec::new(),
+            initial_tasks: Vec::new(),
             prompt: "Explain this code".into(),
         }
     }
@@ -4927,6 +7074,692 @@ mod tests {
             .provider_preferences
             .features
             .insert(key.into(), value);
+    }
+
+    fn acp_permission(title: &str, kind: GrokAcpToolKind) -> GrokAcpPermissionRequest {
+        GrokAcpPermissionRequest {
+            session_id: "session".into(),
+            tool_call: GrokAcpToolCall {
+                id: format!("tool-{title}"),
+                title: Some(title.into()),
+                canonical_mcp_tool_name: None,
+                kind: Some(kind),
+                status: Some(GrokAcpToolStatus::Pending),
+                content: Vec::new(),
+                locations: Vec::new(),
+            },
+            options: vec![
+                crate::grok_acp::GrokAcpPermissionOption {
+                    id: "allow-once".into(),
+                    name: "Allow once".into(),
+                    kind: crate::grok_acp::GrokAcpPermissionOptionKind::AllowOnce,
+                },
+                crate::grok_acp::GrokAcpPermissionOption {
+                    id: "reject-once".into(),
+                    name: "Reject once".into(),
+                    kind: crate::grok_acp::GrokAcpPermissionOptionKind::RejectOnce,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn grok_acp_task_bridge_is_version_pinned() {
+        let supported = CliVersion::parse("grok 0.2.114").unwrap();
+        let old = CliVersion::parse("grok 0.2.111").unwrap();
+        let future = CliVersion::parse("grok 0.3.0").unwrap();
+        assert!(supports_grok_acp_task_bridge(Some(&supported)));
+        assert!(!supports_grok_acp_task_bridge(Some(&old)));
+        assert!(!supports_grok_acp_task_bridge(Some(&future)));
+        assert!(!supports_grok_acp_task_bridge(None));
+    }
+
+    #[test]
+    fn task_tool_prompt_gate_matches_callable_adapters() {
+        assert!(provider_exposes_app_task_tools(
+            "openai_compatible",
+            None,
+            "https://example.com/v1",
+        ));
+        assert!(provider_exposes_app_task_tools(
+            "lm_studio",
+            None,
+            "http://127.0.0.1:1234/v1",
+        ));
+        assert!(provider_exposes_app_task_tools("custom_cli", None, ""));
+        for provider in ["claude_cli", "codex_cli", "kimi_cli", "ollama"] {
+            assert!(
+                !provider_exposes_app_task_tools(provider, None, ""),
+                "{provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn grok_acp_permission_policy_fails_closed_on_residual_tasks_and_unsafe_work() {
+        let blocked = RefCell::new(GrokPermissionBlockState::default());
+        let mut task_permission = acp_permission(
+            "provider-controlled title",
+            GrokAcpToolKind::Other("mcp".into()),
+        );
+        task_permission.tool_call.canonical_mcp_tool_name = Some("adam_tasks__task_create".into());
+        assert!(matches!(
+            grok_acp_permission_decision(
+                &task_permission,
+                PermissionMode::Ask,
+                AiWorkspaceMode::Chat,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+        assert!(blocked.borrow().pending.is_some());
+        blocked.borrow_mut().pending = None;
+
+        let title_only = acp_permission(
+            "adam_tasks__task_create",
+            GrokAcpToolKind::Other("mcp".into()),
+        );
+        assert!(matches!(
+            grok_acp_permission_decision(
+                &title_only,
+                PermissionMode::Ask,
+                AiWorkspaceMode::Chat,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+        blocked.borrow_mut().pending = None;
+
+        for task_name in [
+            "task_create",
+            "task_update",
+            "task_list",
+            "adam_tasks__task_create",
+            "adam_tasks__task_update",
+            "adam_tasks__task_list",
+        ] {
+            let mut title_only = acp_permission(task_name, GrokAcpToolKind::Read);
+            title_only.tool_call.kind = None;
+            assert!(matches!(
+                grok_acp_permission_decision(
+                    &title_only,
+                    PermissionMode::Bypass,
+                    AiWorkspaceMode::Cowork,
+                    &blocked,
+                ),
+                GrokAcpPermissionDecision::Reject { .. }
+            ));
+            blocked.borrow_mut().pending = None;
+        }
+        for task_name in [
+            "adam_tasks__task_create",
+            "adam_tasks__task_update",
+            "adam_tasks__task_list",
+        ] {
+            let mut canonical_only = acp_permission("Read file", GrokAcpToolKind::Read);
+            canonical_only.tool_call.canonical_mcp_tool_name = Some(task_name.into());
+            assert!(matches!(
+                grok_acp_permission_decision(
+                    &canonical_only,
+                    PermissionMode::Bypass,
+                    AiWorkspaceMode::Cowork,
+                    &blocked,
+                ),
+                GrokAcpPermissionDecision::Reject { .. }
+            ));
+            blocked.borrow_mut().pending = None;
+        }
+
+        let mut persistent_only = acp_permission("WebFetch", GrokAcpToolKind::Fetch);
+        persistent_only.options = vec![
+            crate::grok_acp::GrokAcpPermissionOption {
+                id: "allow-always".into(),
+                name: "Always allow".into(),
+                kind: crate::grok_acp::GrokAcpPermissionOptionKind::AllowAlways,
+            },
+            crate::grok_acp::GrokAcpPermissionOption {
+                id: "reject-always".into(),
+                name: "Always reject".into(),
+                kind: crate::grok_acp::GrokAcpPermissionOptionKind::RejectAlways,
+            },
+        ];
+        assert_eq!(
+            grok_acp_permission_decision(
+                &persistent_only,
+                PermissionMode::Ask,
+                AiWorkspaceMode::Chat,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Cancel
+        );
+
+        assert!(matches!(
+            grok_acp_permission_decision(
+                &acp_permission("WebFetch", GrokAcpToolKind::Fetch),
+                PermissionMode::Ask,
+                AiWorkspaceMode::Chat,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Allow { .. }
+        ));
+
+        assert!(matches!(
+            grok_acp_permission_decision(
+                &acp_permission("Edit file", GrokAcpToolKind::Edit),
+                PermissionMode::Auto,
+                AiWorkspaceMode::Chat,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+        assert_eq!(
+            blocked
+                .borrow()
+                .pending
+                .as_ref()
+                .map(|block| block.tool.as_str()),
+            Some("Edit file")
+        );
+
+        blocked.borrow_mut().pending = None;
+        assert!(matches!(
+            grok_acp_permission_decision(
+                &acp_permission("Edit file", GrokAcpToolKind::Edit),
+                PermissionMode::Auto,
+                AiWorkspaceMode::Cowork,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Allow { .. }
+        ));
+
+        for mut permission in [
+            acp_permission("Switch mode", GrokAcpToolKind::SwitchMode),
+            acp_permission(
+                "Future provider tool",
+                GrokAcpToolKind::Other("future_kind".into()),
+            ),
+            acp_permission("Missing kind", GrokAcpToolKind::Read),
+        ] {
+            if permission.tool_call.title.as_deref() == Some("Missing kind") {
+                permission.tool_call.kind = None;
+            }
+            assert!(matches!(
+                grok_acp_permission_decision(
+                    &permission,
+                    PermissionMode::Auto,
+                    AiWorkspaceMode::Cowork,
+                    &blocked,
+                ),
+                GrokAcpPermissionDecision::Reject { .. }
+            ));
+        }
+        assert!(blocked.borrow().pending.is_some());
+        assert!(matches!(
+            grok_acp_permission_decision(
+                &acp_permission("Read file", GrokAcpToolKind::Read),
+                PermissionMode::Auto,
+                AiWorkspaceMode::Cowork,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Allow { .. }
+        ));
+        assert!(
+            blocked.borrow().pending.is_none(),
+            "a later successful permission must consume stale denial context"
+        );
+
+        assert!(matches!(
+            grok_acp_permission_decision(
+                &acp_permission("Spawn subagent", GrokAcpToolKind::Execute),
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Cowork,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+
+        let mut disguised_child = acp_permission("Delegate", GrokAcpToolKind::Execute);
+        disguised_child.tool_call.canonical_mcp_tool_name = Some("spawn_subagent".into());
+        assert!(matches!(
+            grok_acp_permission_decision(
+                &disguised_child,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Cowork,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn grok_acp_permission_errors_keep_terminal_truth() {
+        let outcome =
+            grok_acp_error_outcome(GrokAcpError::WebAccessDisabled { tool: "WebSearch" }, None);
+        assert!(matches!(
+            outcome,
+            RunOutcome::Failed {
+                kind: AiFailureKind::PermissionBlocked,
+                tool: Some(tool),
+                retry: Some(RetryHint::AllowWebAndRetry),
+                ..
+            } if tool == "WebSearch"
+        ));
+
+        let outcome = grok_acp_error_outcome(
+            GrokAcpError::ProviderCancelled,
+            Some(GrokPermissionBlock {
+                tool: "Bash".into(),
+                tool_call_id: "bash-call".into(),
+            }),
+        );
+        assert!(matches!(
+            outcome,
+            RunOutcome::Failed {
+                kind: AiFailureKind::PermissionBlocked,
+                tool: Some(tool),
+                retry: Some(RetryHint::Retry),
+                ..
+            } if tool == "Bash"
+        ));
+
+        assert!(matches!(
+            grok_acp_error_outcome(GrokAcpError::ProviderCancelled, None),
+            RunOutcome::Failed {
+                kind: AiFailureKind::ProviderError,
+                ..
+            }
+        ));
+
+        let blocked = RefCell::new(GrokPermissionBlockState::default());
+        let _ = grok_acp_permission_decision(
+            &acp_permission("Switch mode", GrokAcpToolKind::SwitchMode),
+            PermissionMode::Auto,
+            AiWorkspaceMode::Cowork,
+            &blocked,
+        );
+        let _ = grok_acp_permission_decision(
+            &acp_permission("Read file", GrokAcpToolKind::Read),
+            PermissionMode::Auto,
+            AiWorkspaceMode::Cowork,
+            &blocked,
+        );
+        assert!(matches!(
+            grok_acp_error_outcome(
+                GrokAcpError::ProviderCancelled,
+                blocked.into_inner().pending,
+            ),
+            RunOutcome::Failed {
+                kind: AiFailureKind::ProviderError,
+                ..
+            }
+        ));
+
+        let blocked = RefCell::new(GrokPermissionBlockState::default());
+        let denied = acp_permission("Switch mode", GrokAcpToolKind::SwitchMode);
+        let _ = grok_acp_permission_decision(
+            &denied,
+            PermissionMode::Auto,
+            AiWorkspaceMode::Cowork,
+            &blocked,
+        );
+        blocked
+            .borrow_mut()
+            .observe_event(&GrokAcpEvent::ToolCallUpdate {
+                session_id: "session".into(),
+                tool_call: denied.tool_call.clone(),
+            });
+        assert!(
+            blocked.borrow().pending.is_some(),
+            "the denied tool's own terminal update must retain attribution"
+        );
+        let mut completed_denied_tool = denied.tool_call.clone();
+        completed_denied_tool.status = Some(GrokAcpToolStatus::Completed);
+        blocked
+            .borrow_mut()
+            .observe_event(&GrokAcpEvent::ToolCallUpdate {
+                session_id: "session".into(),
+                tool_call: completed_denied_tool,
+            });
+        assert!(
+            blocked.borrow().pending.is_none(),
+            "completion proves the denied operation continued"
+        );
+
+        let _ = grok_acp_permission_decision(
+            &denied,
+            PermissionMode::Auto,
+            AiWorkspaceMode::Cowork,
+            &blocked,
+        );
+        blocked.borrow_mut().observe_event(&GrokAcpEvent::ToolCall {
+            session_id: "session".into(),
+            tool_call: acp_permission("Different tool", GrokAcpToolKind::Read).tool_call,
+        });
+        assert!(
+            blocked.borrow().pending.is_none(),
+            "a different tool call proves the provider continued beyond the denial"
+        );
+
+        let _ = grok_acp_permission_decision(
+            &denied,
+            PermissionMode::Auto,
+            AiWorkspaceMode::Cowork,
+            &blocked,
+        );
+        blocked
+            .borrow_mut()
+            .observe_event(&GrokAcpEvent::AgentThoughtChunk {
+                session_id: "session".into(),
+                message_id: "thought-after-denial".into(),
+                text: "Explaining why permission was unavailable".into(),
+            });
+        assert!(
+            blocked.borrow().pending.is_some(),
+            "prose can explain a denial and must not erase its attribution"
+        );
+        assert!(matches!(
+            grok_acp_error_outcome(
+                GrokAcpError::ProviderCancelled,
+                blocked.into_inner().pending,
+            ),
+            RunOutcome::Failed {
+                kind: AiFailureKind::PermissionBlocked,
+                tool: Some(tool),
+                ..
+            } if tool == "Switch mode"
+        ));
+    }
+
+    #[test]
+    fn grok_acp_app_task_channel_suppresses_native_plan_snapshots() {
+        let run = request("grok_cli");
+        let (sender, receiver) = unbounded();
+        emit_grok_acp_event(
+            &run,
+            &sender,
+            GrokAcpEvent::PlanSnapshot {
+                session_id: "session".into(),
+                entries: Vec::new(),
+            },
+            &RefCell::new(HashSet::new()),
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_acp_calls_the_http_task_bridge_and_emits_a_whole_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("fake-grok-acp.py");
+        fs::write(
+            &executable,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+import urllib.request
+
+if "--version" in sys.argv:
+    print("grok 0.2.114 (fixture)")
+    raise SystemExit(0)
+
+def receive():
+    line = sys.stdin.readline()
+    if not line:
+        raise RuntimeError("Adam closed ACP stdin")
+    return json.loads(line)
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+initialize = receive()
+send({
+    "jsonrpc": "2.0",
+    "id": initialize["id"],
+    "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+            "loadSession": True,
+            "mcpCapabilities": {"http": True}
+        }
+    }
+})
+
+session = receive()
+server = session["params"]["mcpServers"][0]
+session_id = "fake-acp-session"
+send({"jsonrpc": "2.0", "id": session["id"], "result": {"sessionId": session_id}})
+prompt = receive()
+
+headers = {
+    "Authorization": server["headers"][0]["value"],
+    "Content-Type": "application/json"
+}
+
+def post(value, protocol_version=None):
+    request_headers = dict(headers)
+    if protocol_version is not None:
+        request_headers["MCP-Protocol-Version"] = protocol_version
+    request = urllib.request.Request(
+        server["url"],
+        data=json.dumps(value, separators=(",", ":")).encode(),
+        headers=request_headers,
+        method="POST"
+    )
+    with urllib.request.urlopen(request, timeout=2) as response:
+        body = response.read()
+        return json.loads(body) if body else None
+
+initialized = post({
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "initialize",
+    "params": {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "fake-grok", "version": "0.2.114"}
+    }
+})
+protocol_version = initialized["result"]["protocolVersion"]
+post({
+    "jsonrpc": "2.0",
+    "method": "notifications/initialized",
+    "params": {}
+}, protocol_version)
+created = post({
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
+        "name": "task_create",
+        "arguments": {
+            "content": "Synthesize findings",
+            "activeForm": "Synthesizing findings"
+        }
+    }
+}, protocol_version)
+if created["result"].get("isError"):
+    raise RuntimeError("task_create failed")
+
+send({
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+        "sessionId": session_id,
+        "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "answer-1",
+            "content": {"type": "text", "text": "Task recorded."}
+        }
+    }
+})
+send({
+    "jsonrpc": "2.0",
+    "id": prompt["id"],
+    "result": {"stopReason": "end_turn"}
+})
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let mut run = request("grok_cli");
+        run.cwd = Some(temporary.path().to_path_buf());
+        run.model = "grok-4.5".into();
+        let registry = Arc::new(Mutex::new(TaskToolRegistry::new()));
+        lock_unpoison(&registry)
+            .register_run(
+                run.turn_id,
+                run.conversation_id,
+                PlanChannel::AppTaskTools,
+                &[],
+            )
+            .unwrap();
+        let (sender, receiver) = unbounded();
+        let outcome = run_grok_acp_transport(
+            &run,
+            GrokAcpSpec {
+                program: executable,
+                cwd: temporary.path().to_path_buf(),
+            },
+            &Arc::new(RunControl::default()),
+            &sender,
+            &registry,
+        );
+
+        assert!(matches!(
+            outcome,
+            RunOutcome::Completed { text, session_id }
+                if text == "Task recorded."
+                    && session_id.as_deref() == Some("fake-acp-session")
+        ));
+        let registry_guard = lock_unpoison(&registry);
+        let tasks = registry_guard
+            .tasks_for_conversation(run.conversation_id)
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].content, "Synthesize findings");
+        assert_eq!(
+            tasks[0].active_form.as_deref(),
+            Some("Synthesizing findings")
+        );
+        drop(registry_guard);
+
+        let task_events = receiver
+            .try_iter()
+            .flat_map(|event| match event {
+                AiEvent::Activity { event, .. } => vec![event.kind],
+                AiEvent::ActivityBatch { events, .. } => {
+                    events.into_iter().map(|event| event.kind).collect()
+                }
+                _ => Vec::new(),
+            })
+            .filter_map(|kind| match kind {
+                ActivityKind::TaskMutation { .. } | ActivityKind::PlanUpdate { .. } => {
+                    Some(kind.case_name())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(task_events, ["taskMutation", "planUpdate"]);
+    }
+
+    fn read_fake_http_json(stream: &mut std::net::TcpStream) -> Value {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request_bytes = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        let header_end = loop {
+            if let Some(position) = request_bytes
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+            {
+                break position + 4;
+            }
+            let count = stream.read(&mut buffer).unwrap();
+            assert_ne!(count, 0, "client closed before sending HTTP headers");
+            request_bytes.extend_from_slice(&buffer[..count]);
+        };
+        let headers = std::str::from_utf8(&request_bytes[..header_end]).unwrap();
+        let content_length = headers
+            .split("\r\n")
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .expect("fake server requires Content-Length");
+        let expected = header_end + content_length;
+        while request_bytes.len() < expected {
+            let count = stream.read(&mut buffer).unwrap();
+            assert_ne!(count, 0, "client closed before sending the JSON body");
+            request_bytes.extend_from_slice(&buffer[..count]);
+        }
+        serde_json::from_slice(&request_bytes[header_end..expected]).unwrap()
+    }
+
+    fn write_fake_json(stream: &mut std::net::TcpStream, value: &Value) {
+        let body = serde_json::to_vec(value).unwrap();
+        let headers = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn write_fake_status(stream: &mut std::net::TcpStream, status: &str) {
+        let body = b"{\"error\":\"unsupported tools\"}";
+        let headers = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(headers.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn write_fake_sse(stream: &mut std::net::TcpStream, values: &[Value]) {
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\n\
+                  Content-Type: text/event-stream\r\n\
+                  Connection: close\r\n\
+                  \r\n",
+            )
+            .unwrap();
+        for value in values {
+            stream
+                .write_all(
+                    format!("data: {}\n\n", serde_json::to_string(value).unwrap()).as_bytes(),
+                )
+                .unwrap();
+        }
+        stream.write_all(b"data: [DONE]\n\n").unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn assert_openai_task_tools(body: &Value) {
+        let tools = body["tools"].as_array().expect("task tools were offered");
+        assert_eq!(tools.len(), 3);
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool["function"]["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["task_create", "task_update", "task_list"]
+        );
+        assert!(
+            tools.iter().all(
+                |tool| tool["type"] == "function" && tool["function"]["parameters"].is_object()
+            )
+        );
     }
 
     #[test]
@@ -5348,6 +8181,822 @@ mod tests {
         ] {
             assert!(!body.contains_key(extension));
         }
+    }
+
+    #[test]
+    fn openai_function_tools_translate_mcp_descriptors_only_when_present() {
+        let run = request("openai_compatible");
+        let messages = initial_http_messages(&run);
+        let no_tools = http_request_body_with_context(&run, messages.clone(), &[]);
+        assert!(!no_tools.contains_key("tools"));
+
+        let descriptors = crate::ai_task_tools::task_tool_descriptors();
+        let with_tools =
+            Value::Object(http_request_body_with_context(&run, messages, &descriptors));
+        assert_openai_task_tools(&with_tools);
+        assert_eq!(
+            with_tools["tools"][0]["function"]["parameters"],
+            descriptors[0]["inputSchema"]
+        );
+        assert!(
+            with_tools["tools"][0]["function"]
+                .get("inputSchema")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn openai_legacy_function_call_fragments_are_callable() {
+        let run = request("openai_compatible");
+        let control = RunControl::default();
+        let (events, _) = unbounded();
+        let mut output = String::new();
+        let mut round = HttpRound::default();
+        let mut protocol_error = None;
+        let mut session_emitted = false;
+        for value in [
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "function_call": {
+                            "name": "task_",
+                            "arguments": "{\"content\":\"Legacy"
+                        }
+                    }
+                }]
+            }),
+            json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "function_call": {
+                            "name": "create",
+                            "arguments": " task\"}"
+                        }
+                    },
+                    "finish_reason": "function_call"
+                }]
+            }),
+        ] {
+            dispatch_http_value(
+                &value,
+                &run,
+                &control,
+                &events,
+                &mut output,
+                &mut round,
+                &mut protocol_error,
+                &mut session_emitted,
+                true,
+            );
+        }
+        assert!(protocol_error.is_none(), "{protocol_error:?}");
+        assert_eq!(round.finish_reason.as_deref(), Some("function_call"));
+        let calls = round.tool_calls.finish(run.turn_id, 0).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "task_create");
+        assert_eq!(calls[0].arguments, "{\"content\":\"Legacy task\"}");
+    }
+
+    #[test]
+    fn public_task_tool_call_emits_one_atomic_activity_batch() {
+        let engine = AiEngine::new();
+        let turn_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        lock_unpoison(&engine.active).insert(
+            turn_id,
+            ActiveRun {
+                conversation_id,
+                control: Arc::new(RunControl::default()),
+            },
+        );
+        lock_unpoison(&engine.task_tools)
+            .register_run(turn_id, conversation_id, PlanChannel::AppTaskTools, &[])
+            .unwrap();
+
+        let outcome = engine.call_task_tool(
+            turn_id,
+            "task_create",
+            &json!({"content": "Write report"}),
+            UnixMillis(1),
+        );
+        assert_eq!(outcome.events.len(), 2);
+        assert!(matches!(
+            engine.events.try_recv().unwrap(),
+            AiEvent::ActivityBatch {
+                turn_id: event_turn,
+                conversation_id: event_conversation,
+                events,
+            } if event_turn == turn_id
+                && event_conversation == conversation_id
+                && events == outcome.events
+        ));
+        assert!(engine.events.try_recv().is_err());
+    }
+
+    #[test]
+    fn public_task_tool_delivery_holds_registry_until_batch_is_observable() {
+        let engine = AiEngine::new();
+        let turn_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        lock_unpoison(&engine.active).insert(
+            turn_id,
+            ActiveRun {
+                conversation_id,
+                control: Arc::new(RunControl::default()),
+            },
+        );
+        lock_unpoison(&engine.task_tools)
+            .register_run(turn_id, conversation_id, PlanChannel::AppTaskTools, &[])
+            .unwrap();
+
+        let delivered = std::cell::Cell::new(false);
+        let outcome = engine.call_task_tool_with_sink(
+            turn_id,
+            "task_create",
+            &json!({"content": "Publish atomically"}),
+            UnixMillis(1),
+            |event_conversation, events| {
+                assert_eq!(event_conversation, conversation_id);
+                assert_eq!(events.len(), 2);
+                assert!(
+                    engine.task_tools.try_lock().is_err(),
+                    "terminal revocation could race ahead of batch delivery"
+                );
+                delivered.set(true);
+            },
+        );
+        assert!(!outcome.is_error());
+        assert!(delivered.get());
+    }
+
+    #[test]
+    fn http_continuation_budget_bounds_repeated_large_tool_results_before_sending() {
+        const TEST_BUDGET_BYTES: usize = 256 * 1024;
+        const TOOL_RESULT_BYTES: usize = 32 * 1024;
+
+        let run = request("openai_compatible");
+        let mut messages = initial_http_messages(&run);
+        let mut budget = HttpContinuationBudget::with_limit(&messages, TEST_BUDGET_BYTES)
+            .unwrap_or_else(|_| panic!("small initial request must fit the test budget"));
+        budget
+            .serialize_request(&run, &messages, &[])
+            .unwrap_or_else(|_| panic!("small initial request must serialize"));
+
+        let cumulative_failure = loop {
+            budget
+                .append_message(
+                    &mut messages,
+                    json!({
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call-list",
+                            "type": "function",
+                            "function": {"name": "task_list", "arguments": "{}"}
+                        }]
+                    }),
+                )
+                .unwrap_or_else(|_| panic!("assistant continuation message must fit"));
+            budget
+                .append_message(
+                    &mut messages,
+                    json!({
+                        "role": "tool",
+                        "tool_call_id": "call-list",
+                        "content": "x".repeat(TOOL_RESULT_BYTES)
+                    }),
+                )
+                .unwrap_or_else(|_| panic!("tool result must fit the context budget"));
+            match budget.serialize_request(&run, &messages, &[]) {
+                Ok(_) => {}
+                Err(outcome) => break outcome,
+            }
+        };
+        assert!(matches!(
+            cumulative_failure,
+            RunOutcome::Failed {
+                kind: AiFailureKind::MaxTurnsReached,
+                message,
+                ..
+            } if message.contains("cumulative request budget")
+        ));
+        assert!(budget.sent_request_bytes <= TEST_BUDGET_BYTES);
+        assert!(budget.message_bytes <= TEST_BUDGET_BYTES);
+
+        let message_count = messages.len();
+        let append_failure = budget
+            .append_message(
+                &mut messages,
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "call-too-large",
+                    "content": "y".repeat(TEST_BUDGET_BYTES)
+                }),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            append_failure,
+            RunOutcome::Failed {
+                kind: AiFailureKind::MaxTurnsReached,
+                ..
+            }
+        ));
+        assert_eq!(messages.len(), message_count);
+    }
+
+    #[test]
+    fn openai_http_retries_first_request_without_tools_when_endpoint_rejects_them() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let first_body = read_fake_http_json(&mut first);
+            assert_openai_task_tools(&first_body);
+            write_fake_status(&mut first, "400 Bad Request");
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            let second_body = read_fake_http_json(&mut second);
+            assert!(second_body.get("tools").is_none());
+            write_fake_json(
+                &mut second,
+                &json!({
+                    "model": "plain-compatible-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Plain chat works."},
+                        "finish_reason": "stop"
+                    }]
+                }),
+            );
+        });
+
+        let mut run = request("openai_compatible");
+        run.endpoint = format!("http://{address}/v1");
+        let url = chat_completions_url(&run.endpoint).unwrap();
+        let task_tools = Arc::new(Mutex::new(TaskToolRegistry::new()));
+        lock_unpoison(&task_tools)
+            .register_run(
+                run.turn_id,
+                run.conversation_id,
+                PlanChannel::AppTaskTools,
+                &[],
+            )
+            .unwrap();
+        let control = Arc::new(RunControl::default());
+        let (events, _) = unbounded();
+        let outcome = run_http_blocking(
+            &run,
+            "openai_compatible",
+            url,
+            &control,
+            &events,
+            &task_tools,
+        );
+        server.join().unwrap();
+
+        assert!(matches!(
+            outcome,
+            RunOutcome::Completed { text, session_id: None } if text == "Plain chat works."
+        ));
+    }
+
+    #[test]
+    fn openai_http_fallback_rejects_unsolicited_task_calls() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let first_body = read_fake_http_json(&mut first);
+            assert_openai_task_tools(&first_body);
+            write_fake_status(&mut first, "400 Bad Request");
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            let second_body = read_fake_http_json(&mut second);
+            assert!(second_body.get("tools").is_none());
+            write_fake_json(
+                &mut second,
+                &json!({
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "unsolicited",
+                                "type": "function",
+                                "function": {
+                                    "name": "task_create",
+                                    "arguments": "{\"content\":\"must not run\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+            );
+        });
+
+        let mut run = request("openai_compatible");
+        run.endpoint = format!("http://{address}/v1");
+        let task_tools = Arc::new(Mutex::new(TaskToolRegistry::new()));
+        lock_unpoison(&task_tools)
+            .register_run(
+                run.turn_id,
+                run.conversation_id,
+                PlanChannel::AppTaskTools,
+                &[],
+            )
+            .unwrap();
+        let (events, _) = unbounded();
+        let outcome = run_http_blocking(
+            &run,
+            "openai_compatible",
+            chat_completions_url(&run.endpoint).unwrap(),
+            &Arc::new(RunControl::default()),
+            &events,
+            &task_tools,
+        );
+        server.join().unwrap();
+
+        assert!(matches!(
+            outcome,
+            RunOutcome::Failed {
+                kind: AiFailureKind::ProviderError,
+                message,
+                ..
+            } if message.contains("not authorized")
+        ));
+        assert!(
+            lock_unpoison(&task_tools)
+                .tasks_for_conversation(run.conversation_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn openai_http_rejects_malformed_sse_instead_of_silently_completing() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_fake_http_json(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Connection: close\r\n\
+                      \r\n\
+                      data: {not-json}\n\n\
+                      data: [DONE]\n\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let mut run = request("openai_compatible");
+        run.endpoint = format!("http://{address}/v1");
+        let task_tools = Arc::new(Mutex::new(TaskToolRegistry::new()));
+        lock_unpoison(&task_tools)
+            .register_run(
+                run.turn_id,
+                run.conversation_id,
+                PlanChannel::AppTaskTools,
+                &[],
+            )
+            .unwrap();
+        let (events, _) = unbounded();
+        let outcome = run_http_blocking(
+            &run,
+            "openai_compatible",
+            chat_completions_url(&run.endpoint).unwrap(),
+            &Arc::new(RunControl::default()),
+            &events,
+            &task_tools,
+        );
+        server.join().unwrap();
+
+        assert!(matches!(
+            outcome,
+            RunOutcome::Failed {
+                kind: AiFailureKind::ProviderError,
+                message,
+                ..
+            } if message.contains("malformed JSON")
+        ));
+    }
+
+    #[test]
+    fn openai_http_rejects_stream_eof_without_a_terminal_marker() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_fake_http_json(&mut stream);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Connection: close\r\n\
+                      \r\n\
+                      data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+        });
+
+        let mut run = request("openai_compatible");
+        run.endpoint = format!("http://{address}/v1");
+        let task_tools = Arc::new(Mutex::new(TaskToolRegistry::new()));
+        lock_unpoison(&task_tools)
+            .register_run(
+                run.turn_id,
+                run.conversation_id,
+                PlanChannel::AppTaskTools,
+                &[],
+            )
+            .unwrap();
+        let (events, _) = unbounded();
+        let outcome = run_http_blocking(
+            &run,
+            "openai_compatible",
+            chat_completions_url(&run.endpoint).unwrap(),
+            &Arc::new(RunControl::default()),
+            &events,
+            &task_tools,
+        );
+        server.join().unwrap();
+
+        assert!(matches!(
+            outcome,
+            RunOutcome::Failed {
+                kind: AiFailureKind::ProviderError,
+                message,
+                ..
+            } if message.contains("terminal marker")
+        ));
+    }
+
+    #[test]
+    fn openai_http_does_not_treat_provider_error_finish_reasons_as_success() {
+        use std::net::TcpListener;
+
+        for finish_reason in ["cancelled", "timeout", "error", "future_reason"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let reason = finish_reason.to_owned();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_fake_http_json(&mut stream);
+                write_fake_json(
+                    &mut stream,
+                    &json!({
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "partial"},
+                            "finish_reason": reason
+                        }]
+                    }),
+                );
+            });
+
+            let mut run = request("openai_compatible");
+            run.endpoint = format!("http://{address}/v1");
+            let task_tools = Arc::new(Mutex::new(TaskToolRegistry::new()));
+            lock_unpoison(&task_tools)
+                .register_run(
+                    run.turn_id,
+                    run.conversation_id,
+                    PlanChannel::AppTaskTools,
+                    &[],
+                )
+                .unwrap();
+            let (events, _) = unbounded();
+            let outcome = run_http_blocking(
+                &run,
+                "openai_compatible",
+                chat_completions_url(&run.endpoint).unwrap(),
+                &Arc::new(RunControl::default()),
+                &events,
+                &task_tools,
+            );
+            server.join().unwrap();
+
+            assert!(
+                matches!(
+                    outcome,
+                    RunOutcome::Failed {
+                        kind: AiFailureKind::ProviderError,
+                        ..
+                    }
+                ),
+                "{finish_reason} was not classified as a provider error"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_http_maps_output_limit_finish_reason_to_typed_terminal_state() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_fake_http_json(&mut stream);
+            write_fake_json(
+                &mut stream,
+                &json!({
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "partial"},
+                        "finish_reason": "length"
+                    }]
+                }),
+            );
+        });
+
+        let mut run = request("openai_compatible");
+        run.endpoint = format!("http://{address}/v1");
+        let task_tools = Arc::new(Mutex::new(TaskToolRegistry::new()));
+        lock_unpoison(&task_tools)
+            .register_run(
+                run.turn_id,
+                run.conversation_id,
+                PlanChannel::AppTaskTools,
+                &[],
+            )
+            .unwrap();
+        let (events, _) = unbounded();
+        let outcome = run_http_blocking(
+            &run,
+            "openai_compatible",
+            chat_completions_url(&run.endpoint).unwrap(),
+            &Arc::new(RunControl::default()),
+            &events,
+            &task_tools,
+        );
+        server.join().unwrap();
+
+        assert!(matches!(
+            outcome,
+            RunOutcome::Failed {
+                kind: AiFailureKind::MaxTurnsReached,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn openai_http_continues_streamed_and_non_streamed_task_calls_in_event_order() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let first_body = read_fake_http_json(&mut first);
+            assert_openai_task_tools(&first_body);
+            assert_eq!(first_body["messages"].as_array().unwrap().len(), 1);
+            write_fake_sse(
+                &mut first,
+                &[
+                    json!({
+                        "id": "response-1",
+                        "model": "fake-model",
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": "call-create",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "task_",
+                                        "arguments": "{\"content\":\"Write"
+                                    }
+                                }]
+                            }
+                        }]
+                    }),
+                    json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "function": {
+                                        "name": "create",
+                                        "arguments": " report\",\"activeForm\":\"Writing report\"}"
+                                    }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }]
+                    }),
+                ],
+            );
+            drop(first);
+
+            let (mut second, _) = listener.accept().unwrap();
+            let second_body = read_fake_http_json(&mut second);
+            assert_openai_task_tools(&second_body);
+            let messages = second_body["messages"].as_array().unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message["role"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["user", "assistant", "tool"]
+            );
+            assert_eq!(
+                messages[1]["tool_calls"][0]["function"]["name"],
+                "task_create"
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(
+                    messages[1]["tool_calls"][0]["function"]["arguments"]
+                        .as_str()
+                        .unwrap()
+                )
+                .unwrap(),
+                json!({
+                    "content": "Write report",
+                    "activeForm": "Writing report"
+                })
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(messages[2]["content"].as_str().unwrap()).unwrap()["task_id"],
+                "1"
+            );
+            write_fake_json(
+                &mut second,
+                &json!({
+                    "id": "response-2",
+                    "model": "fake-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-update",
+                                "type": "function",
+                                "function": {
+                                    "name": "task_update",
+                                    "arguments": "{\"task_id\":\"1\",\"status\":\"completed\"}"
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                }),
+            );
+            drop(second);
+
+            let (mut third, _) = listener.accept().unwrap();
+            let third_body = read_fake_http_json(&mut third);
+            assert_openai_task_tools(&third_body);
+            let messages = third_body["messages"].as_array().unwrap();
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message["role"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                ["user", "assistant", "tool", "assistant", "tool"]
+            );
+            assert_eq!(
+                messages[3]["tool_calls"][0]["function"]["name"],
+                "task_update"
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(messages[4]["content"].as_str().unwrap()).unwrap()["status"],
+                "completed"
+            );
+            write_fake_json(
+                &mut third,
+                &json!({
+                    "id": "response-3",
+                    "model": "fake-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "Report ready."},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 2}
+                }),
+            );
+        });
+
+        let mut run = request("openai_compatible");
+        run.endpoint = format!("http://{address}/v1");
+        let url = chat_completions_url(&run.endpoint).unwrap();
+        let task_tools = Arc::new(Mutex::new(TaskToolRegistry::new()));
+        lock_unpoison(&task_tools)
+            .register_run(
+                run.turn_id,
+                run.conversation_id,
+                PlanChannel::AppTaskTools,
+                &[],
+            )
+            .unwrap();
+        let control = Arc::new(RunControl::default());
+        let (events, received) = unbounded();
+        let outcome = run_http_blocking(
+            &run,
+            "openai_compatible",
+            url,
+            &control,
+            &events,
+            &task_tools,
+        );
+        server.join().unwrap();
+
+        assert!(matches!(
+            outcome,
+            RunOutcome::Completed { text, session_id: None } if text == "Report ready."
+        ));
+        let registry = lock_unpoison(&task_tools);
+        let tasks = registry
+            .tasks_for_conversation(run.conversation_id)
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].content, "Write report");
+        assert_eq!(tasks[0].status, PlanItemStatus::Completed);
+        drop(registry);
+
+        let received = received.try_iter().collect::<Vec<_>>();
+        let task_batches = received
+            .iter()
+            .filter_map(|event| match event {
+                AiEvent::ActivityBatch { events, .. } => Some(
+                    events
+                        .iter()
+                        .map(|event| event.kind.case_name())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            task_batches,
+            [
+                vec!["taskMutation", "planUpdate"],
+                vec!["taskMutation", "planUpdate"]
+            ]
+        );
+        let activities = received
+            .into_iter()
+            .flat_map(|event| match event {
+                AiEvent::Activity { event, .. } => vec![event.kind],
+                AiEvent::ActivityBatch { events, .. } => {
+                    events.into_iter().map(|event| event.kind).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let ordered = activities
+            .iter()
+            .filter_map(|kind| match kind {
+                ActivityKind::ToolCall { .. }
+                | ActivityKind::TaskMutation { .. }
+                | ActivityKind::PlanUpdate { .. }
+                | ActivityKind::ToolResult { .. }
+                | ActivityKind::AssistantText { .. } => Some(kind.case_name()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered,
+            [
+                "toolCall",
+                "taskMutation",
+                "planUpdate",
+                "toolResult",
+                "toolCall",
+                "taskMutation",
+                "planUpdate",
+                "toolResult",
+                "assistantText"
+            ]
+        );
+        assert!(matches!(
+            &activities[1],
+            ActivityKind::ToolCall { id, name, .. }
+                if id == "call-create" && name == "task_create"
+        ));
     }
 
     #[test]
@@ -6268,7 +9917,7 @@ mod tests {
         let root = temporary.path();
         assert_eq!(
             grok_session_directory_under(root, session_id),
-            Some(directory.clone())
+            Some(fs::canonicalize(&directory).unwrap())
         );
         let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
         let mut decoded = Vec::new();
@@ -6322,6 +9971,574 @@ mod tests {
             decoder.protocol_error.as_deref(),
             Some("Web access approval could not be answered in this non-interactive Grok run.")
         );
+    }
+
+    #[test]
+    fn grok_session_lookup_rejects_invalid_ids_and_symlink_escape() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = temporary.path().join("sessions").join("encoded-workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        assert_eq!(
+            grok_session_directory_under(temporary.path(), "../outside"),
+            None
+        );
+
+        #[cfg(unix)]
+        {
+            let session_id = "119a1994-0d93-4107-904f-53179b3a6d29";
+            let outside = temporary.path().join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, workspace.join(session_id)).unwrap();
+            assert_eq!(
+                grok_session_directory_under(temporary.path(), session_id),
+                None
+            );
+
+            let linked_home = tempfile::tempdir().unwrap();
+            let outside_sessions = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink(
+                outside_sessions.path(),
+                linked_home.path().join("sessions"),
+            )
+            .unwrap();
+            assert_eq!(
+                grok_session_directory_under(linked_home.path(), session_id),
+                None
+            );
+
+            let safe_session = workspace.join("219a1994-0d93-4107-904f-53179b3a6d29");
+            fs::create_dir_all(&safe_session).unwrap();
+            let outside_file = temporary.path().join("outside-events.jsonl");
+            fs::write(&outside_file, "{\"type\":\"turn_started\"}\n").unwrap();
+            std::os::unix::fs::symlink(&outside_file, safe_session.join("updates.jsonl")).unwrap();
+            std::os::unix::fs::symlink(&outside_file, safe_session.join("events.jsonl")).unwrap();
+            assert_eq!(safe_grok_session_file(&safe_session, "updates.jsonl"), None);
+            assert_eq!(safe_grok_session_file(&safe_session, "events.jsonl"), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_subagent_metadata_rejects_symlinks_and_escaping_child_ids() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent_id = "319a1994-0d93-4107-904f-53179b3a6d29";
+        let parent = temporary.path().join("workspace").join(parent_id);
+        let subagents = parent.join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+
+        let outside_meta = temporary.path().join("outside-meta.json");
+        fs::write(
+            &outside_meta,
+            json!({
+                "subagent_id": "linked-child",
+                "parent_session_id": parent_id,
+                "description": "Must not be projected",
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let linked = subagents.join("linked");
+        fs::create_dir_all(&linked).unwrap();
+        std::os::unix::fs::symlink(&outside_meta, linked.join("meta.json")).unwrap();
+
+        let escaping = subagents.join("escaping");
+        fs::create_dir_all(&escaping).unwrap();
+        fs::write(
+            escaping.join("meta.json"),
+            json!({
+                "subagent_id": "../../outside-child",
+                "parent_session_id": parent_id,
+                "description": "Must not escape",
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
+        let mut decoded = Vec::new();
+        harvest_grok_subagent_metadata(&mut decoder, parent_id, &parent, &mut |event| {
+            decoded.push(event);
+        });
+        assert!(decoded.is_empty());
+        assert!(decoder.task_subjects.is_empty());
+    }
+
+    #[test]
+    fn grok_session_lookup_can_be_bound_to_the_canonical_working_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cwd = temporary.path().join("working folder");
+        fs::create_dir_all(&cwd).unwrap();
+        let workspace_key = grok_workspace_key(&cwd).unwrap();
+        assert!(workspace_key.contains("%2F"));
+        assert!(workspace_key.contains("%20"));
+
+        let session_id = "219a1994-0d93-4107-904f-53179b3a6d29";
+        let expected = temporary
+            .path()
+            .join("grok")
+            .join("sessions")
+            .join(&workspace_key)
+            .join(session_id);
+        let wrong = temporary
+            .path()
+            .join("grok")
+            .join("sessions")
+            .join("another-workspace")
+            .join(session_id);
+        fs::create_dir_all(&expected).unwrap();
+        fs::create_dir_all(&wrong).unwrap();
+
+        assert_eq!(
+            grok_session_directory_in_workspace(
+                &temporary.path().join("grok"),
+                &workspace_key,
+                session_id,
+            ),
+            Some(fs::canonicalize(expected).unwrap())
+        );
+    }
+
+    #[test]
+    fn grok_session_follower_uses_verified_apostrophe_encoding_without_cross_workspace_scan() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cwd = temporary.path().join("Adam's Canvas (current)");
+        fs::create_dir_all(&cwd).unwrap();
+        let workspace_key = grok_workspace_key(&cwd).unwrap();
+        assert!(workspace_key.contains("%27"));
+        assert!(workspace_key.contains("%28current%29"));
+        let provider_workspace_key = workspace_key.replace("%27", "'");
+
+        let grok_home = temporary.path().join("grok");
+        let session_id = "319a1994-0d93-4107-904f-53179b3a6d29";
+        let provider_workspace = grok_home.join("sessions").join(provider_workspace_key);
+        let expected = provider_workspace.join(session_id);
+        let collision = grok_home
+            .join("sessions")
+            .join("unrelated-workspace")
+            .join(session_id);
+        fs::create_dir_all(&expected).unwrap();
+        fs::create_dir_all(&collision).unwrap();
+
+        let mut follower = GrokSessionFollower::under_home_and_workspace(
+            grok_home.clone(),
+            session_id.into(),
+            false,
+            Some(workspace_key.clone()),
+        );
+
+        assert!(follower.resolve_directory());
+        let expected = fs::canonicalize(expected).unwrap();
+        assert_eq!(follower.directory(), Some(expected.as_path()));
+
+        fs::remove_dir_all(expected).unwrap();
+        let mut missing_expected = GrokSessionFollower::under_home_and_workspace(
+            grok_home,
+            session_id.into(),
+            false,
+            Some(workspace_key),
+        );
+        assert!(!missing_expected.resolve_directory());
+        assert_eq!(missing_expected.directory(), None);
+    }
+
+    #[test]
+    fn grok_multiturn_updates_keep_plan_history_and_reduce_id_only_merges() {
+        let temporary = tempfile::tempdir().unwrap();
+        let updates_path = temporary.path().join("updates.jsonl");
+        fs::write(
+            &updates_path,
+            concat!(
+                "{\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"todo-1\",\"title\":\"todo_write\",\"rawInput\":{\"merge\":false,\"todos\":[{\"id\":\"p1\",\"content\":\"Collect sources\",\"status\":\"in_progress\"},{\"id\":\"p2\",\"content\":\"Write report\",\"status\":\"pending\"}]}}}}\n",
+                "{\"params\":{\"update\":{\"sessionUpdate\":\"subagent_spawned\",\"subagent_id\":\"old\",\"description\":\"Old turn\"}}}\n",
+                "{\"params\":{\"update\":{\"sessionUpdate\":\"user_message_chunk\"}}}\n",
+                "{\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"todo-2\",\"title\":\"todo_write\",\"rawInput\":{\"merge\":true,\"todos\":[{\"id\":\"p1\",\"status\":\"completed\"},{\"id\":\"p2\",\"status\":\"in_progress\"}]}}}}\n",
+                "{\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"fetch-1\",\"title\":\"fetch:\",\"rawInput\":{\"url\":\"https://example.com\"}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let updates = grok_current_turn_updates(&updates_path);
+        assert_eq!(
+            updates
+                .iter()
+                .filter(|value| is_grok_todo_write(value))
+                .count(),
+            2
+        );
+        assert!(!updates.iter().any(|value| {
+            string_at(grok_session_update(value), &["subagent_id"]).as_deref() == Some("old")
+        }));
+
+        let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
+        let mut latest_plan = None;
+        for update in updates {
+            for event in decode_grok_session_activity_events(&mut decoder, &update) {
+                if let ActivityKind::PlanUpdate { tasks, .. } = event.kind {
+                    latest_plan = Some(tasks);
+                }
+            }
+        }
+        let tasks = latest_plan.expect("retained native plan");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].content, "Collect sources");
+        assert_eq!(tasks[0].status, PlanItemStatus::Completed);
+        assert_eq!(tasks[1].content, "Write report");
+        assert_eq!(tasks[1].status, PlanItemStatus::InProgress);
+    }
+
+    #[test]
+    fn grok_session_follower_waits_for_complete_lines_and_delivers_each_once() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session_id = "129a1994-0d93-4107-904f-53179b3a6d29";
+        let mut follower = GrokSessionFollower::under_home(
+            temporary.path().to_path_buf(),
+            session_id.into(),
+            false,
+        );
+        let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
+        let mut decoded = Vec::new();
+        follower.poll(true, &mut decoder, &mut |event| decoded.push(event));
+        assert!(decoded.is_empty());
+
+        let directory = temporary
+            .path()
+            .join("sessions")
+            .join("encoded-workspace")
+            .join(session_id);
+        fs::create_dir_all(&directory).unwrap();
+        let first = concat!(
+            "{\"timestamp\":1785423658,\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",",
+            "\"toolCallId\":\"todo-1\",\"title\":\"todo_write\",\"rawInput\":{\"merge\":false,",
+            "\"todos\":[{\"id\":\"p1\",\"content\":\"Collect sources\",\"status\":\"in_progress\"}]}}}}\n"
+        );
+        let second = concat!(
+            "{\"timestamp\":1785423659,\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",",
+            "\"toolCallId\":\"fetch-1\",\"title\":\"fetch:\",",
+            "\"rawInput\":{\"url\":\"https://example.com\"}}}}\n"
+        );
+        let split = second.len() / 2;
+        fs::write(
+            directory.join("updates.jsonl"),
+            format!("{first}{}", &second[..split]),
+        )
+        .unwrap();
+
+        follower.poll(true, &mut decoder, &mut |event| decoded.push(event));
+        assert_eq!(
+            decoded
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    Decoded::Activity(ActivityEvent {
+                        kind: ActivityKind::PlanUpdate { .. },
+                        ..
+                    })
+                ))
+                .count(),
+            1
+        );
+        let plan_time = decoded.iter().find_map(|event| match event {
+            Decoded::Activity(ActivityEvent {
+                at,
+                kind: ActivityKind::PlanUpdate { .. },
+                ..
+            }) => Some(*at),
+            _ => None,
+        });
+        assert_eq!(plan_time, Some(UnixMillis(1_785_423_658_000)));
+        let before_partial_retry = decoded.len();
+        follower.poll(true, &mut decoder, &mut |event| decoded.push(event));
+        assert_eq!(decoded.len(), before_partial_retry);
+
+        OpenOptions::new()
+            .append(true)
+            .open(directory.join("updates.jsonl"))
+            .unwrap()
+            .write_all(&second.as_bytes()[split..])
+            .unwrap();
+        follower.final_drain(&mut decoder, &mut |event| decoded.push(event));
+        assert_eq!(
+            decoded
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    Decoded::Activity(ActivityEvent {
+                        kind: ActivityKind::WebSearch { .. },
+                        ..
+                    })
+                ))
+                .count(),
+            1
+        );
+        let delivered = decoded.len();
+        follower.final_drain(&mut decoder, &mut |event| decoded.push(event));
+        assert_eq!(decoded.len(), delivered);
+    }
+
+    #[test]
+    fn grok_session_follower_disables_on_an_oversized_unterminated_record() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session_id = "139a1994-0d93-4107-904f-53179b3a6d29";
+        let directory = temporary
+            .path()
+            .join("sessions")
+            .join("encoded-workspace")
+            .join(session_id);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("updates.jsonl"),
+            vec![b'x'; MAX_GROK_SESSION_LINE_BYTES + 1],
+        )
+        .unwrap();
+
+        let mut follower = GrokSessionFollower::under_home(
+            temporary.path().to_path_buf(),
+            session_id.into(),
+            false,
+        );
+        let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
+        let mut decoded = Vec::new();
+        follower.poll(true, &mut decoder, &mut |event| decoded.push(event));
+
+        assert!(follower.disabled);
+        assert_eq!(follower.offset, 0);
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn grok_resume_bootstrap_emits_only_the_prior_plan_then_tails_new_activity() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session_id = "229a1994-0d93-4107-904f-53179b3a6d29";
+        let directory = temporary
+            .path()
+            .join("sessions")
+            .join("encoded-workspace")
+            .join(session_id);
+        fs::create_dir_all(&directory).unwrap();
+        let updates_path = directory.join("updates.jsonl");
+        fs::write(
+            &updates_path,
+            concat!(
+                "{\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"todo-1\",\"title\":\"todo_write\",\"rawInput\":{\"merge\":false,\"todos\":[{\"id\":\"p1\",\"content\":\"Keep this plan\",\"status\":\"pending\"}]}}}}\n",
+                "{\"params\":{\"update\":{\"sessionUpdate\":\"subagent_spawned\",\"subagent_id\":\"old-child\",\"description\":\"Old work\"}}}\n"
+            ),
+        )
+        .unwrap();
+        let mut follower = GrokSessionFollower::under_home(
+            temporary.path().to_path_buf(),
+            session_id.into(),
+            true,
+        );
+        OpenOptions::new()
+            .append(true)
+            .open(&updates_path)
+            .unwrap()
+            .write_all(
+                concat!(
+                    "{\"params\":{\"update\":{\"sessionUpdate\":\"user_message_chunk\"}}}\n",
+                    "{\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"fetch-1\",\"title\":\"fetch:\",\"rawInput\":{\"url\":\"https://example.com/new\"}}}}\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+
+        let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
+        let mut decoded = Vec::new();
+        follower.bootstrap(&mut decoder, &mut |event| decoded.push(event));
+        assert_eq!(decoded.len(), 1);
+        assert!(matches!(
+            decoded[0],
+            Decoded::Activity(ActivityEvent {
+                kind: ActivityKind::PlanUpdate { .. },
+                ..
+            })
+        ));
+        assert!(!decoded.iter().any(|event| matches!(
+            event,
+            Decoded::Activity(ActivityEvent {
+                kind: ActivityKind::Subagent { .. },
+                ..
+            })
+        )));
+
+        follower.final_drain(&mut decoder, &mut |event| decoded.push(event));
+        assert!(decoded.iter().any(|event| matches!(
+            event,
+            Decoded::Activity(ActivityEvent {
+                kind: ActivityKind::WebSearch { .. },
+                ..
+            })
+        )));
+        assert!(!decoded.iter().any(|event| matches!(
+            event,
+            Decoded::Activity(ActivityEvent {
+                kind: ActivityKind::Subagent { id, .. },
+                ..
+            }) if id == "old-child"
+        )));
+    }
+
+    #[test]
+    fn grok_resume_bootstrap_retries_a_partial_saved_record_after_newline() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session_id = "329a1994-0d93-4107-904f-53179b3a6d29";
+        let directory = temporary
+            .path()
+            .join("sessions")
+            .join("encoded-workspace")
+            .join(session_id);
+        fs::create_dir_all(&directory).unwrap();
+        let updates_path = directory.join("updates.jsonl");
+        let plan = concat!(
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"todo-1\",",
+            "\"title\":\"todo_write\",\"rawInput\":{\"merge\":false,\"todos\":[",
+            "{\"id\":\"p1\",\"content\":\"Keep this plan\",\"status\":\"pending\"}]}}}}\n"
+        );
+        let web = concat!(
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"fetch-1\",",
+            "\"title\":\"fetch:\",\"rawInput\":{\"url\":\"https://example.com/new\"}}}}\n"
+        );
+        let split = web.len() / 2;
+        fs::write(&updates_path, format!("{plan}{}", &web[..split])).unwrap();
+        let mut follower = GrokSessionFollower::under_home(
+            temporary.path().to_path_buf(),
+            session_id.into(),
+            true,
+        );
+        let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
+        let mut decoded = Vec::new();
+
+        follower.bootstrap(&mut decoder, &mut |event| decoded.push(event));
+        assert_eq!(follower.offset, plan.len() as u64);
+        assert_eq!(
+            decoded
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    Decoded::Activity(ActivityEvent {
+                        kind: ActivityKind::PlanUpdate { .. },
+                        ..
+                    })
+                ))
+                .count(),
+            1
+        );
+
+        OpenOptions::new()
+            .append(true)
+            .open(&updates_path)
+            .unwrap()
+            .write_all(&web.as_bytes()[split..])
+            .unwrap();
+        follower.final_drain(&mut decoder, &mut |event| decoded.push(event));
+        assert_eq!(
+            decoded
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    Decoded::Activity(ActivityEvent {
+                        kind: ActivityKind::WebSearch { .. },
+                        ..
+                    })
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn grok_resume_bootstrap_seeds_native_plan_when_full_snapshot_precedes_scan_window() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session_id = "339a1994-0d93-4107-904f-53179b3a6d29";
+        let directory = temporary
+            .path()
+            .join("sessions")
+            .join("encoded-workspace")
+            .join(session_id);
+        fs::create_dir_all(&directory).unwrap();
+        let updates_path = directory.join("updates.jsonl");
+        let full_snapshot = concat!(
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"todo-full\",",
+            "\"title\":\"todo_write\",\"rawInput\":{\"merge\":false,\"todos\":[",
+            "{\"id\":\"p1\",\"content\":\"Collect sources\",\"status\":\"in_progress\"},",
+            "{\"id\":\"p2\",\"content\":\"Write report\",\"status\":\"pending\"}]}}}}\n"
+        );
+        let merge = concat!(
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"todo-merge\",",
+            "\"title\":\"todo_write\",\"rawInput\":{\"merge\":true,\"todos\":[",
+            "{\"id\":\"p1\",\"status\":\"completed\"}]}}}}\n"
+        );
+        let mut updates = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&updates_path)
+            .unwrap();
+        updates.write_all(full_snapshot.as_bytes()).unwrap();
+        let filler_line_bytes = (MAX_GROK_SESSION_LINE_BYTES / 2) as u64;
+        for index in 1..=34_u64 {
+            updates
+                .seek(SeekFrom::Start(
+                    full_snapshot.len() as u64 + index * filler_line_bytes - 1,
+                ))
+                .unwrap();
+            updates.write_all(b"\n").unwrap();
+        }
+        updates.write_all(merge.as_bytes()).unwrap();
+        drop(updates);
+
+        let file_len = fs::metadata(&updates_path).unwrap().len();
+        let (_, scan_start) =
+            bounded_grok_session_reader(&updates_path, file_len).expect("bounded tail scan");
+        assert!(scan_start > full_snapshot.len() as u64);
+
+        let mut follower = GrokSessionFollower::under_home(
+            temporary.path().to_path_buf(),
+            session_id.into(),
+            true,
+        );
+        let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
+        decoder.seed_grok_native_plan(&[
+            PlanItem {
+                content: "Collect sources".into(),
+                status: PlanItemStatus::InProgress,
+                task_id: Some("p1".into()),
+                origin: PlanItemOrigin::Native,
+                ..PlanItem::default()
+            },
+            PlanItem {
+                content: "Write report".into(),
+                task_id: Some("p2".into()),
+                origin: PlanItemOrigin::Native,
+                ..PlanItem::default()
+            },
+            PlanItem {
+                content: "App-owned task".into(),
+                task_id: Some("app-1".into()),
+                origin: PlanItemOrigin::AppTools,
+                ..PlanItem::default()
+            },
+        ]);
+        let mut decoded = Vec::new();
+        follower.bootstrap(&mut decoder, &mut |event| decoded.push(event));
+
+        let tasks = decoded
+            .iter()
+            .find_map(|event| match event {
+                Decoded::Activity(ActivityEvent {
+                    kind: ActivityKind::PlanUpdate { tasks, .. },
+                    ..
+                }) => Some(tasks),
+                _ => None,
+            })
+            .expect("merge-only bootstrap emits the complete native plan");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].task_id.as_deref(), Some("p1"));
+        assert_eq!(tasks[0].status, PlanItemStatus::Completed);
+        assert_eq!(tasks[1].task_id.as_deref(), Some("p2"));
+        assert_eq!(tasks[1].status, PlanItemStatus::Pending);
     }
 
     #[test]
@@ -6525,6 +10742,45 @@ mod tests {
     }
 
     #[test]
+    fn grok_session_tracking_is_known_before_launch_for_new_and_resumed_turns() {
+        let new_run = request("grok_cli");
+        let specification = preset_process_spec_for_version(
+            "grok_cli",
+            PathBuf::from("/tmp/grok"),
+            &new_run,
+            "0.2.111",
+        )
+        .unwrap();
+        let arguments = argument_strings(&specification);
+        let expected = new_run.turn_id.to_string();
+        assert!(has_argument_pair(&arguments, "--session-id", &expected));
+        assert_eq!(
+            specification.grok_session_id.as_deref(),
+            Some(expected.as_str())
+        );
+
+        let mut resumed = request("grok_cli");
+        resumed.resume_session_id = Some("329a1994-0d93-4107-904f-53179b3a6d29".into());
+        let specification = preset_process_spec_for_version(
+            "grok_cli",
+            PathBuf::from("/tmp/grok"),
+            &resumed,
+            "0.2.111",
+        )
+        .unwrap();
+        let arguments = argument_strings(&specification);
+        assert_eq!(
+            &arguments[..2],
+            ["--resume", "329a1994-0d93-4107-904f-53179b3a6d29"]
+        );
+        assert!(!arguments.iter().any(|argument| argument == "--session-id"));
+        assert_eq!(
+            specification.grok_session_id.as_deref(),
+            Some("329a1994-0d93-4107-904f-53179b3a6d29")
+        );
+    }
+
+    #[test]
     fn preset_resume_and_system_prompt_shaping_is_provider_native_and_whole_argument() {
         let system = "Follow the workspace policy.\nKeep edits focused.";
         for provider in ["claude_cli", "codex_cli", "grok_cli"] {
@@ -6621,6 +10877,7 @@ mod tests {
             cwd: None,
             prompt_input: PromptInput::Argument,
             output_mode: OutputMode::PlainText,
+            grok_session_id: None,
         };
         let control = Arc::new(RunControl::default());
         let (sender, _receiver) = unbounded();
@@ -6630,6 +10887,7 @@ mod tests {
             specification,
             &control,
             &sender,
+            None,
             Duration::from_millis(50),
         );
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -6679,6 +10937,11 @@ mod tests {
             // Keep the response body open with no data. This deterministically
             // wedges the blocking read until the test explicitly closes it.
             let _ = close_receiver.recv_timeout(Duration::from_secs(5));
+            let _ = stream.write_all(
+                b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"late\"},\"finish_reason\":\"stop\"}]}\n\n\
+                  data: [DONE]\n\n",
+            );
+            let _ = stream.flush();
         });
 
         let mut run = request("openai_compatible");
@@ -6741,6 +11004,18 @@ mod tests {
             "the run slot was released while the HTTP worker was still blocked"
         );
         assert!(
+            engine.task_tool_descriptors(turn_id).is_empty(),
+            "task tools remained visible after the terminal event"
+        );
+        let denied = engine.call_task_tool(
+            turn_id,
+            "task_create",
+            &json!({"content": "must not be created"}),
+            UnixMillis(10),
+        );
+        assert!(denied.is_error());
+        assert!(denied.events.is_empty());
+        assert!(
             engine.cancel(turn_id),
             "the blocked worker must remain represented as an active run"
         );
@@ -6757,11 +11032,17 @@ mod tests {
             "the run slot was not released after the HTTP worker exited"
         );
         while let Some(event) = engine.try_recv() {
-            if matches!(
-                event,
-                AiEvent::Completed { .. } | AiEvent::Failed { .. } | AiEvent::Cancelled { .. }
-            ) {
-                terminal_count += 1;
+            match event {
+                AiEvent::Completed { .. } | AiEvent::Failed { .. } | AiEvent::Cancelled { .. } => {
+                    terminal_count += 1;
+                }
+                AiEvent::Activity { .. } | AiEvent::Delta { .. } | AiEvent::StreamReset { .. } => {
+                    panic!("HTTP worker emitted model activity after its terminal event");
+                }
+                AiEvent::ActivityBatch { .. } => {
+                    panic!("HTTP worker emitted batched activity after its terminal event");
+                }
+                AiEvent::Started { .. } => {}
             }
         }
         assert_eq!(terminal_count, 1, "a duplicate terminal event was emitted");

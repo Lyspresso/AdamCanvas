@@ -37,7 +37,8 @@ Together, the profiles identify:
 - transport: CLI process, local chat endpoint, or remote compatible endpoint;
 - stream dialect: structured provider events or plain text;
 - declared plan source: provider-native plan events or Adam-owned task tools;
-  only provider-native events are live in this PR1 baseline;
+  plan-capable runs expose exactly one of those channels, while adapters
+  without a callable or trustworthy plan transport expose neither;
 - continuity: native provider session or bounded transcript replay;
 - system-instruction channel: a native flag/config/API system message or a
   fenced block inside the prompt;
@@ -84,7 +85,7 @@ accepted values.
 | --- | --- | --- | --- |
 | Codex 0.144.1 | Known GPT-5.6 Sol, Terra, and Luna choices plus custom model ID | Sol/Terra: Low through Ultra; Luna: Low through Max; other models: Low through XHigh | Explicit web-search enable |
 | Claude Code 2.1.128 | Provider default, Opus, Sonnet, Haiku, or custom model ID | Low, Medium, High, XHigh, Max | Web tools on/off and optional fallback model |
-| Grok 0.2.111 | Provider default, Grok 4.5, or custom model ID | Low, Medium, High | Web search, planning, memory, and a 1–100 turn limit; subagents forced off |
+| Grok 0.2.111 / 0.2.114 | Provider default, Grok 4.5, or custom model ID | Low, Medium, High | Web search, planning, memory, and a 1–100 turn limit; subagents forced off |
 | Kimi 1.49.0 | Provider default or custom model ID | Provider default | Thinking on/off |
 | Ollama 0.32.1 | Required local model ID | Low, Medium, High, or thinking on/off | Local model execution |
 | LM Studio | Required loaded model ID | Provider default | Local server endpoint and memory-only key |
@@ -99,13 +100,23 @@ The visible choices map to real provider controls:
   `--fallback-model`, and explicit WebSearch/WebFetch allow or deny filters.
   Adam does not emit a Claude `--max-turns` flag because the supported
   installed CLI does not expose one.
-- Grok 0.2.111 receives `--reasoning-effort` only for Low, Medium, or High,
-  plus supported ability-disable flags, experimental memory enable when
-  requested, `--max-turns`, and an exact read-only or workspace sandbox.
-  Its multiplexed stream does not attach child identity to text, so Adam
-  always sends `--no-subagents` for this version. Unless web is explicitly
-  switched off, read-only Chat research grants only `WebSearch` and
-  `WebFetch`; it never turns that into blanket filesystem-mutation approval.
+- Captured Grok 0.2.111 and 0.2.114 runtimes receive
+  `--reasoning-effort` only for Low, Medium, or High, plus supported
+  ability-disable flags, experimental memory enable when requested,
+  `--max-turns`, and an exact read-only or workspace sandbox. Grok 0.2.114
+  uses its structured Agent Client Protocol transport so Adam can attach its
+  authenticated task-tool server and answer typed permission requests. That
+  ACP path disables Grok's native planner even when an older saved preference
+  enabled it, preserving one task authority for the run. Forced web denial is
+  reported as permission-blocked with the exact WebSearch or WebFetch retry,
+  and the per-run bridge credential is redacted across structured fields,
+  object keys, and arbitrary streamed-text chunk boundaries before activity
+  or transcript persistence.
+  Earlier captured versions use the structured CLI stream plus a live
+  session-file follower. Neither verified channel safely scopes child prose,
+  so Adam always sends `--no-subagents`. Unless web is explicitly switched
+  off, read-only Chat research grants only `WebSearch` and `WebFetch`; it
+  never turns that into blanket filesystem-mutation approval.
 - Kimi receives `--thinking` or `--no-thinking`.
 - The captured Ollama runtime receives its supported `--think` level or
   boolean.
@@ -121,7 +132,8 @@ Unsupported saved values are cleared back to provider default rather than
 being forwarded optimistically.
 
 Generic OpenAI-compatible HTTP bodies intentionally remain limited to
-`model`, `messages`, and `stream`. Adam does not assume that every compatible
+`model`, `messages`, `stream`, and ordinary OpenAI function descriptors when
+Adam's task tools are available. Adam does not assume that every compatible
 server accepts OpenAI-, Anthropic-, or xAI-specific reasoning extensions.
 
 ## Structured activity
@@ -193,12 +205,67 @@ becomes a snapshot, while Claude `TaskCreate` and `TaskUpdate` become
 incremental mutations with their status and active-form label retained. The
 projection is intentionally provider-neutral after parsing.
 
-This PR1 baseline does not yet expose Adam-owned task tools to the model and
-does not poll a live Adam task-session file. Consequently, it cannot promise a
-checklist for a provider that emits no native task events. Adam-owned
-whole-list task snapshots and their live polling contract are PR2 work; the
-task mutation and origin types already present in the normalized vocabulary do
-not make those tools callable.
+For providers without a trustworthy native plan stream, Adam owns a small
+conversation-scoped task store. Tool availability remains run-scoped, and a
+capable run exposes exactly three model-callable tools:
+
+- `task_create` requires `content`, accepts an optional present-continuous
+  `activeForm`, and returns a stable task ID;
+- `task_update` requires `task_id`, may patch status, content, or
+  `activeForm`, and creates a row with that exact ID when it does not yet
+  exist; and
+- `task_list` returns the current ordered list without emitting activity.
+
+The task-tool wire statuses are `pending`, `in_progress`, `completed`, and
+`cancelled`. Each successful mutation emits a visible `TaskMutation` followed
+by a `PlanUpdate` containing the entire reduced list. Fields are trimmed,
+empty required fields and unknown arguments are rejected, and user-facing
+text is capped at 512 UTF-8 bytes.
+Adam task tools can create at most 512 rows; updates to existing rows remain
+available at that limit, while attempts to create another row fail without
+emitting activity. A larger provider-native or persisted checklist is retained
+in full and remains listable, but task-tool mutations fail closed until a
+native snapshot reduces it to the supported mutation limit.
+
+Tool exposure is checked both when a provider lists tools and when it calls
+one. Dead runs fail closed. Claude and Codex keep their native task channel and
+never receive Adam’s task tools. Verified Grok ACP, compatible HTTP function
+calling, and the explicit Custom CLI bridge contract receive Adam’s tools and
+do not project a second native plan channel. The tools are independent of
+canvas access: a model can maintain Progress without gaining permission to
+read or mutate canvas data.
+
+HTTP providers receive ordinary function-tool descriptors and may perform up
+to 16 bounded continuation rounds. A streamed or non-streamed function call is
+assembled before dispatch, and the assistant tool call plus tool result are
+returned to the model for its next response. Both current `tool_calls` arrays
+and the legacy single `function_call` shape are normalized. The complete
+serialized continuation history has a 32 MiB cumulative request budget,
+checked before allocation and send, so repeated large tool results cannot
+grow an unbounded request. Because generic compatible endpoints have no
+dependable capability handshake, a 400, 404, or 422 response to the first
+tool-bearing request is retried once without tools; ordinary chat therefore
+remains usable on models without function calling. A Custom CLI wrapper
+receives the ephemeral `ADAM_TASK_MCP_URL` and
+`ADAM_TASK_MCP_AUTHORIZATION` environment variables. The endpoint is a
+loopback-only MCP server with a per-run bearer token. Adam never puts that
+token in the prompt or saved configuration, and it expires when the run ends.
+The bridge implements the MCP `2025-06-18` Streamable HTTP contract only:
+initialization negotiates clients onto that version, and every later request
+must carry the matching `MCP-Protocol-Version` header.
+As with any arbitrary executable, a hostile Custom CLI could still echo its
+own environment into provider output, so Custom CLI wrappers remain trusted
+local integrations.
+
+Captured legacy Grok streams also follow the matching session
+`updates.jsonl` while the process is running. Complete new lines are reduced
+into typed task, tool, and session activity without waiting for process exit;
+partial trailing lines wait for the next poll. Reads enforce the line limit
+before allocation, and an oversized unterminated record disables the follower
+without moving its cursor into provider-controlled payload. New user-message
+markers no longer discard the prior plan. Resumed decoding is seeded from the
+persisted native checklist before the bounded tail scan, so merge-only updates
+retain tasks whose original full snapshot predates that scan window.
 
 The inspector applies one strict precedence rule:
 
@@ -208,7 +275,8 @@ The inspector applies one strict precedence rule:
 3. otherwise, no checklist.
 
 An empty native snapshot deliberately clears native rows, while independently
-created task-tool rows survive until their own update or deletion. A
+created task-tool rows survive until updated, cancelled, or replaced by a
+newer authoritative whole-list snapshot. A
 subjectless update for an unknown task ID is a true no-op: it cannot create an
 empty live plan or hide the saved checklist. On native resume, ID-only live
 updates fold onto saved task IDs so the real task keeps its name and status.
@@ -233,6 +301,12 @@ This distinction matters for providers such as Grok or plain local models that
 may stream useful work but no structured task list. Adam shows their real
 activity without manufacturing Claude-like progress.
 
+The newest full task snapshot is committed with the assistant turn, including
+an explicitly empty list. A later turn seeds its live store from that snapshot,
+and relaunch restores the same order, labels, origins, and statuses. A turn
+that did not publish or mutate a task list does not manufacture an empty
+snapshot that would erase earlier progress.
+
 ## Subagents are a separate lifecycle projection
 
 Subagents are not checklist rows and are not inferred from prose such as “I’ll
@@ -248,35 +322,36 @@ parent/child indentation. **View all** opens a wider Active/Done subagent
 panel without leaving the conversation. Repeated status updates replace the
 earlier state for that child rather than creating duplicate “agent” rows.
 
-New Grok 0.2.111 runs are deliberately excluded from this projection. Its
-multiplexed stream uses identity-less text envelopes for parent and child
-prose, so Adam forces subagents off instead of leaking child responses into
-the parent transcript or inventing ownership. Scoped Grok child lifecycle and
-prose events are PR3 work. Codex collaboration calls and subagent-activity
-items join thread aliases into the same lifecycle. Claude Agent/legacy Task
-calls, task lifecycle notifications, and tool-progress events join tool-use,
-task, and provider-agent IDs. Unsupported providers simply show no Subagents
-section instead of an invented one.
+New runs on the captured Grok versions are deliberately excluded from this
+projection. Their available streams do not provide a proven, end-to-end scoped
+child-prose channel, so Adam forces subagents off instead of leaking child
+responses into the parent transcript or inventing ownership. Scoped Grok child
+lifecycle and prose events are PR3 work. Codex collaboration calls and
+subagent-activity items join thread aliases into the same lifecycle. Claude
+Agent/legacy Task calls, task lifecycle notifications, and tool-progress
+events join tool-use, task, and provider-agent IDs. Unsupported providers
+simply show no Subagents section instead of an invented one.
 
-## Inspector, outputs, files, and context
+## Inspector, artifacts, files, and context
 
-The right side is a task workspace with five independent, collapsible
+The right side is a task workspace with six independent, collapsible
 sections:
 
 - **Progress** — the authoritative task projection described above;
-- **Subagents** — real child-agent lifecycle, counts, and parent/child tree;
-- **Outputs** — files and host artifacts actually created by the conversation;
+- **Agents** — real child-agent lifecycle, counts, and parent/child tree;
+- **Artifacts** — files and host artifacts actually created by the conversation;
+- **Activity** — tools, commands, searches, and other execution diagnostics;
 - **Working folder** — an expandable file tree for the scoped folder; and
 - **Context** — supplied attachments, observed tool/search/host context,
   session identity, replay pressure, and usage.
 
-Outputs are provenance-based. Successful file changes deduplicate by path, and
+Artifacts are provenance-based. Successful file changes deduplicate by path, and
 a later delete strikes the earlier output. A host create may introduce an
 output; a host update or delete can revise only an artifact that this trace
 already created. Updating pre-existing host data does not falsely claim it as
 a newly produced deliverable.
 
-The first eight outputs are shown by default, with an explicit Show all
+The first eight artifacts are shown by default, with an explicit Show all
 control. Text and Markdown outputs open in a wider in-app File view with path,
 size, selectable content, Reveal, missing-file feedback, and a 256 KiB preview
 bound. Unsupported binary files remain revealable without being decoded as
@@ -410,6 +485,12 @@ that will feed calls into that gate. Until then, the Canvas inspector actions
 are visible user-invoked operations and should not be described as autonomous
 model tools.
 
+Adam’s task-tool bridge is deliberately separate from that future canvas
+bridge. It is a loopback-only, bearer-authenticated, per-run MCP endpoint. Its
+tool list and every call are re-authorized against the active run and the
+run’s single declared plan channel; possessing a stale endpoint or token
+cannot revive a completed run.
+
 ## Data boundaries
 
 - The workspace stores conversations, messages, attachments, typed activity,
@@ -434,9 +515,12 @@ model tools.
 The current harness does not claim:
 
 - a completed model-callable Adam host-tool server;
-- model-callable Adam task tools or live Adam task-snapshot polling, which are
-  PR2 work;
 - scoped child prose for identity-less Grok streams, which is PR3 work;
+- native Adam task-tool attachment for Kimi or Ollama CLI builds that expose
+  no verified external-tool transport;
+- an interactive approval sheet for every provider permission request—safe
+  read-only web requests can be granted narrowly, while a request Adam cannot
+  safely answer terminates with a typed permission-blocked outcome;
 - scheduled/background dispatch;
 - automatic long-history summary generation;
 - a finished Character editor and memory UI; or

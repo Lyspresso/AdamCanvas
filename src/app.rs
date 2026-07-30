@@ -1,7 +1,7 @@
 use crate::{
     ai::{
         AiEngine, AiEvent, AiFailureKind, AiRunRequest, clamp_provider_preferences,
-        installed_runtime_tuning,
+        installed_runtime_tuning, provider_exposes_app_task_tools, resolve_effective_provider_id,
     },
     ai_prompt::{
         BuiltPrompt, HistoricalTurn, HistoryRole, PromptAttachment, PromptBudget, PromptContinuity,
@@ -12,9 +12,9 @@ use crate::{
     assets::AssetStore,
     automation::{ReconcileRequest, canvas_objects_from_workspace, reconcile_workspace},
     chat_core::{
-        ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, PlanItemStatus,
-        ProgressSource, RetryHint, RuntimeTuningProfile, StreamDialect, SubagentStatus,
-        SystemPromptChannel, TurnStatus, assistant_flat_text, capability_profile,
+        ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, PlanItem,
+        PlanItemStatus, ProgressSource, RetryHint, RuntimeTuningProfile, StreamDialect,
+        SubagentStatus, SystemPromptChannel, TurnStatus, assistant_flat_text, capability_profile,
         current_work_label, latest_turn_status, newest_plan, project_artifacts, project_context,
         project_progress, project_subagents, project_usage,
     },
@@ -417,6 +417,8 @@ struct AiChatRuntime {
     streamed_text: String,
     activities: Vec<String>,
     activity_trace: ActivityAccumulator,
+    task_seed: Option<Vec<PlanItem>>,
+    task_state_changed: bool,
     prompt_budget: Option<PromptBudget>,
     error: Option<String>,
     inspector_notice: Option<String>,
@@ -446,6 +448,8 @@ impl Default for AiChatRuntime {
             streamed_text: String::new(),
             activities: Vec::new(),
             activity_trace: ActivityAccumulator::new(),
+            task_seed: None,
+            task_state_changed: false,
             prompt_budget: None,
             error: None,
             inspector_notice: None,
@@ -6795,11 +6799,23 @@ impl AdamApp {
         let runtime = self.chat_runtimes.entry(conversation_id).or_default();
         let api_key =
             (!runtime.api_key.trim().is_empty()).then(|| runtime.api_key.trim().to_owned());
+        let task_seed =
+            newest_plan(&persisted_ai_activity(&conversation)).map(|progress| progress.items);
         let built_prompt = self.compose_ai_prompt(
             &conversation,
             &user_text,
             &attachments,
-            &provider_id,
+            resolve_effective_provider_id(
+                &provider_id,
+                conversation
+                    .settings
+                    .working_directory
+                    .as_deref()
+                    .map(Path::new),
+                &conversation.settings.api_endpoint,
+            )
+            .as_deref()
+            .unwrap_or(&provider_id),
             if resume_session_id.is_some() {
                 PromptContinuity::Resume
             } else {
@@ -6828,6 +6844,7 @@ impl AdamApp {
             api_key,
             custom_command: conversation.settings.custom_command.clone(),
             custom_arguments: conversation.settings.custom_arguments.clone(),
+            initial_tasks: task_seed.clone().unwrap_or_default(),
             prompt: built_prompt.prompt,
             system_prompt: built_prompt.system_channel,
             resume_session_id: resume_session_id.clone(),
@@ -6871,6 +6888,8 @@ impl AdamApp {
                 runtime.streamed_text.clear();
                 runtime.activities.clear();
                 runtime.activity_trace = ActivityAccumulator::new();
+                runtime.task_seed = task_seed;
+                runtime.task_state_changed = false;
                 runtime.prompt_budget = Some(prompt_budget);
                 runtime.activities.push(format!(
                     "Starting {} in {} mode",
@@ -7118,14 +7137,44 @@ impl AdamApp {
                     let runtime = self.chat_runtimes.entry(conversation_id).or_default();
                     runtime.active_had_productive_activity |=
                         ai_trace_has_productive_activity(std::slice::from_ref(&event));
+                    runtime.task_state_changed |= matches!(
+                        &event.kind,
+                        ActivityKind::PlanUpdate { .. } | ActivityKind::TaskMutation { .. }
+                    );
                     push_ai_activity(runtime, ai_activity_summary(&event.kind));
                     runtime.activity_trace.ingest(event);
                 }
+                AiEvent::ActivityBatch { events, .. } => {
+                    let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+                    for event in events {
+                        runtime.active_had_productive_activity |=
+                            ai_trace_has_productive_activity(std::slice::from_ref(&event));
+                        runtime.task_state_changed |= matches!(
+                            &event.kind,
+                            ActivityKind::PlanUpdate { .. } | ActivityKind::TaskMutation { .. }
+                        );
+                        push_ai_activity(runtime, ai_activity_summary(&event.kind));
+                        runtime.activity_trace.ingest(event);
+                    }
+                }
                 AiEvent::StreamReset { .. } => {
                     let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+                    let preserved_tasks = preserve_task_seed_before_stream_reset(runtime);
                     runtime.streamed_text.clear();
                     runtime.activity_trace = ActivityAccumulator::new();
                     runtime.activities.clear();
+                    if let Some(tasks) = preserved_tasks {
+                        runtime.activity_trace.ingest(HarnessActivityEvent::new(
+                            Uuid::new_v4(),
+                            unix_now(),
+                            ActivityKind::PlanUpdate {
+                                tasks,
+                                authoritative: true,
+                                compacted: true,
+                                replaces_native: false,
+                            },
+                        ));
+                    }
                     push_ai_activity(
                         runtime,
                         "Structured stream became invalid; using safe text recovery".into(),
@@ -7185,6 +7234,7 @@ impl AdamApp {
                                 format!("Provider session {}", truncate(&session_id, 18)),
                             );
                         }
+                        ensure_trailing_task_snapshot(runtime);
                         ensure_terminal_status(
                             &mut runtime.activity_trace,
                             TurnStatus::Completed,
@@ -7263,6 +7313,7 @@ impl AdamApp {
                                 runtime.active_had_productive_activity = false;
                                 runtime.streamed_text.clear();
                                 runtime.activity_trace = ActivityAccumulator::new();
+                                runtime.task_state_changed = false;
                                 runtime.activities.clear();
                                 runtime.error = None;
                                 push_ai_activity(
@@ -7298,6 +7349,7 @@ impl AdamApp {
                                 message: message.clone(),
                             },
                         ));
+                        ensure_trailing_task_snapshot(runtime);
                         ensure_terminal_status(
                             &mut runtime.activity_trace,
                             turn_status_for_failure(kind),
@@ -7380,6 +7432,7 @@ impl AdamApp {
                                 message: "Stopped by the user".into(),
                             },
                         ));
+                        ensure_trailing_task_snapshot(runtime);
                         ensure_terminal_status(
                             &mut runtime.activity_trace,
                             TurnStatus::UserCancelled,
@@ -7601,7 +7654,19 @@ impl AdamApp {
                     "Use the live workspace block below as the current source of truth.".into(),
                 ),
                 memory_hint: None,
-                task_tool_hint: None,
+                task_tool_hint: provider_exposes_app_task_tools(
+                    provider_id,
+                    conversation
+                        .settings
+                        .working_directory
+                        .as_deref()
+                        .map(Path::new),
+                    &conversation.settings.api_endpoint,
+                )
+                .then(|| {
+                        "Keep Adam's Progress checklist current with task_create, task_update, and task_list when those tools are offered. Create concrete main-agent steps before substantial work, move only the active step to in_progress, and finish each step as it completes. Checklist bookkeeping is allowed in every access stance and does not modify files or canvas data. Do not use prose, command activity, or child-agent counts as a substitute for the checklist."
+                            .into()
+                }),
             },
             history,
             compaction_splice: None,
@@ -12058,6 +12123,127 @@ fn ensure_terminal_status(
             message,
             tool: None,
             retry,
+        },
+    ));
+}
+
+/// Salvage resets discard malformed provider activity, but task-tool events
+/// can arrive through an independent structured channel. Fold their newest
+/// state into the seed before clearing the trace so terminal persistence does
+/// not lose a valid checklist.
+fn preserve_task_seed_before_stream_reset(runtime: &mut AiChatRuntime) -> Option<Vec<PlanItem>> {
+    if !runtime.task_state_changed {
+        return None;
+    }
+
+    // Row origin describes who first created a task, not which channel
+    // authored the snapshot. An Adam task-tool update intentionally keeps a
+    // seeded native row's origin, so the authoritative whole-list snapshot is
+    // the trust boundary for task-tool state.
+    //
+    // Legacy Grok is the one exception: its updates.jsonl follower is the
+    // provider's only plan channel. Those snapshots are normalized native
+    // events, but the follower offset has already advanced when a stdout
+    // salvage reset arrives, so they cannot be replayed after the trace is
+    // cleared.
+    let preserve_legacy_grok_follower = runtime.active_provider_id.as_deref() == Some("grok_cli");
+    let trusted_task_events = runtime
+        .activity_trace
+        .events
+        .iter()
+        .filter_map(|event| match &event.kind {
+            ActivityKind::TaskMutation {
+                origin: crate::chat_core::PlanItemOrigin::AppTools,
+                ..
+            } => Some(event.clone()),
+            ActivityKind::PlanUpdate {
+                authoritative: true,
+                ..
+            } => Some(event.clone()),
+            ActivityKind::PlanUpdate { .. } if preserve_legacy_grok_follower => Some(event.clone()),
+            ActivityKind::PlanUpdate { tasks, .. } => {
+                let tasks = tasks
+                    .iter()
+                    .filter(|task| task.origin == crate::chat_core::PlanItemOrigin::AppTools)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!tasks.is_empty()).then_some(HarnessActivityEvent {
+                    id: event.id,
+                    at: event.at,
+                    duration_ms: event.duration_ms,
+                    kind: ActivityKind::PlanUpdate {
+                        tasks,
+                        authoritative: false,
+                        compacted: true,
+                        replaces_native: false,
+                    },
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if trusted_task_events.is_empty() {
+        // The poisoned provider stream owns native plan events. They are no
+        // more trustworthy than its text and tool records; keep the saved
+        // pre-turn seed untouched and do not manufacture a terminal snapshot.
+        runtime.task_state_changed = false;
+        return None;
+    }
+
+    let mut task_events = Vec::with_capacity(runtime.activity_trace.events.len() + 1);
+    if let Some(seed) = runtime.task_seed.as_ref() {
+        task_events.push(HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            unix_now(),
+            ActivityKind::PlanUpdate {
+                tasks: seed.clone(),
+                authoritative: true,
+                compacted: true,
+                replaces_native: false,
+            },
+        ));
+    }
+    task_events.extend(trusted_task_events);
+    runtime.task_seed = newest_plan(&task_events).map(|progress| progress.items);
+    runtime.task_seed.clone()
+}
+
+/// Materialize a full, ordered task snapshot after the last mutation so the
+/// turn remains self-contained after compaction, save, and relaunch.
+///
+/// A taskless turn deliberately emits nothing. The seed is the newest saved
+/// snapshot from before this run; live native snapshots and task-tool
+/// mutations then fold over it using the same origin-aware reducer as the UI.
+fn ensure_trailing_task_snapshot(runtime: &mut AiChatRuntime) {
+    if !runtime.task_state_changed {
+        return;
+    }
+
+    let mut task_events = Vec::with_capacity(runtime.activity_trace.events.len() + 1);
+    if let Some(seed) = runtime.task_seed.as_ref() {
+        task_events.push(HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            unix_now(),
+            ActivityKind::PlanUpdate {
+                tasks: seed.clone(),
+                authoritative: true,
+                compacted: true,
+                replaces_native: false,
+            },
+        ));
+    }
+    task_events.extend(runtime.activity_trace.events.iter().cloned());
+    let Some(progress) = newest_plan(&task_events) else {
+        return;
+    };
+    runtime.activity_trace.ingest(HarnessActivityEvent::new(
+        Uuid::new_v4(),
+        unix_now(),
+        ActivityKind::PlanUpdate {
+            tasks: progress.items,
+            authoritative: true,
+            compacted: true,
+            replaces_native: false,
         },
     ));
 }
@@ -16823,6 +17009,346 @@ mod tests {
         let terminal = latest_turn_status(&trace.events).unwrap();
         assert_eq!(terminal.status, TurnStatus::ProviderError);
         assert_eq!(terminal.retry, Some(RetryHint::Retry));
+    }
+
+    #[test]
+    fn trailing_task_snapshot_folds_saved_state_and_live_mutations() {
+        let mut runtime = AiChatRuntime {
+            task_seed: Some(vec![PlanItem {
+                content: "Inspect inputs".into(),
+                active_form: Some("Inspecting inputs".into()),
+                status: PlanItemStatus::Pending,
+                task_id: Some("native-1".into()),
+                origin: crate::chat_core::PlanItemOrigin::Native,
+            }]),
+            task_state_changed: true,
+            ..AiChatRuntime::default()
+        };
+        runtime.activity_trace.ingest(HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(2),
+            ActivityKind::TaskMutation {
+                kind: crate::chat_core::TaskMutationKind::Update,
+                origin: crate::chat_core::PlanItemOrigin::Native,
+                content: String::new(),
+                task_id: Some("native-1".into()),
+                status: Some(PlanItemStatus::Completed),
+                active_form: None,
+                result_summary: None,
+            },
+        ));
+
+        ensure_trailing_task_snapshot(&mut runtime);
+
+        let persisted = runtime.activity_trace.events_for_persistence();
+        let progress = newest_plan(&persisted).expect("durable task snapshot");
+        assert_eq!(progress.items.len(), 1);
+        assert_eq!(progress.items[0].content, "Inspect inputs");
+        assert_eq!(progress.items[0].status, PlanItemStatus::Completed);
+        assert!(persisted.iter().any(|event| matches!(
+            event.kind,
+            ActivityKind::PlanUpdate {
+                compacted: true,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn trailing_task_snapshot_is_not_invented_for_a_taskless_turn() {
+        let mut runtime = AiChatRuntime::default();
+        ensure_trailing_task_snapshot(&mut runtime);
+        assert!(runtime.activity_trace.events.is_empty());
+    }
+
+    #[test]
+    fn trailing_task_snapshot_persists_an_explicit_empty_list() {
+        let mut runtime = AiChatRuntime {
+            task_seed: Some(Vec::new()),
+            task_state_changed: true,
+            ..AiChatRuntime::default()
+        };
+        ensure_trailing_task_snapshot(&mut runtime);
+        let progress =
+            newest_plan(&runtime.activity_trace.events).expect("explicit empty task snapshot");
+        assert!(progress.items.is_empty());
+    }
+
+    fn reset_runtime_activity_for_test(runtime: &mut AiChatRuntime) {
+        let preserved_tasks = preserve_task_seed_before_stream_reset(runtime);
+        runtime.activity_trace = ActivityAccumulator::new();
+        if let Some(tasks) = preserved_tasks {
+            runtime.activity_trace.ingest(HarnessActivityEvent::new(
+                Uuid::new_v4(),
+                UnixMillis(99),
+                ActivityKind::PlanUpdate {
+                    tasks,
+                    authoritative: true,
+                    compacted: true,
+                    replaces_native: false,
+                },
+            ));
+        }
+    }
+
+    #[test]
+    fn stream_reset_preserves_the_latest_structured_task_state() {
+        let mut runtime = AiChatRuntime {
+            task_seed: Some(vec![PlanItem {
+                content: "Saved".into(),
+                task_id: Some("1".into()),
+                origin: crate::chat_core::PlanItemOrigin::AppTools,
+                ..PlanItem::default()
+            }]),
+            task_state_changed: true,
+            ..AiChatRuntime::default()
+        };
+        runtime.activity_trace.ingest(HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(2),
+            ActivityKind::TaskMutation {
+                kind: crate::chat_core::TaskMutationKind::Update,
+                origin: crate::chat_core::PlanItemOrigin::AppTools,
+                content: String::new(),
+                task_id: Some("1".into()),
+                status: Some(PlanItemStatus::Completed),
+                active_form: None,
+                result_summary: None,
+            },
+        ));
+
+        reset_runtime_activity_for_test(&mut runtime);
+        let live = project_progress(&[], &runtime.activity_trace.events);
+        assert_eq!(live.items.len(), 1);
+        assert_eq!(live.items[0].status, PlanItemStatus::Completed);
+        ensure_trailing_task_snapshot(&mut runtime);
+
+        let progress =
+            newest_plan(&runtime.activity_trace.events).expect("task state survived reset");
+        assert_eq!(progress.items.len(), 1);
+        assert_eq!(progress.items[0].content, "Saved");
+        assert_eq!(progress.items[0].status, PlanItemStatus::Completed);
+    }
+
+    #[test]
+    fn repeated_stream_reset_keeps_preserved_task_state_dirty_for_terminal_persistence() {
+        let mut runtime = AiChatRuntime {
+            task_seed: Some(vec![PlanItem {
+                content: "Saved".into(),
+                task_id: Some("1".into()),
+                origin: crate::chat_core::PlanItemOrigin::AppTools,
+                ..PlanItem::default()
+            }]),
+            task_state_changed: true,
+            ..AiChatRuntime::default()
+        };
+        runtime.activity_trace.ingest(HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(2),
+            ActivityKind::TaskMutation {
+                kind: crate::chat_core::TaskMutationKind::Update,
+                origin: crate::chat_core::PlanItemOrigin::AppTools,
+                content: String::new(),
+                task_id: Some("1".into()),
+                status: Some(PlanItemStatus::Completed),
+                active_form: None,
+                result_summary: None,
+            },
+        ));
+
+        reset_runtime_activity_for_test(&mut runtime);
+        reset_runtime_activity_for_test(&mut runtime);
+        assert!(runtime.task_state_changed);
+        ensure_trailing_task_snapshot(&mut runtime);
+
+        let persisted = runtime.activity_trace.events_for_persistence();
+        let progress = newest_plan(&persisted).expect("task state survived repeated resets");
+        assert_eq!(progress.items.len(), 1);
+        assert_eq!(progress.items[0].content, "Saved");
+        assert_eq!(progress.items[0].status, PlanItemStatus::Completed);
+    }
+
+    #[test]
+    fn stream_reset_discards_native_plan_state_from_the_poisoned_turn() {
+        let mut runtime = AiChatRuntime {
+            active_provider_id: Some("claude_cli".into()),
+            task_state_changed: true,
+            ..AiChatRuntime::default()
+        };
+        runtime.activity_trace.ingest(HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(2),
+            ActivityKind::TaskMutation {
+                kind: crate::chat_core::TaskMutationKind::Update,
+                origin: crate::chat_core::PlanItemOrigin::Native,
+                content: "Seeded native task".into(),
+                task_id: Some("native-1".into()),
+                status: Some(PlanItemStatus::Completed),
+                active_form: None,
+                result_summary: Some("Task native-1 → completed".into()),
+            },
+        ));
+        runtime.activity_trace.ingest(HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(3),
+            ActivityKind::PlanUpdate {
+                tasks: vec![PlanItem {
+                    content: "Untrusted native step".into(),
+                    task_id: Some("native-1".into()),
+                    origin: crate::chat_core::PlanItemOrigin::Native,
+                    ..PlanItem::default()
+                }],
+                authoritative: false,
+                compacted: false,
+                replaces_native: true,
+            },
+        ));
+
+        reset_runtime_activity_for_test(&mut runtime);
+        ensure_trailing_task_snapshot(&mut runtime);
+
+        assert!(runtime.task_seed.is_none());
+        assert!(!runtime.task_state_changed);
+        assert!(runtime.activity_trace.events.is_empty());
+    }
+
+    #[test]
+    fn stream_reset_preserves_adam_snapshot_when_updated_row_keeps_native_origin() {
+        let mut runtime = AiChatRuntime {
+            active_provider_id: Some("openai_compatible".into()),
+            task_seed: Some(vec![PlanItem {
+                content: "Seeded native task".into(),
+                task_id: Some("native-1".into()),
+                origin: crate::chat_core::PlanItemOrigin::Native,
+                ..PlanItem::default()
+            }]),
+            task_state_changed: true,
+            ..AiChatRuntime::default()
+        };
+        runtime.activity_trace.ingest(HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(2),
+            ActivityKind::PlanUpdate {
+                tasks: vec![PlanItem {
+                    content: "Seeded native task".into(),
+                    status: PlanItemStatus::Completed,
+                    task_id: Some("native-1".into()),
+                    origin: crate::chat_core::PlanItemOrigin::Native,
+                    ..PlanItem::default()
+                }],
+                authoritative: true,
+                compacted: false,
+                replaces_native: false,
+            },
+        ));
+
+        reset_runtime_activity_for_test(&mut runtime);
+        ensure_trailing_task_snapshot(&mut runtime);
+
+        let progress =
+            newest_plan(&runtime.activity_trace.events).expect("Adam snapshot survived reset");
+        assert_eq!(progress.items.len(), 1);
+        assert_eq!(progress.items[0].status, PlanItemStatus::Completed);
+        assert_eq!(
+            progress.items[0].origin,
+            crate::chat_core::PlanItemOrigin::Native
+        );
+    }
+
+    #[test]
+    fn stream_reset_preserves_legacy_grok_follower_snapshot_without_replay() {
+        let mut runtime = AiChatRuntime {
+            active_provider_id: Some("grok_cli".into()),
+            task_seed: Some(vec![PlanItem {
+                content: "Old follower task".into(),
+                task_id: Some("old".into()),
+                origin: crate::chat_core::PlanItemOrigin::Native,
+                ..PlanItem::default()
+            }]),
+            task_state_changed: true,
+            ..AiChatRuntime::default()
+        };
+        runtime.activity_trace.ingest(HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(2),
+            ActivityKind::PlanUpdate {
+                tasks: vec![PlanItem {
+                    content: "Latest follower task".into(),
+                    status: PlanItemStatus::InProgress,
+                    task_id: Some("latest".into()),
+                    origin: crate::chat_core::PlanItemOrigin::Native,
+                    ..PlanItem::default()
+                }],
+                authoritative: false,
+                compacted: false,
+                replaces_native: true,
+            },
+        ));
+
+        reset_runtime_activity_for_test(&mut runtime);
+        ensure_trailing_task_snapshot(&mut runtime);
+
+        let progress =
+            newest_plan(&runtime.activity_trace.events).expect("follower snapshot survived reset");
+        assert_eq!(progress.items.len(), 1);
+        assert_eq!(progress.items[0].content, "Latest follower task");
+        assert_eq!(progress.items[0].status, PlanItemStatus::InProgress);
+    }
+
+    #[test]
+    fn persisted_task_snapshot_round_trips_for_relaunch_seed() {
+        let task_snapshot = vec![
+            PlanItem {
+                content: "Inspect inputs".into(),
+                active_form: Some("Inspecting inputs".into()),
+                status: PlanItemStatus::Completed,
+                task_id: Some("1".into()),
+                origin: crate::chat_core::PlanItemOrigin::AppTools,
+            },
+            PlanItem {
+                content: "Write result".into(),
+                active_form: Some("Writing result".into()),
+                status: PlanItemStatus::InProgress,
+                task_id: Some("2".into()),
+                origin: crate::chat_core::PlanItemOrigin::AppTools,
+            },
+        ];
+        let snapshot_event = HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(4),
+            ActivityKind::PlanUpdate {
+                tasks: task_snapshot.clone(),
+                authoritative: true,
+                compacted: true,
+                replaces_native: false,
+            },
+        );
+        let mut conversation = AiConversation::new(
+            Uuid::new_v4(),
+            "Durable progress",
+            PermissionMode::Ask,
+            UnixMillis(1),
+        );
+        conversation
+            .append_message_with_activity(
+                Uuid::new_v4(),
+                MessageRole::Assistant,
+                "Working",
+                UnixMillis(5),
+                Vec::new(),
+                Vec::new(),
+                vec![snapshot_event],
+                Some(Uuid::new_v4()),
+            )
+            .unwrap();
+
+        let encoded = serde_json::to_vec(&conversation).unwrap();
+        let restored: AiConversation = serde_json::from_slice(&encoded).unwrap();
+        let relaunched_seed = newest_plan(&persisted_ai_activity(&restored))
+            .expect("relaunch restores task snapshot")
+            .items;
+
+        assert_eq!(relaunched_seed, task_snapshot);
     }
 
     #[test]
