@@ -50,6 +50,8 @@ Verified against EarlIt source (`AgentTaskStore.swift`, `AgentActivityModels.swi
 - Persist live snapshots with the turn; relaunch restores.
 - Task tools remain independent of canvas access.
 
+*PR 2 merged 2026-07-30 (77467b4) after re-review; carried P2 follow-ups: Grok `{slug}-{hash}`/`.cwd` long-path session discovery, replay tool-call map accounting vs max_events, permission-tool label preservation on PermissionResolved, >512-byte native task ids, stale denied-permission diagnostic clearing.*
+
 ### PR 3 — `codex/subagent-progress`
 - Child lifecycle with stable child ids + parent linkage; every task/text event scoped `Main` or a specific child.
 - Aggregate line ("3/5 done · 2 working"); expandable child detail; child checklist **only** from real child task events; otherwise status + current activity — never invented steps.
