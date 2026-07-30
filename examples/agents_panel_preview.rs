@@ -87,7 +87,10 @@ fn synthetic_rows() -> Vec<AgentRow> {
         AgentRow {
             meta: meta("grok_cli"),
             kind: AgentRowKind::Probed {
-                availability: AgentAvailability::Detected { version: None },
+                availability: AgentAvailability::DetectedSeriesTested {
+                    version: CliVersion::parse("0.2.114").expect("version"),
+                    tested: CliVersion::parse("0.2.111").expect("version"),
+                },
             },
             program: Some("/usr/local/bin/grok".into()),
             auth: agents_panel::AgentAuth::NotApplicable,

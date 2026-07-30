@@ -1,0 +1,14 @@
+{
+  "provider": "Grok CLI",
+  "version": "0.2.114",
+  "build": "0c785038798",
+  "capturedAt": "2026-07-30",
+  "command": "grok --single <prompt> --output-format streaming-json --permission-mode auto --sandbox read-only --disable-web-search --no-plan --no-memory --reasoning-effort low --max-turns 5",
+  "redactions": [
+    "session and request ids replaced",
+    "cost values zeroed (keys retained — they are new in this version)",
+    "thought deltas coalesced",
+    "text chunks coalesced without changing their envelope shape"
+  ],
+  "note": "Drift capture against the tested 0.2.111 grammar: identical envelope types (thought/text/end); text envelopes still carry NO child identity, so the subagents-off rule stands; the only change is additive cost keys on the end envelope. parent-child re-capture deliberately left for the contract-row landing (Codex lane)."
+}

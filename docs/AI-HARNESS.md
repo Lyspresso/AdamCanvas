@@ -74,9 +74,24 @@ so a missing CLI is visible before Send instead of after it fails. Statuses:
 
 - **Not detected** — the binary was not found on the discovery paths above.
 - **Detected vX.Y.Z** — found, but no captured runtime contract covers this
-  version; provider defaults apply and no tuning controls are exposed.
+  version; provider defaults apply and no tuning controls are exposed. When
+  a contract exists for a different version, the hover names it so drift is
+  visible instead of silent.
+- **Detected vX.Y.Z · tested series (vA.B.C)** — found in the same
+  major.minor series as a tested contract version with only a newer patch
+  (the usual self-update drift). Safe defaults still apply; full "verified"
+  returns with the next contract capture. Never granted on downgrades or a
+  different series.
 - **Detected vX.Y.Z · verified** — found and the version matches a captured
   contract row in `runtime_tuning_profile`.
+
+Drift captures under `tests/fixtures/ai/<provider>/<version>/` back the
+series policy: a grammar canary test asserts a drifted capture introduces
+no envelope types beyond the tested contract and keeps the shapes resume
+depends on (see grok 0.2.114 vs 0.2.111 — identical grammar, additive
+cost keys only). A single-turn capture cannot exercise subagent scoping;
+that proof waits for the parent-child re-capture when the contract row
+lands.
 
 Detection reuses the launch path's own resolver and version cache through the
 additive accessor `ai::probe_installed_provider` — what the panel shows and

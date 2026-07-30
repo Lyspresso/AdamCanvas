@@ -29,10 +29,38 @@ pub enum AgentAvailability {
     Detected {
         version: Option<CliVersion>,
     },
+    /// Found in the same major.minor series as a tested contract version,
+    /// newer patch — self-updating CLIs land here between contract
+    /// captures. Softer than verified: safe defaults still apply.
+    DetectedSeriesTested {
+        version: CliVersion,
+        tested: CliVersion,
+    },
     /// Found and the version matches a verified runtime-contract row.
     DetectedVerified {
         version: CliVersion,
     },
+}
+
+/// Display mirror of the verified contract rows in chat_core's
+/// `runtime_tuning_profile`, used for series matching and drift copy. A
+/// unit test asserts every entry classifies as verified and names a real
+/// probed provider id; completeness cannot be machine-checked (chat_core
+/// exposes no version enumeration), so contract-row PRs must update this
+/// list too — the parity plan's queued-task note says exactly that.
+const TESTED_VERSIONS: &[(&str, &str)] = &[
+    ("claude_cli", "2.1.128"),
+    ("codex_cli", "0.144.1"),
+    ("grok_cli", "0.2.111"),
+    ("kimi_cli", "1.49.0"),
+    ("ollama", "0.32.1"),
+];
+
+fn tested_version_for(provider_id: &str) -> Option<CliVersion> {
+    TESTED_VERSIONS
+        .iter()
+        .find(|(id, _)| *id == provider_id)
+        .and_then(|(_, version)| CliVersion::parse(version))
 }
 
 /// Sign-in axis, filled only for providers whose CLI has a vendor status
@@ -791,11 +819,20 @@ pub fn classify_probe(provider_id: &str, probe: &ProviderProbe) -> AgentAvailabi
     let verified = tuned.reasoning_efforts != baseline.reasoning_efforts
         || tuned.supports_scoped_child_text != baseline.supports_scoped_child_text;
     if verified {
-        AgentAvailability::DetectedVerified { version }
-    } else {
-        AgentAvailability::Detected {
-            version: Some(version),
-        }
+        return AgentAvailability::DetectedVerified { version };
+    }
+    // Same major.minor as a tested version with only a newer patch: the
+    // usual self-update drift. Softer badge; older-than-tested or a
+    // different series stays plain Detected (never grant on downgrade).
+    if let Some(tested) = tested_version_for(provider_id)
+        && version.major == tested.major
+        && version.minor == tested.minor
+        && version.patch > tested.patch
+    {
+        return AgentAvailability::DetectedSeriesTested { version, tested };
+    }
+    AgentAvailability::Detected {
+        version: Some(version),
     }
 }
 
@@ -877,6 +914,10 @@ pub fn availability_label(availability: &AgentAvailability) -> String {
         } => format!(
             "Detected v{}.{}.{}",
             version.major, version.minor, version.patch
+        ),
+        AgentAvailability::DetectedSeriesTested { version, tested } => format!(
+            "Detected v{}.{}.{} · tested series (v{}.{}.{})",
+            version.major, version.minor, version.patch, tested.major, tested.minor, tested.patch
         ),
         AgentAvailability::DetectedVerified { version } => format!(
             "Detected v{}.{}.{} · verified",
@@ -1080,7 +1121,9 @@ fn probed_row_ui(
 ) {
     let tone = match availability {
         AgentAvailability::NotDetected => palette.tertiary_text,
-        AgentAvailability::Detected { .. } => palette.secondary_text,
+        AgentAvailability::Detected { .. } | AgentAvailability::DetectedSeriesTested { .. } => {
+            palette.secondary_text
+        }
         AgentAvailability::DetectedVerified { .. } => palette.accent,
     };
     let missing = *availability == AgentAvailability::NotDetected;
@@ -1193,11 +1236,23 @@ fn probed_row_ui(
     if let Some(program) = &row.program {
         hover.push(program.to_string_lossy().into_owned());
     }
-    if matches!(
-        availability,
-        AgentAvailability::Detected { version: Some(_) }
-    ) {
-        hover.push("No captured contract for this version; provider defaults apply.".into());
+    match availability {
+        AgentAvailability::Detected { version: Some(_) } => {
+            hover.push(match tested_version_for(row.meta.provider_id) {
+                Some(tested) => format!(
+                    "Tested version is v{}.{}.{}; this build differs — provider defaults apply until it's re-tested.",
+                    tested.major, tested.minor, tested.patch
+                ),
+                None => "No captured contract for this version; provider defaults apply.".into(),
+            });
+        }
+        AgentAvailability::DetectedSeriesTested { tested, .. } => {
+            hover.push(format!(
+                "Same series as the tested v{}.{}.{} with only newer patch updates; safe defaults apply until the next contract capture.",
+                tested.major, tested.minor, tested.patch
+            ));
+        }
+        _ => {}
     }
     if missing && !row.meta.install_hint.is_empty() {
         hover.push(row.meta.install_hint.into());
@@ -1786,6 +1841,123 @@ mod tests {
         assert_eq!(
             classify_auth_output(Some(false), "{\"loggedIn\":false}"),
             AgentAuth::SignedOut
+        );
+    }
+
+    #[test]
+    fn tested_versions_mirror_the_verified_contract_rows() {
+        for (provider_id, version) in TESTED_VERSIONS {
+            assert!(
+                matches!(
+                    classify_probe(provider_id, &probe(Some("/bin/stub"), Some(version))),
+                    AgentAvailability::DetectedVerified { .. }
+                ),
+                "{provider_id} {version} must classify as verified — the display mirror has drifted from runtime_tuning_profile"
+            );
+            // Guard against alias-keyed entries ("grok" vs "grok_cli") that
+            // would classify fine yet be dead at lookup/hover time.
+            assert!(
+                AGENT_PROVIDERS
+                    .iter()
+                    .any(|meta| meta.provider_id == *provider_id && meta.binary.is_some()),
+                "{provider_id} must be a probed provider id, not an alias"
+            );
+            assert!(
+                tested_version_for(provider_id).is_some(),
+                "{provider_id} entry must parse and resolve through tested_version_for"
+            );
+        }
+    }
+
+    #[test]
+    fn newer_patch_in_a_tested_series_classifies_as_series_tested() {
+        match classify_probe("grok_cli", &probe(Some("/bin/grok"), Some("0.2.114"))) {
+            AgentAvailability::DetectedSeriesTested { version, tested } => {
+                assert_eq!((version.major, version.minor, version.patch), (0, 2, 114));
+                assert_eq!((tested.major, tested.minor, tested.patch), (0, 2, 111));
+            }
+            other => panic!("expected series-tested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn older_patch_or_different_series_never_earns_the_series_badge() {
+        assert!(matches!(
+            classify_probe("grok_cli", &probe(Some("/bin/grok"), Some("0.2.110"))),
+            AgentAvailability::Detected { .. }
+        ));
+        assert!(matches!(
+            classify_probe("grok_cli", &probe(Some("/bin/grok"), Some("0.3.0"))),
+            AgentAvailability::Detected { .. }
+        ));
+        assert!(matches!(
+            classify_probe("grok_cli", &probe(Some("/bin/grok"), Some("1.2.112"))),
+            AgentAvailability::Detected { .. }
+        ));
+    }
+
+    #[test]
+    fn series_tested_label_names_both_versions() {
+        let label = availability_label(&AgentAvailability::DetectedSeriesTested {
+            version: CliVersion::parse("0.2.114").expect("version"),
+            tested: CliVersion::parse("0.2.111").expect("version"),
+        });
+        assert_eq!(label, "Detected v0.2.114 · tested series (v0.2.111)");
+    }
+
+    #[test]
+    fn grok_0_2_114_stream_grammar_matches_the_tested_contract() {
+        // The drift canary: the captured 0.2.114 stream must introduce no
+        // envelope types beyond the tested 0.2.111 grammar, its text
+        // envelopes must keep the bare {type,data} shape, and the end
+        // envelope must still carry the sessionId resume depends on. This
+        // single-turn capture cannot exercise subagent scoping — the
+        // parent-child re-capture is deliberately deferred to the
+        // contract-row landing (see the 0.2.114 manifest).
+        fn envelope_types(fixture: &str) -> std::collections::BTreeSet<String> {
+            fixture
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| {
+                    serde_json::from_str::<serde_json::Value>(line).expect("fixture line is JSON")
+                        ["type"]
+                        .as_str()
+                        .expect("envelope has a type")
+                        .to_owned()
+                })
+                .collect()
+        }
+        let tested = include_str!("../tests/fixtures/ai/grok/0.2.111/basic.jsonl");
+        let drifted = include_str!("../tests/fixtures/ai/grok/0.2.114/basic.jsonl");
+        let new_types: Vec<_> = envelope_types(drifted)
+            .difference(&envelope_types(tested))
+            .cloned()
+            .collect();
+        assert!(
+            new_types.is_empty(),
+            "0.2.114 introduced envelope types outside the tested grammar: {new_types:?}"
+        );
+        let mut saw_session_id = false;
+        for line in drifted.lines().filter(|line| !line.trim().is_empty()) {
+            let envelope: serde_json::Value = serde_json::from_str(line).expect("JSON");
+            if envelope["type"] == "end" {
+                saw_session_id |= envelope.get("sessionId").is_some();
+            }
+            if envelope["type"] == "text" {
+                let keys: std::collections::BTreeSet<_> = envelope
+                    .as_object()
+                    .expect("object")
+                    .keys()
+                    .cloned()
+                    .collect();
+                let expected: std::collections::BTreeSet<_> =
+                    ["data".to_owned(), "type".to_owned()].into_iter().collect();
+                assert_eq!(keys, expected, "text envelopes must keep the bare shape");
+            }
+        }
+        assert!(
+            saw_session_id,
+            "the end envelope must keep sessionId — native resume depends on it"
         );
     }
 
