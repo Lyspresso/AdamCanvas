@@ -82,3 +82,5 @@ Verified against EarlIt source (`AgentTaskStore.swift`, `AgentActivityModels.swi
 ## Conflict protocol for this effort
 
 `src/app.rs` is the shared hot file. Codex PRs 1–2 should avoid the inspector render functions (`render_ai_workspace_panel` and its section fns); Claude's PR 5 stays inside them + new widget modules. PR 3/4 card-content handoffs: Codex lands the projection/data change first, Claude follows with rendering. Merge order: 1 → 2 → (3, 5 in parallel) → 4.
+
+Sideline workstream ordering (2026-07-30): the Agents-panel **PR A (GitHub #3)** holds until `codex/main-progress` merges, then rebases and lands — its only touchpoints with PR 2 are the `lib.rs` module list and the `app.rs` import block (verified against Codex's in-flight worktree; its `ai.rs` edits skip the accessor's insertion region entirely). Zero-conflict ordering beats trivial-conflict ordering while a large PR is in flight.
