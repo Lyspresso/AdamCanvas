@@ -39,7 +39,7 @@ Verified against EarlIt source (`AgentTaskStore.swift`, `AgentActivityModels.swi
 ### PR 1 — `codex/harness-baseline`
 - Capture real event fixtures per provider/version (Codex CLI JSONL, Claude Code stream-json — schemas in github.com/openai/codex and github.com/anthropics/claude-code — plus locally captured Grok + Kimi streams) and pin decoder tests on them.
 - Version-aware `CapabilityProfile`: one table per provider (incl. supported reasoning-effort values) that **both** the launch arg builder and the settings UI read. Unsupported values are unselectable and clamped with self-heal; a setting the CLI rejects must be impossible to launch.
-- **Stopgap for garbled prose:** drop/segregate non-parent `text` from the main streamed cell (parent-only), keyed on envelope identity. Full per-child rendering comes in PR 3.
+- **Stopgap for garbled prose** — *revised by evidence during PR 1:* the plan assumed live Grok text envelopes carry child identity; the captured fixture (`tests/fixtures/ai/grok/0.2.111/parent-child.jsonl`) proved they don't — parent and child `type:text` records are structurally indistinguishable, so identity-keyed suppression would corrupt valid parent prose. Shipped fail-closed equivalent: Grok 0.2.111 and unknown versions always launch `--no-subagents` (saved preference healed to Off, composer explains why). PR 3 re-enables child execution only via a genuinely scoped channel.
 - Fix the salvage double-append (allow repeated `StreamReset` or make salvage idempotent on the UI buffer).
 - Explicit terminal outcomes: `completed | stopped | blocked | timedOut | turnLimit | providerError` — drives the run header; checked rows alone never imply success.
 - Reconcile `docs/AI-HARNESS.md` claims with actual implementation.
@@ -53,7 +53,7 @@ Verified against EarlIt source (`AgentTaskStore.swift`, `AgentActivityModels.swi
 ### PR 3 — `codex/subagent-progress`
 - Child lifecycle with stable child ids + parent linkage; every task/text event scoped `Main` or a specific child.
 - Aggregate line ("3/5 done · 2 working"); expandable child detail; child checklist **only** from real child task events; otherwise status + current activity — never invented steps.
-- Per-child prose cells replace the PR 1 stopgap.
+- Per-child prose cells; **re-enabling Grok subagents requires a genuinely scoped child channel** (e.g. the session updates file, which does carry `subagent_id`/`child_session_id`) — live stdout cannot provide it on Grok 0.2.111 (see PR 1 deviation). `supports_scoped_child_text` flips per version only with fixture proof.
 
 ### PR 4 — `codex/artifacts`
 - User-facing rename Outputs → Artifacts. Sources: confirmed successful `FileChange` (failed/declined excluded) + **created** canvas entities (emit `HostMutation` from production canvas tools; creations only — annotate/move don't count).
