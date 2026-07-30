@@ -62,6 +62,7 @@ Verified against EarlIt source (`AgentTaskStore.swift`, `AgentActivityModels.swi
 
 ### PR 5 — `task-rail` (Claude, `work/claude`)
 - Card rail per the target structure; Resources collapsed by default; Activity/diagnostics moved out of Progress.
+  *Shipped 2026-07-30:* the stepper; Activity relocated out of the Progress card; cards renamed Agents/Artifacts (rename moved up from PR 4's scope — rendering is Claude's lane); Working folder demoted — count dropped from its header, opens only when a folder is needed but unset; header status chip now reflects the terminal outcome (Completed / Stopped / Needs attention). Working folder + Context remain sibling collapsed cards rather than one Resources wrapper — same demotion intent, simpler tree.
 - EarlIt stepper grammar: filled circle + check (done) / stroked circle + spinner (active, label = `activeForm`) / hollow circle (pending) / slash (cancelled); short connector stub under each glyph; completed rows full-strength text, others secondary, cancelled struck.
 - Empty states: live-run-no-plan → spinner + elapsed timer; idle → decorative placeholder + "Steps will show as the task unfolds."; finished-without-checklist → "Completed without a checklist." (never bare "No task list yet." on a finished run); persisted plan on idle → "Task complete."
 - Accessibility: AccessKit labels, contrast, reduced-motion (static glyph instead of spinner), large-text reflow.

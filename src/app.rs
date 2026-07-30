@@ -12339,19 +12339,21 @@ fn render_ai_inspector(
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Workspace").size(15.0).strong());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(if runtime.active_turn.is_some() {
-                            "Running"
-                        } else {
-                            "Ready"
-                        })
-                        .size(10.5)
-                        .color(if runtime.active_turn.is_some() {
-                            colors.accent
-                        } else {
-                            colors.secondary_text
-                        }),
-                    );
+                    let (status_label, status_color) = if runtime.active_turn.is_some() {
+                        ("Running", colors.accent)
+                    } else {
+                        match terminal.as_ref() {
+                            Some(terminal) if terminal.status.is_successful() => {
+                                ("Completed", colors.secondary_text)
+                            }
+                            Some(terminal) if terminal.status == TurnStatus::UserCancelled => {
+                                ("Stopped", colors.secondary_text)
+                            }
+                            Some(_) => ("Needs attention", colors.danger),
+                            None => ("Ready", colors.secondary_text),
+                        }
+                    };
+                    ui.label(RichText::new(status_label).size(10.5).color(status_color));
                 });
             });
             if let Some(notice) = runtime.inspector_notice.as_deref() {
@@ -12422,10 +12424,20 @@ fn render_ai_inspector(
                                 "The latest task list is empty."
                             }
                             (false, ProgressSource::None) => {
-                                if has_history {
-                                    "Completed without a checklist."
-                                } else {
+                                if !has_history {
                                     "Steps will show as the task unfolds."
+                                } else {
+                                    match terminal.as_ref() {
+                                        Some(terminal) if terminal.status.is_successful() => {
+                                            "Completed without a checklist."
+                                        }
+                                        Some(terminal)
+                                            if terminal.status == TurnStatus::UserCancelled =>
+                                        {
+                                            "Stopped before a checklist was published."
+                                        }
+                                        _ => "No checklist was published.",
+                                    }
                                 }
                             }
                         })
@@ -12469,8 +12481,6 @@ fn render_ai_inspector(
                         ui.label(RichText::new(summary).size(10.5).color(color));
                     }
                 }
-
-                render_ai_inspector_activity(ui, live_events, colors);
             });
 
             if !subagents.is_empty() {
@@ -12486,15 +12496,17 @@ fn render_ai_inspector(
             }
 
             ui.add_space(4.0);
-            egui::CollapsingHeader::new(format!("Outputs · {}", outputs.len()))
+            egui::CollapsingHeader::new(format!("Artifacts · {}", outputs.len()))
                 .id_salt(("ai-inspector-outputs", conversation_id))
                 .default_open(true)
                 .show(ui, |ui| {
                     if outputs.is_empty() {
                         ui.label(
-                            RichText::new("Files and artifacts created by the agent appear here.")
-                                .size(11.0)
-                                .color(colors.tertiary_text),
+                            RichText::new(
+                                "Files and canvas items created during the task land here.",
+                            )
+                            .size(11.0)
+                            .color(colors.tertiary_text),
                         );
                     }
                     let visible_count = if runtime.show_all_outputs {
@@ -12550,7 +12562,7 @@ fn render_ai_inspector(
                             .small_button(if runtime.show_all_outputs {
                                 "Show fewer"
                             } else {
-                                "Show all outputs"
+                                "Show all artifacts"
                             })
                             .clicked()
                     {
@@ -12558,73 +12570,71 @@ fn render_ai_inspector(
                     }
                 });
 
+            render_ai_inspector_activity(ui, conversation_id, live_events, colors);
+
             ui.add_space(4.0);
-            egui::CollapsingHeader::new(format!(
-                "Working folder{}",
-                if runtime.workspace_files.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · {}", runtime.workspace_files.len())
-                }
-            ))
-            .id_salt(("ai-inspector-folder", conversation_id))
-            .default_open(conversation.settings.workspace_mode != AiWorkspaceMode::Chat)
-            .show(ui, |ui| {
-                let running = runtime.active_turn.is_some();
-                if let Some(directory) = conversation.settings.working_directory.as_deref() {
-                    ui.label(
-                        RichText::new(compact_path_label(Path::new(directory), 52))
-                            .size(10.5)
-                            .monospace()
-                            .color(colors.secondary_text),
-                    );
-                    ui.horizontal(|ui| {
-                        ui.add_enabled_ui(!running, |ui| {
-                            action.choose_folder |= ui.small_button("Change…").clicked();
-                            action.clear_folder |= ui.small_button("Clear").clicked();
+            egui::CollapsingHeader::new("Working folder")
+                .id_salt(("ai-inspector-folder", conversation_id))
+                .default_open(
+                    conversation.settings.workspace_mode != AiWorkspaceMode::Chat
+                        && conversation.settings.working_directory.is_none(),
+                )
+                .show(ui, |ui| {
+                    let running = runtime.active_turn.is_some();
+                    if let Some(directory) = conversation.settings.working_directory.as_deref() {
+                        ui.label(
+                            RichText::new(compact_path_label(Path::new(directory), 52))
+                                .size(10.5)
+                                .monospace()
+                                .color(colors.secondary_text),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.add_enabled_ui(!running, |ui| {
+                                action.choose_folder |= ui.small_button("Change…").clicked();
+                                action.clear_folder |= ui.small_button("Clear").clicked();
+                            });
+                            action.refresh_folder |= ui.small_button("Refresh").clicked();
                         });
-                        action.refresh_folder |= ui.small_button("Refresh").clicked();
-                    });
-                    ui.add_space(5.0);
-                    match canonical_ai_workspace_root(Path::new(directory)) {
-                        Ok(canonical_root) => {
-                            if runtime.workspace_files.is_empty() {
+                        ui.add_space(5.0);
+                        match canonical_ai_workspace_root(Path::new(directory)) {
+                            Ok(canonical_root) => {
+                                if runtime.workspace_files.is_empty() {
+                                    ui.label(
+                                        RichText::new("No top-level items found.")
+                                            .size(11.0)
+                                            .color(colors.tertiary_text),
+                                    );
+                                }
+                                for file in runtime.workspace_files.iter().take(40) {
+                                    render_ai_workspace_entry(
+                                        ui,
+                                        &canonical_root,
+                                        file,
+                                        0,
+                                        action,
+                                        colors,
+                                    );
+                                }
+                            }
+                            Err(message) => {
                                 ui.label(
-                                    RichText::new("No top-level items found.")
-                                        .size(11.0)
+                                    RichText::new(message)
+                                        .size(10.5)
                                         .color(colors.tertiary_text),
                                 );
                             }
-                            for file in runtime.workspace_files.iter().take(40) {
-                                render_ai_workspace_entry(
-                                    ui,
-                                    &canonical_root,
-                                    file,
-                                    0,
-                                    action,
-                                    colors,
-                                );
-                            }
                         }
-                        Err(message) => {
-                            ui.label(
-                                RichText::new(message)
-                                    .size(10.5)
-                                    .color(colors.tertiary_text),
-                            );
-                        }
+                    } else {
+                        ui.label(
+                            RichText::new("Choose the folder this session may read or change.")
+                                .size(11.0)
+                                .color(colors.tertiary_text),
+                        );
+                        action.choose_folder |= ui
+                            .add_enabled(!running, Button::new("Choose Folder…"))
+                            .clicked();
                     }
-                } else {
-                    ui.label(
-                        RichText::new("Choose the folder this session may read or change.")
-                            .size(11.0)
-                            .color(colors.tertiary_text),
-                    );
-                    action.choose_folder |= ui
-                        .add_enabled(!running, Button::new("Choose Folder…"))
-                        .clicked();
-                }
-            });
+                });
 
             ui.add_space(4.0);
             let attachment_count = conversation
@@ -12922,7 +12932,7 @@ fn render_ai_subagents_panel(
         })
         .count();
 
-    egui::CollapsingHeader::new(format!("Subagents · {}", subagents.len()))
+    egui::CollapsingHeader::new(format!("Agents · {}", subagents.len()))
         .id_salt(("ai-inspector-subagents", conversation_id))
         .default_open(true)
         .show(ui, |ui| {
@@ -12940,7 +12950,7 @@ fn render_ai_subagents_panel(
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui
                         .small_button("View all")
-                        .on_hover_text("Open the full subagent panel")
+                        .on_hover_text("Open the full agents panel")
                         .clicked()
                     {
                         action.open_subagents_detail = true;
@@ -13122,13 +13132,9 @@ fn render_ai_subagents_detail(
     colors: Theme,
 ) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Subagents").size(15.0).strong());
+        ui.label(RichText::new("Agents").size(15.0).strong());
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui
-                .button("×")
-                .on_hover_text("Close subagent panel")
-                .clicked()
-            {
+            if ui.button("×").on_hover_text("Close agents panel").clicked() {
                 action.close_subagents_detail = true;
             }
         });
@@ -13364,7 +13370,12 @@ fn render_ai_terminal_card(
         });
 }
 
-fn render_ai_inspector_activity(ui: &mut Ui, live_events: &[HarnessActivityEvent], colors: Theme) {
+fn render_ai_inspector_activity(
+    ui: &mut Ui,
+    conversation_id: Uuid,
+    live_events: &[HarnessActivityEvent],
+    colors: Theme,
+) {
     let newest_reasoning = live_events
         .iter()
         .rposition(|event| matches!(event.kind, ActivityKind::Thinking { .. }));
@@ -13396,7 +13407,7 @@ fn render_ai_inspector_activity(ui: &mut Ui, live_events: &[HarnessActivityEvent
     }
     ui.add_space(6.0);
     egui::CollapsingHeader::new(format!("Activity · {}", detailed.len()))
-        .id_salt(("ai-inspector-activity", detailed[0].id))
+        .id_salt(("ai-inspector-activity", conversation_id))
         .show(ui, |ui| {
             for event in detailed {
                 ui.horizontal_top(|ui| {
