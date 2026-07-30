@@ -28,7 +28,7 @@ Verified against EarlIt source (`AgentTaskStore.swift`, `AgentActivityModels.swi
 
 - Three agent-facing tools, **no delete**: `task_create{content required, activeForm}` → returns `task_id`; `task_update{task_id required, status, content, activeForm}` — **unknown id creates** with that id; `task_list{}` read-only, emits no events.
 - Every mutating call emits **two** events: a `TaskMutation` (transcript row) then a `PlanUpdate` carrying the **entire re-reduced list**. Whole-list snapshots, never deltas — the accumulator replaces the previous plan in place.
-- Statuses: `pending | inProgress | completed | cancelled`. `activeForm` is present-continuous ("Synthesizing findings…") and is what the UI shows while in progress.
+- Statuses: `pending | in_progress | completed | cancelled`. `activeForm` is present-continuous ("Synthesizing findings…") and is what the UI shows while in progress. *(Wire spelling aligned 2026-07-30 to Adam's implementation and provider spellings; EarlIt's Swift source uses `inProgress`, which is the same status, not a different one.)*
 - Origin tracking: `Native` vs `AppTools`. A native snapshot **replaces** native-origin rows; app-tool rows survive and re-append after. Adam already implements this in `merge_plan_snapshot` — keep it.
 - **Exposure gate:** an agent sees exactly one channel. Claude/Codex CLIs → native plan stream, task tools withheld. Grok/custom/HTTP → task tools exposed, gated at tool-list time AND call time. Fail closed for dead runs.
 - Field hygiene: trim, reject empty, cap field bytes (EarlIt: 512), reject unknown arguments.
