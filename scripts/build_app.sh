@@ -25,7 +25,7 @@ if [[ -d "$ICON_SOURCE" ]]; then
         --app-icon Adam \
         --output-partial-info-plist "$ICON_INFO" \
         "$ICON_SOURCE"
-    /usr/libexec/PlistBuddy -c "Merge $ICON_INFO" "$CONTENTS_DIR/Info.plist"
+    /usr/libexec/PlistBuddy -c "Merge '$ICON_INFO'" "$CONTENTS_DIR/Info.plist"
 elif [[ -f "$PROJECT_DIR/Resources/Adam.icns" ]]; then
     cp "$PROJECT_DIR/Resources/Adam.icns" "$CONTENTS_DIR/Resources/Adam.icns"
     /usr/libexec/PlistBuddy -c "Add :CFBundleIconFile string Adam" "$CONTENTS_DIR/Info.plist" 2>/dev/null \

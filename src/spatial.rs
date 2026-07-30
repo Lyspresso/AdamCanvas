@@ -230,6 +230,7 @@ mod tests {
             content: TileContent::Note {
                 text: String::new(),
             },
+            canvas_style: crate::model::CanvasTileStyle::Standard,
             intrinsic_image_size: None,
         }
     }

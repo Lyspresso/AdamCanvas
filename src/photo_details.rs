@@ -955,6 +955,7 @@ mod tests {
                 path: PathBuf::from("/private/library/IMG_0042.HEIC"),
                 kind: FileKind::Image,
             },
+            canvas_style: crate::model::CanvasTileStyle::Standard,
             intrinsic_image_size: Some([4_032, 3_024]),
         }
     }

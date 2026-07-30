@@ -1,6 +1,11 @@
+pub mod ai;
+pub mod ai_prompt;
+pub mod ai_state;
+pub mod ai_tool_gate;
 pub mod app;
 pub mod assets;
 pub mod automation;
+pub mod chat_core;
 pub mod clipboard;
 pub mod domain;
 pub mod dots;

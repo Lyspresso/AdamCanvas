@@ -236,12 +236,29 @@ impl TileContent {
     }
 }
 
+/// Canvas-only presentation for note-backed objects. Keeping this separate
+/// from `TileContent` preserves note semantics while allowing borderless text
+/// and paper surfaces to round-trip in older libraries.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanvasTileStyle {
+    #[default]
+    Standard,
+    FreeText,
+    /// Decode-only compatibility for the short-lived Paper tool. Workspace
+    /// normalization immediately turns these into ordinary notes.
+    #[serde(rename = "paper")]
+    LegacyPaper,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Tile {
     pub id: Uuid,
     pub title: String,
     pub rect: WorldRect,
     pub content: TileContent,
+    #[serde(default)]
+    pub canvas_style: CanvasTileStyle,
     /// Encoded pixel dimensions for image files. Keeping these with the tile
     /// lets resize gestures preserve the source aspect without reopening the
     /// image on the UI thread. Older libraries decode this as unknown.
@@ -256,6 +273,7 @@ impl Tile {
             title: title.into(),
             rect,
             content,
+            canvas_style: CanvasTileStyle::Standard,
             intrinsic_image_size: None,
         }
     }
@@ -281,6 +299,7 @@ impl Tile {
             title: title.into(),
             rect,
             content: TileContent::Pile { pile_id: id },
+            canvas_style: CanvasTileStyle::Standard,
             intrinsic_image_size: None,
         }
     }
@@ -445,6 +464,12 @@ impl Workspace {
             page.size = sanitize_page_size(page.size);
             page.view = page.view.normalized();
             for tile in &mut page.tiles {
+                if tile.canvas_style == CanvasTileStyle::LegacyPaper {
+                    tile.canvas_style = CanvasTileStyle::Standard;
+                    if tile.title == "Paper" {
+                        tile.title = "Note".into();
+                    }
+                }
                 if !tile.rect.is_finite() {
                     tile.rect =
                         WorldRect::from_min_size(DEFAULT_PLACEMENT_ORIGIN, DEFAULT_TILE_SIZE);
@@ -656,6 +681,7 @@ mod tests {
             content: TileContent::Note {
                 text: title.to_owned(),
             },
+            canvas_style: CanvasTileStyle::Standard,
             intrinsic_image_size: None,
         }
     }
@@ -794,11 +820,13 @@ mod tests {
             "image.png",
             WorldRect::new(1.0, 2.0, 300.0, 200.0),
         ));
-        page.add_tile(Tile::note(
+        let mut text = Tile::note(
             "Thought",
             "Make it spatial",
             WorldRect::new(4.0, 5.0, 240.0, 160.0),
-        ));
+        );
+        text.canvas_style = CanvasTileStyle::FreeText;
+        page.add_tile(text);
         page.add_tile(Tile::website(
             "Rust",
             "https://www.rust-lang.org",
@@ -810,7 +838,32 @@ mod tests {
         assert_eq!(decoded, workspace);
         assert_eq!(decoded.active_page().tiles[0].kind(), TileKind::Image);
         assert_eq!(decoded.active_page().tiles[1].kind(), TileKind::Note);
+        assert_eq!(
+            decoded.active_page().tiles[1].canvas_style,
+            CanvasTileStyle::FreeText
+        );
         assert_eq!(decoded.active_page().tiles[2].kind(), TileKind::Website);
+    }
+
+    #[test]
+    fn legacy_paper_decodes_and_normalizes_to_an_ordinary_note() {
+        let mut workspace = Workspace::new();
+        let mut paper = Tile::note("Paper", "", WorldRect::new(20.0, 30.0, 400.0, 400.0));
+        paper.canvas_style = CanvasTileStyle::LegacyPaper;
+        workspace.active_page_mut().add_tile(paper);
+
+        let encoded = serde_json::to_string(&workspace).unwrap();
+        assert!(encoded.contains("\"canvas_style\":\"paper\""));
+        let decoded: Workspace = serde_json::from_str(&encoded).unwrap();
+        let normalized = decoded.normalized();
+        let migrated = &normalized.active_page().tiles[0];
+        assert_eq!(migrated.canvas_style, CanvasTileStyle::Standard);
+        assert_eq!(migrated.title, "Note");
+        assert!(
+            !serde_json::to_string(&normalized)
+                .unwrap()
+                .contains("\"paper\"")
+        );
     }
 
     #[test]

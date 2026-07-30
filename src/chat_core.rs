@@ -1,0 +1,3193 @@
+//! Pure, provider-neutral building blocks for Adam's AI harness.
+//!
+//! This module deliberately performs no I/O and owns no UI state. Producers
+//! normalize provider output into [`ActivityEvent`] values; every consumer
+//! derives its view of a turn by folding that same ordered event stream.
+//! Callers supply event ids and timestamps so replay is deterministic.
+
+use crate::domain::UnixMillis;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+use uuid::Uuid;
+
+/// Live streams retain at most this many ordinary activity records.
+pub const LIVE_ACTIVITY_EVENT_CAP: usize = 500;
+
+/// Persisted traces use a separate cap because their must-keep set differs
+/// from live eviction. Keep these constants separate even while equal.
+pub const PERSISTED_ACTIVITY_EVENT_CAP: usize = 500;
+
+/// Provider-reported lifecycle state for commands, file changes, and similar
+/// work items.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum ActivityStatus {
+    InProgress,
+    #[default]
+    Completed,
+    Failed,
+    Declined,
+}
+
+impl ActivityStatus {
+    pub fn is_successful(self) -> bool {
+        self == Self::Completed
+    }
+
+    pub fn is_terminal(self) -> bool {
+        self != Self::InProgress
+    }
+}
+
+/// The three stable file-change values used by structured CLI streams.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum FileChangeKind {
+    Add,
+    Delete,
+    #[default]
+    Update,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FileChange {
+    /// Absolute by contract. A parser resolves relative paths against the
+    /// run's working directory before emitting this value.
+    pub path: String,
+    pub kind: FileChangeKind,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanItemStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanItemOrigin {
+    #[default]
+    Native,
+    AppTools,
+}
+
+/// One row in a whole-plan snapshot.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PlanItem {
+    pub content: String,
+    /// Present-continuous label used while this row runs, such as
+    /// "Updating the index".
+    pub active_form: Option<String>,
+    pub status: PlanItemStatus,
+    pub task_id: Option<String>,
+    pub origin: PlanItemOrigin,
+}
+
+impl PlanItem {
+    pub fn stable_id(&self) -> &str {
+        self.task_id.as_deref().unwrap_or(&self.content)
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum TaskMutationKind {
+    #[default]
+    Create,
+    Update,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum HostMutationKind {
+    Create,
+    #[default]
+    Update,
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionResolution {
+    Allowed,
+    Denied,
+}
+
+/// The single activity vocabulary shared by every CLI, API, host tool, and
+/// permission producer.
+///
+/// `type` and the fifteen camel-cased case values form the persisted wire
+/// format. Additions should therefore be treated as schema changes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ActivityKind {
+    AssistantText {
+        #[serde(default)]
+        text: String,
+    },
+    Thinking {
+        #[serde(default)]
+        text: String,
+    },
+    ToolCall {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        server: Option<String>,
+        #[serde(default)]
+        input_summary: Option<String>,
+    },
+    ToolResult {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        output: Option<String>,
+        #[serde(default)]
+        is_error: bool,
+    },
+    Command {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        command: String,
+        #[serde(default)]
+        output_tail: Option<String>,
+        #[serde(default)]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        status: ActivityStatus,
+    },
+    FileChange {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        changes: Vec<FileChange>,
+        #[serde(default)]
+        status: ActivityStatus,
+    },
+    WebSearch {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        query: String,
+    },
+    PlanUpdate {
+        #[serde(default)]
+        tasks: Vec<PlanItem>,
+        /// True only for an accumulator-generated durability snapshot.
+        #[serde(default, skip_serializing_if = "is_false")]
+        compacted: bool,
+        /// A compacted snapshot carries native replacement semantics only
+        /// when the folded range contained a provider-native snapshot.
+        #[serde(default, skip_serializing_if = "is_false")]
+        replaces_native: bool,
+    },
+    TaskMutation {
+        #[serde(default)]
+        kind: TaskMutationKind,
+        #[serde(default)]
+        content: String,
+        #[serde(default)]
+        task_id: Option<String>,
+        #[serde(default)]
+        status: Option<PlanItemStatus>,
+        #[serde(default)]
+        active_form: Option<String>,
+        #[serde(default)]
+        result_summary: Option<String>,
+    },
+    HostMutation {
+        #[serde(default)]
+        tool: String,
+        #[serde(default)]
+        summary: String,
+        #[serde(default)]
+        entity_id: Option<String>,
+        #[serde(default)]
+        container_name: Option<String>,
+        #[serde(default)]
+        kind: HostMutationKind,
+    },
+    HostRead {
+        #[serde(default)]
+        tool: String,
+        #[serde(default)]
+        entity_id: Option<String>,
+        #[serde(default)]
+        container_name: Option<String>,
+    },
+    PermissionPrompt {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        tool: String,
+        #[serde(default)]
+        summary: String,
+        #[serde(default)]
+        resolution: Option<PermissionResolution>,
+    },
+    Usage {
+        #[serde(default)]
+        input: Option<u64>,
+        #[serde(default)]
+        output: Option<u64>,
+        #[serde(default)]
+        cached_input: Option<u64>,
+        #[serde(default)]
+        reasoning: Option<u64>,
+        #[serde(default)]
+        cost_usd: Option<f64>,
+    },
+    TurnError {
+        #[serde(default)]
+        message: String,
+    },
+    SessionInfo {
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+}
+
+impl Default for ActivityKind {
+    fn default() -> Self {
+        Self::AssistantText {
+            text: String::new(),
+        }
+    }
+}
+
+impl ActivityKind {
+    /// Persisted case name.
+    pub const fn case_name(&self) -> &'static str {
+        match self {
+            Self::AssistantText { .. } => "assistantText",
+            Self::Thinking { .. } => "thinking",
+            Self::ToolCall { .. } => "toolCall",
+            Self::ToolResult { .. } => "toolResult",
+            Self::Command { .. } => "command",
+            Self::FileChange { .. } => "fileChange",
+            Self::WebSearch { .. } => "webSearch",
+            Self::PlanUpdate { .. } => "planUpdate",
+            Self::TaskMutation { .. } => "taskMutation",
+            Self::HostMutation { .. } => "hostMutation",
+            Self::HostRead { .. } => "hostRead",
+            Self::PermissionPrompt { .. } => "permissionPrompt",
+            Self::Usage { .. } => "usage",
+            Self::TurnError { .. } => "turnError",
+            Self::SessionInfo { .. } => "sessionInfo",
+        }
+    }
+
+    /// Identity for the six started → updated → completed lifecycle cases.
+    ///
+    /// The case prefix prevents, for example, a generic tool result from
+    /// resolving a richer command record that happens to share its id.
+    pub fn lifecycle_key(&self) -> Option<String> {
+        let (case_name, id) = match self {
+            Self::ToolCall { id, .. } => ("toolCall", id),
+            Self::ToolResult { id, .. } => ("toolResult", id),
+            Self::Command { id, .. } => ("command", id),
+            Self::FileChange { id, .. } => ("fileChange", id),
+            Self::WebSearch { id, .. } => ("webSearch", id),
+            Self::PermissionPrompt { id, .. } => ("permissionPrompt", id),
+            _ => return None,
+        };
+        Some(format!("{case_name}:{id}"))
+    }
+
+    /// Errors and permission prompts must remain visible at every verbosity.
+    pub const fn is_foldable(&self) -> bool {
+        !matches!(self, Self::TurnError { .. } | Self::PermissionPrompt { .. })
+    }
+
+    pub const fn is_plan_snapshot(&self) -> bool {
+        matches!(self, Self::PlanUpdate { .. })
+    }
+
+    pub const fn plan_replaces_native(&self) -> bool {
+        matches!(
+            self,
+            Self::PlanUpdate {
+                compacted: false,
+                ..
+            } | Self::PlanUpdate {
+                replaces_native: true,
+                ..
+            }
+        )
+    }
+
+    pub const fn is_task_state(&self) -> bool {
+        matches!(self, Self::PlanUpdate { .. } | Self::TaskMutation { .. })
+    }
+
+    fn is_persist_must_keep(&self) -> bool {
+        matches!(
+            self,
+            Self::AssistantText { .. }
+                | Self::Thinking { .. }
+                | Self::FileChange { .. }
+                | Self::TaskMutation { .. }
+                | Self::HostMutation { .. }
+                | Self::PermissionPrompt { .. }
+                | Self::TurnError { .. }
+        )
+    }
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// One immutable-identity record in a turn's ordered activity trace.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ActivityEvent {
+    /// Stable UI/persistence identity. Accumulator updates never replace it.
+    pub id: Uuid,
+    /// Start time. Lifecycle completion never overwrites it.
+    pub at: UnixMillis,
+    /// Filled by lifecycle completion as `completion.at - start.at`.
+    pub duration_ms: Option<i64>,
+    pub kind: ActivityKind,
+}
+
+impl ActivityEvent {
+    pub fn new(id: Uuid, at: UnixMillis, kind: ActivityKind) -> Self {
+        Self {
+            id,
+            at,
+            duration_ms: None,
+            kind,
+        }
+    }
+
+    pub fn assistant_text(id: Uuid, at: UnixMillis, text: impl Into<String>) -> ActivityEvent {
+        Self::new(id, at, ActivityKind::AssistantText { text: text.into() })
+    }
+
+    pub fn thinking(id: Uuid, at: UnixMillis, text: impl Into<String>) -> ActivityEvent {
+        Self::new(id, at, ActivityKind::Thinking { text: text.into() })
+    }
+}
+
+/// Deterministic in-memory activity fold.
+///
+/// Ingest order is contractual: merge, lifecycle update, append, then
+/// live-cap eviction. Task mutations remain visible provenance until cap
+/// pressure requires folding them into one durable plan snapshot.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ActivityAccumulator {
+    pub events: Vec<ActivityEvent>,
+    #[serde(skip, default = "default_live_cap")]
+    max_events: usize,
+}
+
+const fn default_live_cap() -> usize {
+    LIVE_ACTIVITY_EVENT_CAP
+}
+
+impl Default for ActivityAccumulator {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            max_events: LIVE_ACTIVITY_EVENT_CAP,
+        }
+    }
+}
+
+impl ActivityAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Test/embedding seam. A zero cap is normalized to one because every
+    /// newly ingested event must have a representable result.
+    pub fn with_max_events(max_events: usize) -> Self {
+        Self {
+            events: Vec::new(),
+            max_events: max_events.max(1),
+        }
+    }
+
+    pub fn max_events(&self) -> usize {
+        self.max_events
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn ingest_many(&mut self, events: impl IntoIterator<Item = ActivityEvent>) {
+        for event in events {
+            self.ingest(event);
+        }
+    }
+
+    pub fn ingest(&mut self, incoming: ActivityEvent) {
+        // 1. Consecutive text or thinking deltas merge and keep the first
+        // record's identity/start time.
+        if let Some(last) = self.events.last_mut() {
+            match (&mut last.kind, &incoming.kind) {
+                (
+                    ActivityKind::AssistantText { text: existing },
+                    ActivityKind::AssistantText { text: delta },
+                )
+                | (
+                    ActivityKind::Thinking { text: existing },
+                    ActivityKind::Thinking { text: delta },
+                ) => {
+                    existing.push_str(delta);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // 2. A new native snapshot can reuse the last snapshot's stable UI
+        // identity when no task mutation sits between them. Mutations form a
+        // semantic boundary and must remain in provider order.
+        if let ActivityKind::PlanUpdate {
+            tasks: incoming,
+            compacted: incoming_compacted,
+            replaces_native: incoming_replaces_native,
+        } = &incoming.kind
+            && let Some(index) = self
+                .events
+                .iter()
+                .rposition(|event| event.kind.is_plan_snapshot())
+            && !self.events[index + 1..]
+                .iter()
+                .any(|event| matches!(event.kind, ActivityKind::TaskMutation { .. }))
+            && let ActivityKind::PlanUpdate {
+                tasks: existing,
+                compacted: existing_compacted,
+                replaces_native: existing_replaces_native,
+            } = &mut self.events[index].kind
+        {
+            *existing = merge_plan_snapshot(
+                existing,
+                incoming,
+                !*incoming_compacted || *incoming_replaces_native,
+            );
+            *existing_compacted = *incoming_compacted;
+            *existing_replaces_native = *incoming_replaces_native;
+            return;
+        }
+
+        // 3. Lifecycle completions replace only their case-prefixed match.
+        if let Some(key) = incoming.kind.lifecycle_key()
+            && let Some(index) = self
+                .events
+                .iter()
+                .position(|event| event.kind.lifecycle_key().as_deref() == Some(key.as_str()))
+        {
+            let original_at = self.events[index].at;
+            self.events[index].duration_ms = Some(incoming.at.elapsed_since(original_at));
+            self.events[index].kind = incoming.kind;
+            return;
+        }
+
+        // 4. Task events append in provider order. Whole-plan snapshots and
+        // mutations are folded only by projections, preserving the mutation
+        // summaries in Activity during ordinary runs.
+        self.events.push(incoming);
+        self.enforce_live_cap();
+    }
+
+    pub fn events_for_persistence(&self) -> Vec<ActivityEvent> {
+        activity_events_for_persistence(&self.events, PERSISTED_ACTIVITY_EVENT_CAP)
+    }
+
+    fn enforce_live_cap(&mut self) {
+        while self.events.len() > self.max_events {
+            let Some(eviction) = self
+                .events
+                .iter()
+                .position(|event| event.kind.is_foldable() && !event.kind.is_plan_snapshot())
+            else {
+                // A plan, errors, and permission prompts are all exempt.
+                // Their combined must-keep set may therefore exceed the soft
+                // live cap rather than silently deleting authoritative state.
+                break;
+            };
+            if self.events[eviction].kind.is_task_state() {
+                if self.compact_task_state() {
+                    continue;
+                }
+                // A subjectless id-only mutation can be meaningful only when
+                // projected onto a saved task list. Without that seed it
+                // cannot be folded safely, so evict another ordinary record.
+                if let Some(alternative) = self.events.iter().position(|event| {
+                    event.kind.is_foldable()
+                        && !event.kind.is_task_state()
+                        && !event.kind.is_plan_snapshot()
+                }) {
+                    self.events.remove(alternative);
+                    continue;
+                }
+                break;
+            }
+            self.events.remove(eviction);
+        }
+    }
+
+    /// Replaces every task-state record with one equivalent full snapshot.
+    /// This is deliberately a cap-pressure operation: normal traces retain
+    /// TaskMutation provenance, while very long traces cannot lose the task
+    /// list merely because an early create/update record was evicted.
+    fn compact_task_state(&mut self) -> bool {
+        let Some(first_task_index) = self
+            .events
+            .iter()
+            .position(|event| event.kind.is_task_state())
+        else {
+            return false;
+        };
+        let Some(progress) = newest_plan(&self.events) else {
+            // This may be an id-only resumed update whose matching task lives
+            // in persisted progress. Preserve it for project_progress.
+            return false;
+        };
+        let projected_task_ids = progress
+            .items
+            .iter()
+            .filter_map(|item| item.task_id.clone())
+            .collect::<BTreeSet<_>>();
+        let unresolved = self
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ActivityKind::TaskMutation {
+                    kind: TaskMutationKind::Update,
+                    content,
+                    task_id: Some(task_id),
+                    ..
+                } if content.trim().is_empty() && !projected_task_ids.contains(task_id) => {
+                    Some(event.id)
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let snapshot_identity = self
+            .events
+            .iter()
+            .find(|event| event.kind.is_plan_snapshot())
+            .cloned()
+            .or_else(|| {
+                self.events
+                    .iter()
+                    .find(|event| event.kind.is_task_state() && !unresolved.contains(&event.id))
+                    .cloned()
+            })
+            .expect("a locally projectable task event supplies snapshot identity");
+        let replaces_native = self
+            .events
+            .iter()
+            .any(|event| event.kind.plan_replaces_native());
+        let provenance_budget = self.max_events.saturating_sub(1).min(8);
+        let bounded_provenance = self
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(event.kind, ActivityKind::TaskMutation { .. })
+                    && event.id != snapshot_identity.id
+                    && !unresolved.contains(&event.id)
+            })
+            .rev()
+            .take(provenance_budget)
+            .map(|event| event.id)
+            .collect::<BTreeSet<_>>();
+        let provenance = self
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(event.kind, ActivityKind::TaskMutation { .. })
+                    && event.id != snapshot_identity.id
+                    && (unresolved.contains(&event.id) || bounded_provenance.contains(&event.id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let insertion_index = self.events[..first_task_index]
+            .iter()
+            .filter(|event| !event.kind.is_task_state())
+            .count();
+        let before = self.events.clone();
+        self.events.retain(|event| !event.kind.is_task_state());
+        self.events.splice(
+            insertion_index..insertion_index,
+            provenance.into_iter().chain(std::iter::once(ActivityEvent {
+                id: snapshot_identity.id,
+                at: snapshot_identity.at,
+                duration_ms: snapshot_identity.duration_ms,
+                kind: ActivityKind::PlanUpdate {
+                    tasks: progress.items,
+                    compacted: true,
+                    replaces_native,
+                },
+            })),
+        );
+        self.events != before
+    }
+}
+
+/// Applies the persistence must-keep contract while preserving original
+/// event order.
+///
+/// All errors, prompts, file changes, host mutations (Adam's artifact-bearing
+/// domain case), merged text/thinking, and the trailing plan survive. Newest
+/// ordinary events fill the remaining budget. Must-keeps may exceed `cap`.
+pub fn activity_events_for_persistence(events: &[ActivityEvent], cap: usize) -> Vec<ActivityEvent> {
+    if events.is_empty() {
+        return Vec::new();
+    }
+
+    let trailing_plan = events
+        .iter()
+        .rposition(|event| event.kind.is_plan_snapshot());
+    let mut retained = BTreeSet::new();
+    for (index, event) in events.iter().enumerate() {
+        if event.kind.is_persist_must_keep() || trailing_plan == Some(index) {
+            retained.insert(index);
+        }
+    }
+
+    let target = cap.max(1);
+    if retained.len() < target {
+        for index in (0..events.len()).rev() {
+            if retained.len() >= target {
+                break;
+            }
+            retained.insert(index);
+        }
+    }
+
+    retained
+        .into_iter()
+        .map(|index| events[index].clone())
+        .collect()
+}
+
+/// Flattens normalized assistant prose without re-reading raw provider output.
+pub fn assistant_flat_text(events: &[ActivityEvent]) -> String {
+    let mut text = String::new();
+    for event in events {
+        if let ActivityKind::AssistantText { text: delta } = &event.kind {
+            text.push_str(delta);
+        }
+    }
+    text
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProgressSource {
+    Live,
+    Persisted,
+    #[default]
+    None,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ProgressProjection {
+    pub source: ProgressSource,
+    pub event_id: Uuid,
+    pub at: UnixMillis,
+    pub items: Vec<PlanItem>,
+    pub pending: usize,
+    pub in_progress: usize,
+    pub completed: usize,
+    pub cancelled: usize,
+}
+
+impl ProgressProjection {
+    fn from_items(event_id: Uuid, at: UnixMillis, items: Vec<PlanItem>) -> Self {
+        let mut projection = Self {
+            event_id,
+            at,
+            items,
+            ..Self::default()
+        };
+        for item in &projection.items {
+            match item.status {
+                PlanItemStatus::Pending => projection.pending += 1,
+                PlanItemStatus::InProgress => projection.in_progress += 1,
+                PlanItemStatus::Completed => projection.completed += 1,
+                PlanItemStatus::Cancelled => projection.cancelled += 1,
+            }
+        }
+        projection
+    }
+
+    pub fn total(&self) -> usize {
+        self.items.len()
+    }
+}
+
+/// Folds whole-plan snapshots and the task mutations that follow them.
+///
+/// A newer provider-native snapshot replaces native rows while preserving
+/// app-tool rows. Creates append in event order unless a stable id makes them
+/// an idempotent re-emit. Updates match exact task id first, then exact
+/// content; unknown named updates create a new app-tool task.
+pub fn newest_plan(events: &[ActivityEvent]) -> Option<ProgressProjection> {
+    let mut folded: Option<(Uuid, UnixMillis, Vec<PlanItem>)> = None;
+
+    for event in events {
+        match &event.kind {
+            ActivityKind::PlanUpdate {
+                tasks,
+                compacted,
+                replaces_native,
+            } => {
+                let items = folded
+                    .as_ref()
+                    .map(|(_, _, existing)| {
+                        merge_plan_snapshot(existing, tasks, !*compacted || *replaces_native)
+                    })
+                    .unwrap_or_else(|| tasks.clone());
+                folded = Some((event.id, event.at, items));
+            }
+            ActivityKind::TaskMutation {
+                kind,
+                content,
+                task_id,
+                status,
+                active_form,
+                ..
+            } => {
+                if let Some((event_id, at, items)) = folded.as_mut() {
+                    if apply_task_mutation(
+                        items,
+                        *kind,
+                        content,
+                        task_id.as_deref(),
+                        *status,
+                        active_form.as_deref(),
+                    ) {
+                        *event_id = event.id;
+                        *at = event.at;
+                    }
+                } else {
+                    let mut items = Vec::new();
+                    if apply_task_mutation(
+                        &mut items,
+                        *kind,
+                        content,
+                        task_id.as_deref(),
+                        *status,
+                        active_form.as_deref(),
+                    ) {
+                        folded = Some((event.id, event.at, items));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    folded.map(|(event_id, at, items)| ProgressProjection::from_items(event_id, at, items))
+}
+
+fn merge_plan_snapshot(
+    existing: &[PlanItem],
+    incoming: &[PlanItem],
+    replaces_native: bool,
+) -> Vec<PlanItem> {
+    let previous_native = existing
+        .iter()
+        .filter(|item| item.origin == PlanItemOrigin::Native)
+        .collect::<Vec<_>>();
+    let mut consumed_previous = BTreeSet::new();
+    let mut incoming_native = incoming
+        .iter()
+        .filter(|item| item.origin == PlanItemOrigin::Native)
+        .cloned()
+        .collect::<Vec<_>>();
+    for item in &incoming_native {
+        if let Some(task_id) = item.task_id.as_deref()
+            && let Some((previous_index, _)) = previous_native
+                .iter()
+                .enumerate()
+                .find(|(_, previous)| previous.task_id.as_deref() == Some(task_id))
+        {
+            consumed_previous.insert(previous_index);
+        }
+    }
+    for item in &mut incoming_native {
+        if item.task_id.is_none()
+            && let Some((previous_index, previous)) =
+                previous_native
+                    .iter()
+                    .enumerate()
+                    .find(|(index, previous)| {
+                        !consumed_previous.contains(index) && previous.content == item.content
+                    })
+        {
+            item.task_id.clone_from(&previous.task_id);
+            consumed_previous.insert(previous_index);
+        }
+    }
+    let mut native = if replaces_native {
+        incoming_native
+    } else {
+        let mut merged = existing
+            .iter()
+            .filter(|item| item.origin == PlanItemOrigin::Native)
+            .cloned()
+            .collect::<Vec<_>>();
+        for incoming_item in incoming_native {
+            let by_id = incoming_item.task_id.as_deref().and_then(|id| {
+                merged
+                    .iter()
+                    .position(|item| item.task_id.as_deref() == Some(id))
+            });
+            let by_content = merged
+                .iter()
+                .position(|item| item.content == incoming_item.content);
+            if let Some(index) = by_id.or(by_content) {
+                merged[index] = incoming_item;
+            } else {
+                merged.push(incoming_item);
+            }
+        }
+        merged
+    };
+
+    let mut app_tools = existing
+        .iter()
+        .filter(|item| item.origin == PlanItemOrigin::AppTools)
+        .cloned()
+        .collect::<Vec<_>>();
+    for mut incoming_item in incoming
+        .iter()
+        .filter(|item| item.origin == PlanItemOrigin::AppTools)
+        .cloned()
+    {
+        let by_id = incoming_item.task_id.as_deref().and_then(|id| {
+            app_tools
+                .iter()
+                .position(|item| item.task_id.as_deref() == Some(id))
+        });
+        let by_content = app_tools
+            .iter()
+            .position(|item| item.content == incoming_item.content);
+        if let Some(index) = by_id.or(by_content) {
+            if incoming_item.task_id.is_none() {
+                incoming_item.task_id.clone_from(&app_tools[index].task_id);
+            }
+            app_tools[index] = incoming_item;
+        } else {
+            app_tools.push(incoming_item);
+        }
+    }
+
+    native.extend(app_tools);
+    native
+}
+
+fn apply_task_mutation(
+    items: &mut Vec<PlanItem>,
+    kind: TaskMutationKind,
+    content: &str,
+    task_id: Option<&str>,
+    status: Option<PlanItemStatus>,
+    active_form: Option<&str>,
+) -> bool {
+    let by_id = task_id.and_then(|id| {
+        items
+            .iter()
+            .position(|item| item.task_id.as_deref() == Some(id))
+    });
+    let by_content = items.iter().position(|item| item.content == content);
+    let existing = match kind {
+        // Creates with no stable id are distinct tasks even when their prose
+        // matches. A repeated stable id is treated as an idempotent re-emit.
+        TaskMutationKind::Create => by_id,
+        TaskMutationKind::Update => by_id.or(by_content),
+    };
+
+    if let Some(index) = existing {
+        let item = &mut items[index];
+        let before = item.clone();
+        if !content.is_empty() {
+            item.content = content.to_owned();
+        }
+        if let Some(task_id) = task_id {
+            item.task_id = Some(task_id.to_owned());
+        }
+        if let Some(status) = status {
+            item.status = status;
+        }
+        if let Some(active_form) = active_form {
+            item.active_form = Some(active_form.to_owned());
+        }
+        return *item != before;
+    }
+
+    if content.trim().is_empty() {
+        return false;
+    }
+
+    items.push(PlanItem {
+        content: content.to_owned(),
+        active_form: active_form.map(str::to_owned),
+        status: status.unwrap_or_default(),
+        task_id: task_id.map(str::to_owned),
+        origin: PlanItemOrigin::AppTools,
+    });
+    true
+}
+
+/// Resolves the progress visible in the inspector without mixing live and
+/// historical task lists. Any explicit live snapshot wins, including an empty
+/// snapshot that deliberately clears the active task list. Persisted progress
+/// is used only when the active turn has emitted no task state at all.
+pub fn project_progress(
+    persisted_events: &[ActivityEvent],
+    live_events: &[ActivityEvent],
+) -> ProgressProjection {
+    let persisted = newest_plan(persisted_events);
+    let live_has_snapshot = live_events
+        .iter()
+        .any(|event| event.kind.is_plan_snapshot());
+    let live_has_mutation = live_events
+        .iter()
+        .any(|event| matches!(event.kind, ActivityKind::TaskMutation { .. }));
+
+    if live_has_snapshot || live_has_mutation {
+        let mut combined = Vec::with_capacity(live_events.len() + usize::from(persisted.is_some()));
+        if let Some(saved) = persisted.as_ref() {
+            combined.push(ActivityEvent::new(
+                saved.event_id,
+                saved.at,
+                ActivityKind::PlanUpdate {
+                    tasks: saved.items.clone(),
+                    compacted: false,
+                    replaces_native: false,
+                },
+            ));
+        }
+        combined.extend_from_slice(live_events);
+        if let Some(mut live) = newest_plan(&combined)
+            && (live_has_snapshot
+                || persisted
+                    .as_ref()
+                    .is_none_or(|saved| saved.items != live.items))
+        {
+            live.source = ProgressSource::Live;
+            return live;
+        }
+    }
+
+    if let Some(mut persisted) = persisted {
+        persisted.source = ProgressSource::Persisted;
+        return persisted;
+    }
+    ProgressProjection::default()
+}
+
+/// Returns the best short label for an active run.
+///
+/// The explicit active form of an in-progress plan row is authoritative.
+/// Otherwise the newest meaningful live activity wins. Callers supply the
+/// honest provider-specific fallback used when neither signal exists.
+pub fn current_work_label(
+    progress: &ProgressProjection,
+    live_events: &[ActivityEvent],
+    generic_label: &str,
+) -> String {
+    if let Some(active_form) = progress
+        .items
+        .iter()
+        .filter(|item| item.status == PlanItemStatus::InProgress)
+        .find_map(|item| {
+            item.active_form
+                .as_deref()
+                .filter(|label| !label.trim().is_empty())
+        })
+    {
+        return active_form.to_owned();
+    }
+
+    let mut resolved_tool_calls = BTreeSet::<String>::new();
+    for event in live_events.iter().rev() {
+        match &event.kind {
+            ActivityKind::ToolResult { id, .. } => {
+                if !id.is_empty() {
+                    resolved_tool_calls.insert(id.clone());
+                }
+            }
+            ActivityKind::ToolCall {
+                id,
+                name,
+                input_summary,
+                ..
+            } if id.is_empty() || !resolved_tool_calls.contains(id) => {
+                if !name.trim().is_empty() {
+                    return input_summary
+                        .as_deref()
+                        .filter(|summary| !summary.trim().is_empty())
+                        .map(|summary| format!("Using {name} · {summary}"))
+                        .unwrap_or_else(|| format!("Using {name}"));
+                }
+            }
+            ActivityKind::Command {
+                command,
+                status: ActivityStatus::InProgress,
+                ..
+            } if !command.trim().is_empty() => return format!("Running {command}"),
+            ActivityKind::FileChange {
+                changes,
+                status: ActivityStatus::InProgress,
+                ..
+            } => {
+                return match changes.as_slice() {
+                    [change] => {
+                        let (title, _) = split_path_label(&change.path);
+                        if title.trim().is_empty() {
+                            "Updating a file".into()
+                        } else {
+                            format!("Updating {title}")
+                        }
+                    }
+                    [] => "Updating files".into(),
+                    _ => format!("Updating {} files", changes.len()),
+                };
+            }
+            ActivityKind::WebSearch { query, .. } if !query.trim().is_empty() => {
+                return format!("Searching for {query}");
+            }
+            ActivityKind::TaskMutation {
+                content,
+                status: Some(PlanItemStatus::InProgress),
+                active_form,
+                ..
+            } => {
+                if let Some(label) = active_form
+                    .as_deref()
+                    .filter(|label| !label.trim().is_empty())
+                {
+                    return label.to_owned();
+                }
+                if !content.trim().is_empty() {
+                    return content.clone();
+                }
+            }
+            ActivityKind::PermissionPrompt {
+                tool,
+                summary,
+                resolution: None,
+                ..
+            } => {
+                if !summary.trim().is_empty() {
+                    return format!("Waiting for permission · {summary}");
+                }
+                if !tool.trim().is_empty() {
+                    return format!("Waiting for permission · {tool}");
+                }
+            }
+            ActivityKind::Thinking { text } if !text.trim().is_empty() => {
+                return "Thinking".into();
+            }
+            _ => {}
+        }
+    }
+
+    generic_label.to_owned()
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum ArtifactSource {
+    File {
+        path: String,
+        change: FileChangeKind,
+    },
+    Host {
+        tool: String,
+        entity_id: Option<String>,
+        container_name: Option<String>,
+        mutation: HostMutationKind,
+    },
+}
+
+impl Default for ArtifactSource {
+    fn default() -> Self {
+        Self::File {
+            path: String::new(),
+            change: FileChangeKind::Update,
+        }
+    }
+}
+
+/// One newest-wins output record for a conversation.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ArtifactProjection {
+    pub id: String,
+    pub title: String,
+    pub subtitle: Option<String>,
+    pub source: ArtifactSource,
+    pub at: UnixMillis,
+    pub is_deleted: bool,
+}
+
+impl ArtifactProjection {
+    pub fn file_path(&self) -> Option<&str> {
+        match &self.source {
+            ArtifactSource::File { path, .. } => Some(path),
+            ArtifactSource::Host { .. } => None,
+        }
+    }
+}
+
+/// Outputs from file and host mutations, deduped within this event stream.
+///
+/// Newer timestamps win; on a timestamp tie, the later event in stream order
+/// wins. Consequently a later delete replaces and strikes an earlier add.
+pub fn project_artifacts(events: &[ActivityEvent]) -> Vec<ArtifactProjection> {
+    let mut by_identity = BTreeMap::<String, ArtifactProjection>::new();
+
+    for event in events {
+        match &event.kind {
+            ActivityKind::FileChange {
+                changes, status, ..
+            } if *status != ActivityStatus::Failed && *status != ActivityStatus::Declined => {
+                for change in changes {
+                    let id = format!("file:{}", change.path);
+                    let (title, subtitle) = split_path_label(&change.path);
+                    upsert_artifact(
+                        &mut by_identity,
+                        ArtifactProjection {
+                            id,
+                            title,
+                            subtitle,
+                            source: ArtifactSource::File {
+                                path: change.path.clone(),
+                                change: change.kind,
+                            },
+                            at: event.at,
+                            is_deleted: change.kind == FileChangeKind::Delete,
+                        },
+                    );
+                }
+            }
+            ActivityKind::HostMutation {
+                tool,
+                summary,
+                entity_id,
+                container_name,
+                kind,
+            } => {
+                // Only a creation invents a host output. An update or delete
+                // can revise an already-created entity when it carries the
+                // same stable id, but an operation on pre-existing host data
+                // is provenance rather than a produced artifact.
+                let id = match (kind, entity_id.as_deref()) {
+                    (HostMutationKind::Create, Some(id)) => format!("host:{id}"),
+                    (HostMutationKind::Create, None) => format!("host-event:{}", event.id),
+                    (HostMutationKind::Update | HostMutationKind::Delete, Some(id)) => {
+                        let id = format!("host:{id}");
+                        if !by_identity.contains_key(&id) {
+                            continue;
+                        }
+                        id
+                    }
+                    (HostMutationKind::Update | HostMutationKind::Delete, None) => continue,
+                };
+                upsert_artifact(
+                    &mut by_identity,
+                    ArtifactProjection {
+                        id,
+                        title: summary.clone(),
+                        subtitle: container_name.clone(),
+                        source: ArtifactSource::Host {
+                            tool: tool.clone(),
+                            entity_id: entity_id.clone(),
+                            container_name: container_name.clone(),
+                            mutation: *kind,
+                        },
+                        at: event.at,
+                        is_deleted: *kind == HostMutationKind::Delete,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let mut outputs: Vec<_> = by_identity.into_values().collect();
+    outputs.sort_by(|left, right| right.at.cmp(&left.at).then_with(|| left.id.cmp(&right.id)));
+    outputs
+}
+
+fn upsert_artifact(
+    artifacts: &mut BTreeMap<String, ArtifactProjection>,
+    incoming: ArtifactProjection,
+) {
+    if artifacts
+        .get(&incoming.id)
+        .is_some_and(|existing| existing.at > incoming.at)
+    {
+        return;
+    }
+    artifacts.insert(incoming.id.clone(), incoming);
+}
+
+fn split_path_label(path: &str) -> (String, Option<String>) {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    let separator = trimmed.rfind(['/', '\\']);
+    match separator {
+        Some(index) => {
+            let title = trimmed[index + 1..].to_owned();
+            let parent = &trimmed[..index];
+            (
+                if title.is_empty() {
+                    trimmed.to_owned()
+                } else {
+                    title
+                },
+                (!parent.is_empty()).then(|| parent.to_owned()),
+            )
+        }
+        None => (trimmed.to_owned(), None),
+    }
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum ContextKind {
+    #[default]
+    Tool,
+    Command,
+    WebSearch,
+    HostContainer,
+    HostEntity,
+}
+
+/// One aggregated provenance/use-count record.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ContextProjection {
+    pub id: String,
+    pub kind: ContextKind,
+    pub identifier: String,
+    pub first_used_at: UnixMillis,
+    pub use_count: u64,
+}
+
+/// Aggregates the external context a conversation used.
+pub fn project_context(events: &[ActivityEvent]) -> Vec<ContextProjection> {
+    let mut by_identity = BTreeMap::<String, ContextProjection>::new();
+
+    let mut note = |kind: ContextKind, identifier: String, at: UnixMillis| {
+        let id = format!("{}|{identifier}", context_kind_name(kind));
+        if let Some(existing) = by_identity.get_mut(&id) {
+            existing.use_count = existing.use_count.saturating_add(1);
+            existing.first_used_at = existing.first_used_at.min(at);
+        } else {
+            by_identity.insert(
+                id.clone(),
+                ContextProjection {
+                    id,
+                    kind,
+                    identifier,
+                    first_used_at: at,
+                    use_count: 1,
+                },
+            );
+        }
+    };
+
+    for event in events {
+        match &event.kind {
+            ActivityKind::ToolCall { name, server, .. } => note(
+                ContextKind::Tool,
+                server
+                    .as_ref()
+                    .map(|server| format!("{server} · {name}"))
+                    .unwrap_or_else(|| name.clone()),
+                event.at,
+            ),
+            ActivityKind::Command { command, .. } => {
+                note(ContextKind::Command, command_identity(command), event.at)
+            }
+            ActivityKind::WebSearch { query, .. } => {
+                note(ContextKind::WebSearch, query.clone(), event.at)
+            }
+            ActivityKind::HostRead {
+                tool,
+                entity_id,
+                container_name,
+            } => {
+                if let Some(container) = container_name {
+                    note(ContextKind::HostContainer, container.clone(), event.at);
+                } else if let Some(entity) = entity_id {
+                    note(ContextKind::HostEntity, entity.clone(), event.at);
+                } else {
+                    note(ContextKind::Tool, tool.clone(), event.at);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut context: Vec<_> = by_identity.into_values().collect();
+    context.sort_by(|left, right| {
+        left.first_used_at
+            .cmp(&right.first_used_at)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    context
+}
+
+const fn context_kind_name(kind: ContextKind) -> &'static str {
+    match kind {
+        ContextKind::Tool => "tool",
+        ContextKind::Command => "command",
+        ContextKind::WebSearch => "webSearch",
+        ContextKind::HostContainer => "hostContainer",
+        ContextKind::HostEntity => "hostEntity",
+    }
+}
+
+fn command_identity(command: &str) -> String {
+    let first = command.split_whitespace().next().unwrap_or(command);
+    first
+        .trim_matches(['\'', '"'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(first)
+        .to_owned()
+}
+
+/// Aggregate accounting over all reported usage records.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct UsageProjection {
+    pub input: u64,
+    pub output: u64,
+    pub cached_input: u64,
+    pub reasoning: u64,
+    pub cost_usd: Option<f64>,
+    /// Distinguishes a provider-reported zero from no usage support.
+    pub has_data: bool,
+}
+
+impl UsageProjection {
+    pub fn total_tokens(&self) -> u64 {
+        self.input.saturating_add(self.output)
+    }
+}
+
+pub fn project_usage(events: &[ActivityEvent]) -> UsageProjection {
+    let mut usage = UsageProjection::default();
+    for event in events {
+        let ActivityKind::Usage {
+            input,
+            output,
+            cached_input,
+            reasoning,
+            cost_usd,
+        } = &event.kind
+        else {
+            continue;
+        };
+        usage.has_data = true;
+        usage.input = usage.input.saturating_add(input.unwrap_or(0));
+        usage.output = usage.output.saturating_add(output.unwrap_or(0));
+        usage.cached_input = usage.cached_input.saturating_add(cached_input.unwrap_or(0));
+        usage.reasoning = usage.reasoning.saturating_add(reasoning.unwrap_or(0));
+        if let Some(cost) = cost_usd {
+            usage.cost_usd = Some(usage.cost_usd.unwrap_or(0.0) + cost);
+        }
+    }
+    usage
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum ProviderKind {
+    Claude,
+    Codex,
+    Grok,
+    Kimi,
+    LmStudio,
+    Ollama,
+    OpenAiCompatible,
+    #[default]
+    Custom,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum TransportKind {
+    #[default]
+    CliProcess,
+    HttpChatCompletions,
+    LocalHttpChatCompletions,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum StreamDialect {
+    #[default]
+    PlainText,
+    CodexJsonLines,
+    ClaudeStreamJson,
+    GrokStreamingJson,
+    KimiStreamJson,
+    OpenAiCompatibleJson,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum PlanChannel {
+    NativeStream,
+    #[default]
+    AppTaskTools,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum ResumeStrategy {
+    #[default]
+    None,
+    CodexExecSubcommand,
+    ResumeFlagPrepend,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum SystemPromptChannel {
+    AppendFlag {
+        flag: String,
+    },
+    ConfigOverride {
+        key: String,
+    },
+    ApiSystemMessage,
+    #[default]
+    InPrompt,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolsOffStrategy {
+    /// Remove/revoke the per-run host token. The CLI has no separate native
+    /// server-disable argument.
+    HostTokenOnly,
+    /// Disable the configured host tool server and revoke its run token.
+    CodexConfigAndHostToken,
+    /// Do not send API tool definitions.
+    OmitApiTools,
+    /// This transport has no registered host-tool channel.
+    #[default]
+    PromptOnly,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum SandboxStrategy {
+    #[default]
+    None,
+    CodexSandboxConfig,
+    GrokSandboxProfile,
+}
+
+/// Declarative, derived-only description of a provider runtime.
+///
+/// `provider` preserves the configured identity. Built-in and internally
+/// resolved providers may derive a runtime family from the executable
+/// basename. Explicit Custom CLI stays plain-text and replay-only because its
+/// runner does not apply a built-in provider's stream, resume, or system-flag
+/// contract.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CapabilityProfile {
+    pub provider: ProviderKind,
+    pub runtime_family: ProviderKind,
+    pub executable_basename: String,
+    pub transport: TransportKind,
+    pub stream_dialect: StreamDialect,
+    pub plan_channel: PlanChannel,
+    pub resume: ResumeStrategy,
+    pub system_prompt: SystemPromptChannel,
+    pub tools_off: ToolsOffStrategy,
+    pub sandbox: SandboxStrategy,
+}
+
+impl CapabilityProfile {
+    pub fn derive(provider_id: &str, executable: &str, arguments: &[String]) -> Self {
+        capability_profile(provider_id, executable, arguments)
+    }
+
+    pub fn has_structured_stream(&self) -> bool {
+        self.stream_dialect != StreamDialect::PlainText
+    }
+
+    pub fn has_native_plan(&self) -> bool {
+        self.plan_channel == PlanChannel::NativeStream
+    }
+
+    pub fn supports_native_resume(&self) -> bool {
+        self.resume != ResumeStrategy::None
+    }
+}
+
+/// Pure capability derivation from configured provider identity, executable
+/// basename, and the pre-rewrite argument template.
+pub fn capability_profile(
+    provider_id: &str,
+    executable: &str,
+    arguments: &[String],
+) -> CapabilityProfile {
+    let basename = executable_basename(executable);
+    let configured = provider_from_id(provider_id);
+    let executable_family = provider_from_executable(&basename);
+    let provider = match configured {
+        Some(ProviderKind::Custom) => ProviderKind::Custom,
+        Some(provider) => provider,
+        None => executable_family.unwrap_or(ProviderKind::Custom),
+    };
+    let runtime_family = if provider == ProviderKind::Custom {
+        ProviderKind::Custom
+    } else {
+        executable_family.unwrap_or(provider)
+    };
+
+    let is_lm_studio_cli = runtime_family == ProviderKind::LmStudio && !basename.is_empty();
+    let transport = match runtime_family {
+        ProviderKind::OpenAiCompatible => TransportKind::HttpChatCompletions,
+        ProviderKind::LmStudio if !is_lm_studio_cli => TransportKind::LocalHttpChatCompletions,
+        _ => TransportKind::CliProcess,
+    };
+
+    let has_argument = |expected: &str| arguments.iter().any(|value| value == expected);
+    let stream_dialect = match runtime_family {
+        ProviderKind::Codex if has_argument("--json") => StreamDialect::CodexJsonLines,
+        ProviderKind::Claude if has_argument("stream-json") => StreamDialect::ClaudeStreamJson,
+        ProviderKind::Grok if has_argument("streaming-json") => StreamDialect::GrokStreamingJson,
+        ProviderKind::Kimi if has_argument("stream-json") => StreamDialect::KimiStreamJson,
+        ProviderKind::OpenAiCompatible => StreamDialect::OpenAiCompatibleJson,
+        ProviderKind::LmStudio if !is_lm_studio_cli => StreamDialect::OpenAiCompatibleJson,
+        _ => StreamDialect::PlainText,
+    };
+
+    let plan_channel = match runtime_family {
+        ProviderKind::Claude | ProviderKind::Codex => PlanChannel::NativeStream,
+        _ => PlanChannel::AppTaskTools,
+    };
+    let resume = match runtime_family {
+        ProviderKind::Codex => ResumeStrategy::CodexExecSubcommand,
+        ProviderKind::Claude | ProviderKind::Grok => ResumeStrategy::ResumeFlagPrepend,
+        _ => ResumeStrategy::None,
+    };
+    let system_prompt = match runtime_family {
+        ProviderKind::Claude => SystemPromptChannel::AppendFlag {
+            flag: "--append-system-prompt".into(),
+        },
+        ProviderKind::Grok => SystemPromptChannel::AppendFlag {
+            flag: "--rules".into(),
+        },
+        ProviderKind::Codex => SystemPromptChannel::ConfigOverride {
+            key: "developer_instructions".into(),
+        },
+        ProviderKind::OpenAiCompatible | ProviderKind::LmStudio
+            if transport != TransportKind::CliProcess =>
+        {
+            SystemPromptChannel::ApiSystemMessage
+        }
+        _ => SystemPromptChannel::InPrompt,
+    };
+    let tools_off = match runtime_family {
+        ProviderKind::Codex => ToolsOffStrategy::CodexConfigAndHostToken,
+        ProviderKind::Claude | ProviderKind::Grok | ProviderKind::Kimi => {
+            ToolsOffStrategy::HostTokenOnly
+        }
+        ProviderKind::OpenAiCompatible => ToolsOffStrategy::OmitApiTools,
+        ProviderKind::LmStudio if transport != TransportKind::CliProcess => {
+            ToolsOffStrategy::OmitApiTools
+        }
+        ProviderKind::Custom => ToolsOffStrategy::HostTokenOnly,
+        ProviderKind::LmStudio | ProviderKind::Ollama => ToolsOffStrategy::PromptOnly,
+    };
+    let sandbox = match runtime_family {
+        ProviderKind::Codex => SandboxStrategy::CodexSandboxConfig,
+        ProviderKind::Grok => SandboxStrategy::GrokSandboxProfile,
+        _ => SandboxStrategy::None,
+    };
+
+    CapabilityProfile {
+        provider,
+        runtime_family,
+        executable_basename: basename,
+        transport,
+        stream_dialect,
+        plan_channel,
+        resume,
+        system_prompt,
+        tools_off,
+        sandbox,
+    }
+}
+
+fn executable_basename(executable: &str) -> String {
+    executable
+        .trim()
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn provider_from_id(provider_id: &str) -> Option<ProviderKind> {
+    let normalized = provider_id
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    match normalized.as_str() {
+        "claude" | "claude_cli" | "anthropic" => Some(ProviderKind::Claude),
+        "codex" | "codex_cli" | "openai_codex" => Some(ProviderKind::Codex),
+        "grok" | "grok_cli" | "xai" => Some(ProviderKind::Grok),
+        "kimi" | "kimi_cli" | "moonshot" => Some(ProviderKind::Kimi),
+        "lmstudio" | "lm_studio" | "lms" => Some(ProviderKind::LmStudio),
+        "ollama" => Some(ProviderKind::Ollama),
+        "openai" | "openai_compatible" => Some(ProviderKind::OpenAiCompatible),
+        "custom" | "custom_cli" => Some(ProviderKind::Custom),
+        "auto" | "" => None,
+        _ => Some(ProviderKind::Custom),
+    }
+}
+
+fn provider_from_executable(basename: &str) -> Option<ProviderKind> {
+    match basename {
+        "claude" => Some(ProviderKind::Claude),
+        "codex" => Some(ProviderKind::Codex),
+        "grok" => Some(ProviderKind::Grok),
+        "kimi" => Some(ProviderKind::Kimi),
+        "lms" | "lmstudio" => Some(ProviderKind::LmStudio),
+        "ollama" => Some(ProviderKind::Ollama),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(number: u128, at: i64, kind: ActivityKind) -> ActivityEvent {
+        ActivityEvent::new(Uuid::from_u128(number), UnixMillis(at), kind)
+    }
+
+    fn command(id: impl Into<String>, status: ActivityStatus) -> ActivityKind {
+        ActivityKind::Command {
+            id: id.into(),
+            command: "ls -la".into(),
+            output_tail: None,
+            exit_code: None,
+            status,
+        }
+    }
+
+    fn plan(label: &str, status: PlanItemStatus) -> ActivityKind {
+        ActivityKind::PlanUpdate {
+            tasks: vec![PlanItem {
+                content: label.into(),
+                status,
+                ..PlanItem::default()
+            }],
+            compacted: false,
+            replaces_native: false,
+        }
+    }
+
+    fn task_mutation(
+        kind: TaskMutationKind,
+        content: &str,
+        task_id: Option<&str>,
+        status: Option<PlanItemStatus>,
+        active_form: Option<&str>,
+    ) -> ActivityKind {
+        ActivityKind::TaskMutation {
+            kind,
+            content: content.into(),
+            task_id: task_id.map(str::to_owned),
+            status,
+            active_form: active_form.map(str::to_owned),
+            result_summary: None,
+        }
+    }
+
+    #[test]
+    fn consecutive_text_and_thinking_merge_without_replacing_identity() {
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest(ActivityEvent::assistant_text(
+            Uuid::from_u128(1),
+            UnixMillis(10),
+            "Hello",
+        ));
+        accumulator.ingest(ActivityEvent::assistant_text(
+            Uuid::from_u128(2),
+            UnixMillis(20),
+            " world",
+        ));
+        accumulator.ingest(ActivityEvent::thinking(
+            Uuid::from_u128(3),
+            UnixMillis(30),
+            "Read",
+        ));
+        accumulator.ingest(ActivityEvent::thinking(
+            Uuid::from_u128(4),
+            UnixMillis(40),
+            " docs",
+        ));
+
+        assert_eq!(accumulator.len(), 2);
+        assert_eq!(accumulator.events[0].id, Uuid::from_u128(1));
+        assert_eq!(accumulator.events[0].at, UnixMillis(10));
+        assert_eq!(
+            accumulator.events[0].kind,
+            ActivityKind::AssistantText {
+                text: "Hello world".into()
+            }
+        );
+        assert_eq!(
+            accumulator.events[1].kind,
+            ActivityKind::Thinking {
+                text: "Read docs".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_activity_boundary_prevents_text_merge() {
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest(ActivityEvent::assistant_text(
+            Uuid::from_u128(1),
+            UnixMillis(1),
+            "before",
+        ));
+        accumulator.ingest(event(2, 2, command("c1", ActivityStatus::Completed)));
+        accumulator.ingest(ActivityEvent::assistant_text(
+            Uuid::from_u128(3),
+            UnixMillis(3),
+            "after",
+        ));
+        assert_eq!(accumulator.len(), 3);
+        assert_eq!(assistant_flat_text(&accumulator.events), "beforeafter");
+    }
+
+    #[test]
+    fn plan_replacement_keeps_original_index_id_and_timestamp() {
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest(event(1, 10, plan("First", PlanItemStatus::Pending)));
+        accumulator.ingest(event(
+            2,
+            11,
+            ActivityKind::AssistantText {
+                text: "Work".into(),
+            },
+        ));
+        accumulator.ingest(event(3, 12, plan("First", PlanItemStatus::Completed)));
+
+        assert_eq!(accumulator.len(), 2);
+        assert_eq!(accumulator.events[0].id, Uuid::from_u128(1));
+        assert_eq!(accumulator.events[0].at, UnixMillis(10));
+        let progress = newest_plan(&accumulator.events).unwrap();
+        assert_eq!(progress.completed, 1);
+        assert_eq!(progress.event_id, Uuid::from_u128(1));
+    }
+
+    #[test]
+    fn accumulator_compacts_task_mutations_only_under_cap_pressure() {
+        let mut accumulator = ActivityAccumulator::with_max_events(4);
+        accumulator.ingest(event(
+            1,
+            1,
+            task_mutation(
+                TaskMutationKind::Create,
+                "Verify the build",
+                Some("task-1"),
+                Some(PlanItemStatus::Pending),
+                Some("Verifying the build"),
+            ),
+        ));
+        for index in 2..8 {
+            accumulator.ingest(event(
+                index,
+                index as i64,
+                ActivityKind::WebSearch {
+                    id: format!("search-{index}"),
+                    query: format!("query {index}"),
+                },
+            ));
+        }
+        accumulator.ingest(event(
+            8,
+            8,
+            task_mutation(
+                TaskMutationKind::Update,
+                "",
+                Some("task-1"),
+                Some(PlanItemStatus::Completed),
+                None,
+            ),
+        ));
+
+        assert_eq!(
+            accumulator
+                .events
+                .iter()
+                .filter(|event| event.kind.is_plan_snapshot())
+                .count(),
+            1
+        );
+        assert!(
+            accumulator
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, ActivityKind::TaskMutation { .. }))
+        );
+        let progress = newest_plan(&accumulator.events).unwrap();
+        assert_eq!(progress.items.len(), 1);
+        assert_eq!(progress.items[0].content, "Verify the build");
+        assert_eq!(progress.items[0].status, PlanItemStatus::Completed);
+        assert!(newest_plan(&accumulator.events_for_persistence()).is_some());
+    }
+
+    #[test]
+    fn plan_fold_replaces_native_rows_but_preserves_app_tool_rows() {
+        let snapshot = ActivityKind::PlanUpdate {
+            tasks: vec![
+                PlanItem {
+                    content: "First".into(),
+                    task_id: Some("one".into()),
+                    status: PlanItemStatus::Pending,
+                    ..PlanItem::default()
+                },
+                PlanItem {
+                    content: "Match by content".into(),
+                    status: PlanItemStatus::Pending,
+                    ..PlanItem::default()
+                },
+            ],
+            compacted: false,
+            replaces_native: false,
+        };
+        let events = vec![
+            event(
+                1,
+                1,
+                task_mutation(
+                    TaskMutationKind::Create,
+                    "Discarded by snapshot",
+                    Some("old"),
+                    None,
+                    None,
+                ),
+            ),
+            event(2, 2, snapshot),
+            // Exact id wins even though the content changes.
+            event(
+                3,
+                3,
+                task_mutation(
+                    TaskMutationKind::Update,
+                    "First renamed",
+                    Some("one"),
+                    Some(PlanItemStatus::Completed),
+                    None,
+                ),
+            ),
+            // The unknown id falls through to exact-content matching.
+            event(
+                4,
+                4,
+                task_mutation(
+                    TaskMutationKind::Update,
+                    "Match by content",
+                    Some("two"),
+                    Some(PlanItemStatus::InProgress),
+                    Some("Matching by content"),
+                ),
+            ),
+            event(
+                5,
+                5,
+                task_mutation(
+                    TaskMutationKind::Create,
+                    "Created later",
+                    Some("three"),
+                    None,
+                    None,
+                ),
+            ),
+            // Unknown named updates create a deterministic tail row.
+            event(
+                6,
+                6,
+                task_mutation(
+                    TaskMutationKind::Update,
+                    "Unknown update",
+                    Some("four"),
+                    Some(PlanItemStatus::Cancelled),
+                    None,
+                ),
+            ),
+        ];
+
+        let projection = newest_plan(&events).unwrap();
+        assert_eq!(projection.event_id, Uuid::from_u128(6));
+        assert_eq!(projection.at, UnixMillis(6));
+        assert_eq!(
+            projection
+                .items
+                .iter()
+                .map(|item| item.content.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "First renamed",
+                "Match by content",
+                "Discarded by snapshot",
+                "Created later",
+                "Unknown update"
+            ]
+        );
+        assert_eq!(projection.items[0].task_id.as_deref(), Some("one"));
+        assert_eq!(projection.items[0].status, PlanItemStatus::Completed);
+        assert_eq!(projection.items[1].task_id.as_deref(), Some("two"));
+        assert_eq!(
+            projection.items[1].active_form.as_deref(),
+            Some("Matching by content")
+        );
+        assert_eq!(projection.items[1].origin, PlanItemOrigin::Native);
+        assert_eq!(projection.items[2].origin, PlanItemOrigin::AppTools);
+        assert_eq!(projection.items[2].status, PlanItemStatus::Pending);
+        assert_eq!(projection.items[3].origin, PlanItemOrigin::AppTools);
+        assert_eq!(projection.items[4].status, PlanItemStatus::Cancelled);
+        assert_eq!(projection.pending, 2);
+        assert_eq!(projection.in_progress, 1);
+        assert_eq!(projection.completed, 1);
+        assert_eq!(projection.cancelled, 1);
+    }
+
+    #[test]
+    fn mutation_only_plan_preserves_distinct_create_rows_without_ids() {
+        let events = vec![
+            event(
+                1,
+                1,
+                task_mutation(TaskMutationKind::Create, "One", None, None, None),
+            ),
+            event(
+                2,
+                2,
+                task_mutation(
+                    TaskMutationKind::Create,
+                    "One",
+                    Some("1"),
+                    Some(PlanItemStatus::InProgress),
+                    Some("Doing one"),
+                ),
+            ),
+        ];
+
+        let projection = newest_plan(&events).unwrap();
+        assert_eq!(projection.items.len(), 2);
+        assert_eq!(projection.items[0].task_id, None);
+        assert_eq!(projection.items[0].origin, PlanItemOrigin::AppTools);
+        assert_eq!(projection.items[1].task_id.as_deref(), Some("1"));
+        assert_eq!(projection.items[1].status, PlanItemStatus::InProgress);
+        assert_eq!(projection.items[1].origin, PlanItemOrigin::AppTools);
+    }
+
+    #[test]
+    fn unmatched_subjectless_update_is_a_true_no_op_in_raw_and_accumulated_streams() {
+        let update = event(
+            1,
+            1,
+            task_mutation(
+                TaskMutationKind::Update,
+                "",
+                Some("unknown-task"),
+                Some(PlanItemStatus::Completed),
+                None,
+            ),
+        );
+        assert!(newest_plan(std::slice::from_ref(&update)).is_none());
+
+        let persisted = vec![event(2, 2, plan("Saved task", PlanItemStatus::Pending))];
+        let projected = project_progress(&persisted, std::slice::from_ref(&update));
+        assert_eq!(projected.source, ProgressSource::Persisted);
+        assert_eq!(projected.items[0].content, "Saved task");
+
+        let mut accumulator = ActivityAccumulator::with_max_events(2);
+        accumulator.ingest(update);
+        accumulator.ingest(event(
+            3,
+            3,
+            ActivityKind::WebSearch {
+                id: "search-1".into(),
+                query: "one".into(),
+            },
+        ));
+        accumulator.ingest(event(
+            4,
+            4,
+            ActivityKind::WebSearch {
+                id: "search-2".into(),
+                query: "two".into(),
+            },
+        ));
+        assert!(newest_plan(&accumulator.events).is_none());
+    }
+
+    #[test]
+    fn native_snapshot_recovers_ids_and_reappends_app_tool_tasks() {
+        let events = vec![
+            event(
+                1,
+                1,
+                ActivityKind::PlanUpdate {
+                    tasks: vec![PlanItem {
+                        content: "Native task".into(),
+                        task_id: Some("native-7".into()),
+                        origin: PlanItemOrigin::Native,
+                        ..PlanItem::default()
+                    }],
+                    compacted: false,
+                    replaces_native: false,
+                },
+            ),
+            event(
+                2,
+                2,
+                task_mutation(
+                    TaskMutationKind::Create,
+                    "App task",
+                    Some("app-3"),
+                    Some(PlanItemStatus::InProgress),
+                    Some("Doing app task"),
+                ),
+            ),
+            event(
+                3,
+                3,
+                ActivityKind::PlanUpdate {
+                    tasks: vec![PlanItem {
+                        content: "Native task".into(),
+                        status: PlanItemStatus::Completed,
+                        origin: PlanItemOrigin::Native,
+                        ..PlanItem::default()
+                    }],
+                    compacted: false,
+                    replaces_native: false,
+                },
+            ),
+        ];
+
+        let projection = newest_plan(&events).unwrap();
+        assert_eq!(projection.items.len(), 2);
+        assert_eq!(projection.items[0].task_id.as_deref(), Some("native-7"));
+        assert_eq!(projection.items[0].status, PlanItemStatus::Completed);
+        assert_eq!(projection.items[1].task_id.as_deref(), Some("app-3"));
+        assert_eq!(projection.items[1].origin, PlanItemOrigin::AppTools);
+        assert_eq!(projection.items[1].status, PlanItemStatus::InProgress);
+    }
+
+    #[test]
+    fn native_id_recovery_consumes_duplicate_content_matches_once() {
+        let events = vec![
+            event(
+                1,
+                1,
+                ActivityKind::PlanUpdate {
+                    tasks: vec![
+                        PlanItem {
+                            content: "Same wording".into(),
+                            task_id: Some("native-1".into()),
+                            ..PlanItem::default()
+                        },
+                        PlanItem {
+                            content: "Same wording".into(),
+                            task_id: Some("native-2".into()),
+                            ..PlanItem::default()
+                        },
+                    ],
+                    compacted: false,
+                    replaces_native: false,
+                },
+            ),
+            event(
+                2,
+                2,
+                ActivityKind::PlanUpdate {
+                    tasks: vec![
+                        PlanItem {
+                            content: "Same wording".into(),
+                            task_id: Some("native-1".into()),
+                            status: PlanItemStatus::InProgress,
+                            ..PlanItem::default()
+                        },
+                        PlanItem {
+                            content: "Same wording".into(),
+                            status: PlanItemStatus::Pending,
+                            ..PlanItem::default()
+                        },
+                    ],
+                    compacted: false,
+                    replaces_native: false,
+                },
+            ),
+        ];
+
+        let projection = newest_plan(&events).unwrap();
+        assert_eq!(projection.items.len(), 2);
+        assert_eq!(projection.items[0].task_id.as_deref(), Some("native-1"));
+        assert_eq!(projection.items[1].task_id.as_deref(), Some("native-2"));
+    }
+
+    #[test]
+    fn ordinary_accumulation_retains_task_mutation_provenance() {
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest(event(
+            1,
+            1,
+            task_mutation(
+                TaskMutationKind::Create,
+                "Trace me",
+                Some("trace-1"),
+                Some(PlanItemStatus::Pending),
+                None,
+            ),
+        ));
+        accumulator.ingest(event(
+            2,
+            2,
+            task_mutation(
+                TaskMutationKind::Update,
+                "",
+                Some("trace-1"),
+                Some(PlanItemStatus::Completed),
+                None,
+            ),
+        ));
+
+        assert_eq!(
+            accumulator
+                .events
+                .iter()
+                .filter(|event| matches!(event.kind, ActivityKind::TaskMutation { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            accumulator
+                .events_for_persistence()
+                .iter()
+                .filter(|event| matches!(event.kind, ActivityKind::TaskMutation { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(newest_plan(&accumulator.events).unwrap().completed, 1);
+    }
+
+    #[test]
+    fn task_id_match_takes_precedence_over_matching_another_rows_content() {
+        let events = vec![
+            event(
+                1,
+                1,
+                ActivityKind::PlanUpdate {
+                    tasks: vec![
+                        PlanItem {
+                            content: "Matched by id".into(),
+                            task_id: Some("one".into()),
+                            ..PlanItem::default()
+                        },
+                        PlanItem {
+                            content: "Shared content".into(),
+                            task_id: Some("two".into()),
+                            ..PlanItem::default()
+                        },
+                    ],
+                    compacted: false,
+                    replaces_native: false,
+                },
+            ),
+            event(
+                2,
+                2,
+                task_mutation(
+                    TaskMutationKind::Update,
+                    "Shared content",
+                    Some("one"),
+                    Some(PlanItemStatus::Completed),
+                    None,
+                ),
+            ),
+        ];
+
+        let projection = newest_plan(&events).unwrap();
+        assert_eq!(projection.items.len(), 2);
+        assert_eq!(projection.items[0].task_id.as_deref(), Some("one"));
+        assert_eq!(projection.items[0].content, "Shared content");
+        assert_eq!(projection.items[0].status, PlanItemStatus::Completed);
+        assert_eq!(projection.items[1].task_id.as_deref(), Some("two"));
+        assert_eq!(projection.items[1].status, PlanItemStatus::Pending);
+    }
+
+    #[test]
+    fn progress_projection_prefers_explicit_live_state_then_persisted_then_none() {
+        let persisted = vec![event(1, 1, plan("Persisted", PlanItemStatus::Completed))];
+        let live = vec![event(
+            2,
+            2,
+            task_mutation(
+                TaskMutationKind::Create,
+                "Live",
+                Some("live"),
+                Some(PlanItemStatus::InProgress),
+                Some("Doing live work"),
+            ),
+        )];
+
+        let live_projection = project_progress(&persisted, &live);
+        assert_eq!(live_projection.source, ProgressSource::Live);
+        assert_eq!(
+            live_projection
+                .items
+                .iter()
+                .map(|item| item.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Persisted", "Live"]
+        );
+
+        let empty_live = vec![event(
+            3,
+            3,
+            ActivityKind::PlanUpdate {
+                tasks: Vec::new(),
+                compacted: false,
+                replaces_native: false,
+            },
+        )];
+        let cleared_live = project_progress(&persisted, &empty_live);
+        assert_eq!(cleared_live.source, ProgressSource::Live);
+        assert!(cleared_live.items.is_empty());
+
+        let persisted_projection = project_progress(&persisted, &[]);
+        assert_eq!(persisted_projection.source, ProgressSource::Persisted);
+        assert_eq!(persisted_projection.items[0].content, "Persisted");
+
+        let none = project_progress(&[], &[]);
+        assert_eq!(none.source, ProgressSource::None);
+        assert!(none.items.is_empty());
+    }
+
+    #[test]
+    fn progress_projection_applies_resumed_id_only_updates_to_saved_tasks() {
+        let persisted = vec![event(
+            1,
+            1,
+            task_mutation(
+                TaskMutationKind::Create,
+                "Audit the workspace",
+                Some("provider-task-9"),
+                Some(PlanItemStatus::Pending),
+                None,
+            ),
+        )];
+        let live = vec![event(
+            2,
+            2,
+            task_mutation(
+                TaskMutationKind::Update,
+                "",
+                Some("provider-task-9"),
+                Some(PlanItemStatus::Completed),
+                None,
+            ),
+        )];
+
+        let projection = project_progress(&persisted, &live);
+        assert_eq!(projection.source, ProgressSource::Live);
+        assert_eq!(projection.items.len(), 1);
+        assert_eq!(projection.items[0].content, "Audit the workspace");
+        assert_eq!(projection.items[0].status, PlanItemStatus::Completed);
+    }
+
+    #[test]
+    fn live_cap_preserves_resumed_id_only_updates_until_saved_tasks_can_seed_them() {
+        let persisted = vec![event(
+            1,
+            1,
+            task_mutation(
+                TaskMutationKind::Create,
+                "Resume me",
+                Some("resume-1"),
+                Some(PlanItemStatus::Pending),
+                None,
+            ),
+        )];
+        let mut live = ActivityAccumulator::with_max_events(1);
+        live.ingest(event(
+            2,
+            2,
+            task_mutation(
+                TaskMutationKind::Update,
+                "",
+                Some("resume-1"),
+                Some(PlanItemStatus::Completed),
+                None,
+            ),
+        ));
+        live.ingest(event(
+            3,
+            3,
+            ActivityKind::WebSearch {
+                id: "incidental".into(),
+                query: "incidental".into(),
+            },
+        ));
+
+        assert_eq!(live.len(), 1);
+        assert!(matches!(
+            live.events[0].kind,
+            ActivityKind::TaskMutation { .. }
+        ));
+        let projection = project_progress(&persisted, &live.events);
+        assert_eq!(projection.source, ProgressSource::Live);
+        assert_eq!(projection.completed, 1);
+        assert_eq!(projection.items[0].content, "Resume me");
+    }
+
+    #[test]
+    fn mutation_only_compaction_does_not_gain_native_reset_semantics() {
+        let persisted = vec![event(
+            1,
+            1,
+            ActivityKind::PlanUpdate {
+                tasks: vec![PlanItem {
+                    content: "Persisted native task".into(),
+                    task_id: Some("native-x".into()),
+                    status: PlanItemStatus::Pending,
+                    origin: PlanItemOrigin::Native,
+                    ..PlanItem::default()
+                }],
+                compacted: false,
+                replaces_native: false,
+            },
+        )];
+        let mut live = ActivityAccumulator::with_max_events(1);
+        live.ingest(event(
+            2,
+            2,
+            task_mutation(
+                TaskMutationKind::Update,
+                "",
+                Some("native-x"),
+                Some(PlanItemStatus::Completed),
+                None,
+            ),
+        ));
+        live.ingest(event(
+            3,
+            3,
+            task_mutation(
+                TaskMutationKind::Create,
+                "New app task",
+                Some("app-y"),
+                Some(PlanItemStatus::Pending),
+                None,
+            ),
+        ));
+
+        assert!(live.len() > live.max_events());
+        assert!(live.events.iter().any(|event| matches!(
+            event.kind,
+            ActivityKind::PlanUpdate {
+                compacted: true,
+                replaces_native: false,
+                ..
+            }
+        )));
+        let projection = project_progress(&persisted, &live.events);
+        assert_eq!(projection.source, ProgressSource::Live);
+        assert_eq!(projection.items.len(), 2);
+        assert_eq!(projection.items[0].task_id.as_deref(), Some("native-x"));
+        assert_eq!(projection.items[0].status, PlanItemStatus::Completed);
+        assert_eq!(projection.items[1].task_id.as_deref(), Some("app-y"));
+    }
+
+    #[test]
+    fn current_work_label_prefers_plan_active_form_over_newer_activity() {
+        let progress = newest_plan(&[event(
+            1,
+            1,
+            ActivityKind::PlanUpdate {
+                tasks: vec![PlanItem {
+                    content: "Edit files".into(),
+                    active_form: Some("Editing the project".into()),
+                    status: PlanItemStatus::InProgress,
+                    ..PlanItem::default()
+                }],
+                compacted: false,
+                replaces_native: false,
+            },
+        )])
+        .unwrap();
+        let live = vec![event(2, 2, command("c", ActivityStatus::InProgress))];
+
+        assert_eq!(
+            current_work_label(&progress, &live, "Agent is working"),
+            "Editing the project"
+        );
+    }
+
+    #[test]
+    fn current_work_label_uses_latest_unresolved_meaningful_activity() {
+        let progress = ProgressProjection::default();
+        let live = vec![
+            event(
+                1,
+                1,
+                ActivityKind::Command {
+                    id: "command".into(),
+                    command: "cargo test".into(),
+                    output_tail: None,
+                    exit_code: None,
+                    status: ActivityStatus::InProgress,
+                },
+            ),
+            event(
+                2,
+                2,
+                ActivityKind::ToolCall {
+                    id: "resolved".into(),
+                    name: "read_file".into(),
+                    server: None,
+                    input_summary: None,
+                },
+            ),
+            event(
+                3,
+                3,
+                ActivityKind::ToolResult {
+                    id: "resolved".into(),
+                    output: Some("done".into()),
+                    is_error: false,
+                },
+            ),
+            event(
+                4,
+                4,
+                ActivityKind::FileChange {
+                    id: "file".into(),
+                    changes: vec![FileChange {
+                        path: "/work/src/lib.rs".into(),
+                        kind: FileChangeKind::Update,
+                    }],
+                    status: ActivityStatus::InProgress,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            current_work_label(&progress, &live[..3], "Agent is working"),
+            "Running cargo test"
+        );
+        assert_eq!(
+            current_work_label(&progress, &live, "Agent is working"),
+            "Updating lib.rs"
+        );
+    }
+
+    #[test]
+    fn current_work_label_falls_back_when_activity_is_terminal_or_incidental() {
+        let progress = ProgressProjection::default();
+        let live = vec![
+            event(1, 1, command("done", ActivityStatus::Completed)),
+            event(
+                2,
+                2,
+                ActivityKind::Usage {
+                    input: Some(1),
+                    output: Some(1),
+                    cached_input: None,
+                    reasoning: None,
+                    cost_usd: None,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            current_work_label(&progress, &live, "Codex is working"),
+            "Codex is working"
+        );
+    }
+
+    #[test]
+    fn lifecycle_update_is_case_scoped_and_sets_duration() {
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest(event(1, 100, command("shared", ActivityStatus::InProgress)));
+        accumulator.ingest(event(
+            2,
+            101,
+            ActivityKind::ToolResult {
+                id: "shared".into(),
+                output: Some("not the command".into()),
+                is_error: false,
+            },
+        ));
+        accumulator.ingest(event(
+            3,
+            103,
+            ActivityKind::Command {
+                id: "shared".into(),
+                command: "ls -la".into(),
+                output_tail: Some("done".into()),
+                exit_code: Some(0),
+                status: ActivityStatus::Completed,
+            },
+        ));
+
+        assert_eq!(accumulator.len(), 2);
+        assert_eq!(accumulator.events[0].id, Uuid::from_u128(1));
+        assert_eq!(accumulator.events[0].at, UnixMillis(100));
+        assert_eq!(accumulator.events[0].duration_ms, Some(3));
+        assert!(matches!(
+            accumulator.events[0].kind,
+            ActivityKind::Command {
+                status: ActivityStatus::Completed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn live_cap_preserves_plan_error_and_prompt_amid_foldable_chatter() {
+        let mut accumulator = ActivityAccumulator::with_max_events(5);
+        accumulator.ingest(event(1, 1, plan("Keep", PlanItemStatus::Pending)));
+        accumulator.ingest(event(
+            2,
+            2,
+            ActivityKind::TurnError {
+                message: "Keep error".into(),
+            },
+        ));
+        accumulator.ingest(event(
+            3,
+            3,
+            ActivityKind::PermissionPrompt {
+                id: "p1".into(),
+                tool: "write".into(),
+                summary: "Keep prompt".into(),
+                resolution: None,
+            },
+        ));
+        for index in 0..20 {
+            accumulator.ingest(event(
+                100 + index,
+                100 + index as i64,
+                command(format!("c{index}"), ActivityStatus::Completed),
+            ));
+        }
+
+        assert_eq!(accumulator.len(), 5);
+        assert!(
+            accumulator
+                .events
+                .iter()
+                .any(|event| event.kind.is_plan_snapshot())
+        );
+        assert!(
+            accumulator
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, ActivityKind::TurnError { .. }))
+        );
+        assert!(
+            accumulator
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, ActivityKind::PermissionPrompt { .. }))
+        );
+    }
+
+    #[test]
+    fn must_keep_plan_and_error_may_exceed_an_impossibly_small_live_cap() {
+        let mut accumulator = ActivityAccumulator::with_max_events(1);
+        accumulator.ingest(event(1, 1, plan("Keep plan", PlanItemStatus::Pending)));
+        accumulator.ingest(event(
+            2,
+            2,
+            ActivityKind::TurnError {
+                message: "Keep error".into(),
+            },
+        ));
+
+        assert_eq!(accumulator.len(), 2);
+        assert!(newest_plan(&accumulator.events).is_some());
+        assert!(
+            accumulator
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, ActivityKind::TurnError { .. }))
+        );
+    }
+
+    #[test]
+    fn persistence_retains_artifact_and_transcript_evidence_beyond_cap() {
+        let events = vec![
+            event(
+                1,
+                1,
+                ActivityKind::AssistantText {
+                    text: "answer".into(),
+                },
+            ),
+            event(
+                2,
+                2,
+                ActivityKind::FileChange {
+                    id: "f".into(),
+                    changes: vec![FileChange {
+                        path: "/tmp/a.txt".into(),
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+            event(
+                3,
+                3,
+                ActivityKind::HostMutation {
+                    tool: "create_note".into(),
+                    summary: "Note".into(),
+                    entity_id: Some("n1".into()),
+                    container_name: None,
+                    kind: HostMutationKind::Create,
+                },
+            ),
+            event(
+                4,
+                4,
+                ActivityKind::TurnError {
+                    message: "error".into(),
+                },
+            ),
+            event(5, 5, plan("Keep plan", PlanItemStatus::Pending)),
+        ];
+        let retained = activity_events_for_persistence(&events, 2);
+        assert_eq!(retained.len(), 5);
+        assert_eq!(
+            retained.iter().map(|event| event.id).collect::<Vec<_>>(),
+            events.iter().map(|event| event.id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn artifact_projection_dedupes_and_later_delete_strikes_add() {
+        let events = vec![
+            event(
+                1,
+                1,
+                ActivityKind::FileChange {
+                    id: "f1".into(),
+                    changes: vec![FileChange {
+                        path: "/work/report.md".into(),
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+            event(
+                2,
+                2,
+                ActivityKind::FileChange {
+                    id: "f2".into(),
+                    changes: vec![FileChange {
+                        path: "/work/report.md".into(),
+                        kind: FileChangeKind::Delete,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+            event(
+                3,
+                3,
+                ActivityKind::FileChange {
+                    id: "failed".into(),
+                    changes: vec![FileChange {
+                        path: "/work/never.txt".into(),
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::Failed,
+                },
+            ),
+        ];
+        let outputs = project_artifacts(&events);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].title, "report.md");
+        assert!(outputs[0].is_deleted);
+        assert_eq!(outputs[0].at, UnixMillis(2));
+    }
+
+    #[test]
+    fn host_outputs_dedupe_by_entity_and_unknown_creations_stay_distinct() {
+        let host = |entity_id: Option<&str>, summary: &str, kind| ActivityKind::HostMutation {
+            tool: "note".into(),
+            summary: summary.into(),
+            entity_id: entity_id.map(str::to_owned),
+            container_name: Some("Project".into()),
+            kind,
+        };
+        let events = vec![
+            event(
+                1,
+                1,
+                host(Some("n1"), "Created note", HostMutationKind::Create),
+            ),
+            event(
+                2,
+                2,
+                host(Some("n1"), "Deleted note", HostMutationKind::Delete),
+            ),
+            event(3, 3, host(None, "New note A", HostMutationKind::Create)),
+            event(4, 4, host(None, "New note B", HostMutationKind::Create)),
+        ];
+        let outputs = project_artifacts(&events);
+        assert_eq!(outputs.len(), 3);
+        let known = outputs
+            .iter()
+            .find(|output| output.id == "host:n1")
+            .unwrap();
+        assert!(known.is_deleted);
+        assert_eq!(known.title, "Deleted note");
+    }
+
+    #[test]
+    fn host_updates_and_deletes_only_change_outputs_created_in_the_trace() {
+        let host = |entity_id: Option<&str>, summary: &str, kind| ActivityKind::HostMutation {
+            tool: "note".into(),
+            summary: summary.into(),
+            entity_id: entity_id.map(str::to_owned),
+            container_name: Some("Project".into()),
+            kind,
+        };
+        let events = vec![
+            event(
+                1,
+                1,
+                host(
+                    Some("pre-existing-update"),
+                    "Updated old note",
+                    HostMutationKind::Update,
+                ),
+            ),
+            event(
+                2,
+                2,
+                host(
+                    Some("pre-existing-delete"),
+                    "Deleted old note",
+                    HostMutationKind::Delete,
+                ),
+            ),
+            event(
+                3,
+                3,
+                host(None, "Anonymous update", HostMutationKind::Update),
+            ),
+            event(
+                4,
+                4,
+                host(Some("created"), "Created note", HostMutationKind::Create),
+            ),
+            event(
+                5,
+                5,
+                host(Some("created"), "Updated note", HostMutationKind::Update),
+            ),
+        ];
+
+        let outputs = project_artifacts(&events);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].id, "host:created");
+        assert_eq!(outputs[0].title, "Updated note");
+        assert!(!outputs[0].is_deleted);
+        assert_eq!(outputs[0].at, UnixMillis(5));
+    }
+
+    #[test]
+    fn context_projection_aggregates_identical_tools_commands_and_reads() {
+        let events = vec![
+            event(
+                1,
+                20,
+                ActivityKind::Command {
+                    id: "c1".into(),
+                    command: "/bin/ls -la".into(),
+                    output_tail: None,
+                    exit_code: Some(0),
+                    status: ActivityStatus::Completed,
+                },
+            ),
+            event(
+                2,
+                10,
+                ActivityKind::ToolCall {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    server: Some("files".into()),
+                    input_summary: None,
+                },
+            ),
+            event(
+                3,
+                30,
+                ActivityKind::Command {
+                    id: "c2".into(),
+                    command: "ls /tmp".into(),
+                    output_tail: None,
+                    exit_code: Some(0),
+                    status: ActivityStatus::Completed,
+                },
+            ),
+            event(
+                4,
+                40,
+                ActivityKind::HostRead {
+                    tool: "inspect".into(),
+                    entity_id: Some("tile-1".into()),
+                    container_name: None,
+                },
+            ),
+        ];
+        let context = project_context(&events);
+        assert_eq!(context.len(), 3);
+        assert_eq!(context[0].identifier, "files · read");
+        let commands = context
+            .iter()
+            .find(|item| item.kind == ContextKind::Command)
+            .unwrap();
+        assert_eq!(commands.identifier, "ls");
+        assert_eq!(commands.use_count, 2);
+        assert_eq!(commands.first_used_at, UnixMillis(20));
+    }
+
+    #[test]
+    fn usage_projection_sums_optional_fields_and_distinguishes_no_data() {
+        assert!(!project_usage(&[]).has_data);
+        let events = vec![
+            event(
+                1,
+                1,
+                ActivityKind::Usage {
+                    input: Some(10),
+                    output: None,
+                    cached_input: Some(3),
+                    reasoning: None,
+                    cost_usd: Some(0.25),
+                },
+            ),
+            event(
+                2,
+                2,
+                ActivityKind::Usage {
+                    input: Some(2),
+                    output: Some(8),
+                    cached_input: None,
+                    reasoning: Some(4),
+                    cost_usd: Some(0.50),
+                },
+            ),
+        ];
+        let usage = project_usage(&events);
+        assert!(usage.has_data);
+        assert_eq!(usage.input, 12);
+        assert_eq!(usage.output, 8);
+        assert_eq!(usage.total_tokens(), 20);
+        assert_eq!(usage.cached_input, 3);
+        assert_eq!(usage.reasoning, 4);
+        assert_eq!(usage.cost_usd, Some(0.75));
+    }
+
+    #[test]
+    fn all_fifteen_cases_round_trip_through_the_wire_format() {
+        let kinds = vec![
+            ActivityKind::AssistantText { text: "a".into() },
+            ActivityKind::Thinking { text: "t".into() },
+            ActivityKind::ToolCall {
+                id: "1".into(),
+                name: "tool".into(),
+                server: Some("server".into()),
+                input_summary: Some("input".into()),
+            },
+            ActivityKind::ToolResult {
+                id: "1".into(),
+                output: Some("output".into()),
+                is_error: false,
+            },
+            command("2", ActivityStatus::Completed),
+            ActivityKind::FileChange {
+                id: "3".into(),
+                changes: vec![FileChange {
+                    path: "/tmp/a".into(),
+                    kind: FileChangeKind::Update,
+                }],
+                status: ActivityStatus::Completed,
+            },
+            ActivityKind::WebSearch {
+                id: "4".into(),
+                query: "query".into(),
+            },
+            plan("plan", PlanItemStatus::InProgress),
+            ActivityKind::TaskMutation {
+                kind: TaskMutationKind::Create,
+                content: "task".into(),
+                task_id: Some("5".into()),
+                status: Some(PlanItemStatus::InProgress),
+                active_form: Some("Doing task".into()),
+                result_summary: None,
+            },
+            ActivityKind::HostMutation {
+                tool: "create".into(),
+                summary: "created".into(),
+                entity_id: Some("6".into()),
+                container_name: Some("board".into()),
+                kind: HostMutationKind::Create,
+            },
+            ActivityKind::HostRead {
+                tool: "read".into(),
+                entity_id: Some("6".into()),
+                container_name: Some("board".into()),
+            },
+            ActivityKind::PermissionPrompt {
+                id: "7".into(),
+                tool: "delete".into(),
+                summary: "Delete?".into(),
+                resolution: Some(PermissionResolution::Denied),
+            },
+            ActivityKind::Usage {
+                input: Some(1),
+                output: Some(2),
+                cached_input: Some(3),
+                reasoning: Some(4),
+                cost_usd: Some(0.1),
+            },
+            ActivityKind::TurnError {
+                message: "error".into(),
+            },
+            ActivityKind::SessionInfo {
+                model: Some("model".into()),
+                session_id: Some("session".into()),
+            },
+        ];
+        assert_eq!(kinds.len(), 15);
+        let events: Vec<_> = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| event(index as u128 + 1, index as i64, kind))
+            .collect();
+        let encoded = serde_json::to_string(&events).unwrap();
+        for name in [
+            "assistantText",
+            "thinking",
+            "toolCall",
+            "toolResult",
+            "command",
+            "fileChange",
+            "webSearch",
+            "planUpdate",
+            "taskMutation",
+            "hostMutation",
+            "hostRead",
+            "permissionPrompt",
+            "usage",
+            "turnError",
+            "sessionInfo",
+        ] {
+            assert!(encoded.contains(&format!("\"type\":\"{name}\"")));
+        }
+        for field in [
+            "inputSummary",
+            "outputTail",
+            "exitCode",
+            "taskId",
+            "resultSummary",
+            "entityId",
+            "containerName",
+            "cachedInput",
+            "costUsd",
+            "sessionId",
+        ] {
+            assert!(encoded.contains(&format!("\"{field}\"")));
+        }
+        let decoded: Vec<ActivityEvent> = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, events);
+    }
+
+    #[test]
+    fn persisted_records_and_payload_fields_are_default_safe() {
+        let decoded: ActivityEvent =
+            serde_json::from_str(r#"{"kind":{"type":"command"}}"#).unwrap();
+        assert_eq!(decoded.id, Uuid::nil());
+        assert_eq!(decoded.at, UnixMillis::ZERO);
+        assert_eq!(
+            decoded.kind,
+            ActivityKind::Command {
+                id: String::new(),
+                command: String::new(),
+                output_tail: None,
+                exit_code: None,
+                status: ActivityStatus::Completed,
+            }
+        );
+    }
+
+    #[test]
+    fn older_task_mutations_default_new_progress_fields_to_none() {
+        let decoded: ActivityKind = serde_json::from_str(
+            r#"{"type":"taskMutation","kind":"update","content":"Existing","taskId":"1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            decoded,
+            ActivityKind::TaskMutation {
+                kind: TaskMutationKind::Update,
+                content: "Existing".into(),
+                task_id: Some("1".into()),
+                status: None,
+                active_form: None,
+                result_summary: None,
+            }
+        );
+    }
+
+    #[test]
+    fn custom_profile_never_advertises_unimplemented_builtin_shaping() {
+        let arguments = vec!["--output-format".into(), "streaming-json".into()];
+        let profile = capability_profile("custom_cli", "/opt/homebrew/bin/grok", &arguments);
+        assert_eq!(profile.provider, ProviderKind::Custom);
+        assert_eq!(profile.runtime_family, ProviderKind::Custom);
+        assert_eq!(profile.stream_dialect, StreamDialect::PlainText);
+        assert_eq!(profile.resume, ResumeStrategy::None);
+        assert_eq!(profile.sandbox, SandboxStrategy::None);
+        assert_eq!(profile.system_prompt, SystemPromptChannel::InPrompt);
+    }
+
+    #[test]
+    fn capability_dialect_requires_an_exact_pre_rewrite_flag() {
+        let exact = vec!["exec".into(), "--json".into()];
+        let combined = vec!["--output=json".into()];
+        assert_eq!(
+            capability_profile("codex_cli", "codex", &exact).stream_dialect,
+            StreamDialect::CodexJsonLines
+        );
+        assert_eq!(
+            capability_profile("codex_cli", "codex", &combined).stream_dialect,
+            StreamDialect::PlainText
+        );
+    }
+
+    #[test]
+    fn capability_profiles_cover_remote_and_local_model_transports() {
+        let empty = Vec::<String>::new();
+        let openai = capability_profile("openai_compatible", "", &empty);
+        assert_eq!(openai.transport, TransportKind::HttpChatCompletions);
+        assert_eq!(openai.stream_dialect, StreamDialect::OpenAiCompatibleJson);
+        assert_eq!(openai.tools_off, ToolsOffStrategy::OmitApiTools);
+        assert_eq!(openai.system_prompt, SystemPromptChannel::ApiSystemMessage);
+
+        let studio_http = capability_profile("lm_studio", "", &empty);
+        assert_eq!(
+            studio_http.transport,
+            TransportKind::LocalHttpChatCompletions
+        );
+        let studio_cli = capability_profile("lm_studio", "lms", &empty);
+        assert_eq!(studio_cli.transport, TransportKind::CliProcess);
+
+        let kimi_args = vec!["--output-format".into(), "stream-json".into()];
+        let kimi = capability_profile("kimi_cli", "kimi", &kimi_args);
+        assert_eq!(kimi.stream_dialect, StreamDialect::KimiStreamJson);
+        assert_eq!(kimi.plan_channel, PlanChannel::AppTaskTools);
+        assert_eq!(kimi.resume, ResumeStrategy::None);
+
+        let ollama = capability_profile("ollama", "ollama", &empty);
+        assert_eq!(ollama.transport, TransportKind::CliProcess);
+        assert_eq!(ollama.stream_dialect, StreamDialect::PlainText);
+    }
+
+    #[test]
+    fn capability_profiles_round_trip_but_remain_derived_values() {
+        let args = vec!["--output-format".into(), "stream-json".into()];
+        let profile = capability_profile("claude_cli", "claude", &args);
+        let encoded = serde_json::to_string(&profile).unwrap();
+        let decoded: CapabilityProfile = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, profile);
+        assert!(decoded.has_structured_stream());
+        assert!(decoded.has_native_plan());
+        assert!(decoded.supports_native_resume());
+    }
+}

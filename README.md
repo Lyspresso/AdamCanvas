@@ -14,6 +14,12 @@ Notes and websites can be created directly in the app.
 - Photo tiles adopt the image’s natural proportions and draw edge-to-edge;
   they keep that aspect while resizing unless Shift is held for freeform.
 - Select with Command-click or drag a marquee around a group.
+- Use the canvas quick bar for sticky notes, piles, websites, imports,
+  borderless text, copy, paste, and duplicate. Press and drag with the note
+  tool to draw its exact shape, or click for the default size. Canvas text
+  types in place with no card around it; drag it onto an empty or populated
+  sticky note to move the text inside. Double-click a placement tool to keep
+  using it until `×` or Escape clears it. Three empty slots remain available.
 - Copy, paste, duplicate, delete, and drag a selection onto another page in
   the sidebar; hovering a page opens it before the drop.
 - Double-click files and websites to open them; press Space for a Quick Look
@@ -102,9 +108,28 @@ hardware-specific guarantee.
 Adam keeps the canvas light by showing bounded, static previews. PDFs and
 office documents use Quick Look thumbnails and open in their native app for
 full interaction; websites use a local card and open in the default browser.
-The Adam AI tile currently runs a private local stub that exercises
-permissions, protected tiles, approvals, checkpoints, and Trash without
-sending content to a cloud model.
+
+AI-chat tiles open a dedicated full-page workspace with Chat, Cowork, and Code
+modes. Each saved conversation keeps its history, mode, provider, model, and
+working-folder choice. Cowork and Code use the selected working folder, while
+Chat is ready for general conversation. Responses stream into a Markdown
+transcript, and the composer supports attachments and stopping an active turn.
+
+The provider menu supports the locally installed Claude, Codex, Grok, and Kimi
+CLIs; LM Studio; Ollama; OpenAI-compatible APIs; and a configurable Custom CLI.
+CLI providers reuse their existing local sign-in. API keys are held in memory
+for the current app session rather than written into the workspace.
+
+Sandbox, Ask, Plan, Auto, and Bypass permission modes keep agent access explicit.
+Cowork and Code can create and restore checkpoints, proposed canvas changes
+require approval when appropriate, and protected tiles remain guarded from
+destructive actions.
+
+The expanded harness also includes provider capability profiles, normalized
+typed activity, plan/output/context/usage projections, bounded prompt replay,
+safe native-session resume, durable per-conversation queues, parked recovery,
+and visible failure turns. The exact contracts and current honest limitations
+are documented in [docs/AI-HARNESS.md](docs/AI-HARNESS.md).
 
 ## Build the app
 

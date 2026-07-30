@@ -6,6 +6,7 @@
 //! evaluation, authorization, history, and recovery repeatable in tests.
 
 use crate::{
+    chat_core::ActivityEvent,
     model::{TileKind, WorldRect},
     photo_details::PhotoRecord,
 };
@@ -66,6 +67,8 @@ pub enum DomainError {
     HistoryEntryAlreadyUndone(Uuid),
     #[error("conversation {0} does not exist")]
     MissingConversation(ConversationId),
+    #[error("conversation {0} already has the maximum number of queued turns")]
+    AiQueueFull(ConversationId),
     #[error("trash item {0} does not exist")]
     MissingTrashItem(Uuid),
     #[error("tile {0} is already in the trash")]
@@ -2109,17 +2112,68 @@ fn resolve_one_pile(
 
 // MARK: - Persistent AI conversations, authorization, and action logs
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
-    ReadOnly,
-    #[default]
+    Sandbox,
     Ask,
-    PlanFirst,
+    Plan,
+    #[default]
     Auto,
+    Bypass,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+impl<'de> Deserialize<'de> for PermissionMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = JsonValue::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            Some("sandbox" | "read_only") => Self::Sandbox,
+            Some("plan" | "plan_first") => Self::Plan,
+            Some("auto") => Self::Auto,
+            Some("bypass") => Self::Bypass,
+            _ => Self::Ask,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AiPermissionClass {
+    Read,
+    Mutate,
+    Destructive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AiPermissionVerdict {
+    Allow,
+    Prompt,
+    Deny,
+}
+
+/// The host-data permission matrix. Native CLI filesystem posture is a
+/// separate, spawn-bound decision; this policy is evaluated for every Adam
+/// tool call so a mid-run stance change takes effect immediately.
+pub fn ai_permission_verdict(
+    mode: PermissionMode,
+    class: AiPermissionClass,
+) -> AiPermissionVerdict {
+    use AiPermissionClass::{Destructive, Mutate, Read};
+    use AiPermissionVerdict::{Allow, Deny, Prompt};
+
+    match (mode, class) {
+        (_, Read) => Allow,
+        (PermissionMode::Sandbox | PermissionMode::Ask, Mutate | Destructive) => Prompt,
+        (PermissionMode::Plan, Mutate | Destructive) => Deny,
+        (PermissionMode::Auto, Mutate) => Allow,
+        (PermissionMode::Auto, Destructive) => Prompt,
+        (PermissionMode::Bypass, Mutate | Destructive) => Allow,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageRole {
     User,
@@ -2127,7 +2181,211 @@ pub enum MessageRole {
     System,
 }
 
+impl<'de> Deserialize<'de> for MessageRole {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = JsonValue::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            Some("user") => Self::User,
+            Some("system") => Self::System,
+            _ => Self::Assistant,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiWorkspaceMode {
+    #[default]
+    Chat,
+    Cowork,
+    Code,
+}
+
+impl<'de> Deserialize<'de> for AiWorkspaceMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = JsonValue::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            Some("cowork") => Self::Cowork,
+            Some("code") => Self::Code,
+            _ => Self::Chat,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiConversationKind {
+    #[default]
+    Chat,
+    Task,
+}
+
+impl<'de> Deserialize<'de> for AiConversationKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = JsonValue::deserialize(deserializer)?;
+        Ok(match value.as_str() {
+            Some("task") => Self::Task,
+            _ => Self::Chat,
+        })
+    }
+}
+
+fn default_ai_tools_enabled() -> bool {
+    false
+}
+
+pub const AI_FEATURE_MEMORY: &str = "memory";
+pub const AI_FEATURE_PLANNING: &str = "planning";
+pub const AI_FEATURE_SUBAGENTS: &str = "subagents";
+pub const AI_FEATURE_THINKING: &str = "thinking";
+pub const AI_FEATURE_WEB_SEARCH: &str = "web_search";
+
+/// Portable, provider-scoped choices. Feature keys are intentionally open so
+/// newer builds can preserve settings they do not yet understand. Execution
+/// adapters still use an explicit allowlist before emitting any CLI flag.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiProviderPreferences {
+    /// Empty means the provider's current default model.
+    pub model: String,
+    /// Empty means the model/provider default effort.
+    pub reasoning_effort: String,
+    /// Used only by providers with an explicit fallback-model channel.
+    pub fallback_model: String,
+    /// None leaves the provider's own turn limit unchanged.
+    pub max_turns: Option<u32>,
+    /// Absence means provider default; true/false is an explicit user choice.
+    pub features: BTreeMap<String, bool>,
+}
+
+impl AiProviderPreferences {
+    pub fn feature(&self, key: &str) -> Option<bool> {
+        self.features.get(key).copied()
+    }
+
+    pub fn set_feature(&mut self, key: &str, value: Option<bool>) {
+        if let Some(value) = value {
+            self.features.insert(key.to_owned(), value);
+        } else {
+            self.features.remove(key);
+        }
+    }
+
+    pub fn normalized(mut self) -> Self {
+        self.model = self.model.trim().to_owned();
+        self.reasoning_effort = self.reasoning_effort.trim().to_ascii_lowercase();
+        self.fallback_model = self.fallback_model.trim().to_owned();
+        self.max_turns = self.max_turns.map(|turns| turns.clamp(1, 100));
+        self
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiConversationSettings {
+    pub workspace_mode: AiWorkspaceMode,
+    pub provider_id: String,
+    /// Legacy single-provider model field. New writes also populate the
+    /// provider-scoped profile map, while old workspaces migrate lazily.
+    pub model: String,
+    pub provider_preferences: BTreeMap<String, AiProviderPreferences>,
+    pub working_directory: Option<String>,
+    pub api_endpoint: String,
+    pub api_key_env: String,
+    pub custom_command: String,
+    pub custom_arguments: Vec<String>,
+}
+
+impl Default for AiConversationSettings {
+    fn default() -> Self {
+        Self {
+            workspace_mode: AiWorkspaceMode::Chat,
+            provider_id: "auto".into(),
+            model: String::new(),
+            provider_preferences: BTreeMap::new(),
+            working_directory: None,
+            api_endpoint: "http://127.0.0.1:1234/v1".into(),
+            api_key_env: "OPENAI_API_KEY".into(),
+            custom_command: String::new(),
+            custom_arguments: Vec::new(),
+        }
+    }
+}
+
+impl AiConversationSettings {
+    pub fn profile_for(&self, provider_id: &str) -> AiProviderPreferences {
+        let mut profile = self
+            .provider_preferences
+            .get(provider_id)
+            .cloned()
+            .unwrap_or_default();
+        if profile.model.trim().is_empty()
+            && provider_id == self.provider_id
+            && !self.model.trim().is_empty()
+        {
+            profile.model = self.model.clone();
+        }
+        profile.normalized()
+    }
+
+    pub fn set_profile_for(&mut self, provider_id: &str, profile: AiProviderPreferences) {
+        let profile = profile.normalized();
+        if provider_id == self.provider_id {
+            self.model.clone_from(&profile.model);
+        }
+        self.provider_preferences
+            .insert(provider_id.to_owned(), profile);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AiAttachmentRef {
+    pub id: Uuid,
+    pub name: String,
+    pub path: String,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AiQueuedTurn {
+    pub id: Uuid,
+    pub text: String,
+    pub attachments: Vec<AiAttachmentRef>,
+    pub queued_at: UnixMillis,
+    /// Captured at enqueue time so changing the selected provider cannot
+    /// silently retarget work the user already submitted.
+    pub provider_id: Option<String>,
+    pub model: Option<String>,
+    /// Full non-secret provider choices captured when the message is queued.
+    /// None identifies a legacy queue entry.
+    pub provider_profile: Option<AiProviderPreferences>,
+}
+
+impl Default for AiQueuedTurn {
+    fn default() -> Self {
+        Self {
+            id: Uuid::nil(),
+            text: String::new(),
+            attachments: Vec::new(),
+            queued_at: UnixMillis::ZERO,
+            provider_id: None,
+            model: None,
+            provider_profile: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ConversationMessage {
     pub id: Uuid,
     pub sequence: u64,
@@ -2135,6 +2393,29 @@ pub struct ConversationMessage {
     pub text: String,
     pub at: UnixMillis,
     pub related_action_ids: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AiAttachmentRef>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_activity_events_lossy"
+    )]
+    pub activities: Vec<ActivityEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<Uuid>,
+}
+
+fn deserialize_activity_events_lossy<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ActivityEvent>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<JsonValue>::deserialize(deserializer)?;
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2189,8 +2470,7 @@ pub enum ApprovalEvidence<'a> {
 pub enum AuthorizationDecision {
     Allowed,
     NeedsActionConfirmation,
-    NeedsPlanApproval,
-    DeniedReadOnly,
+    DeniedPlanMode,
     DeniedProtectedTiles { tile_ids: BTreeSet<TileId> },
     DeniedOutsideCurrentPage,
     DeniedPermanentDelete,
@@ -2222,24 +2502,15 @@ pub fn authorize_ai_action(
     if request.page_id != current_page {
         return AuthorizationDecision::DeniedOutsideCurrentPage;
     }
-    match mode {
-        PermissionMode::ReadOnly => AuthorizationDecision::DeniedReadOnly,
-        PermissionMode::Ask => match evidence {
+    match ai_permission_verdict(mode, AiPermissionClass::Mutate) {
+        AiPermissionVerdict::Allow => AuthorizationDecision::Allowed,
+        AiPermissionVerdict::Prompt => match evidence {
             ApprovalEvidence::SpecificAction(id) if id == request.id => {
                 AuthorizationDecision::Allowed
             }
             _ => AuthorizationDecision::NeedsActionConfirmation,
         },
-        PermissionMode::PlanFirst => match evidence {
-            ApprovalEvidence::Plan(plan)
-                if plan.conversation_id == request.conversation_id
-                    && plan.action_ids.contains(&request.id) =>
-            {
-                AuthorizationDecision::Allowed
-            }
-            _ => AuthorizationDecision::NeedsPlanApproval,
-        },
-        PermissionMode::Auto => AuthorizationDecision::Allowed,
+        AiPermissionVerdict::Deny => AuthorizationDecision::DeniedPlanMode,
     }
 }
 
@@ -2284,12 +2555,31 @@ pub struct AiConversation {
     pub permission_mode: PermissionMode,
     pub created_at: UnixMillis,
     pub updated_at: UnixMillis,
+    #[serde(default)]
+    pub settings: AiConversationSettings,
+    #[serde(default)]
+    pub kind: AiConversationKind,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub unread: bool,
+    #[serde(default = "default_ai_tools_enabled")]
+    pub tools_enabled: bool,
+    #[serde(default)]
+    pub project_id: Option<Uuid>,
+    #[serde(default)]
+    pub character_id: Option<Uuid>,
+    #[serde(default)]
+    queued_turns: Vec<AiQueuedTurn>,
+    #[serde(default)]
+    pub queue_paused: bool,
     messages: Vec<ConversationMessage>,
     actions: Vec<AiActionRecord>,
     checkpoints: Vec<AiCheckpoint>,
 }
 
 const AI_CHECKPOINT_LIMIT: usize = 32;
+pub const AI_QUEUE_LIMIT: usize = 50;
 
 impl AiConversation {
     pub fn new(
@@ -2304,6 +2594,15 @@ impl AiConversation {
             permission_mode,
             created_at: now,
             updated_at: now,
+            settings: AiConversationSettings::default(),
+            kind: AiConversationKind::Chat,
+            pinned: false,
+            unread: false,
+            tools_enabled: false,
+            project_id: None,
+            character_id: None,
+            queued_turns: Vec::new(),
+            queue_paused: false,
             messages: Vec::new(),
             actions: Vec::new(),
             checkpoints: Vec::new(),
@@ -2322,6 +2621,39 @@ impl AiConversation {
         &self.checkpoints
     }
 
+    pub fn queued_turns(&self) -> &[AiQueuedTurn] {
+        &self.queued_turns
+    }
+
+    pub fn enqueue_turn(&mut self, turn: AiQueuedTurn) -> Result<(), DomainError> {
+        if self.queued_turns.iter().any(|queued| queued.id == turn.id) {
+            return Err(DomainError::DuplicateId(turn.id));
+        }
+        if self.queued_turns.len() >= AI_QUEUE_LIMIT {
+            return Err(DomainError::AiQueueFull(self.id));
+        }
+        self.updated_at = turn.queued_at;
+        self.queued_turns.push(turn);
+        Ok(())
+    }
+
+    pub fn remove_queued_turn(&mut self, id: Uuid) -> Option<AiQueuedTurn> {
+        let index = self.queued_turns.iter().position(|turn| turn.id == id)?;
+        Some(self.queued_turns.remove(index))
+    }
+
+    pub fn pop_queued_turn(&mut self) -> Option<AiQueuedTurn> {
+        if self.queue_paused || self.queued_turns.is_empty() {
+            return None;
+        }
+        Some(self.queued_turns.remove(0))
+    }
+
+    pub fn clear_queued_turns(&mut self) {
+        self.queued_turns.clear();
+        self.queue_paused = true;
+    }
+
     pub fn append_message(
         &mut self,
         id: Uuid,
@@ -2329,6 +2661,42 @@ impl AiConversation {
         text: impl Into<String>,
         at: UnixMillis,
         related_action_ids: Vec<Uuid>,
+    ) -> Result<u64, DomainError> {
+        self.append_message_with_attachments(id, role, text, at, related_action_ids, Vec::new())
+    }
+
+    pub fn append_message_with_attachments(
+        &mut self,
+        id: Uuid,
+        role: MessageRole,
+        text: impl Into<String>,
+        at: UnixMillis,
+        related_action_ids: Vec<Uuid>,
+        attachments: Vec<AiAttachmentRef>,
+    ) -> Result<u64, DomainError> {
+        self.append_message_with_activity(
+            id,
+            role,
+            text,
+            at,
+            related_action_ids,
+            attachments,
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_message_with_activity(
+        &mut self,
+        id: Uuid,
+        role: MessageRole,
+        text: impl Into<String>,
+        at: UnixMillis,
+        related_action_ids: Vec<Uuid>,
+        attachments: Vec<AiAttachmentRef>,
+        activities: Vec<ActivityEvent>,
+        turn_id: Option<Uuid>,
     ) -> Result<u64, DomainError> {
         if self.messages.iter().any(|message| message.id == id) {
             return Err(DomainError::DuplicateId(id));
@@ -2345,6 +2713,9 @@ impl AiConversation {
             text: text.into(),
             at,
             related_action_ids,
+            attachments,
+            activities,
+            turn_id,
         });
         self.updated_at = at;
         Ok(sequence)
@@ -3328,13 +3699,13 @@ mod tests {
         };
         assert_eq!(
             authorize_ai_action(
-                PermissionMode::ReadOnly,
+                PermissionMode::Plan,
                 id(3),
                 &BTreeSet::new(),
                 &request,
                 ApprovalEvidence::None
             ),
-            AuthorizationDecision::DeniedReadOnly
+            AuthorizationDecision::DeniedPlanMode
         );
         assert_eq!(
             authorize_ai_action(
@@ -3372,6 +3743,252 @@ mod tests {
             ),
             AuthorizationDecision::DeniedPermanentDelete
         );
+    }
+
+    #[test]
+    fn ai_permission_matrix_is_three_way_and_fail_closed_in_plan_mode() {
+        use AiPermissionClass::{Destructive, Mutate, Read};
+        use AiPermissionVerdict::{Allow, Deny, Prompt};
+
+        for mode in [
+            PermissionMode::Sandbox,
+            PermissionMode::Ask,
+            PermissionMode::Plan,
+            PermissionMode::Auto,
+            PermissionMode::Bypass,
+        ] {
+            assert_eq!(ai_permission_verdict(mode, Read), Allow);
+        }
+        for mode in [PermissionMode::Sandbox, PermissionMode::Ask] {
+            assert_eq!(ai_permission_verdict(mode, Mutate), Prompt);
+            assert_eq!(ai_permission_verdict(mode, Destructive), Prompt);
+        }
+        assert_eq!(ai_permission_verdict(PermissionMode::Plan, Mutate), Deny);
+        assert_eq!(
+            ai_permission_verdict(PermissionMode::Plan, Destructive),
+            Deny
+        );
+        assert_eq!(ai_permission_verdict(PermissionMode::Auto, Mutate), Allow);
+        assert_eq!(
+            ai_permission_verdict(PermissionMode::Auto, Destructive),
+            Prompt
+        );
+        assert_eq!(ai_permission_verdict(PermissionMode::Bypass, Mutate), Allow);
+        assert_eq!(
+            ai_permission_verdict(PermissionMode::Bypass, Destructive),
+            Allow
+        );
+    }
+
+    #[test]
+    fn ai_conversation_settings_have_safe_defaults_and_allow_partial_profiles() {
+        let defaults = AiConversationSettings::default();
+        assert_eq!(defaults.workspace_mode, AiWorkspaceMode::Chat);
+        assert_eq!(defaults.provider_id, "auto");
+        assert!(defaults.model.is_empty());
+        assert!(defaults.provider_preferences.is_empty());
+        assert_eq!(defaults.working_directory, None);
+        assert_eq!(defaults.api_endpoint, "http://127.0.0.1:1234/v1");
+        assert_eq!(defaults.api_key_env, "OPENAI_API_KEY");
+        assert!(defaults.custom_command.is_empty());
+        assert!(defaults.custom_arguments.is_empty());
+
+        let partial: AiConversationSettings =
+            serde_json::from_value(json!({"provider_id": "claude"})).unwrap();
+        assert_eq!(partial.provider_id, "claude");
+        assert_eq!(partial.workspace_mode, AiWorkspaceMode::Chat);
+        assert_eq!(partial.api_endpoint, defaults.api_endpoint);
+        assert_eq!(partial.api_key_env, defaults.api_key_env);
+    }
+
+    #[test]
+    fn queued_turns_are_fifo_and_round_trip_with_legacy_safe_defaults() {
+        let mut conversation = AiConversation::new(id(1), "Queue", PermissionMode::Ask, at(0));
+        for index in 0..3u128 {
+            conversation
+                .enqueue_turn(AiQueuedTurn {
+                    id: id(10 + index),
+                    text: format!("turn {index}"),
+                    attachments: Vec::new(),
+                    queued_at: at(index as i64 + 1),
+                    provider_id: Some("codex_cli".into()),
+                    model: None,
+                    provider_profile: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(conversation.queued_turns()[0].text, "turn 0");
+        assert_eq!(conversation.pop_queued_turn().unwrap().text, "turn 0");
+        conversation.queue_paused = true;
+        assert!(conversation.pop_queued_turn().is_none());
+        conversation.queue_paused = false;
+        assert_eq!(conversation.pop_queued_turn().unwrap().text, "turn 1");
+
+        let encoded = serde_json::to_value(&conversation).unwrap();
+        let decoded: AiConversation = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.queued_turns()[0].text, "turn 2");
+        assert!(!decoded.tools_enabled);
+    }
+
+    #[test]
+    fn provider_preferences_are_isolated_normalized_and_legacy_model_safe() {
+        let mut settings = AiConversationSettings {
+            provider_id: "claude_cli".into(),
+            model: "  opus  ".into(),
+            ..AiConversationSettings::default()
+        };
+        assert_eq!(settings.profile_for("claude_cli").model, "opus");
+        assert!(settings.profile_for("codex_cli").model.is_empty());
+
+        let mut codex = AiProviderPreferences {
+            model: " gpt-5.6-sol ".into(),
+            reasoning_effort: " ULTRA ".into(),
+            max_turns: Some(500),
+            ..AiProviderPreferences::default()
+        };
+        codex.set_feature(AI_FEATURE_WEB_SEARCH, Some(true));
+        settings.set_profile_for("codex_cli", codex);
+        let codex = settings.profile_for("codex_cli");
+        assert_eq!(codex.model, "gpt-5.6-sol");
+        assert_eq!(codex.reasoning_effort, "ultra");
+        assert_eq!(codex.max_turns, Some(100));
+        assert_eq!(codex.feature(AI_FEATURE_WEB_SEARCH), Some(true));
+        assert_eq!(settings.model.trim(), "opus");
+
+        let encoded = serde_json::to_value(&settings).unwrap();
+        let decoded: AiConversationSettings = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.profile_for("codex_cli"), codex);
+    }
+
+    #[test]
+    fn messages_support_attachments_without_changing_the_existing_append_api() {
+        let mut conversation =
+            AiConversation::new(id(1), "Attachments", PermissionMode::Ask, at(0));
+        let attachment = AiAttachmentRef {
+            id: id(2),
+            name: "brief.pdf".into(),
+            path: "/managed/brief.pdf".into(),
+            size_bytes: Some(4_096),
+        };
+
+        assert_eq!(
+            conversation
+                .append_message_with_attachments(
+                    id(3),
+                    MessageRole::User,
+                    "Review this",
+                    at(1),
+                    vec![],
+                    vec![attachment.clone()],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(conversation.messages()[0].attachments, vec![attachment]);
+
+        conversation
+            .append_message(id(4), MessageRole::Assistant, "Ready", at(2), vec![])
+            .unwrap();
+        assert!(conversation.messages()[1].attachments.is_empty());
+        let encoded = serde_json::to_value(conversation.messages()).unwrap();
+        assert!(encoded[1].get("attachments").is_none());
+    }
+
+    #[test]
+    fn assistant_text_and_typed_activity_commit_as_one_persisted_turn() {
+        let mut conversation = AiConversation::new(id(1), "Typed turn", PermissionMode::Ask, at(0));
+        let turn_id = id(9);
+        let activity = ActivityEvent::assistant_text(id(3), at(2), "Ready");
+        conversation
+            .append_message_with_activity(
+                id(2),
+                MessageRole::Assistant,
+                "Ready",
+                at(2),
+                Vec::new(),
+                Vec::new(),
+                vec![activity.clone()],
+                Some(turn_id),
+            )
+            .unwrap();
+
+        let decoded: AiConversation =
+            serde_json::from_value(serde_json::to_value(&conversation).unwrap()).unwrap();
+        assert_eq!(decoded.messages()[0].activities, vec![activity]);
+        assert_eq!(decoded.messages()[0].turn_id, Some(turn_id));
+    }
+
+    #[test]
+    fn future_ai_enums_fail_closed_without_blank_workspace_recovery() {
+        let mut conversation =
+            AiConversation::new(id(1), "Future safe", PermissionMode::Ask, at(0));
+        conversation
+            .append_message_with_activity(
+                id(2),
+                MessageRole::Assistant,
+                "Kept",
+                at(1),
+                Vec::new(),
+                Vec::new(),
+                vec![ActivityEvent::assistant_text(id(3), at(1), "Kept")],
+                Some(id(4)),
+            )
+            .unwrap();
+
+        let mut encoded = serde_json::to_value(&conversation).unwrap();
+        encoded["permission_mode"] = json!("future_permission");
+        encoded["settings"]["workspace_mode"] = json!("future_surface");
+        encoded["kind"] = json!("future_kind");
+        encoded["messages"][0]["role"] = json!("future_role");
+        encoded["messages"][0]["activities"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "id": id(5),
+                "at": 2,
+                "kind": {"type": "futureActivity", "payload": "ignored"}
+            }));
+
+        let decoded: AiConversation = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.permission_mode, PermissionMode::Ask);
+        assert_eq!(decoded.settings.workspace_mode, AiWorkspaceMode::Chat);
+        assert_eq!(decoded.kind, AiConversationKind::Chat);
+        assert_eq!(decoded.messages()[0].role, MessageRole::Assistant);
+        assert_eq!(decoded.messages()[0].activities.len(), 1);
+    }
+
+    #[test]
+    fn literal_legacy_conversation_without_settings_or_attachments_still_decodes() {
+        let encoded = r#"
+        {
+          "id": "00000000-0000-0000-0000-000000000001",
+          "title": "Legacy chat",
+          "permission_mode": "ask",
+          "created_at": 0,
+          "updated_at": 1000,
+          "messages": [
+            {
+              "id": "00000000-0000-0000-0000-000000000002",
+              "sequence": 1,
+              "role": "user",
+              "text": "Hello",
+              "at": 1000,
+              "related_action_ids": []
+            }
+          ],
+          "actions": [],
+          "checkpoints": []
+        }
+        "#;
+
+        let conversation: AiConversation = serde_json::from_str(encoded).unwrap();
+        assert_eq!(conversation.settings, AiConversationSettings::default());
+        assert_eq!(conversation.messages().len(), 1);
+        assert!(conversation.messages()[0].attachments.is_empty());
+
+        let round_trip: AiConversation =
+            serde_json::from_slice(&serde_json::to_vec(&conversation).unwrap()).unwrap();
+        assert_eq!(round_trip, conversation);
     }
 
     #[test]
