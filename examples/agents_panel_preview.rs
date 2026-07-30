@@ -70,6 +70,7 @@ fn synthetic_rows() -> Vec<AgentRow> {
                 },
             },
             program: Some("/opt/homebrew/bin/claude".into()),
+            auth: agents_panel::AgentAuth::SignedIn,
             selected: true,
         },
         AgentRow {
@@ -80,6 +81,7 @@ fn synthetic_rows() -> Vec<AgentRow> {
                 },
             },
             program: Some("/usr/local/bin/codex".into()),
+            auth: agents_panel::AgentAuth::SignedOut,
             selected: false,
         },
         AgentRow {
@@ -88,6 +90,7 @@ fn synthetic_rows() -> Vec<AgentRow> {
                 availability: AgentAvailability::Detected { version: None },
             },
             program: Some("/usr/local/bin/grok".into()),
+            auth: agents_panel::AgentAuth::NotApplicable,
             selected: false,
         },
         AgentRow {
@@ -96,6 +99,7 @@ fn synthetic_rows() -> Vec<AgentRow> {
                 availability: AgentAvailability::NotDetected,
             },
             program: None,
+            auth: agents_panel::AgentAuth::Unknown,
             selected: false,
         },
         AgentRow {
@@ -104,6 +108,7 @@ fn synthetic_rows() -> Vec<AgentRow> {
                 first_available: Some("Claude CLI"),
             },
             program: None,
+            auth: agents_panel::AgentAuth::Unknown,
             selected: false,
         },
         AgentRow {
@@ -112,6 +117,7 @@ fn synthetic_rows() -> Vec<AgentRow> {
                 note: "No local install — uses the endpoint configured per conversation.",
             },
             program: None,
+            auth: agents_panel::AgentAuth::Unknown,
             selected: false,
         },
     ]

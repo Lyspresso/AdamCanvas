@@ -8595,6 +8595,10 @@ impl AdamApp {
             context.copy_text(command.to_owned());
             self.toast("Install command copied", context);
         }
+        if let Some(command) = action.copy_sign_in {
+            context.copy_text(command.to_owned());
+            self.toast("Sign-in command copied — paste it in Terminal", context);
+        }
         if let Some(url) = action.open_docs {
             platform::open_url(url);
         }

@@ -97,7 +97,19 @@ Execution is user-initiated, one at a time, via `/bin/zsh -lc` with
 threads, a five-minute deadline with kill, and a post-install
 cache-bypassing re-probe: if the installer finishes but the binary still
 does not resolve on the discovery paths, the panel says so honestly and
-keeps the full command log. Sign-in status remains a planned second axis.
+keeps the full command log.
+
+Sign-in is the second, orthogonal status axis: for Claude (`claude auth
+status`) and Codex (`codex login status`) the scan runs the vendor's own
+status command against the resolved binary — bounded exactly like installs
+(own process group, five-second deadline group-kill, bounded drain) — and
+caches the result per resolved path so ordinary rescans stay cheap
+(Refresh and the post-install rescan re-probe). Classification: signed-out
+markers dominate exit codes, and a command that ran but errored without a
+marker is "Sign-in unknown", never "Signed out" — the CLI must state the
+auth fact itself. Rows show "Signed in" / "Signed out" (with a copyable
+vendor sign-in command) or "Sign-in unknown"; providers without a vendor
+status command show nothing — their sign-in happens at launch.
 
 ## Models, reasoning, and abilities
 
