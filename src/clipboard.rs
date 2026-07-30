@@ -55,17 +55,16 @@ pub fn write_tiles(
     #[cfg(target_os = "macos")]
     {
         write_macos_pasteboard(&json, &external_text)?;
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(target_os = "macos"))]
-    let encoded = format!("{TILE_PREFIX_V2}{json}");
-    #[cfg(not(target_os = "macos"))]
-    let mut clipboard = arboard::Clipboard::new()?;
-    #[cfg(not(target_os = "macos"))]
-    clipboard.set_text(encoded)?;
-    #[cfg(not(target_os = "macos"))]
-    Ok(())
+    {
+        let encoded = format!("{TILE_PREFIX_V2}{json}");
+        let mut clipboard = arboard::Clipboard::new()?;
+        clipboard.set_text(encoded)?;
+        Ok(())
+    }
 }
 
 pub fn write_text(text: &str) -> anyhow::Result<()> {
@@ -82,7 +81,7 @@ pub fn write_text(text: &str) -> anyhow::Result<()> {
         if !pasteboard.setString_forType(&value, string_type) {
             anyhow::bail!("macOS rejected Adam's text");
         }
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(target_os = "macos"))]

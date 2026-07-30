@@ -1,0 +1,26 @@
+{"type":"thought","data":"The"}
+{"type":"thought","data":" user"}
+{"type":"thought","data":" wants"}
+{"type":"thought","data":" me"}
+{"type":"thought","data":" to"}
+{"type":"thought","data":" reply"}
+{"type":"thought","data":" with"}
+{"type":"thought","data":" exactly"}
+{"type":"thought","data":":"}
+{"type":"thought","data":" ADAM"}
+{"type":"thought","data":"_"}
+{"type":"thought","data":"FI"}
+{"type":"thought","data":"XT"}
+{"type":"thought","data":"URE"}
+{"type":"thought","data":"_"}
+{"type":"thought","data":"OK"}
+{"type":"thought","data":"\n"}
+{"type":"text","data":"AD"}
+{"type":"text","data":"AM"}
+{"type":"text","data":"_"}
+{"type":"text","data":"FI"}
+{"type":"text","data":"XT"}
+{"type":"text","data":"URE"}
+{"type":"text","data":"_"}
+{"type":"text","data":"OK"}
+{"type":"end","stopReason":"EndTurn","sessionId":"019fb014-6999-7f61-9b33-c39331fc4d73","requestId":"effb6b1e-0f72-48e4-a1fc-d4d3444ffad1","usage":{"input_tokens":2797,"cache_read_input_tokens":11136,"output_tokens":50,"reasoning_tokens":38,"total_tokens":13983},"num_turns":1,"total_cost_usd":0.0092348,"total_cost_usd_ticks":92348000,"modelUsage":{"grok-4.5-build":{"inputTokens":2797,"outputTokens":50,"cacheReadInputTokens":11136,"modelCalls":1,"costUSD":0.0092348}}}

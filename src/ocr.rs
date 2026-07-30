@@ -122,13 +122,13 @@ pub fn source_fingerprint(path: &Path) -> std::io::Result<String> {
     {
         use std::os::unix::fs::MetadataExt as _;
 
-        return Ok(format!(
+        Ok(format!(
             "{fingerprint}:dev={}:ino={}:ctime={}.{:09}",
             metadata.dev(),
             metadata.ino(),
             metadata.ctime(),
             metadata.ctime_nsec()
-        ));
+        ))
     }
 
     #[cfg(not(unix))]

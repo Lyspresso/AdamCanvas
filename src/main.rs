@@ -1,4 +1,5 @@
 fn main() -> eframe::Result {
+    adam_canvas::platform::initialize_ai_completion_notifications();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
     let mut wgpu_options = eframe::WgpuConfiguration {
@@ -20,7 +21,10 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Adam")
             .with_inner_size([1380.0, 860.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_min_inner_size([900.0, 600.0])
+            .with_fullsize_content_view(true)
+            .with_title_shown(false)
+            .with_titlebar_shown(false),
         ..Default::default()
     };
 

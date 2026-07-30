@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"019fb014-1c94-7631-b78a-e9d79d125880"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"ADAM_FIXTURE_OK"}}
+{"type":"turn.completed","usage":{"input_tokens":17871,"cached_input_tokens":0,"output_tokens":9,"reasoning_output_tokens":0}}

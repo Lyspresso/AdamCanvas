@@ -24,6 +24,16 @@ Notes and websites can be created directly in the app.
   tag, and one broad pile can watch many tiles with an optional timed rule.
 - Create standalone tag tiles, persistent AI-chat tiles, rich notes, and
   timed or instant auto-tag rules.
+- Chat with locally installed Codex, Grok, or Claude Code from a dedicated
+  three-pane workspace. Chats stream structured activity, keep a searchable
+  output library, queue safely at the four-run limit, and can resume supported
+  provider sessions.
+- Choose a permission stance per chat, review sensitive actions, stop live
+  runs, retry or regenerate turns, and revert completed Adam changes from
+  recorded checkpoints. Protected and out-of-scope canvas items remain gated.
+- Organize chats into projects and reusable characters, attach scoped
+  append-only memory, manage custom CLI agents and skills, and schedule
+  one-time or repeating prompts. Scheduled work is reconciled after relaunch.
 - Protect important tiles, filter globally by tag, inspect details and tag
   provenance, and restore items from Adam’s Trash.
 - Right-click a photo for an editable two-sentence visual description,
@@ -97,14 +107,53 @@ The model and culling test suite includes canvases above the requested
 measured with Instruments on the target Mac before making a
 hardware-specific guarantee.
 
+## AI chat
+
+Open **AI Chat** from the toolbar, or add an AI chat tile to the current
+canvas. Adam detects supported local CLI agents and launches each run directly,
+without a shell. Its three-pane chat workspace includes separate Home, Cowork,
+and Code conversation pools plus Cast, a character-centered view across all
+three. It also includes searchable history, projects, reusable skills and
+characters, an outputs library, durable queues, and local-time schedules. Completed
+background replies can appear as native macOS notifications and reopen the
+correct chat when clicked. Schedules run while Adam is open; overdue one-shots
+catch up, while repeating schedules use a 15-minute catch-up window.
+
+Adam projects only the chat’s permitted workspace context into a run. Tool
+requests return through a loopback-only authenticated server, are checked
+against the active run and permission stance, and are then applied on Adam’s
+UI thread. Secrets selected for a custom agent remain process environment
+values and are not written into chat history. Each run receives a short-lived
+credential and private process boundary; Stop, timeout, quit, and normal
+completion revoke it and clean up descendant processes. Adam reports a built-in
+agent as connected only after its registration command succeeds and an
+authenticated tool-list request reaches the live server.
+
+Chats can keep scoped, append-only memory through a character or project.
+Canvas changes are permission-gated, privacy-checked against the current page,
+and recorded with a durable rewind checkpoint before the agent is told they
+succeeded. The first chat message can generate a local title when a compatible
+local LM Studio endpoint is available; long histories can also be compacted
+locally, and memory observations can be synthesized into derived recall without
+altering their append-only log. No local-model enrichment is required for
+chatting.
+
+Chat transcripts and AI sidecars live alongside Adam’s app data in a separate
+`ai-chat-history` store. Canvas chat tiles are lightweight links: copying a tile
+creates a fresh chat shell, and deleting a chat permanently removes its linked
+tiles.
+
 ## Current preview boundaries
 
 Adam keeps the canvas light by showing bounded, static previews. PDFs and
 office documents use Quick Look thumbnails and open in their native app for
 full interaction; websites use a local card and open in the default browser.
-The Adam AI tile currently runs a private local stub that exercises
-permissions, protected tiles, approvals, checkpoints, and Trash without
-sending content to a cloud model.
+
+Custom CLI agents can participate in text chat, but Adam canvas, task, and
+memory tools currently require the built-in Codex, Grok, or Claude Code
+integrations. Provider model traffic follows the selected CLI’s own account,
+configuration, and privacy terms; Adam itself does not proxy prompts through
+an Adam-hosted model service.
 
 ## Build the app
 

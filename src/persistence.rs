@@ -65,10 +65,7 @@ impl AppPaths {
 
     pub fn ensure(&self) -> std::io::Result<()> {
         if let Some(error) = &self.initialization_error {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                error.clone(),
-            ));
+            return Err(std::io::Error::other(error.clone()));
         }
         fs::create_dir_all(&self.assets)?;
         fs::create_dir_all(&self.thumbnails)?;
@@ -375,6 +372,11 @@ enum SaveCommand {
         request_id: u64,
         workspace: Workspace,
     },
+    SaveBlocking {
+        request_id: u64,
+        workspace: Workspace,
+        completion: Sender<Result<(), String>>,
+    },
     Shutdown {
         request_id: u64,
         workspace: Workspace,
@@ -450,6 +452,26 @@ impl SaveWorker {
         self.completions.try_recv().ok()
     }
 
+    /// Persists one snapshot and waits for its durable completion receipt.
+    ///
+    /// This is reserved for cross-store transactions such as an AI-authored
+    /// canvas mutation. Ordinary edits continue to use the debounced worker.
+    pub fn save_blocking(&self, workspace: Workspace) -> Result<u64, String> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let (completion, receipt) = bounded(1);
+        self.sender
+            .send(SaveCommand::SaveBlocking {
+                request_id,
+                workspace,
+                completion,
+            })
+            .map_err(|_| "Adam's save worker is unavailable.".to_owned())?;
+        receipt
+            .recv()
+            .map_err(|_| "Adam's save worker stopped before confirming the save.".to_owned())??;
+        Ok(request_id)
+    }
+
     pub fn shutdown(&mut self, workspace: Workspace) {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let _ = self.sender.send(SaveCommand::Shutdown {
@@ -482,7 +504,15 @@ fn save_loop(
     receiver: Receiver<SaveCommand>,
     completions: Sender<SaveCompletion>,
 ) {
-    while let Ok(command) = receiver.recv() {
+    let mut pending = None;
+    loop {
+        let command = match pending.take() {
+            Some(command) => command,
+            None => match receiver.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
         match command {
             SaveCommand::Save {
                 mut request_id,
@@ -503,6 +533,10 @@ fn save_loop(
                             });
                             request_id = newer_id;
                             workspace = newer;
+                        }
+                        blocking @ SaveCommand::SaveBlocking { .. } => {
+                            pending = Some(blocking);
+                            break;
                         }
                         SaveCommand::Shutdown {
                             request_id: newer_id,
@@ -529,6 +563,18 @@ fn save_loop(
                 if shutdown {
                     break;
                 }
+            }
+            SaveCommand::SaveBlocking {
+                request_id,
+                workspace,
+                completion,
+            } => {
+                let outcome =
+                    save_workspace_atomic(&paths, &workspace).map_err(|error| format!("{error:#}"));
+                if let Err(error) = &outcome {
+                    log::error!("could not complete required Adam save {request_id}: {error}");
+                }
+                let _ = completion.send(outcome);
             }
             SaveCommand::Shutdown {
                 request_id,
@@ -780,6 +826,48 @@ mod tests {
         let completion = wait_for_completion(&worker, request_id);
 
         assert!(matches!(completion.outcome, SaveOutcome::Failed(_)));
+        worker.stop();
+    }
+
+    #[test]
+    fn blocking_save_is_durable_and_preserves_async_receipts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let mut worker = SaveWorker::start(paths.clone());
+        let mut first = Workspace::default();
+        first.active_page_mut().name = "queued".into();
+        let mut required = first.clone();
+        required.active_page_mut().name = "required".into();
+        let queued_request = worker
+            .request_tracked(first)
+            .expect("ordinary save should queue");
+
+        let required_request = worker
+            .save_blocking(required)
+            .expect("required save should reach durable storage");
+        let queued_completion = wait_for_completion(&worker, queued_request);
+
+        assert_ne!(queued_request, required_request);
+        assert_eq!(queued_completion.outcome, SaveOutcome::Saved);
+        assert_eq!(
+            load_workspace(&paths).unwrap().active_page().name,
+            "required"
+        );
+        worker.stop();
+    }
+
+    #[test]
+    fn blocking_save_reports_atomic_write_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let blocked_root = temporary.path().join("not-a-directory");
+        fs::write(&blocked_root, b"file blocks directory creation").unwrap();
+        let mut worker = SaveWorker::start(AppPaths::at(blocked_root));
+
+        let error = worker
+            .save_blocking(Workspace::default())
+            .expect_err("required save must report a durability failure");
+
+        assert!(!error.is_empty());
         worker.stop();
     }
 
