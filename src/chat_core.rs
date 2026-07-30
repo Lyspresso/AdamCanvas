@@ -82,6 +82,14 @@ pub enum PlanItemOrigin {
     #[default]
     Native,
     AppTools,
+    /// Missing `origin` on a pre-provenance `taskMutation`.
+    ///
+    /// Main matched those mutations against either row origin and created an
+    /// AppTools row only when no match existed. This sentinel preserves that
+    /// replay behavior without becoming a materialized plan-row origin.
+    #[doc(hidden)]
+    #[serde(skip)]
+    LegacyAppTools,
 }
 
 /// One row in a whole-plan snapshot.
@@ -276,7 +284,10 @@ pub enum ActivityKind {
     TaskMutation {
         #[serde(default)]
         kind: TaskMutationKind,
-        #[serde(default)]
+        #[serde(
+            default = "legacy_task_mutation_origin",
+            skip_serializing_if = "is_legacy_task_mutation_origin"
+        )]
         origin: PlanItemOrigin,
         #[serde(default)]
         content: String,
@@ -465,6 +476,14 @@ impl ActivityKind {
 
 const fn is_false(value: &bool) -> bool {
     !*value
+}
+
+const fn legacy_task_mutation_origin() -> PlanItemOrigin {
+    PlanItemOrigin::LegacyAppTools
+}
+
+const fn is_legacy_task_mutation_origin(origin: &PlanItemOrigin) -> bool {
+    matches!(origin, PlanItemOrigin::LegacyAppTools)
 }
 
 /// One immutable-identity record in a turn's ordered activity trace.
@@ -727,15 +746,6 @@ impl ActivityAccumulator {
             // in persisted progress. Preserve it for project_progress.
             return false;
         };
-        let projected_task_ids = progress
-            .items
-            .iter()
-            .filter_map(|item| {
-                item.task_id
-                    .as_ref()
-                    .map(|task_id| (item.origin, task_id.clone()))
-            })
-            .collect::<BTreeSet<_>>();
         let unresolved = self
             .events
             .iter()
@@ -747,7 +757,10 @@ impl ActivityAccumulator {
                     task_id: Some(task_id),
                     ..
                 } if content.trim().is_empty()
-                    && !projected_task_ids.contains(&(*origin, task_id.clone())) =>
+                    && !progress.items.iter().any(|item| {
+                        task_mutation_origin_matches(*origin, item.origin)
+                            && item.task_id.as_deref() == Some(task_id)
+                    }) =>
                 {
                     Some(event.id)
                 }
@@ -1211,14 +1224,15 @@ fn apply_task_mutation(
     status: Option<PlanItemStatus>,
     active_form: Option<&str>,
 ) -> bool {
+    let legacy = origin == PlanItemOrigin::LegacyAppTools;
     let by_id = task_id.and_then(|id| {
-        items
-            .iter()
-            .position(|item| item.origin == origin && item.task_id.as_deref() == Some(id))
+        items.iter().position(|item| {
+            task_mutation_origin_matches(origin, item.origin) && item.task_id.as_deref() == Some(id)
+        })
     });
-    let by_content = items
-        .iter()
-        .position(|item| item.origin == origin && item.content == content);
+    let by_content = items.iter().position(|item| {
+        task_mutation_origin_matches(origin, item.origin) && item.content == content
+    });
     let existing = match kind {
         // Creates with no stable id are distinct tasks even when their prose
         // matches. A repeated stable id is treated as an idempotent re-emit.
@@ -1253,9 +1267,20 @@ fn apply_task_mutation(
         active_form: active_form.map(str::to_owned),
         status: status.unwrap_or_default(),
         task_id: task_id.map(str::to_owned),
-        origin,
+        origin: if legacy {
+            PlanItemOrigin::AppTools
+        } else {
+            origin
+        },
     });
     true
+}
+
+fn task_mutation_origin_matches(
+    mutation_origin: PlanItemOrigin,
+    item_origin: PlanItemOrigin,
+) -> bool {
+    mutation_origin == PlanItemOrigin::LegacyAppTools || mutation_origin == item_origin
 }
 
 /// Resolves the progress visible in the inspector without mixing live and
@@ -2238,6 +2263,116 @@ mod tests {
             active_form: active_form.map(str::to_owned),
             result_summary: None,
         }
+    }
+
+    /// Replay oracle copied from main at 0d4d52f, before task mutations
+    /// carried explicit origin provenance.
+    fn main_era_apply_task_mutation(
+        items: &mut Vec<PlanItem>,
+        kind: TaskMutationKind,
+        content: &str,
+        task_id: Option<&str>,
+        status: Option<PlanItemStatus>,
+        active_form: Option<&str>,
+    ) -> bool {
+        let by_id = task_id.and_then(|id| {
+            items
+                .iter()
+                .position(|item| item.task_id.as_deref() == Some(id))
+        });
+        let by_content = items.iter().position(|item| item.content == content);
+        let existing = match kind {
+            TaskMutationKind::Create => by_id,
+            TaskMutationKind::Update => by_id.or(by_content),
+        };
+        if let Some(index) = existing {
+            let item = &mut items[index];
+            let before = item.clone();
+            if !content.is_empty() {
+                item.content = content.to_owned();
+            }
+            if let Some(task_id) = task_id {
+                item.task_id = Some(task_id.to_owned());
+            }
+            if let Some(status) = status {
+                item.status = status;
+            }
+            if let Some(active_form) = active_form {
+                item.active_form = Some(active_form.to_owned());
+            }
+            return *item != before;
+        }
+        if content.trim().is_empty() {
+            return false;
+        }
+        items.push(PlanItem {
+            content: content.to_owned(),
+            active_form: active_form.map(str::to_owned),
+            status: status.unwrap_or_default(),
+            task_id: task_id.map(str::to_owned),
+            origin: PlanItemOrigin::AppTools,
+        });
+        true
+    }
+
+    fn main_era_plan_items(events: &[ActivityEvent]) -> Option<Vec<PlanItem>> {
+        let mut folded = None::<Vec<PlanItem>>;
+        for event in events {
+            match &event.kind {
+                ActivityKind::PlanUpdate {
+                    tasks,
+                    compacted,
+                    replaces_native,
+                    ..
+                } => {
+                    folded = Some(
+                        folded
+                            .as_deref()
+                            .map(|existing| {
+                                merge_plan_snapshot(
+                                    existing,
+                                    tasks,
+                                    !*compacted || *replaces_native,
+                                )
+                            })
+                            .unwrap_or_else(|| tasks.clone()),
+                    );
+                }
+                ActivityKind::TaskMutation {
+                    kind,
+                    content,
+                    task_id,
+                    status,
+                    active_form,
+                    ..
+                } => {
+                    if let Some(items) = folded.as_mut() {
+                        main_era_apply_task_mutation(
+                            items,
+                            *kind,
+                            content,
+                            task_id.as_deref(),
+                            *status,
+                            active_form.as_deref(),
+                        );
+                    } else {
+                        let mut items = Vec::new();
+                        if main_era_apply_task_mutation(
+                            &mut items,
+                            *kind,
+                            content,
+                            task_id.as_deref(),
+                            *status,
+                            active_form.as_deref(),
+                        ) {
+                            folded = Some(items);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        folded
     }
 
     #[test]
@@ -3873,16 +4008,16 @@ mod tests {
     }
 
     #[test]
-    fn task_mutation_origin_defaults_native_and_round_trips() {
-        let decoded: ActivityKind = serde_json::from_str(
+    fn task_mutation_origin_distinguishes_legacy_absence_from_explicit_origins() {
+        let legacy: ActivityKind = serde_json::from_str(
             r#"{"type":"taskMutation","kind":"update","content":"Existing","taskId":"1"}"#,
         )
         .unwrap();
         assert_eq!(
-            decoded,
+            legacy,
             ActivityKind::TaskMutation {
                 kind: TaskMutationKind::Update,
-                origin: PlanItemOrigin::Native,
+                origin: PlanItemOrigin::LegacyAppTools,
                 content: "Existing".into(),
                 task_id: Some("1".into()),
                 status: None,
@@ -3891,11 +4026,43 @@ mod tests {
             }
         );
 
-        let encoded = serde_json::to_string(&decoded).unwrap();
+        let encoded = serde_json::to_string(&legacy).unwrap();
+        assert!(!encoded.contains(r#""origin""#));
+        assert!(!encoded.contains("legacyAppTools"));
+        assert_eq!(
+            serde_json::from_str::<ActivityKind>(&encoded).unwrap(),
+            legacy
+        );
+        let materialized = newest_plan(&[event(1, 1, legacy)]).unwrap().items;
+        assert_eq!(materialized[0].origin, PlanItemOrigin::AppTools);
+        assert!(
+            materialized
+                .iter()
+                .all(|item| item.origin != PlanItemOrigin::LegacyAppTools)
+        );
+        let snapshot = serde_json::to_string(&ActivityKind::PlanUpdate {
+            tasks: materialized,
+            authoritative: true,
+            compacted: true,
+            replaces_native: false,
+        })
+        .unwrap();
+        assert!(!snapshot.contains("legacyAppTools"));
+        assert!(snapshot.contains(r#""origin":"appTools""#));
+
+        let native = task_mutation_with_origin(
+            TaskMutationKind::Update,
+            PlanItemOrigin::Native,
+            "Native task",
+            Some("native-1"),
+            Some(PlanItemStatus::Completed),
+            None,
+        );
+        let encoded = serde_json::to_string(&native).unwrap();
         assert!(encoded.contains(r#""origin":"native""#));
         assert_eq!(
             serde_json::from_str::<ActivityKind>(&encoded).unwrap(),
-            decoded
+            native
         );
 
         let app_tools = task_mutation_with_origin(
@@ -3910,6 +4077,173 @@ mod tests {
             serde_json::from_str::<ActivityKind>(&serde_json::to_string(&app_tools).unwrap())
                 .unwrap(),
             app_tools
+        );
+    }
+
+    #[test]
+    fn legacy_task_replay_updates_existing_app_row_without_a_stale_duplicate() {
+        let saved = r#"[
+            {
+                "kind": {
+                    "type": "planUpdate",
+                    "tasks": [{
+                        "content": "Fix tests",
+                        "status": "inProgress",
+                        "taskId": "task-1",
+                        "origin": "appTools"
+                    }],
+                    "compacted": true
+                }
+            },
+            {
+                "kind": {
+                    "type": "taskMutation",
+                    "kind": "update",
+                    "content": "Fix tests",
+                    "taskId": "task-1",
+                    "status": "completed"
+                }
+            }
+        ]"#;
+        let events: Vec<ActivityEvent> = serde_json::from_str(saved).unwrap();
+
+        let projected = newest_plan(&events).expect("legacy saved checklist");
+        assert_eq!(
+            projected.items,
+            main_era_plan_items(&events).expect("main-era replay oracle")
+        );
+        assert_eq!(projected.items.len(), 1);
+        assert_eq!(projected.items[0].content, "Fix tests");
+        assert_eq!(projected.items[0].status, PlanItemStatus::Completed);
+        assert_eq!(projected.items[0].origin, PlanItemOrigin::AppTools);
+
+        let encoded = serde_json::to_value(&events).unwrap();
+        assert!(
+            encoded[1]["kind"].get("origin").is_none(),
+            "re-saving must preserve the legacy missing-origin marker"
+        );
+        let replayed: Vec<ActivityEvent> = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            newest_plan(&replayed).unwrap().items,
+            projected.items,
+            "a save cycle must not make the migrated projection drift"
+        );
+    }
+
+    #[test]
+    fn legacy_native_update_compacts_and_reloads_as_the_main_era_projection() {
+        let legacy_update: ActivityKind = serde_json::from_str(
+            r#"{
+                "type": "taskMutation",
+                "kind": "update",
+                "content": "",
+                "taskId": "native-1",
+                "status": "completed"
+            }"#,
+        )
+        .unwrap();
+        let original = vec![
+            event(
+                1,
+                1,
+                ActivityKind::PlanUpdate {
+                    tasks: vec![PlanItem {
+                        content: "Run native task".into(),
+                        task_id: Some("native-1".into()),
+                        status: PlanItemStatus::InProgress,
+                        origin: PlanItemOrigin::Native,
+                        ..PlanItem::default()
+                    }],
+                    authoritative: false,
+                    compacted: false,
+                    replaces_native: false,
+                },
+            ),
+            event(2, 2, legacy_update),
+        ];
+        let expected =
+            main_era_plan_items(&original).expect("main-era replay updates the native row");
+
+        let mut accumulator = ActivityAccumulator::with_max_events(1);
+        accumulator.ingest_many(original);
+
+        assert_eq!(
+            accumulator.len(),
+            1,
+            "a legacy update resolved against a Native row must not remain as unresolved provenance"
+        );
+        assert!(matches!(
+            accumulator.events[0].kind,
+            ActivityKind::PlanUpdate {
+                compacted: true,
+                ..
+            }
+        ));
+        assert_eq!(newest_plan(&accumulator.events).unwrap().items, expected);
+        assert_eq!(expected.len(), 1);
+        assert_eq!(expected[0].origin, PlanItemOrigin::Native);
+        assert_eq!(expected[0].status, PlanItemStatus::Completed);
+
+        let saved = serde_json::to_string(&accumulator.events_for_persistence()).unwrap();
+        assert!(!saved.contains("legacyAppTools"));
+        let reloaded: Vec<ActivityEvent> = serde_json::from_str(&saved).unwrap();
+        assert_eq!(newest_plan(&reloaded).unwrap().items, expected);
+        assert!(
+            newest_plan(&reloaded)
+                .unwrap()
+                .items
+                .iter()
+                .all(|item| item.origin != PlanItemOrigin::LegacyAppTools)
+        );
+    }
+
+    #[test]
+    fn legacy_task_replay_preserves_a_side_task_across_native_replacement() {
+        let saved = r#"[
+            {
+                "kind": {
+                    "type": "taskMutation",
+                    "kind": "create",
+                    "content": "Check side effects",
+                    "taskId": "side-1",
+                    "status": "pending"
+                }
+            },
+            {
+                "kind": {
+                    "type": "planUpdate",
+                    "tasks": [{
+                        "content": "Run main task",
+                        "status": "completed",
+                        "taskId": "native-1",
+                        "origin": "native"
+                    }]
+                }
+            }
+        ]"#;
+        let events: Vec<ActivityEvent> = serde_json::from_str(saved).unwrap();
+
+        let projected = newest_plan(&events).expect("legacy side task and native plan");
+        assert_eq!(
+            projected.items,
+            main_era_plan_items(&events).expect("main-era replay oracle")
+        );
+        assert_eq!(projected.items.len(), 2);
+        assert_eq!(projected.items[0].content, "Run main task");
+        assert_eq!(projected.items[0].origin, PlanItemOrigin::Native);
+        assert_eq!(projected.items[1].content, "Check side effects");
+        assert_eq!(projected.items[1].origin, PlanItemOrigin::AppTools);
+
+        let encoded = serde_json::to_value(&events).unwrap();
+        assert!(
+            encoded[0]["kind"].get("origin").is_none(),
+            "legacy task provenance must not be rewritten ambiguously"
+        );
+        let replayed: Vec<ActivityEvent> = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            newest_plan(&replayed).unwrap().items,
+            projected.items,
+            "native replacement after a save cycle must retain the side task"
         );
     }
 
