@@ -66,6 +66,31 @@ Desktop-launch discovery checks Adam’s process `PATH`, `~/.local/bin`,
 entered by absolute path as a Custom CLI; Adam deliberately does not execute a
 login shell just to discover commands.
 
+## Detection preflight (Agents panel)
+
+The Agents panel (quick-bar `◎`, module `src/agents_panel.rs`) shows every
+provider with a live availability status so a missing CLI is visible before
+Send instead of after it fails. Statuses:
+
+- **Not detected** — the binary was not found on the discovery paths above.
+- **Detected vX.Y.Z** — found, but no captured runtime contract covers this
+  version; provider defaults apply and no tuning controls are exposed.
+- **Detected vX.Y.Z · verified** — found and the version matches a captured
+  contract row in `runtime_tuning_profile`.
+
+Detection reuses the launch path's own resolver and version cache through the
+additive accessor `ai::probe_installed_provider` — what the panel shows and
+what a turn runs cannot drift. Scans run on a background worker
+(`adam-agents-scan`); the panel's Refresh bypasses the version cache so an
+upgraded binary re-probes. The chat composer surfaces a pre-Send banner from
+the same cached snapshot (LM Studio is exempt while an endpoint is
+configured, and Automatic only warns when all four CLI candidates are
+missing). The panel is read-only detection plus install guidance: install
+commands are compiled-in copy-only strings from `AGENT_PROVIDERS`, never
+executed, and never sourced from user-editable data. Sign-in status is a
+planned second axis; one-click install is planned behind the same
+compiled-in allowlist.
+
 ## Models, reasoning, and abilities
 
 Provider controls live beside the composer because they describe the next

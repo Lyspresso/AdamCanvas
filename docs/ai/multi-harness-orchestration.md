@@ -65,6 +65,12 @@ local endpoints — see §5).
 
 ## 5. Future: two coordinated agents inside Adam (design research only)
 
+> Shipped adjacent to (not from) this section, 2026-07-30: the Agents panel
+> (`src/agents_panel.rs`, branch `work/claude-agents`) — read-only provider
+> detection and install guidance. None of the seven gates below are touched;
+> auto-install execution and sign-in probes remain future work, and seat
+> eligibility surfacing can later build on its verified-version statuses.
+
 Goal stated by Lydia 2026-07-30: eventually either (a) a standing PM arrangement where
 one agent leads another (as Claude leads Codex on this repo today), and/or (b) **Adam
 itself** can run two AI agents that collaborate this way on any project.
