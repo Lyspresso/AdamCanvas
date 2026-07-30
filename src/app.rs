@@ -1,5 +1,5 @@
 use crate::{
-    ai::{AiEngine, AiEvent, AiRunRequest},
+    ai::{AiEngine, AiEvent, AiFailureKind, AiRunRequest},
     ai_prompt::{
         BuiltPrompt, HistoricalTurn, HistoryRole, PromptAttachment, PromptBudget, PromptContinuity,
         PromptInput as HarnessPromptInput, PromptNotices, SystemDelivery, SystemInstructions,
@@ -10,9 +10,10 @@ use crate::{
     automation::{ReconcileRequest, canvas_objects_from_workspace, reconcile_workspace},
     chat_core::{
         ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, PlanItemStatus,
-        ProgressSource, StreamDialect, SystemPromptChannel, assistant_flat_text,
-        capability_profile, current_work_label, newest_plan, project_artifacts, project_context,
-        project_progress, project_usage,
+        ProgressSource, RetryHint, StreamDialect, SubagentStatus, SystemPromptChannel, TurnStatus,
+        assistant_flat_text, capability_profile, current_work_label, latest_turn_status,
+        newest_plan, project_artifacts, project_context, project_progress, project_subagents,
+        project_usage,
     },
     clipboard::{self, PasteContent},
     domain::{
@@ -404,6 +405,8 @@ struct AiChatRuntime {
     active_provider_id: Option<String>,
     active_model: Option<String>,
     active_provider_profile: Option<AiProviderPreferences>,
+    last_provider_id: Option<String>,
+    last_provider_profile: Option<AiProviderPreferences>,
     active_started_at: Option<Instant>,
     active_used_resume: bool,
     active_had_productive_activity: bool,
@@ -418,6 +421,7 @@ struct AiChatRuntime {
     show_inspector: bool,
     workspace_files: Vec<AiWorkspaceFile>,
     file_preview: Option<AiFilePreview>,
+    show_subagents_detail: bool,
     show_all_outputs: bool,
 }
 
@@ -430,6 +434,8 @@ impl Default for AiChatRuntime {
             active_provider_id: None,
             active_model: None,
             active_provider_profile: None,
+            last_provider_id: None,
+            last_provider_profile: None,
             active_started_at: None,
             active_used_resume: false,
             active_had_productive_activity: false,
@@ -444,6 +450,7 @@ impl Default for AiChatRuntime {
             show_inspector: true,
             workspace_files: Vec::new(),
             file_preview: None,
+            show_subagents_detail: false,
             show_all_outputs: false,
         }
     }
@@ -471,7 +478,10 @@ struct AiWorkspaceUiAction {
     reveal_file: Option<PathBuf>,
     reveal_attachment: Option<PathBuf>,
     close_file_preview: bool,
+    open_subagents_detail: bool,
+    close_subagents_detail: bool,
     toggle_all_outputs: bool,
+    retry_turn: Option<RetryHint>,
 }
 
 struct AiTilePreview {
@@ -1013,6 +1023,7 @@ impl AdamApp {
                 }
             }
         };
+        let persistence_base = workspace.clone();
         let mut ai_recovery_changed = false;
         let recovery_time = unix_now();
         for conversation in workspace.domain.conversations.conversations.values_mut() {
@@ -1036,7 +1047,7 @@ impl AdamApp {
                 ai_recovery_changed = true;
             }
         }
-        let saves = SaveWorker::start(paths.clone());
+        let saves = SaveWorker::start_with_base(paths.clone(), persistence_base);
         let previews = PreviewCache::start(paths.clone(), creation.egui_ctx.clone());
         let structured_previews = StructuredPreviewCache::start(creation.egui_ctx.clone());
         let (image_paste_jobs, image_paste_results) =
@@ -6032,10 +6043,10 @@ impl AdamApp {
         let show_inspector = runtime.show_inspector && root.available_width() >= 720.0;
 
         if show_inspector {
-            let previewing_file = runtime.file_preview.is_some();
+            let showing_detail = runtime.file_preview.is_some() || runtime.show_subagents_detail;
             egui::Panel::right("adam-ai-inspector")
-                .default_size(if previewing_file { 480.0 } else { 332.0 })
-                .size_range(if previewing_file {
+                .default_size(if showing_detail { 480.0 } else { 332.0 })
+                .size_range(if showing_detail {
                     400.0..=680.0
                 } else {
                     300.0..=440.0
@@ -6055,6 +6066,15 @@ impl AdamApp {
                             &runtime,
                             &mut action,
                             &mut self.markdown_cache,
+                            colors,
+                        );
+                    } else if runtime.show_subagents_detail {
+                        let events = projected_ai_activity(&conversation, &runtime);
+                        render_ai_subagents_detail(
+                            ui,
+                            conversation_id,
+                            &project_subagents(&events),
+                            &mut action,
                             colors,
                         );
                     } else {
@@ -6183,6 +6203,16 @@ impl AdamApp {
         {
             runtime.file_preview = None;
         }
+        if action.open_subagents_detail {
+            let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+            runtime.file_preview = None;
+            runtime.show_subagents_detail = true;
+        }
+        if action.close_subagents_detail
+            && let Some(runtime) = self.chat_runtimes.get_mut(&conversation_id)
+        {
+            runtime.show_subagents_detail = false;
+        }
         if action.toggle_all_outputs
             && let Some(runtime) = self.chat_runtimes.get_mut(&conversation_id)
         {
@@ -6195,6 +6225,7 @@ impl AdamApp {
             };
             let runtime = self.chat_runtimes.entry(conversation_id).or_default();
             runtime.file_preview = Some(preview);
+            runtime.show_subagents_detail = false;
             runtime.inspector_notice = None;
         }
         if let Some(path) = action.preview_attachment {
@@ -6204,6 +6235,7 @@ impl AdamApp {
             };
             let runtime = self.chat_runtimes.entry(conversation_id).or_default();
             runtime.file_preview = Some(preview);
+            runtime.show_subagents_detail = false;
             runtime.inspector_notice = None;
         }
         if let Some(path) = action.reveal_file {
@@ -6264,6 +6296,9 @@ impl AdamApp {
         }
         if action.stop {
             self.stop_ai_turn(conversation_id);
+        }
+        if let Some(retry) = action.retry_turn {
+            self.retry_ai_turn(conversation_id, retry, context);
         }
         if let Some(queued_id) = action.remove_queued_turn {
             if let Some(conversation) = self
@@ -6458,6 +6493,85 @@ impl AdamApp {
             let runtime = self.chat_runtimes.entry(conversation_id).or_default();
             runtime.draft.clear();
             runtime.pending_attachments.clear();
+        }
+    }
+
+    fn retry_ai_turn(&mut self, conversation_id: Uuid, retry: RetryHint, context: &Context) {
+        if self.ai_engine.is_conversation_running(conversation_id)
+            || self
+                .chat_runtimes
+                .get(&conversation_id)
+                .is_some_and(|runtime| runtime.active_turn.is_some())
+        {
+            return;
+        }
+        let Some(conversation) = self
+            .workspace
+            .domain
+            .conversations
+            .conversations
+            .get(&conversation_id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(previous) = conversation
+            .messages()
+            .iter()
+            .rev()
+            .find(|message| message.role == MessageRole::User)
+            .cloned()
+        else {
+            self.chat_runtimes
+                .entry(conversation_id)
+                .or_default()
+                .inspector_notice = Some("There is no earlier request to retry.".into());
+            return;
+        };
+
+        let (provider_id, mut provider_profile) = self
+            .chat_runtimes
+            .get(&conversation_id)
+            .and_then(|runtime| {
+                runtime
+                    .last_provider_id
+                    .clone()
+                    .zip(runtime.last_provider_profile.clone())
+            })
+            .unwrap_or_else(|| {
+                let provider_id = conversation.settings.provider_id.clone();
+                let profile = conversation.settings.profile_for(&provider_id);
+                (provider_id, profile)
+            });
+        if retry == RetryHint::AllowWebAndRetry {
+            provider_profile.set_feature(AI_FEATURE_WEB_SEARCH, Some(true));
+        }
+        {
+            let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+            runtime.error = None;
+            runtime.inspector_notice = Some(match retry {
+                RetryHint::Retry => "Retrying the request…".into(),
+                RetryHint::AllowWebAndRetry => {
+                    "Retrying with read-only web access for this run…".into()
+                }
+            });
+        }
+        if !self.launch_ai_turn(
+            conversation_id,
+            previous.text,
+            previous.attachments,
+            AiTurnLaunch {
+                provider_override: Some(provider_id),
+                model_override: Some(provider_profile.model.clone()),
+                provider_profile_override: Some(provider_profile),
+                user_message_already_committed: true,
+            },
+            context,
+        ) {
+            self.chat_runtimes
+                .entry(conversation_id)
+                .or_default()
+                .inspector_notice = Some("The retry could not be started.".into());
         }
     }
 
@@ -6693,7 +6807,9 @@ impl AdamApp {
                 runtime.active_turn = Some(turn_id);
                 runtime.active_provider_id = Some(provider_id.clone());
                 runtime.active_model = Some(model.clone());
-                runtime.active_provider_profile = Some(provider_profile);
+                runtime.active_provider_profile = Some(provider_profile.clone());
+                runtime.last_provider_id = Some(provider_id.clone());
+                runtime.last_provider_profile = Some(provider_profile);
                 runtime.active_started_at = Some(Instant::now());
                 runtime.active_used_resume = resume_session_id.is_some();
                 runtime.active_had_productive_activity = false;
@@ -7041,7 +7157,7 @@ impl AdamApp {
                     refresh_folders.insert(conversation_id);
                     drain_queues.insert(conversation_id);
                 }
-                AiEvent::Failed { message, .. } => {
+                AiEvent::Failed { kind, message, .. } => {
                     let retry_message = self
                         .workspace
                         .domain
@@ -7110,7 +7226,13 @@ impl AdamApp {
                                 message: message.clone(),
                             },
                         ));
-                        push_ai_activity(runtime, "Turn failed".into());
+                        let terminal_label = match kind {
+                            AiFailureKind::PermissionBlocked => "Permission needed",
+                            AiFailureKind::TimedOut => "Turn timed out",
+                            AiFailureKind::MaxTurnsReached => "Turn limit reached",
+                            AiFailureKind::ProviderError => "Provider error",
+                        };
+                        push_ai_activity(runtime, terminal_label.into());
                         let partial = std::mem::take(&mut runtime.streamed_text);
                         if assistant_flat_text(&runtime.activity_trace.events)
                             .trim()
@@ -7126,7 +7248,7 @@ impl AdamApp {
                                 ));
                         }
                         let commit_text = if partial.trim().is_empty() {
-                            format!("**Turn failed.**\n\n{message}")
+                            format!("**{terminal_label}.**\n\n{message}")
                         } else {
                             format!("{partial}\n\n_Response interrupted: {message}_")
                         };
@@ -11715,7 +11837,12 @@ fn push_ai_activity(runtime: &mut AiChatRuntime, message: String) {
 fn ai_activity_summary(kind: &ActivityKind) -> String {
     match kind {
         ActivityKind::AssistantText { .. } => "Writing response…".into(),
-        ActivityKind::Thinking { .. } => "Thinking…".into(),
+        ActivityKind::Thinking { text } => text
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(|line| format!("Reasoning · {}", truncate(line.trim(), 76)))
+            .unwrap_or_else(|| "Reasoning".into()),
         ActivityKind::ToolCall { name, .. } => format!("Using {name}…"),
         ActivityKind::ToolResult { is_error, .. } => {
             if *is_error {
@@ -11773,8 +11900,33 @@ fn ai_activity_summary(kind: &ActivityKind) -> String {
         ActivityKind::PermissionPrompt { tool, .. } => {
             format!("Waiting for permission · {tool}")
         }
+        ActivityKind::Subagent { label, status, .. } => {
+            let state = match status {
+                SubagentStatus::Pending => "queued",
+                SubagentStatus::InProgress => "working",
+                SubagentStatus::Completed => "done",
+                SubagentStatus::Failed => "failed",
+                SubagentStatus::Cancelled => "cancelled",
+                SubagentStatus::PermissionBlocked => "permission needed",
+            };
+            format!(
+                "Subagent · {} · {state}",
+                if label.trim().is_empty() {
+                    "unnamed".into()
+                } else {
+                    truncate(label, 64)
+                }
+            )
+        }
         ActivityKind::Usage { .. } => "Usage updated".into(),
         ActivityKind::TurnError { message } => format!("Error: {}", truncate(message, 72)),
+        ActivityKind::TurnStatus {
+            status, message, ..
+        } => message
+            .as_deref()
+            .filter(|message| !message.trim().is_empty())
+            .map(|message| truncate(message, 72))
+            .unwrap_or_else(|| format!("Turn · {status:?}")),
         ActivityKind::SessionInfo { model, .. } => model
             .as_deref()
             .map(|model| format!("Session · {model}"))
@@ -11789,7 +11941,8 @@ fn ai_trace_has_productive_activity(events: &[HarnessActivityEvent]) -> bool {
         }
         ActivityKind::Usage { .. }
         | ActivityKind::SessionInfo { .. }
-        | ActivityKind::TurnError { .. } => false,
+        | ActivityKind::TurnError { .. }
+        | ActivityKind::TurnStatus { .. } => false,
         ActivityKind::ToolCall { .. }
         | ActivityKind::ToolResult { .. }
         | ActivityKind::Command { .. }
@@ -11799,7 +11952,8 @@ fn ai_trace_has_productive_activity(events: &[HarnessActivityEvent]) -> bool {
         | ActivityKind::TaskMutation { .. }
         | ActivityKind::HostMutation { .. }
         | ActivityKind::HostRead { .. }
-        | ActivityKind::PermissionPrompt { .. } => true,
+        | ActivityKind::PermissionPrompt { .. }
+        | ActivityKind::Subagent { .. } => true,
     })
 }
 
@@ -12044,6 +12198,12 @@ fn render_ai_inspector(
     let projected_events = projected_ai_activity(conversation, runtime);
     let progress = project_progress(&persisted_events, live_events);
     let live_progress = project_progress(&[], live_events);
+    let subagents = project_subagents(&projected_events);
+    let terminal = if runtime.active_turn.is_some() {
+        latest_turn_status(live_events)
+    } else {
+        latest_turn_status(&projected_events)
+    };
     let outputs = project_artifacts(&projected_events);
     let context_items = project_context(&projected_events);
     let usage = project_usage(&projected_events);
@@ -12179,16 +12339,36 @@ fn render_ai_inspector(
                         && progress.pending == 0
                     {
                         ui.add_space(4.0);
-                        ui.label(
-                            RichText::new("Task complete.")
-                                .size(10.5)
-                                .color(colors.tertiary_text),
-                        );
+                        let (summary, color) = if progress.cancelled > 0 {
+                            (
+                                format!(
+                                    "{} task{} stopped.",
+                                    progress.cancelled,
+                                    if progress.cancelled == 1 { "" } else { "s" }
+                                ),
+                                colors.danger,
+                            )
+                        } else {
+                            ("Task complete.".to_owned(), colors.tertiary_text)
+                        };
+                        ui.label(RichText::new(summary).size(10.5).color(color));
                     }
                 }
 
                 render_ai_inspector_activity(ui, live_events, colors);
             });
+
+            if !subagents.is_empty() {
+                ui.add_space(4.0);
+                render_ai_subagents_panel(ui, conversation_id, &subagents, action, colors);
+            }
+
+            if let Some(terminal) = terminal.as_ref()
+                && !terminal.status.is_successful()
+            {
+                ui.add_space(4.0);
+                render_ai_terminal_card(ui, conversation_id, terminal, action, colors);
+            }
 
             ui.add_space(4.0);
             egui::CollapsingHeader::new(format!("Outputs · {}", outputs.len()))
@@ -12595,19 +12775,506 @@ fn render_ai_workspace_entry(
     });
 }
 
+fn render_ai_subagents_panel(
+    ui: &mut Ui,
+    conversation_id: Uuid,
+    subagents: &[crate::chat_core::SubagentProjection],
+    action: &mut AiWorkspaceUiAction,
+    colors: Theme,
+) {
+    let working = subagents
+        .iter()
+        .filter(|agent| {
+            matches!(
+                agent.status,
+                SubagentStatus::Pending | SubagentStatus::InProgress
+            )
+        })
+        .count();
+    let done = subagents
+        .iter()
+        .filter(|agent| agent.status == SubagentStatus::Completed)
+        .count();
+    let stopped = subagents
+        .iter()
+        .filter(|agent| {
+            matches!(
+                agent.status,
+                SubagentStatus::Failed
+                    | SubagentStatus::Cancelled
+                    | SubagentStatus::PermissionBlocked
+            )
+        })
+        .count();
+
+    egui::CollapsingHeader::new(format!("Subagents · {}", subagents.len()))
+        .id_salt(("ai-inspector-subagents", conversation_id))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("{working} working"))
+                        .size(11.5)
+                        .strong()
+                        .color(if working > 0 {
+                            colors.accent
+                        } else {
+                            colors.secondary_text
+                        }),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .small_button("View all")
+                        .on_hover_text("Open the full subagent panel")
+                        .clicked()
+                    {
+                        action.open_subagents_detail = true;
+                    }
+                    ui.label(
+                        RichText::new(format!("{done} done"))
+                            .size(11.0)
+                            .color(colors.secondary_text),
+                    );
+                    if stopped > 0 {
+                        ui.label(
+                            RichText::new(format!("{stopped} stopped"))
+                                .size(11.0)
+                                .color(colors.danger),
+                        );
+                    }
+                });
+            });
+            ui.add_space(5.0);
+
+            let ids = subagents
+                .iter()
+                .map(|agent| agent.id.as_str())
+                .collect::<HashSet<_>>();
+            let mut children = BTreeMap::<&str, Vec<usize>>::new();
+            let mut roots = Vec::new();
+            for (index, agent) in subagents.iter().enumerate() {
+                match agent
+                    .parent_id
+                    .as_deref()
+                    .filter(|parent| ids.contains(parent) && *parent != agent.id)
+                {
+                    Some(parent) => children.entry(parent).or_default().push(index),
+                    None => roots.push(index),
+                }
+            }
+            let mut rendered = HashSet::<&str>::new();
+            for index in roots {
+                render_ai_subagent_branch(
+                    ui,
+                    subagents,
+                    &children,
+                    index,
+                    0,
+                    &mut rendered,
+                    colors,
+                );
+            }
+            // Malformed provider cycles or missing roots must remain visible.
+            for index in 0..subagents.len() {
+                if !rendered.contains(subagents[index].id.as_str()) {
+                    render_ai_subagent_branch(
+                        ui,
+                        subagents,
+                        &children,
+                        index,
+                        0,
+                        &mut rendered,
+                        colors,
+                    );
+                }
+            }
+        });
+}
+
+fn render_ai_subagent_branch<'a>(
+    ui: &mut Ui,
+    subagents: &'a [crate::chat_core::SubagentProjection],
+    children: &BTreeMap<&'a str, Vec<usize>>,
+    index: usize,
+    depth: usize,
+    rendered: &mut HashSet<&'a str>,
+    colors: Theme,
+) {
+    let agent = &subagents[index];
+    if !rendered.insert(agent.id.as_str()) {
+        return;
+    }
+    let (glyph, status_label, color) = match agent.status {
+        SubagentStatus::Pending => ("○", "Queued", colors.tertiary_text),
+        SubagentStatus::InProgress => ("●", "Working", colors.accent),
+        SubagentStatus::Completed => ("✓", "Done", colors.accent),
+        SubagentStatus::Failed => ("!", "Failed", colors.danger),
+        SubagentStatus::Cancelled => ("×", "Cancelled", colors.tertiary_text),
+        SubagentStatus::PermissionBlocked => ("!", "Permission needed", colors.danger),
+    };
+    ui.horizontal(|ui| {
+        ui.add_space((depth.min(6) as f32) * 12.0);
+        ui.label(RichText::new(glyph).size(11.0).color(color));
+        ui.vertical(|ui| {
+            let label = if agent.label.trim().is_empty() {
+                "Subagent"
+            } else {
+                &agent.label
+            };
+            ui.label(
+                RichText::new(truncate(label, 62))
+                    .size(11.5)
+                    .strong()
+                    .color(colors.secondary_text),
+            );
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(status_label).size(9.5).color(color));
+                if let Some(model) = agent.model.as_deref() {
+                    ui.label(
+                        RichText::new(model)
+                            .size(9.5)
+                            .monospace()
+                            .color(colors.tertiary_text),
+                    );
+                }
+                if let Some(tool_calls) = agent.tool_calls {
+                    ui.label(
+                        RichText::new(format!(
+                            "{tool_calls} tool call{}",
+                            if tool_calls == 1 { "" } else { "s" }
+                        ))
+                        .size(9.5)
+                        .color(colors.tertiary_text),
+                    );
+                }
+                if let Some(duration_ms) = agent.duration_ms {
+                    ui.label(
+                        RichText::new(format!("{:.1}s", duration_ms as f64 / 1_000.0))
+                            .size(9.5)
+                            .monospace()
+                            .color(colors.tertiary_text),
+                    );
+                }
+            });
+            if let Some(detail) = agent
+                .detail
+                .as_deref()
+                .filter(|detail| !detail.trim().is_empty())
+            {
+                ui.label(RichText::new(truncate(detail, 96)).size(10.0).color(
+                    if matches!(
+                        agent.status,
+                        SubagentStatus::Failed | SubagentStatus::PermissionBlocked
+                    ) {
+                        colors.danger
+                    } else {
+                        colors.tertiary_text
+                    },
+                ));
+            }
+            ui.label(
+                RichText::new(truncate(&agent.id, 38))
+                    .size(8.5)
+                    .monospace()
+                    .color(colors.tertiary_text),
+            );
+        });
+    });
+    ui.add_space(4.0);
+
+    if depth < 8
+        && let Some(child_indices) = children.get(agent.id.as_str())
+    {
+        for child_index in child_indices {
+            render_ai_subagent_branch(
+                ui,
+                subagents,
+                children,
+                *child_index,
+                depth + 1,
+                rendered,
+                colors,
+            );
+        }
+    }
+}
+
+fn render_ai_subagents_detail(
+    ui: &mut Ui,
+    conversation_id: Uuid,
+    subagents: &[crate::chat_core::SubagentProjection],
+    action: &mut AiWorkspaceUiAction,
+    colors: Theme,
+) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Subagents").size(15.0).strong());
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui
+                .button("×")
+                .on_hover_text("Close subagent panel")
+                .clicked()
+            {
+                action.close_subagents_detail = true;
+            }
+        });
+    });
+    ui.add_space(6.0);
+
+    let active = subagents
+        .iter()
+        .filter(|agent| !agent.status.is_terminal())
+        .collect::<Vec<_>>();
+    let finished = subagents
+        .iter()
+        .filter(|agent| agent.status.is_terminal())
+        .collect::<Vec<_>>();
+    ui.label(
+        RichText::new(format!(
+            "{} working · {} done or stopped",
+            active.len(),
+            finished.len()
+        ))
+        .size(10.5)
+        .color(colors.secondary_text),
+    );
+    ui.add_space(7.0);
+    ui.separator();
+    ui.add_space(8.0);
+
+    egui::ScrollArea::vertical()
+        .id_salt(("ai-subagents-detail", conversation_id))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.label(RichText::new("Active").size(11.5).strong());
+            ui.add_space(5.0);
+            if active.is_empty() {
+                ui.label(
+                    RichText::new("No subagents are currently working.")
+                        .size(10.5)
+                        .color(colors.tertiary_text),
+                );
+            } else {
+                for agent in active {
+                    render_ai_subagent_detail_row(ui, agent, colors);
+                    ui.add_space(6.0);
+                }
+            }
+
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(format!("Done · {}", finished.len()))
+                    .size(11.5)
+                    .strong(),
+            );
+            ui.add_space(5.0);
+            if finished.is_empty() {
+                ui.label(
+                    RichText::new("Completed and stopped subagents appear here.")
+                        .size(10.5)
+                        .color(colors.tertiary_text),
+                );
+            } else {
+                for agent in finished {
+                    render_ai_subagent_detail_row(ui, agent, colors);
+                    ui.add_space(6.0);
+                }
+            }
+        });
+}
+
+fn render_ai_subagent_detail_row(
+    ui: &mut Ui,
+    agent: &crate::chat_core::SubagentProjection,
+    colors: Theme,
+) {
+    let (glyph, status, color) = match agent.status {
+        SubagentStatus::Pending => ("○", "Queued", colors.tertiary_text),
+        SubagentStatus::InProgress => ("●", "Working", colors.accent),
+        SubagentStatus::Completed => ("✓", "Completed", colors.accent),
+        SubagentStatus::Failed => ("!", "Failed", colors.danger),
+        SubagentStatus::Cancelled => ("×", "Cancelled", colors.tertiary_text),
+        SubagentStatus::PermissionBlocked => ("!", "Permission needed", colors.danger),
+    };
+    Frame::NONE
+        .fill(colors.panel_inset)
+        .corner_radius(9)
+        .inner_margin(Margin::same(10))
+        .stroke(Stroke::new(1.0, colors.tile_border))
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.label(RichText::new(glyph).size(12.0).color(color));
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(if agent.label.trim().is_empty() {
+                            "Subagent"
+                        } else {
+                            &agent.label
+                        })
+                        .size(12.0)
+                        .strong()
+                        .color(colors.text),
+                    );
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(status).size(9.5).color(color));
+                        if let Some(model) = agent.model.as_deref() {
+                            ui.label(
+                                RichText::new(model)
+                                    .size(9.5)
+                                    .monospace()
+                                    .color(colors.tertiary_text),
+                            );
+                        }
+                        if let Some(tool_calls) = agent.tool_calls {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{tool_calls} tool call{}",
+                                    if tool_calls == 1 { "" } else { "s" }
+                                ))
+                                .size(9.5)
+                                .color(colors.tertiary_text),
+                            );
+                        }
+                        let duration_ms = agent.duration_ms.or_else(|| {
+                            (!agent.status.is_terminal())
+                                .then(|| unix_now().elapsed_since(agent.at))
+                        });
+                        if let Some(duration_ms) = duration_ms.filter(|duration| *duration >= 0) {
+                            ui.label(
+                                RichText::new(format!("{:.1}s", duration_ms as f64 / 1_000.0))
+                                    .size(9.5)
+                                    .monospace()
+                                    .color(colors.tertiary_text),
+                            );
+                        }
+                    });
+                    if let Some(detail) = agent
+                        .detail
+                        .as_deref()
+                        .filter(|detail| !detail.trim().is_empty())
+                    {
+                        ui.label(RichText::new(detail).size(10.5).color(
+                            if matches!(
+                                agent.status,
+                                SubagentStatus::Failed | SubagentStatus::PermissionBlocked
+                            ) {
+                                colors.danger
+                            } else {
+                                colors.secondary_text
+                            },
+                        ));
+                    }
+                    let mut metadata = Vec::new();
+                    if let Some(parent_id) = agent.parent_id.as_deref() {
+                        metadata.push(format!("parent {}", truncate(parent_id, 20)));
+                    }
+                    metadata.push(truncate(&agent.id, 34));
+                    ui.label(
+                        RichText::new(metadata.join(" · "))
+                            .size(8.5)
+                            .monospace()
+                            .color(colors.tertiary_text),
+                    );
+                });
+            });
+        });
+}
+
+fn render_ai_terminal_card(
+    ui: &mut Ui,
+    conversation_id: Uuid,
+    terminal: &crate::chat_core::TurnStatusProjection,
+    action: &mut AiWorkspaceUiAction,
+    colors: Theme,
+) {
+    let (title, color) = match terminal.status {
+        TurnStatus::InProgress => ("Working", colors.accent),
+        TurnStatus::Completed => ("Completed", colors.accent),
+        TurnStatus::UserCancelled => ("Stopped", colors.secondary_text),
+        TurnStatus::PermissionBlocked => ("Permission needed", colors.danger),
+        TurnStatus::TimedOut => ("Timed out", colors.danger),
+        TurnStatus::MaxTurnsReached => ("Turn limit reached", colors.danger),
+        TurnStatus::ProviderError => ("Provider error", colors.danger),
+    };
+    Frame::NONE
+        .fill(if terminal.status == TurnStatus::PermissionBlocked {
+            colors.selection_fill
+        } else {
+            colors
+                .danger
+                .gamma_multiply(if colors.dark { 0.12 } else { 0.07 })
+        })
+        .corner_radius(8)
+        .inner_margin(Margin::same(9))
+        .show(ui, |ui| {
+            ui.label(RichText::new(title).strong().color(color));
+            if let Some(message) = terminal
+                .message
+                .as_deref()
+                .filter(|message| !message.trim().is_empty())
+            {
+                ui.label(
+                    RichText::new(message)
+                        .size(10.5)
+                        .color(colors.secondary_text),
+                );
+            }
+            if let Some(tool) = terminal
+                .tool
+                .as_deref()
+                .filter(|tool| !tool.trim().is_empty())
+            {
+                ui.label(
+                    RichText::new(format!("Blocked tool · {tool}"))
+                        .size(9.5)
+                        .monospace()
+                        .color(colors.tertiary_text),
+                );
+            }
+            if let Some(retry) = terminal.retry {
+                ui.add_space(3.0);
+                let label = match retry {
+                    RetryHint::Retry => "Retry",
+                    RetryHint::AllowWebAndRetry => "Allow web for this run",
+                };
+                if ui
+                    .push_id(
+                        ("ai-turn-retry", conversation_id, terminal.event_id),
+                        |ui| ui.small_button(label).clicked(),
+                    )
+                    .inner
+                {
+                    action.retry_turn = Some(retry);
+                }
+            }
+        });
+}
+
 fn render_ai_inspector_activity(ui: &mut Ui, live_events: &[HarnessActivityEvent], colors: Theme) {
+    let newest_reasoning = live_events
+        .iter()
+        .rposition(|event| matches!(event.kind, ActivityKind::Thinking { .. }));
     let detailed = live_events
         .iter()
+        .enumerate()
         .filter(|event| {
+            let (index, event) = *event;
+            if matches!(event.kind, ActivityKind::Thinking { .. })
+                && Some(index) != newest_reasoning
+            {
+                return false;
+            }
             !matches!(
                 &event.kind,
                 ActivityKind::AssistantText { .. }
                     | ActivityKind::PlanUpdate { .. }
                     | ActivityKind::TaskMutation { .. }
+                    | ActivityKind::Subagent { .. }
                     | ActivityKind::Usage { .. }
+                    | ActivityKind::TurnStatus { .. }
                     | ActivityKind::SessionInfo { .. }
             )
         })
+        .map(|(_, event)| event)
         .collect::<Vec<_>>();
     if detailed.is_empty() {
         return;
@@ -12842,6 +13509,7 @@ fn render_ai_chat_page(
                     ui,
                     &runtime.streamed_text,
                     &runtime.activity_trace.events,
+                    runtime.active_started_at,
                     markdown_cache,
                     colors,
                 );
@@ -12851,6 +13519,15 @@ fn render_ai_chat_page(
                     ai_avatar(ui, colors);
                     ui.add_space(8.0);
                     ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() - 48.0).max(220.0));
+                        render_ai_work_header(
+                            ui,
+                            &runtime.activity_trace.events,
+                            runtime.active_started_at,
+                            colors,
+                        );
+                        render_ai_activity_trace(ui, &runtime.activity_trace.events, colors);
+                        ui.add_space(7.0);
                         ui.horizontal(|ui| {
                             ui.spinner();
                             ui.label(
@@ -12859,12 +13536,22 @@ fn render_ai_chat_page(
                                     .italics(),
                             );
                         });
-                        render_ai_activity_trace(ui, &runtime.activity_trace.events, colors);
                     });
                 });
                 ui.add_space(16.0);
             }
             if let Some(error) = &runtime.error {
+                let error_title = latest_turn_status(&runtime.activity_trace.events)
+                    .map(|terminal| match terminal.status {
+                        TurnStatus::PermissionBlocked => "Permission needed",
+                        TurnStatus::TimedOut => "Timed out",
+                        TurnStatus::MaxTurnsReached => "Turn limit reached",
+                        TurnStatus::UserCancelled => "Stopped",
+                        TurnStatus::InProgress
+                        | TurnStatus::Completed
+                        | TurnStatus::ProviderError => "Provider error",
+                    })
+                    .unwrap_or("Provider error");
                 Frame::NONE
                     .fill(
                         colors
@@ -12874,11 +13561,7 @@ fn render_ai_chat_page(
                     .corner_radius(10)
                     .inner_margin(Margin::same(12))
                     .show(ui, |ui| {
-                        ui.label(
-                            RichText::new("Provider error")
-                                .strong()
-                                .color(colors.danger),
-                        );
+                        ui.label(RichText::new(error_title).strong().color(colors.danger));
                         ui.label(RichText::new(error).color(colors.secondary_text));
                     });
                 ui.add_space(14.0);
@@ -12907,6 +13590,7 @@ fn render_ai_chat_page(
         ui.add_space(inset);
         ui.vertical(|ui| {
             ui.set_width((available - inset * 2.0).clamp(320.0, 880.0));
+            render_ai_chat_progress_pill(ui, runtime, colors);
             render_ai_queue_bar(ui, conversation, runtime, action, colors);
             render_ai_composer(
                 ui,
@@ -12919,6 +13603,40 @@ fn render_ai_chat_page(
             );
         });
     });
+}
+
+fn render_ai_chat_progress_pill(ui: &mut Ui, runtime: &AiChatRuntime, colors: Theme) {
+    if runtime.active_turn.is_none() {
+        return;
+    }
+    let progress = project_progress(&[], &runtime.activity_trace.events);
+    if progress.items.is_empty() {
+        return;
+    }
+    let current = if progress.pending + progress.in_progress == 0 {
+        progress.total()
+    } else {
+        (progress.completed + progress.cancelled + 1).min(progress.total())
+    };
+    ui.horizontal(|ui| {
+        ui.add_space(((ui.available_width() - 112.0) * 0.5).max(0.0));
+        Frame::NONE
+            .fill(colors.panel_inset)
+            .corner_radius(14)
+            .inner_margin(Margin::symmetric(10, 5))
+            .stroke(Stroke::new(1.0, colors.tile_border))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("○").size(9.5).color(colors.accent));
+                    ui.label(
+                        RichText::new(format!("Step {current}/{}", progress.total()))
+                            .size(10.5)
+                            .color(colors.secondary_text),
+                    );
+                });
+            });
+    });
+    ui.add_space(6.0);
 }
 
 fn render_ai_queue_bar(
@@ -13051,6 +13769,60 @@ fn render_ai_empty_state(
     });
 }
 
+fn render_ai_work_header(
+    ui: &mut Ui,
+    events: &[HarnessActivityEvent],
+    live_started_at: Option<Instant>,
+    colors: Theme,
+) {
+    let live = live_started_at.is_some();
+    let duration = live_started_at
+        .map(|started| started.elapsed())
+        .or_else(|| {
+            let first = events.iter().map(|event| event.at.0).min()?;
+            let last = events
+                .iter()
+                .map(|event| event.at.0.saturating_add(event.duration_ms.unwrap_or(0)))
+                .max()?;
+            (last > first).then(|| Duration::from_millis((last - first) as u64))
+        });
+    let has_work = live
+        || events.iter().any(|event| {
+            !matches!(
+                event.kind,
+                ActivityKind::AssistantText { .. }
+                    | ActivityKind::Usage { .. }
+                    | ActivityKind::SessionInfo { .. }
+            )
+        });
+    if !has_work {
+        return;
+    }
+    let terminal = latest_turn_status(events);
+    let verb = if live {
+        "Working"
+    } else {
+        match terminal.as_ref().map(|terminal| terminal.status) {
+            Some(TurnStatus::UserCancelled) => "Stopped",
+            Some(TurnStatus::PermissionBlocked) => "Blocked",
+            Some(TurnStatus::TimedOut) => "Timed out",
+            Some(TurnStatus::MaxTurnsReached) => "Reached the turn limit",
+            Some(TurnStatus::ProviderError) => "Failed",
+            _ => "Worked",
+        }
+    };
+    ui.label(
+        RichText::new(match duration {
+            Some(duration) => format!("{verb} for {}", format_elapsed(duration)),
+            None => verb.into(),
+        })
+        .size(10.5)
+        .color(colors.tertiary_text),
+    );
+    ui.separator();
+    ui.add_space(5.0);
+}
+
 fn render_ai_message(
     ui: &mut Ui,
     message: &crate::domain::ConversationMessage,
@@ -13082,8 +13854,12 @@ fn render_ai_message(
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.set_width((ui.available_width() - 48.0).max(220.0));
-                    CommonMarkViewer::new().show(ui, markdown_cache, &message.text);
+                    render_ai_work_header(ui, &message.activities, None, colors);
                     render_ai_activity_trace(ui, &message.activities, colors);
+                    if !message.activities.is_empty() && !message.text.trim().is_empty() {
+                        ui.add_space(8.0);
+                    }
+                    CommonMarkViewer::new().show(ui, markdown_cache, &message.text);
                     render_persisted_attachments(ui, &message.attachments, action);
                     ui.horizontal(|ui| {
                         if ui
@@ -13113,9 +13889,139 @@ fn render_ai_message(
     }
 }
 
+fn render_ai_inline_subagents(
+    ui: &mut Ui,
+    subagents: &[crate::chat_core::SubagentProjection],
+    colors: Theme,
+) {
+    let working = subagents
+        .iter()
+        .filter(|agent| {
+            matches!(
+                agent.status,
+                SubagentStatus::Pending | SubagentStatus::InProgress
+            )
+        })
+        .count();
+    let done = subagents
+        .iter()
+        .filter(|agent| agent.status == SubagentStatus::Completed)
+        .count();
+    let stopped = subagents.len().saturating_sub(working + done);
+
+    ui.horizontal_wrapped(|ui| {
+        for agent in subagents.iter().take(4) {
+            let (glyph, state, color) = match agent.status {
+                SubagentStatus::Pending => ("○", "queued", colors.tertiary_text),
+                SubagentStatus::InProgress => ("●", "working", colors.accent),
+                SubagentStatus::Completed => ("✓", "done", colors.accent),
+                SubagentStatus::Failed => ("!", "failed", colors.danger),
+                SubagentStatus::PermissionBlocked => ("!", "blocked", colors.danger),
+                SubagentStatus::Cancelled => ("×", "stopped", colors.tertiary_text),
+            };
+            Frame::NONE
+                .fill(colors.panel_inset)
+                .corner_radius(12)
+                .inner_margin(Margin::symmetric(8, 4))
+                .stroke(Stroke::new(1.0, colors.tile_border))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(glyph).size(9.5).color(color));
+                        ui.label(
+                            RichText::new(truncate(
+                                if agent.label.trim().is_empty() {
+                                    "Subagent"
+                                } else {
+                                    &agent.label
+                                },
+                                28,
+                            ))
+                            .size(10.5)
+                            .color(colors.secondary_text),
+                        );
+                        ui.label(RichText::new(state).size(9.5).color(
+                            if matches!(
+                                agent.status,
+                                SubagentStatus::Failed | SubagentStatus::PermissionBlocked
+                            ) {
+                                colors.danger
+                            } else {
+                                colors.tertiary_text
+                            },
+                        ));
+                    });
+                });
+        }
+        if subagents.len() > 4 {
+            ui.label(
+                RichText::new(format!("+{} more", subagents.len() - 4))
+                    .size(10.0)
+                    .color(colors.tertiary_text),
+            );
+        }
+        let mut summary = Vec::new();
+        if working > 0 {
+            summary.push(format!("{working} working"));
+        }
+        if done > 0 {
+            summary.push(format!("{done} done"));
+        }
+        if stopped > 0 {
+            summary.push(format!("{stopped} stopped"));
+        }
+        if !summary.is_empty() {
+            ui.label(
+                RichText::new(summary.join(" · "))
+                    .size(10.0)
+                    .color(if stopped > 0 {
+                        colors.danger
+                    } else {
+                        colors.tertiary_text
+                    }),
+            );
+        }
+    });
+}
+
+fn render_ai_activity_row(ui: &mut Ui, event: &HarnessActivityEvent, colors: Theme) {
+    ui.horizontal_top(|ui| {
+        let (glyph, color) = match &event.kind {
+            ActivityKind::Thinking { .. } => ("◌", colors.tertiary_text),
+            ActivityKind::WebSearch { .. } => ("⌕", colors.accent),
+            ActivityKind::ToolResult { is_error: true, .. }
+            | ActivityKind::Command {
+                status: crate::chat_core::ActivityStatus::Failed,
+                ..
+            } => ("!", colors.danger),
+            ActivityKind::FileChange { .. } => ("◇", colors.accent),
+            _ => ("›", colors.accent),
+        };
+        ui.label(RichText::new(glyph).color(color));
+        ui.label(
+            RichText::new(ai_activity_summary(&event.kind))
+                .size(11.0)
+                .color(colors.secondary_text),
+        );
+        if let Some(duration) = event.duration_ms.filter(|duration| *duration >= 500) {
+            ui.label(
+                RichText::new(format!("{:.1}s", duration as f64 / 1_000.0))
+                    .size(10.0)
+                    .monospace()
+                    .color(colors.tertiary_text),
+            );
+        }
+    });
+}
+
 fn render_ai_activity_trace(ui: &mut Ui, events: &[HarnessActivityEvent], colors: Theme) {
     if events.is_empty() {
         return;
+    }
+
+    let subagents = project_subagents(events);
+    if !subagents.is_empty() {
+        ui.add_space(8.0);
+        render_ai_inline_subagents(ui, &subagents, colors);
     }
 
     if let Some(progress) = newest_plan(events) {
@@ -13149,92 +14055,131 @@ fn render_ai_activity_trace(ui: &mut Ui, events: &[HarnessActivityEvent], colors
             });
     }
 
+    let newest_reasoning = events
+        .iter()
+        .rposition(|event| matches!(event.kind, ActivityKind::Thinking { .. }));
     let detailed = events
         .iter()
-        .filter(|event| {
+        .enumerate()
+        .filter(|entry| {
+            let (index, event) = *entry;
+            if matches!(event.kind, ActivityKind::Thinking { .. })
+                && Some(index) != newest_reasoning
+            {
+                return false;
+            }
             !matches!(
                 &event.kind,
                 ActivityKind::AssistantText { .. }
                     | ActivityKind::PlanUpdate { .. }
+                    | ActivityKind::Subagent { .. }
                     | ActivityKind::Usage { .. }
                     | ActivityKind::SessionInfo { .. }
                     | ActivityKind::TurnError { .. }
+                    | ActivityKind::TurnStatus { .. }
                     | ActivityKind::PermissionPrompt { .. }
             )
         })
+        .map(|(_, event)| event)
         .collect::<Vec<_>>();
     if !detailed.is_empty() {
         ui.add_space(6.0);
-        egui::CollapsingHeader::new(format!(
-            "Activity · {} event{}",
-            detailed.len(),
-            if detailed.len() == 1 { "" } else { "s" }
-        ))
-        .id_salt(("activity-trace", events[0].id))
-        .show(ui, |ui| {
-            for event in detailed {
-                ui.horizontal_top(|ui| {
-                    ui.label(RichText::new("›").color(colors.accent));
-                    ui.label(
-                        RichText::new(ai_activity_summary(&event.kind))
-                            .size(11.0)
-                            .color(colors.secondary_text),
-                    );
-                    if let Some(duration) = event.duration_ms.filter(|duration| *duration >= 500) {
-                        ui.label(
-                            RichText::new(format!("{:.1}s", duration as f64 / 1_000.0))
-                                .size(10.0)
-                                .monospace()
-                                .color(colors.tertiary_text),
-                        );
-                    }
-                });
-            }
-        });
+        let visible_start = detailed.len().saturating_sub(5);
+        if visible_start > 0 {
+            egui::CollapsingHeader::new(format!(
+                "Show {visible_start} earlier event{}",
+                if visible_start == 1 { "" } else { "s" }
+            ))
+            .id_salt(("activity-trace", events[0].id))
+            .show(ui, |ui| {
+                for event in &detailed[..visible_start] {
+                    render_ai_activity_row(ui, event, colors);
+                }
+            });
+        }
+        for event in &detailed[visible_start..] {
+            render_ai_activity_row(ui, event, colors);
+        }
     }
 
     for event in events {
-        match &event.kind {
-            ActivityKind::PermissionPrompt {
-                tool,
-                summary,
-                resolution,
-                ..
-            } => {
-                ui.add_space(6.0);
-                Frame::NONE
-                    .fill(colors.selection_fill)
-                    .corner_radius(8)
-                    .inner_margin(Margin::same(8))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(match resolution {
-                                Some(crate::chat_core::PermissionResolution::Allowed) => {
-                                    "Allowed ✓"
-                                }
-                                Some(crate::chat_core::PermissionResolution::Denied) => "Denied ×",
-                                None => "Permission required",
-                            })
-                            .strong(),
-                        );
-                        ui.label(RichText::new(tool).monospace().size(10.5));
-                        ui.label(
-                            RichText::new(summary)
-                                .size(11.0)
-                                .color(colors.secondary_text),
-                        );
-                    });
-            }
-            ActivityKind::TurnError { message } => {
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(format!("Error · {message}"))
-                        .size(11.0)
-                        .color(colors.danger),
-                );
-            }
-            _ => {}
+        if let ActivityKind::PermissionPrompt {
+            tool,
+            summary,
+            resolution,
+            ..
+        } = &event.kind
+        {
+            ui.add_space(6.0);
+            Frame::NONE
+                .fill(colors.selection_fill)
+                .corner_radius(8)
+                .inner_margin(Margin::same(8))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(match resolution {
+                            Some(crate::chat_core::PermissionResolution::Allowed) => "Allowed ✓",
+                            Some(crate::chat_core::PermissionResolution::Denied) => "Denied ×",
+                            None => "Permission required",
+                        })
+                        .strong(),
+                    );
+                    ui.label(RichText::new(tool).monospace().size(10.5));
+                    ui.label(
+                        RichText::new(summary)
+                            .size(11.0)
+                            .color(colors.secondary_text),
+                    );
+                });
         }
+    }
+    if let Some(terminal) =
+        latest_turn_status(events).filter(|terminal| !terminal.status.is_successful())
+    {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                terminal
+                    .message
+                    .as_deref()
+                    .unwrap_or(match terminal.status {
+                        TurnStatus::InProgress => "Working",
+                        TurnStatus::Completed => "Completed",
+                        TurnStatus::UserCancelled => "Stopped",
+                        TurnStatus::PermissionBlocked => "Permission needed",
+                        TurnStatus::TimedOut => "Timed out",
+                        TurnStatus::MaxTurnsReached => "Turn limit reached",
+                        TurnStatus::ProviderError => "Provider error",
+                    }),
+            )
+            .size(11.0)
+            .color(if terminal.status == TurnStatus::UserCancelled {
+                colors.secondary_text
+            } else {
+                colors.danger
+            }),
+        );
+        if let Some(tool) = terminal.tool.as_deref() {
+            ui.label(
+                RichText::new(format!("Blocked tool · {tool}"))
+                    .size(9.5)
+                    .monospace()
+                    .color(colors.tertiary_text),
+            );
+        }
+    } else if let Some(message) = events.iter().rev().find_map(|event| {
+        if let ActivityKind::TurnError { message } = &event.kind {
+            Some(message)
+        } else {
+            None
+        }
+    }) {
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!("Error · {message}"))
+                .size(11.0)
+                .color(colors.danger),
+        );
     }
 
     let outputs = project_artifacts(events);
@@ -13290,6 +14235,7 @@ fn render_streaming_ai_message(
     ui: &mut Ui,
     text: &str,
     events: &[HarnessActivityEvent],
+    started_at: Option<Instant>,
     markdown_cache: &mut CommonMarkCache,
     colors: Theme,
 ) {
@@ -13298,16 +14244,12 @@ fn render_streaming_ai_message(
         ui.add_space(8.0);
         ui.vertical(|ui| {
             ui.set_width((ui.available_width() - 48.0).max(220.0));
-            CommonMarkViewer::new().show(ui, markdown_cache, text);
-            ui.horizontal(|ui| {
-                ui.spinner();
-                ui.label(
-                    RichText::new("Streaming")
-                        .size(10.5)
-                        .color(colors.tertiary_text),
-                );
-            });
+            render_ai_work_header(ui, events, started_at, colors);
             render_ai_activity_trace(ui, events, colors);
+            if !events.is_empty() && !text.trim().is_empty() {
+                ui.add_space(8.0);
+            }
+            CommonMarkViewer::new().show(ui, markdown_cache, text);
         });
     });
 }
@@ -13640,7 +14582,10 @@ fn ai_reasoning_options(provider_id: &str, model: &str) -> &'static [&'static st
         "codex_cli" if model == "gpt-5.6-luna" => &["", "low", "medium", "high", "xhigh", "max"],
         "codex_cli" => &["", "low", "medium", "high", "xhigh"],
         "claude_cli" => &["", "low", "medium", "high", "xhigh", "max"],
-        "grok_cli" | "ollama" => &["", "low", "medium", "high"],
+        "grok_cli" => &[
+            "", "none", "minimal", "low", "medium", "high", "xhigh", "max",
+        ],
+        "ollama" => &["", "low", "medium", "high"],
         "custom_cli" => &["", "low", "medium", "high", "xhigh", "max", "ultra"],
         _ => &[],
     }
@@ -13763,14 +14708,7 @@ fn render_ai_provider_abilities(
             );
         }
         "grok_cli" => {
-            render_ai_feature_choice(
-                ui,
-                profile,
-                AI_FEATURE_WEB_SEARCH,
-                "Web search",
-                false,
-                true,
-            );
+            render_ai_feature_choice(ui, profile, AI_FEATURE_WEB_SEARCH, "Web search", true, true);
             render_ai_feature_choice(ui, profile, AI_FEATURE_PLANNING, "Planning", false, true);
             render_ai_feature_choice(ui, profile, AI_FEATURE_SUBAGENTS, "Subagents", false, true);
             render_ai_feature_choice(ui, profile, AI_FEATURE_MEMORY, "Memory", true, true);
@@ -15754,7 +16692,9 @@ mod tests {
         );
         assert_eq!(
             ai_reasoning_options("grok_cli", "grok-4.5"),
-            &["", "low", "medium", "high"]
+            &[
+                "", "none", "minimal", "low", "medium", "high", "xhigh", "max"
+            ]
         );
         assert!(ai_reasoning_options("openai_compatible", "custom").is_empty());
     }
