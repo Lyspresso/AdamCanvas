@@ -492,6 +492,47 @@ pub fn clamp_provider_preferences(
     *preferences != original
 }
 
+/// Read-only installation facts for one built-in provider CLI, consumed by
+/// the Agents panel (src/agents_panel.rs). Recorded as an additive fixed
+/// point in docs/plans/progress-artifacts-parity.md.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ProviderProbe {
+    pub executable: Option<&'static str>,
+    pub program: Option<PathBuf>,
+    pub version: Option<CliVersion>,
+}
+
+/// Resolve and version-probe a built-in provider CLI without launching a
+/// turn. `refresh` drops the resolved path's cached version first so an
+/// upgraded binary at the same path re-probes; plain calls stay cache-cheap.
+pub fn probe_installed_provider(provider_id: &str, refresh: bool) -> ProviderProbe {
+    let Some(executable) = built_in_cli_executable(provider_id) else {
+        return ProviderProbe::default();
+    };
+    let Some(program) = resolve_executable(executable, None) else {
+        return ProviderProbe {
+            executable: Some(executable),
+            program: None,
+            version: None,
+        };
+    };
+    if refresh {
+        invalidate_cached_cli_version(&program);
+    }
+    let version = cached_cli_version(&program);
+    ProviderProbe {
+        executable: Some(executable),
+        program: Some(program),
+        version,
+    }
+}
+
+fn invalidate_cached_cli_version(program: &Path) {
+    let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    lock_unpoison(cache).remove(&key);
+}
+
 fn runtime_tuning_for_program(
     provider_id: &str,
     program: &Path,
@@ -5495,6 +5536,48 @@ mod tests {
         ] {
             assert!(search.contains(&expected), "missing {}", expected.display());
         }
+    }
+
+    #[test]
+    fn probe_reports_no_executable_for_non_cli_providers() {
+        for provider_id in ["auto", "openai_compatible", "custom_cli", "unknown"] {
+            let probe = probe_installed_provider(provider_id, false);
+            assert_eq!(probe, ProviderProbe::default(), "provider {provider_id}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stub_executable_probe_reports_path_and_version_and_refresh_reprobes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("adam-probe-stub");
+        fs::write(&stub, "#!/bin/sh\necho 9.9.9\n").expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let program =
+            resolve_executable(&stub.to_string_lossy(), None).expect("absolute stub path resolves");
+        assert_eq!(
+            cached_cli_version(&program),
+            CliVersion::parse("9.9.9"),
+            "first probe reads the stub version"
+        );
+
+        fs::write(&stub, "#!/bin/sh\necho 9.9.10\n").expect("rewrite stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+        assert_eq!(
+            cached_cli_version(&program),
+            CliVersion::parse("9.9.9"),
+            "without invalidation the cached version is returned"
+        );
+
+        invalidate_cached_cli_version(&program);
+        assert_eq!(
+            cached_cli_version(&program),
+            CliVersion::parse("9.9.10"),
+            "refresh drops the cache entry so the new version is probed"
+        );
     }
 
     #[test]
