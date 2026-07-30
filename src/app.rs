@@ -12180,6 +12180,17 @@ fn persisted_ai_activity(conversation: &AiConversation) -> Vec<HarnessActivityEv
         .collect()
 }
 
+fn progress_stepper_palette(colors: Theme) -> crate::progress_stepper::StepperPalette {
+    crate::progress_stepper::StepperPalette {
+        accent: colors.accent,
+        on_accent: Color32::WHITE,
+        text: colors.text,
+        secondary_text: colors.secondary_text,
+        tertiary_text: colors.tertiary_text,
+        connector: colors.separator,
+    }
+}
+
 fn render_ai_inspector(
     ui: &mut Ui,
     conversation_id: Uuid,
@@ -12281,6 +12292,14 @@ fn render_ai_inspector(
                 }
 
                 if progress.items.is_empty() {
+                    let has_history = !conversation.messages().is_empty();
+                    if runtime.active_turn.is_none() && !has_history {
+                        crate::progress_stepper::stepper_placeholder_ui(
+                            ui,
+                            &progress_stepper_palette(colors),
+                        );
+                        ui.add_space(4.0);
+                    }
                     ui.label(
                         RichText::new(match (runtime.active_turn.is_some(), progress.source) {
                             (true, ProgressSource::Live) => "The agent’s task list is empty.",
@@ -12288,7 +12307,13 @@ fn render_ai_inspector(
                             (false, ProgressSource::Persisted | ProgressSource::Live) => {
                                 "The latest task list is empty."
                             }
-                            (false, ProgressSource::None) => "No task list yet.",
+                            (false, ProgressSource::None) => {
+                                if has_history {
+                                    "Completed without a checklist."
+                                } else {
+                                    "Steps will show as the task unfolds."
+                                }
+                            }
                         })
                         .size(11.0)
                         .color(colors.tertiary_text),
@@ -12304,36 +12329,12 @@ fn render_ai_inspector(
                         .color(colors.tertiary_text),
                     );
                     ui.add_space(4.0);
-                    for (index, item) in progress.items.iter().enumerate() {
-                        let (glyph, color) = match item.status {
-                            PlanItemStatus::Pending => ("○", colors.tertiary_text),
-                            PlanItemStatus::InProgress => ("●", colors.accent),
-                            PlanItemStatus::Completed => ("✓", colors.accent),
-                            PlanItemStatus::Cancelled => ("×", colors.tertiary_text),
-                        };
-                        ui.horizontal_top(|ui| {
-                            ui.label(RichText::new(glyph).size(11.0).color(color));
-                            let label = if item.status == PlanItemStatus::InProgress {
-                                item.active_form.as_deref().unwrap_or(&item.content)
-                            } else {
-                                &item.content
-                            };
-                            let mut text =
-                                RichText::new(format!("{}. {}", index + 1, truncate(label, 72)))
-                                    .size(11.5)
-                                    .color(if item.status == PlanItemStatus::InProgress {
-                                        colors.text
-                                    } else {
-                                        colors.secondary_text
-                                    });
-                            if item.status == PlanItemStatus::Completed
-                                || item.status == PlanItemStatus::Cancelled
-                            {
-                                text = text.strikethrough();
-                            }
-                            ui.label(text);
-                        });
-                    }
+                    let rows = crate::progress_stepper::step_rows(&progress.items, 72);
+                    crate::progress_stepper::stepper_ui(
+                        ui,
+                        &rows,
+                        &progress_stepper_palette(colors),
+                    );
                     if runtime.active_turn.is_none()
                         && progress.in_progress == 0
                         && progress.pending == 0

@@ -19,5 +19,6 @@ pub mod persistence;
 pub mod photo_details;
 pub mod platform;
 pub mod preview;
+pub mod progress_stepper;
 pub mod spatial;
 pub mod structured_preview;
