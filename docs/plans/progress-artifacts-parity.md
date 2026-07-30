@@ -54,6 +54,7 @@ Verified against EarlIt source (`AgentTaskStore.swift`, `AgentActivityModels.swi
 - Child lifecycle with stable child ids + parent linkage; every task/text event scoped `Main` or a specific child.
 - Aggregate line ("3/5 done · 2 working"); expandable child detail; child checklist **only** from real child task events; otherwise status + current activity — never invented steps.
 - Per-child prose cells; **re-enabling Grok subagents requires a genuinely scoped child channel** (e.g. the session updates file, which does carry `subagent_id`/`child_session_id`) — live stdout cannot provide it on Grok 0.2.111 (see PR 1 deviation). `supports_scoped_child_text` flips per version only with fixture proof.
+- *Candidate channel (pending PR 2 review, 2026-07-30):* Codex's in-flight work adds a Grok **ACP** (Agent Client Protocol) transport (`src/grok_acp.rs`) that may supersede session-file polling and provide the scoped channel directly. Not yet accepted spec — evaluated on evidence (fixtures + tests) when PR 2 opens; if accepted, this section's mechanism updates accordingly.
 
 ### PR 4 — `codex/artifacts`
 - User-facing rename Outputs → Artifacts. Sources: confirmed successful `FileChange` (failed/declined excluded) + **created** canvas entities (emit `HostMutation` from production canvas tools; creations only — annotate/move don't count).
