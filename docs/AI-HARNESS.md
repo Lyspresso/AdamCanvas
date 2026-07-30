@@ -71,7 +71,7 @@ not silently translate that into Medium or another guessed default.
 | --- | --- | --- | --- |
 | Codex | Known GPT-5.6 Sol, Terra, and Luna choices plus custom model ID | Sol/Terra: Low through Ultra; Luna: Low through Max; older listed models: Low through XHigh | Explicit web-search enable |
 | Claude | Provider default, Opus, Sonnet, Haiku, or custom model ID | Low, Medium, High, XHigh, Max | Web tools on/off and optional fallback model |
-| Grok | Provider default, Grok 4.5, or custom model ID | Low, Medium, High | Web search, planning, subagents, memory, and a 1–100 turn limit |
+| Grok | Provider default, Grok 4.5, or custom model ID | None, Minimal, Low, Medium, High, XHigh, Max | Web search, planning, subagents, memory, and a 1–100 turn limit |
 | Kimi | Provider default or custom model ID | Provider default | Thinking on/off |
 | Ollama | Required local model ID | Low, Medium, High, or thinking on/off | Local model execution |
 | LM Studio | Required loaded model ID | Provider default | Local server endpoint and memory-only key |
@@ -87,7 +87,9 @@ The visible choices map to real provider controls:
   `--max-turns` flag because the supported installed CLI does not expose one.
 - Grok receives `--reasoning-effort`, supported ability-disable flags,
   experimental memory enable when requested, `--max-turns`, and an exact
-  read-only or workspace sandbox.
+  read-only or workspace sandbox. Unless web is explicitly switched off,
+  read-only Chat research grants only `WebSearch` and `WebFetch`; it never
+  turns that into blanket filesystem-mutation approval.
 - Kimi receives `--thinking` or `--no-thinking`.
 - Ollama receives its supported `--think` level or boolean.
 - Custom CLI may use `{prompt}`, `{model}`, `{reasoning_effort}`, and
@@ -111,6 +113,10 @@ Provider output is normalized into one ordered, typed activity vocabulary:
 - task and host mutations;
 - host reads;
 - permission prompts;
+- child-agent lifecycle updates, including parent identity, status, model,
+  tool count, detail, and elapsed time;
+- explicit terminal outcomes: completed, user-cancelled, permission-blocked,
+  timed out, maximum turns reached, or provider error;
 - usage;
 - turn errors; and
 - model/session information.
@@ -136,6 +142,7 @@ The same activity log drives every projection:
 
 - response transcript;
 - progress inspector;
+- inline and right-rail subagent views;
 - collapsible activity rows;
 - output files and artifacts;
 - context-used list;
@@ -195,12 +202,35 @@ This distinction matters for providers such as Grok or plain local models that
 may stream useful work but no structured task list. Adam shows their real
 activity without manufacturing Claude-like progress.
 
+## Subagents are a separate lifecycle projection
+
+Subagents are not checklist rows and are not inferred from prose such as “I’ll
+launch five agents.” Adam creates them only from genuine provider child-agent
+events. Each stable child ID is projected through pending, working, completed,
+failed, cancelled, or permission-blocked states. Parent IDs preserve a nested
+tree when a provider launches children from another child.
+
+The chat shows compact live chips beside the relevant activity update, with
+working, done, and stopped totals. The right rail expands the same events into
+individual rows with status, model, tool-call count, duration, detail, and
+parent/child indentation. **View all** opens a wider Active/Done subagent
+panel without leaving the conversation. Repeated status updates replace the
+earlier state for that child rather than creating duplicate “agent” rows.
+
+Grok child-agent and task events are harvested from the matching provider
+session’s structured update stream after the turn. Codex collaboration calls
+and subagent-activity items join thread aliases into the same lifecycle.
+Claude Agent/legacy Task calls, task lifecycle notifications, and tool-progress
+events join tool-use, task, and provider-agent IDs. Unsupported providers
+simply show no Subagents section instead of an invented one.
+
 ## Inspector, outputs, files, and context
 
-The right side is a task workspace with four independent, collapsible
+The right side is a task workspace with five independent, collapsible
 sections:
 
 - **Progress** — the authoritative task projection described above;
+- **Subagents** — real child-agent lifecycle, counts, and parent/child tree;
 - **Outputs** — files and host artifacts actually created by the conversation;
 - **Working folder** — an expandable file tree for the scoped folder; and
 - **Context** — supplied attachments, observed tool/search/host context,
@@ -295,8 +325,19 @@ provides the file path for a capable workspace agent.
   marker rather than pretending the provider completed.
 
 Every terminal path commits a visible assistant turn. Failures and stops keep
-partial output and typed diagnostic activity. Background completions mark the
-conversation unread.
+partial output and typed diagnostic activity. The transcript and inspector
+name the real terminal state instead of collapsing permission blocks, timeouts,
+turn limits, provider errors, and user cancellation into “Stopped:
+Cancelled.” A permission-blocked web run offers **Allow web for this run**,
+which retries the last request with a narrow one-run web grant. Background
+completions mark the conversation unread.
+
+The transcript follows a compact work chronology: a Working/Worked/Blocked
+header with elapsed time, coalesced activity rows, live subagent chips,
+provider commentary, the final response, and the genuine checklist step
+indicator near the composer. Consecutive reasoning updates collapse to the
+latest useful line instead of rendering dozens of identical “Thinking…”
+entries.
 
 ## Access stances
 
@@ -343,6 +384,11 @@ model tools.
 - Future or malformed AI enum values fail closed without blanking the whole
   library: unknown access becomes Ask, unknown surfaces become Chat, unknown
   roles become Assistant, and unrecognized typed activity entries are skipped.
+- Conversation saves use a process-local mutex and a cross-process file lock
+  around a revision-aware three-way merge. Distinct conversations and
+  non-conflicting edits survive stale writers. Before atomic replacement Adam
+  rotates a validated `library.previous.json`; unreadable files are preserved
+  as timestamped recovery copies instead of being silently overwritten.
 
 ## Deliberate limits
 
