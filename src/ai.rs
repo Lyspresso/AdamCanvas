@@ -488,10 +488,6 @@ impl AiEngine {
         outcome
     }
 
-    pub fn forget_task_conversation(&self, conversation_id: Uuid) -> bool {
-        lock_unpoison(&self.task_tools).remove_conversation(conversation_id)
-    }
-
     pub fn cancel_all(&self) {
         let controls: Vec<_> = lock_unpoison(&self.active)
             .values()
@@ -1589,6 +1585,42 @@ fn is_explicit_web_tool(tool: Option<&str>) -> bool {
 #[derive(Clone, Debug)]
 struct GrokPermissionBlock {
     tool: String,
+    tool_call_id: String,
+}
+
+#[derive(Debug, Default)]
+struct GrokPermissionBlockState {
+    pending: Option<GrokPermissionBlock>,
+}
+
+impl GrokPermissionBlockState {
+    fn observe_event(&mut self, event: &GrokAcpEvent) {
+        match event {
+            // These events are part of the permission exchange itself. A
+            // terminal refusal/cancellation immediately after them can still
+            // be attributed to the denied request.
+            GrokAcpEvent::PermissionRequested { .. }
+            | GrokAcpEvent::PermissionResolved { .. }
+            | GrokAcpEvent::Terminal { .. }
+            | GrokAcpEvent::SessionStarted { .. }
+            | GrokAcpEvent::AgentMessageChunk { .. }
+            | GrokAcpEvent::AgentThoughtChunk { .. } => {}
+            // Once the provider continues doing substantive work, an older
+            // denial is no longer evidence for a later terminal outcome.
+            GrokAcpEvent::ToolCall { tool_call, .. }
+            | GrokAcpEvent::ToolCallUpdate { tool_call, .. }
+                if self
+                    .pending
+                    .as_ref()
+                    .is_some_and(|block| block.tool_call_id == tool_call.id)
+                    && tool_call.status != Some(GrokAcpToolStatus::Completed) => {}
+            GrokAcpEvent::ToolCall { .. }
+            | GrokAcpEvent::ToolCallUpdate { .. }
+            | GrokAcpEvent::PlanSnapshot { .. } => {
+                self.pending = None;
+            }
+        }
+    }
 }
 
 fn run_grok_acp_transport(
@@ -1678,7 +1710,7 @@ fn run_grok_acp_transport(
         },
     };
 
-    let permission_block = RefCell::new(None::<GrokPermissionBlock>);
+    let permission_block = RefCell::new(GrokPermissionBlockState::default());
     let emitted_tool_calls = RefCell::new(HashSet::<String>::new());
     let result = run_grok_acp(
         &acp_request,
@@ -1691,7 +1723,10 @@ fn run_grok_acp_transport(
                 &permission_block,
             )
         },
-        |event| emit_grok_acp_event(request, event_sender, event, &emitted_tool_calls),
+        |event| {
+            permission_block.borrow_mut().observe_event(&event);
+            emit_grok_acp_event(request, event_sender, event, &emitted_tool_calls);
+        },
     );
     let bridge_stop = bridge.stop();
 
@@ -1704,7 +1739,7 @@ fn run_grok_acp_transport(
         ));
     }
 
-    let permission_block = permission_block.into_inner();
+    let permission_block = permission_block.into_inner().pending;
     match result {
         Err(error) => grok_acp_error_outcome(error, permission_block),
         Ok(outcome) => match outcome.stop_reason {
@@ -1773,13 +1808,10 @@ fn grok_acp_permission_decision(
     permission: &GrokAcpPermissionRequest,
     mode: PermissionMode,
     workspace_mode: AiWorkspaceMode,
-    blocked: &RefCell<Option<GrokPermissionBlock>>,
+    blocked: &RefCell<GrokPermissionBlockState>,
 ) -> GrokAcpPermissionDecision {
     let tool = grok_acp_tool_label(&permission.tool_call);
-    let is_residual_task_prompt = matches!(
-        permission.tool_call.canonical_mcp_tool_name.as_deref(),
-        Some("adam_tasks__task_create" | "adam_tasks__task_update" | "adam_tasks__task_list")
-    );
+    let tool_call_id = permission.tool_call.id.clone();
     let normalized = tool
         .chars()
         .filter(char::is_ascii_alphanumeric)
@@ -1794,6 +1826,19 @@ fn grok_acp_permission_decision(
         .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect::<String>();
+    let is_residual_task_prompt = [&normalized, &canonical_normalized]
+        .into_iter()
+        .any(|name| {
+            matches!(
+                name.as_str(),
+                "taskcreate"
+                    | "taskupdate"
+                    | "tasklist"
+                    | "adamtaskstaskcreate"
+                    | "adamtaskstaskupdate"
+                    | "adamtaskstasklist"
+            )
+        });
     let asks_for_child = [&normalized, &canonical_normalized]
         .into_iter()
         .any(|name| {
@@ -1809,7 +1854,8 @@ fn grok_acp_permission_decision(
             | GrokAcpToolKind::Fetch
             | GrokAcpToolKind::Think,
         ) => AiPermissionClass::Read,
-        Some(GrokAcpToolKind::Delete) => AiPermissionClass::Destructive,
+        Some(GrokAcpToolKind::Delete | GrokAcpToolKind::SwitchMode | GrokAcpToolKind::Other(_))
+        | None => AiPermissionClass::Destructive,
         _ => AiPermissionClass::Mutate,
     };
     // Exact task calls are pre-authorized by Grok's process-level MCPTool
@@ -1828,16 +1874,19 @@ fn grok_acp_permission_decision(
     match verdict {
         AiPermissionVerdict::Allow => {
             if let Some(option) = permission.first_allow_once_option() {
+                // A successful later approval is proof that an older denial
+                // no longer explains this turn's eventual terminal state.
+                blocked.borrow_mut().pending = None;
                 GrokAcpPermissionDecision::Allow {
                     option_id: option.id.clone(),
                 }
             } else {
-                *blocked.borrow_mut() = Some(GrokPermissionBlock { tool });
+                blocked.borrow_mut().pending = Some(GrokPermissionBlock { tool, tool_call_id });
                 GrokAcpPermissionDecision::Cancel
             }
         }
         AiPermissionVerdict::Prompt | AiPermissionVerdict::Deny => {
-            *blocked.borrow_mut() = Some(GrokPermissionBlock { tool });
+            blocked.borrow_mut().pending = Some(GrokPermissionBlock { tool, tool_call_id });
             permission
                 .first_reject_once_option()
                 .map(|option| GrokAcpPermissionDecision::Reject {
@@ -5143,6 +5192,22 @@ fn grok_session_directory_in_workspace(
     session_id: &str,
 ) -> Option<PathBuf> {
     Uuid::parse_str(session_id).ok()?;
+    grok_session_directory_for_workspace_key(grok_home, workspace_key, session_id).or_else(|| {
+        // Grok's workspace encoder leaves apostrophes literal while
+        // form_urlencoded encodes them as `%27`. Keep lookup bound to the
+        // requested workspace by trying only that verified spelling variant.
+        let grok_key = workspace_key.replace("%27", "'");
+        (grok_key != workspace_key)
+            .then(|| grok_session_directory_for_workspace_key(grok_home, &grok_key, session_id))
+            .flatten()
+    })
+}
+
+fn grok_session_directory_for_workspace_key(
+    grok_home: &Path,
+    workspace_key: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
     if workspace_key.is_empty()
         || workspace_key.contains(['/', '\\'])
         || workspace_key == "."
@@ -7072,7 +7137,7 @@ mod tests {
 
     #[test]
     fn grok_acp_permission_policy_fails_closed_on_residual_tasks_and_unsafe_work() {
-        let blocked = RefCell::new(None);
+        let blocked = RefCell::new(GrokPermissionBlockState::default());
         let mut task_permission = acp_permission(
             "provider-controlled title",
             GrokAcpToolKind::Other("mcp".into()),
@@ -7087,8 +7152,8 @@ mod tests {
             ),
             GrokAcpPermissionDecision::Reject { .. }
         ));
-        assert!(blocked.borrow().is_some());
-        *blocked.borrow_mut() = None;
+        assert!(blocked.borrow().pending.is_some());
+        blocked.borrow_mut().pending = None;
 
         let title_only = acp_permission(
             "adam_tasks__task_create",
@@ -7103,7 +7168,47 @@ mod tests {
             ),
             GrokAcpPermissionDecision::Reject { .. }
         ));
-        *blocked.borrow_mut() = None;
+        blocked.borrow_mut().pending = None;
+
+        for task_name in [
+            "task_create",
+            "task_update",
+            "task_list",
+            "adam_tasks__task_create",
+            "adam_tasks__task_update",
+            "adam_tasks__task_list",
+        ] {
+            let mut title_only = acp_permission(task_name, GrokAcpToolKind::Read);
+            title_only.tool_call.kind = None;
+            assert!(matches!(
+                grok_acp_permission_decision(
+                    &title_only,
+                    PermissionMode::Bypass,
+                    AiWorkspaceMode::Cowork,
+                    &blocked,
+                ),
+                GrokAcpPermissionDecision::Reject { .. }
+            ));
+            blocked.borrow_mut().pending = None;
+        }
+        for task_name in [
+            "adam_tasks__task_create",
+            "adam_tasks__task_update",
+            "adam_tasks__task_list",
+        ] {
+            let mut canonical_only = acp_permission("Read file", GrokAcpToolKind::Read);
+            canonical_only.tool_call.canonical_mcp_tool_name = Some(task_name.into());
+            assert!(matches!(
+                grok_acp_permission_decision(
+                    &canonical_only,
+                    PermissionMode::Bypass,
+                    AiWorkspaceMode::Cowork,
+                    &blocked,
+                ),
+                GrokAcpPermissionDecision::Reject { .. }
+            ));
+            blocked.borrow_mut().pending = None;
+        }
 
         let mut persistent_only = acp_permission("WebFetch", GrokAcpToolKind::Fetch);
         persistent_only.options = vec![
@@ -7148,11 +7253,15 @@ mod tests {
             GrokAcpPermissionDecision::Reject { .. }
         ));
         assert_eq!(
-            blocked.borrow().as_ref().map(|block| block.tool.as_str()),
+            blocked
+                .borrow()
+                .pending
+                .as_ref()
+                .map(|block| block.tool.as_str()),
             Some("Edit file")
         );
 
-        *blocked.borrow_mut() = None;
+        blocked.borrow_mut().pending = None;
         assert!(matches!(
             grok_acp_permission_decision(
                 &acp_permission("Edit file", GrokAcpToolKind::Edit),
@@ -7162,6 +7271,43 @@ mod tests {
             ),
             GrokAcpPermissionDecision::Allow { .. }
         ));
+
+        for mut permission in [
+            acp_permission("Switch mode", GrokAcpToolKind::SwitchMode),
+            acp_permission(
+                "Future provider tool",
+                GrokAcpToolKind::Other("future_kind".into()),
+            ),
+            acp_permission("Missing kind", GrokAcpToolKind::Read),
+        ] {
+            if permission.tool_call.title.as_deref() == Some("Missing kind") {
+                permission.tool_call.kind = None;
+            }
+            assert!(matches!(
+                grok_acp_permission_decision(
+                    &permission,
+                    PermissionMode::Auto,
+                    AiWorkspaceMode::Cowork,
+                    &blocked,
+                ),
+                GrokAcpPermissionDecision::Reject { .. }
+            ));
+        }
+        assert!(blocked.borrow().pending.is_some());
+        assert!(matches!(
+            grok_acp_permission_decision(
+                &acp_permission("Read file", GrokAcpToolKind::Read),
+                PermissionMode::Auto,
+                AiWorkspaceMode::Cowork,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Allow { .. }
+        ));
+        assert!(
+            blocked.borrow().pending.is_none(),
+            "a later successful permission must consume stale denial context"
+        );
+
         assert!(matches!(
             grok_acp_permission_decision(
                 &acp_permission("Spawn subagent", GrokAcpToolKind::Execute),
@@ -7203,6 +7349,7 @@ mod tests {
             GrokAcpError::ProviderCancelled,
             Some(GrokPermissionBlock {
                 tool: "Bash".into(),
+                tool_call_id: "bash-call".into(),
             }),
         );
         assert!(matches!(
@@ -7221,6 +7368,105 @@ mod tests {
                 kind: AiFailureKind::ProviderError,
                 ..
             }
+        ));
+
+        let blocked = RefCell::new(GrokPermissionBlockState::default());
+        let _ = grok_acp_permission_decision(
+            &acp_permission("Switch mode", GrokAcpToolKind::SwitchMode),
+            PermissionMode::Auto,
+            AiWorkspaceMode::Cowork,
+            &blocked,
+        );
+        let _ = grok_acp_permission_decision(
+            &acp_permission("Read file", GrokAcpToolKind::Read),
+            PermissionMode::Auto,
+            AiWorkspaceMode::Cowork,
+            &blocked,
+        );
+        assert!(matches!(
+            grok_acp_error_outcome(
+                GrokAcpError::ProviderCancelled,
+                blocked.into_inner().pending,
+            ),
+            RunOutcome::Failed {
+                kind: AiFailureKind::ProviderError,
+                ..
+            }
+        ));
+
+        let blocked = RefCell::new(GrokPermissionBlockState::default());
+        let denied = acp_permission("Switch mode", GrokAcpToolKind::SwitchMode);
+        let _ = grok_acp_permission_decision(
+            &denied,
+            PermissionMode::Auto,
+            AiWorkspaceMode::Cowork,
+            &blocked,
+        );
+        blocked
+            .borrow_mut()
+            .observe_event(&GrokAcpEvent::ToolCallUpdate {
+                session_id: "session".into(),
+                tool_call: denied.tool_call.clone(),
+            });
+        assert!(
+            blocked.borrow().pending.is_some(),
+            "the denied tool's own terminal update must retain attribution"
+        );
+        let mut completed_denied_tool = denied.tool_call.clone();
+        completed_denied_tool.status = Some(GrokAcpToolStatus::Completed);
+        blocked
+            .borrow_mut()
+            .observe_event(&GrokAcpEvent::ToolCallUpdate {
+                session_id: "session".into(),
+                tool_call: completed_denied_tool,
+            });
+        assert!(
+            blocked.borrow().pending.is_none(),
+            "completion proves the denied operation continued"
+        );
+
+        let _ = grok_acp_permission_decision(
+            &denied,
+            PermissionMode::Auto,
+            AiWorkspaceMode::Cowork,
+            &blocked,
+        );
+        blocked.borrow_mut().observe_event(&GrokAcpEvent::ToolCall {
+            session_id: "session".into(),
+            tool_call: acp_permission("Different tool", GrokAcpToolKind::Read).tool_call,
+        });
+        assert!(
+            blocked.borrow().pending.is_none(),
+            "a different tool call proves the provider continued beyond the denial"
+        );
+
+        let _ = grok_acp_permission_decision(
+            &denied,
+            PermissionMode::Auto,
+            AiWorkspaceMode::Cowork,
+            &blocked,
+        );
+        blocked
+            .borrow_mut()
+            .observe_event(&GrokAcpEvent::AgentThoughtChunk {
+                session_id: "session".into(),
+                message_id: "thought-after-denial".into(),
+                text: "Explaining why permission was unavailable".into(),
+            });
+        assert!(
+            blocked.borrow().pending.is_some(),
+            "prose can explain a denial and must not erase its attribution"
+        );
+        assert!(matches!(
+            grok_acp_error_outcome(
+                GrokAcpError::ProviderCancelled,
+                blocked.into_inner().pending,
+            ),
+            RunOutcome::Failed {
+                kind: AiFailureKind::PermissionBlocked,
+                tool: Some(tool),
+                ..
+            } if tool == "Switch mode"
         ));
     }
 
@@ -9852,6 +10098,49 @@ send({
             ),
             Some(fs::canonicalize(expected).unwrap())
         );
+    }
+
+    #[test]
+    fn grok_session_follower_uses_verified_apostrophe_encoding_without_cross_workspace_scan() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cwd = temporary.path().join("Adam's Canvas (current)");
+        fs::create_dir_all(&cwd).unwrap();
+        let workspace_key = grok_workspace_key(&cwd).unwrap();
+        assert!(workspace_key.contains("%27"));
+        assert!(workspace_key.contains("%28current%29"));
+        let provider_workspace_key = workspace_key.replace("%27", "'");
+
+        let grok_home = temporary.path().join("grok");
+        let session_id = "319a1994-0d93-4107-904f-53179b3a6d29";
+        let provider_workspace = grok_home.join("sessions").join(provider_workspace_key);
+        let expected = provider_workspace.join(session_id);
+        let collision = grok_home
+            .join("sessions")
+            .join("unrelated-workspace")
+            .join(session_id);
+        fs::create_dir_all(&expected).unwrap();
+        fs::create_dir_all(&collision).unwrap();
+
+        let mut follower = GrokSessionFollower::under_home_and_workspace(
+            grok_home.clone(),
+            session_id.into(),
+            false,
+            Some(workspace_key.clone()),
+        );
+
+        assert!(follower.resolve_directory());
+        let expected = fs::canonicalize(expected).unwrap();
+        assert_eq!(follower.directory(), Some(expected.as_path()));
+
+        fs::remove_dir_all(expected).unwrap();
+        let mut missing_expected = GrokSessionFollower::under_home_and_workspace(
+            grok_home,
+            session_id.into(),
+            false,
+            Some(workspace_key),
+        );
+        assert!(!missing_expected.resolve_directory());
+        assert_eq!(missing_expected.directory(), None);
     }
 
     #[test]

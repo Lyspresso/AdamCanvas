@@ -650,20 +650,6 @@ impl TaskToolRegistry {
             .or_insert_with(|| TaskToolStore::new(conversation_id))
             .observe_activity(event)
     }
-
-    /// Removes an idle conversation's in-memory store.
-    ///
-    /// Returns false while a run still owns that conversation.
-    pub fn remove_conversation(&mut self, conversation_id: Uuid) -> bool {
-        if self
-            .active_runs
-            .values()
-            .any(|run| run.conversation_id == conversation_id)
-        {
-            return false;
-        }
-        self.stores.remove(&conversation_id).is_some()
-    }
 }
 
 fn required_field(value: Option<&Value>) -> Result<String, ()> {
@@ -1596,14 +1582,5 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].content, "App-owned");
         assert_eq!(tasks[0].origin, PlanItemOrigin::AppTools);
-    }
-
-    #[test]
-    fn removing_conversation_fails_while_live_and_succeeds_when_idle() {
-        let (mut registry, run_id, conversation_id) = registry_with_run(PlanChannel::AppTaskTools);
-        assert!(!registry.remove_conversation(conversation_id));
-        assert!(registry.unregister_run(run_id));
-        assert!(registry.remove_conversation(conversation_id));
-        assert!(registry.tasks_for_conversation(conversation_id).is_none());
     }
 }
