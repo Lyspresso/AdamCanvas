@@ -261,6 +261,10 @@ pub enum ActivityKind {
     PlanUpdate {
         #[serde(default)]
         tasks: Vec<PlanItem>,
+        /// True when `tasks` is the complete cross-origin conversation list,
+        /// so no task state before this event may survive the snapshot.
+        #[serde(default, skip_serializing_if = "is_false")]
+        authoritative: bool,
         /// True only for an accumulator-generated durability snapshot.
         #[serde(default, skip_serializing_if = "is_false")]
         compacted: bool,
@@ -272,6 +276,8 @@ pub enum ActivityKind {
     TaskMutation {
         #[serde(default)]
         kind: TaskMutationKind,
+        #[serde(default)]
+        origin: PlanItemOrigin,
         #[serde(default)]
         content: String,
         #[serde(default)]
@@ -576,6 +582,7 @@ impl ActivityAccumulator {
         // semantic boundary and must remain in provider order.
         if let ActivityKind::PlanUpdate {
             tasks: incoming,
+            authoritative: incoming_authoritative,
             compacted: incoming_compacted,
             replaces_native: incoming_replaces_native,
         } = &incoming.kind
@@ -588,15 +595,21 @@ impl ActivityAccumulator {
                 .any(|event| matches!(event.kind, ActivityKind::TaskMutation { .. }))
             && let ActivityKind::PlanUpdate {
                 tasks: existing,
+                authoritative: existing_authoritative,
                 compacted: existing_compacted,
                 replaces_native: existing_replaces_native,
             } = &mut self.events[index].kind
         {
-            *existing = merge_plan_snapshot(
-                existing,
-                incoming,
-                !*incoming_compacted || *incoming_replaces_native,
-            );
+            *existing = if *incoming_authoritative {
+                incoming.clone()
+            } else {
+                merge_plan_snapshot(
+                    existing,
+                    incoming,
+                    !*incoming_compacted || *incoming_replaces_native,
+                )
+            };
+            *existing_authoritative = *incoming_authoritative;
             *existing_compacted = *incoming_compacted;
             *existing_replaces_native = *incoming_replaces_native;
             return;
@@ -717,7 +730,11 @@ impl ActivityAccumulator {
         let projected_task_ids = progress
             .items
             .iter()
-            .filter_map(|item| item.task_id.clone())
+            .filter_map(|item| {
+                item.task_id
+                    .as_ref()
+                    .map(|task_id| (item.origin, task_id.clone()))
+            })
             .collect::<BTreeSet<_>>();
         let unresolved = self
             .events
@@ -725,10 +742,13 @@ impl ActivityAccumulator {
             .filter_map(|event| match &event.kind {
                 ActivityKind::TaskMutation {
                     kind: TaskMutationKind::Update,
+                    origin,
                     content,
                     task_id: Some(task_id),
                     ..
-                } if content.trim().is_empty() && !projected_task_ids.contains(task_id) => {
+                } if content.trim().is_empty()
+                    && !projected_task_ids.contains(&(*origin, task_id.clone())) =>
+                {
                     Some(event.id)
                 }
                 _ => None,
@@ -750,6 +770,15 @@ impl ActivityAccumulator {
             .events
             .iter()
             .any(|event| event.kind.plan_replaces_native());
+        let authoritative = self.events.iter().any(|event| {
+            matches!(
+                event.kind,
+                ActivityKind::PlanUpdate {
+                    authoritative: true,
+                    ..
+                }
+            )
+        });
         let provenance_budget = self.max_events.saturating_sub(1).min(8);
         let bounded_provenance = self
             .events
@@ -787,6 +816,7 @@ impl ActivityAccumulator {
                 duration_ms: snapshot_identity.duration_ms,
                 kind: ActivityKind::PlanUpdate {
                     tasks: progress.items,
+                    authoritative,
                     compacted: true,
                     replaces_native,
                 },
@@ -1006,7 +1036,8 @@ pub fn latest_turn_status(events: &[ActivityEvent]) -> Option<TurnStatusProjecti
 /// A newer provider-native snapshot replaces native rows while preserving
 /// app-tool rows. Creates append in event order unless a stable id makes them
 /// an idempotent re-emit. Updates match exact task id first, then exact
-/// content; unknown named updates create a new app-tool task.
+/// content within the mutation's origin; unknown named updates create a new
+/// task with that same origin.
 pub fn newest_plan(events: &[ActivityEvent]) -> Option<ProgressProjection> {
     let mut folded: Option<(Uuid, UnixMillis, Vec<PlanItem>)> = None;
 
@@ -1014,19 +1045,25 @@ pub fn newest_plan(events: &[ActivityEvent]) -> Option<ProgressProjection> {
         match &event.kind {
             ActivityKind::PlanUpdate {
                 tasks,
+                authoritative,
                 compacted,
                 replaces_native,
             } => {
-                let items = folded
-                    .as_ref()
-                    .map(|(_, _, existing)| {
-                        merge_plan_snapshot(existing, tasks, !*compacted || *replaces_native)
-                    })
-                    .unwrap_or_else(|| tasks.clone());
+                let items = if *authoritative {
+                    tasks.clone()
+                } else {
+                    folded
+                        .as_ref()
+                        .map(|(_, _, existing)| {
+                            merge_plan_snapshot(existing, tasks, !*compacted || *replaces_native)
+                        })
+                        .unwrap_or_else(|| tasks.clone())
+                };
                 folded = Some((event.id, event.at, items));
             }
             ActivityKind::TaskMutation {
                 kind,
+                origin,
                 content,
                 task_id,
                 status,
@@ -1037,6 +1074,7 @@ pub fn newest_plan(events: &[ActivityEvent]) -> Option<ProgressProjection> {
                     if apply_task_mutation(
                         items,
                         *kind,
+                        *origin,
                         content,
                         task_id.as_deref(),
                         *status,
@@ -1050,6 +1088,7 @@ pub fn newest_plan(events: &[ActivityEvent]) -> Option<ProgressProjection> {
                     if apply_task_mutation(
                         &mut items,
                         *kind,
+                        *origin,
                         content,
                         task_id.as_deref(),
                         *status,
@@ -1166,6 +1205,7 @@ fn merge_plan_snapshot(
 fn apply_task_mutation(
     items: &mut Vec<PlanItem>,
     kind: TaskMutationKind,
+    origin: PlanItemOrigin,
     content: &str,
     task_id: Option<&str>,
     status: Option<PlanItemStatus>,
@@ -1174,9 +1214,11 @@ fn apply_task_mutation(
     let by_id = task_id.and_then(|id| {
         items
             .iter()
-            .position(|item| item.task_id.as_deref() == Some(id))
+            .position(|item| item.origin == origin && item.task_id.as_deref() == Some(id))
     });
-    let by_content = items.iter().position(|item| item.content == content);
+    let by_content = items
+        .iter()
+        .position(|item| item.origin == origin && item.content == content);
     let existing = match kind {
         // Creates with no stable id are distinct tasks even when their prose
         // matches. A repeated stable id is treated as an idempotent re-emit.
@@ -1211,7 +1253,7 @@ fn apply_task_mutation(
         active_form: active_form.map(str::to_owned),
         status: status.unwrap_or_default(),
         task_id: task_id.map(str::to_owned),
-        origin: PlanItemOrigin::AppTools,
+        origin,
     });
     true
 }
@@ -1240,6 +1282,7 @@ pub fn project_progress(
                 saved.at,
                 ActivityKind::PlanUpdate {
                     tasks: saved.items.clone(),
+                    authoritative: true,
                     compacted: false,
                     replaces_native: false,
                 },
@@ -1740,8 +1783,9 @@ pub enum StreamDialect {
 )]
 #[serde(rename_all = "camelCase")]
 pub enum PlanChannel {
-    NativeStream,
     #[default]
+    None,
+    NativeStream,
     AppTaskTools,
 }
 
@@ -1901,6 +1945,12 @@ pub fn runtime_tuning_profile(
             // until a scoped channel is available.
             (GROK_REASONING_0_2_111, false)
         }
+        (ProviderKind::Grok, Some(version)) if version.is(0, 2, 114) => {
+            // The installed 0.2.114 model metadata still advertises exactly
+            // low/medium/high for grok-4.5. ACP makes task calls structured,
+            // but scoped child prose remains a PR 3 capability.
+            (GROK_REASONING_0_2_111, false)
+        }
         (ProviderKind::Kimi, Some(version)) if version.is(1, 49, 0) => (NO_REASONING, true),
         (ProviderKind::Ollama, Some(version)) if version.is(0, 32, 1) => {
             (OLLAMA_REASONING_0_32_1, true)
@@ -2012,7 +2062,13 @@ pub fn capability_profile_for_runtime(
 
     let plan_channel = match runtime_family {
         ProviderKind::Claude | ProviderKind::Codex => PlanChannel::NativeStream,
-        _ => PlanChannel::AppTaskTools,
+        ProviderKind::Grok if version.is_some_and(|version| version.is(0, 2, 114)) => {
+            PlanChannel::AppTaskTools
+        }
+        ProviderKind::Grok => PlanChannel::NativeStream,
+        ProviderKind::OpenAiCompatible | ProviderKind::Custom => PlanChannel::AppTaskTools,
+        ProviderKind::LmStudio if !is_lm_studio_cli => PlanChannel::AppTaskTools,
+        ProviderKind::LmStudio | ProviderKind::Kimi | ProviderKind::Ollama => PlanChannel::None,
     };
     let resume = match runtime_family {
         ProviderKind::Codex => ResumeStrategy::CodexExecSubcommand,
@@ -2142,6 +2198,7 @@ mod tests {
                 status,
                 ..PlanItem::default()
             }],
+            authoritative: false,
             compacted: false,
             replaces_native: false,
         }
@@ -2154,8 +2211,27 @@ mod tests {
         status: Option<PlanItemStatus>,
         active_form: Option<&str>,
     ) -> ActivityKind {
+        task_mutation_with_origin(
+            kind,
+            PlanItemOrigin::AppTools,
+            content,
+            task_id,
+            status,
+            active_form,
+        )
+    }
+
+    fn task_mutation_with_origin(
+        kind: TaskMutationKind,
+        origin: PlanItemOrigin,
+        content: &str,
+        task_id: Option<&str>,
+        status: Option<PlanItemStatus>,
+        active_form: Option<&str>,
+    ) -> ActivityKind {
         ActivityKind::TaskMutation {
             kind,
+            origin,
             content: content.into(),
             task_id: task_id.map(str::to_owned),
             status,
@@ -2302,6 +2378,61 @@ mod tests {
     }
 
     #[test]
+    fn cap_compaction_preserves_authoritative_cross_origin_replacement() {
+        let persisted = vec![event(
+            1,
+            1,
+            ActivityKind::PlanUpdate {
+                tasks: vec![PlanItem {
+                    content: "Removed persisted task".into(),
+                    task_id: Some("old".into()),
+                    origin: PlanItemOrigin::AppTools,
+                    ..PlanItem::default()
+                }],
+                authoritative: true,
+                compacted: false,
+                replaces_native: false,
+            },
+        )];
+        let mut live = ActivityAccumulator::with_max_events(1);
+        live.ingest(event(
+            2,
+            2,
+            ActivityKind::PlanUpdate {
+                tasks: Vec::new(),
+                authoritative: true,
+                compacted: false,
+                replaces_native: false,
+            },
+        ));
+        live.ingest(event(
+            3,
+            3,
+            task_mutation(
+                TaskMutationKind::Create,
+                "Current task",
+                Some("new"),
+                Some(PlanItemStatus::InProgress),
+                Some("Doing current task"),
+            ),
+        ));
+
+        assert_eq!(live.len(), 1);
+        assert!(matches!(
+            live.events[0].kind,
+            ActivityKind::PlanUpdate {
+                authoritative: true,
+                compacted: true,
+                ..
+            }
+        ));
+        let projection = project_progress(&persisted, &live.events);
+        assert_eq!(projection.source, ProgressSource::Live);
+        assert_eq!(projection.items.len(), 1);
+        assert_eq!(projection.items[0].content, "Current task");
+    }
+
+    #[test]
     fn plan_fold_replaces_native_rows_but_preserves_app_tool_rows() {
         let snapshot = ActivityKind::PlanUpdate {
             tasks: vec![
@@ -2317,6 +2448,7 @@ mod tests {
                     ..PlanItem::default()
                 },
             ],
+            authoritative: false,
             compacted: false,
             replaces_native: false,
         };
@@ -2337,8 +2469,9 @@ mod tests {
             event(
                 3,
                 3,
-                task_mutation(
+                task_mutation_with_origin(
                     TaskMutationKind::Update,
+                    PlanItemOrigin::Native,
                     "First renamed",
                     Some("one"),
                     Some(PlanItemStatus::Completed),
@@ -2349,8 +2482,9 @@ mod tests {
             event(
                 4,
                 4,
-                task_mutation(
+                task_mutation_with_origin(
                     TaskMutationKind::Update,
+                    PlanItemOrigin::Native,
                     "Match by content",
                     Some("two"),
                     Some(PlanItemStatus::InProgress),
@@ -2418,6 +2552,52 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_whole_list_snapshot_clears_every_older_task_origin() {
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest(event(
+            1,
+            1,
+            ActivityKind::PlanUpdate {
+                tasks: vec![
+                    PlanItem {
+                        content: "Native".into(),
+                        origin: PlanItemOrigin::Native,
+                        ..PlanItem::default()
+                    },
+                    PlanItem {
+                        content: "App-owned".into(),
+                        origin: PlanItemOrigin::AppTools,
+                        ..PlanItem::default()
+                    },
+                ],
+                authoritative: true,
+                compacted: false,
+                replaces_native: false,
+            },
+        ));
+        accumulator.ingest(event(
+            2,
+            2,
+            ActivityKind::PlanUpdate {
+                tasks: Vec::new(),
+                authoritative: true,
+                compacted: false,
+                replaces_native: false,
+            },
+        ));
+
+        let progress = newest_plan(&accumulator.events).unwrap();
+        assert!(progress.items.is_empty());
+        assert_eq!(progress.event_id, Uuid::from_u128(1));
+        assert!(
+            newest_plan(&accumulator.events_for_persistence())
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn mutation_only_plan_preserves_distinct_create_rows_without_ids() {
         let events = vec![
             event(
@@ -2445,6 +2625,71 @@ mod tests {
         assert_eq!(projection.items[1].task_id.as_deref(), Some("1"));
         assert_eq!(projection.items[1].status, PlanItemStatus::InProgress);
         assert_eq!(projection.items[1].origin, PlanItemOrigin::AppTools);
+    }
+
+    #[test]
+    fn task_mutations_with_the_same_identity_do_not_cross_origins() {
+        let events = vec![
+            event(
+                1,
+                1,
+                task_mutation_with_origin(
+                    TaskMutationKind::Create,
+                    PlanItemOrigin::Native,
+                    "Shared task",
+                    Some("shared-id"),
+                    Some(PlanItemStatus::Pending),
+                    None,
+                ),
+            ),
+            event(
+                2,
+                2,
+                task_mutation_with_origin(
+                    TaskMutationKind::Create,
+                    PlanItemOrigin::AppTools,
+                    "Shared task",
+                    Some("shared-id"),
+                    Some(PlanItemStatus::InProgress),
+                    Some("Doing app task"),
+                ),
+            ),
+            event(
+                3,
+                3,
+                task_mutation_with_origin(
+                    TaskMutationKind::Update,
+                    PlanItemOrigin::Native,
+                    "",
+                    Some("shared-id"),
+                    Some(PlanItemStatus::Completed),
+                    None,
+                ),
+            ),
+            event(
+                4,
+                4,
+                task_mutation_with_origin(
+                    TaskMutationKind::Update,
+                    PlanItemOrigin::AppTools,
+                    "",
+                    Some("shared-id"),
+                    Some(PlanItemStatus::Cancelled),
+                    None,
+                ),
+            ),
+        ];
+
+        let projection = newest_plan(&events).unwrap();
+        assert_eq!(projection.items.len(), 2);
+        assert_eq!(projection.items[0].origin, PlanItemOrigin::Native);
+        assert_eq!(projection.items[0].status, PlanItemStatus::Completed);
+        assert_eq!(projection.items[1].origin, PlanItemOrigin::AppTools);
+        assert_eq!(projection.items[1].status, PlanItemStatus::Cancelled);
+        assert_eq!(
+            projection.items[1].active_form.as_deref(),
+            Some("Doing app task")
+        );
     }
 
     #[test]
@@ -2501,6 +2746,7 @@ mod tests {
                         origin: PlanItemOrigin::Native,
                         ..PlanItem::default()
                     }],
+                    authoritative: false,
                     compacted: false,
                     replaces_native: false,
                 },
@@ -2526,6 +2772,7 @@ mod tests {
                         origin: PlanItemOrigin::Native,
                         ..PlanItem::default()
                     }],
+                    authoritative: false,
                     compacted: false,
                     replaces_native: false,
                 },
@@ -2560,6 +2807,7 @@ mod tests {
                             ..PlanItem::default()
                         },
                     ],
+                    authoritative: false,
                     compacted: false,
                     replaces_native: false,
                 },
@@ -2581,6 +2829,7 @@ mod tests {
                             ..PlanItem::default()
                         },
                     ],
+                    authoritative: false,
                     compacted: false,
                     replaces_native: false,
                 },
@@ -2657,6 +2906,7 @@ mod tests {
                             ..PlanItem::default()
                         },
                     ],
+                    authoritative: false,
                     compacted: false,
                     replaces_native: false,
                 },
@@ -2664,8 +2914,9 @@ mod tests {
             event(
                 2,
                 2,
-                task_mutation(
+                task_mutation_with_origin(
                     TaskMutationKind::Update,
+                    PlanItemOrigin::Native,
                     "Shared content",
                     Some("one"),
                     Some(PlanItemStatus::Completed),
@@ -2714,6 +2965,7 @@ mod tests {
             3,
             ActivityKind::PlanUpdate {
                 tasks: Vec::new(),
+                authoritative: false,
                 compacted: false,
                 replaces_native: false,
             },
@@ -2821,6 +3073,7 @@ mod tests {
                     origin: PlanItemOrigin::Native,
                     ..PlanItem::default()
                 }],
+                authoritative: false,
                 compacted: false,
                 replaces_native: false,
             },
@@ -2829,8 +3082,9 @@ mod tests {
         live.ingest(event(
             2,
             2,
-            task_mutation(
+            task_mutation_with_origin(
                 TaskMutationKind::Update,
+                PlanItemOrigin::Native,
                 "",
                 Some("native-x"),
                 Some(PlanItemStatus::Completed),
@@ -2853,6 +3107,7 @@ mod tests {
         assert!(live.events.iter().any(|event| matches!(
             event.kind,
             ActivityKind::PlanUpdate {
+                authoritative: false,
                 compacted: true,
                 replaces_native: false,
                 ..
@@ -2878,6 +3133,7 @@ mod tests {
                     status: PlanItemStatus::InProgress,
                     ..PlanItem::default()
                 }],
+                authoritative: false,
                 compacted: false,
                 replaces_native: false,
             },
@@ -3473,6 +3729,7 @@ mod tests {
             plan("plan", PlanItemStatus::InProgress),
             ActivityKind::TaskMutation {
                 kind: TaskMutationKind::Create,
+                origin: PlanItemOrigin::AppTools,
                 content: "task".into(),
                 task_id: Some("5".into()),
                 status: Some(PlanItemStatus::InProgress),
@@ -3591,10 +3848,32 @@ mod tests {
                 status: ActivityStatus::Completed,
             }
         );
+
+        let legacy_plan: ActivityKind =
+            serde_json::from_str(r#"{"type":"planUpdate","tasks":[]}"#).unwrap();
+        assert!(matches!(
+            legacy_plan,
+            ActivityKind::PlanUpdate {
+                authoritative: false,
+                ..
+            }
+        ));
+        let authoritative = ActivityKind::PlanUpdate {
+            tasks: Vec::new(),
+            authoritative: true,
+            compacted: false,
+            replaces_native: false,
+        };
+        let encoded = serde_json::to_string(&authoritative).unwrap();
+        assert!(encoded.contains(r#""authoritative":true"#));
+        assert_eq!(
+            serde_json::from_str::<ActivityKind>(&encoded).unwrap(),
+            authoritative
+        );
     }
 
     #[test]
-    fn older_task_mutations_default_new_progress_fields_to_none() {
+    fn task_mutation_origin_defaults_native_and_round_trips() {
         let decoded: ActivityKind = serde_json::from_str(
             r#"{"type":"taskMutation","kind":"update","content":"Existing","taskId":"1"}"#,
         )
@@ -3603,12 +3882,34 @@ mod tests {
             decoded,
             ActivityKind::TaskMutation {
                 kind: TaskMutationKind::Update,
+                origin: PlanItemOrigin::Native,
                 content: "Existing".into(),
                 task_id: Some("1".into()),
                 status: None,
                 active_form: None,
                 result_summary: None,
             }
+        );
+
+        let encoded = serde_json::to_string(&decoded).unwrap();
+        assert!(encoded.contains(r#""origin":"native""#));
+        assert_eq!(
+            serde_json::from_str::<ActivityKind>(&encoded).unwrap(),
+            decoded
+        );
+
+        let app_tools = task_mutation_with_origin(
+            TaskMutationKind::Create,
+            PlanItemOrigin::AppTools,
+            "App task",
+            Some("app-1"),
+            None,
+            None,
+        );
+        assert_eq!(
+            serde_json::from_str::<ActivityKind>(&serde_json::to_string(&app_tools).unwrap())
+                .unwrap(),
+            app_tools
         );
     }
 
@@ -3658,12 +3959,13 @@ mod tests {
         let kimi_args = vec!["--output-format".into(), "stream-json".into()];
         let kimi = capability_profile("kimi_cli", "kimi", &kimi_args);
         assert_eq!(kimi.stream_dialect, StreamDialect::KimiStreamJson);
-        assert_eq!(kimi.plan_channel, PlanChannel::AppTaskTools);
+        assert_eq!(kimi.plan_channel, PlanChannel::None);
         assert_eq!(kimi.resume, ResumeStrategy::None);
 
         let ollama = capability_profile("ollama", "ollama", &empty);
         assert_eq!(ollama.transport, TransportKind::CliProcess);
         assert_eq!(ollama.stream_dialect, StreamDialect::PlainText);
+        assert_eq!(ollama.plan_channel, PlanChannel::None);
     }
 
     #[test]
@@ -3684,6 +3986,7 @@ mod tests {
             ("codex-cli 0.144.1", (0, 144, 1)),
             ("2.1.128 (Claude Code)", (2, 1, 128)),
             ("grok 0.2.111 (94172f2aa4e5)", (0, 2, 111)),
+            ("grok 0.2.114 (0c785038798)", (0, 2, 114)),
             ("warning\nkimi, version 1.49.0", (1, 49, 0)),
             ("Warning: client version is 0.32.1", (0, 32, 1)),
         ] {
@@ -3737,6 +4040,15 @@ mod tests {
                 "{unsupported}"
             );
         }
+
+        let current_grok = CliVersion::parse("grok 0.2.114 (0c785038798)").unwrap();
+        let current_grok_tuning =
+            runtime_tuning_profile(ProviderKind::Grok, Some(&current_grok), "grok-4.5");
+        assert_eq!(
+            current_grok_tuning.reasoning_efforts,
+            GROK_REASONING_0_2_111
+        );
+        assert!(!current_grok_tuning.supports_scoped_child_text);
 
         let unknown = runtime_tuning_profile(
             ProviderKind::Grok,

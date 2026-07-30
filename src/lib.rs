@@ -1,6 +1,8 @@
 pub mod ai;
 pub mod ai_prompt;
 pub mod ai_state;
+pub(crate) mod ai_task_bridge;
+pub(crate) mod ai_task_tools;
 pub mod ai_tool_gate;
 pub mod app;
 pub mod assets;
@@ -9,6 +11,7 @@ pub mod chat_core;
 pub mod clipboard;
 pub mod domain;
 pub mod dots;
+pub(crate) mod grok_acp;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_image_io;
 #[cfg(target_os = "macos")]
