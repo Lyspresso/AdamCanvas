@@ -133,8 +133,25 @@ impl eframe::App for Preview {
                         ui,
                         &synthetic_rows(),
                         false,
+                        None,
+                        None,
                         &palette,
                         &mut action,
+                    );
+                    ui.add_space(18.0);
+                    ui.separator();
+                    ui.add_space(10.0);
+                    ui.heading("Setup screen (all providers missing)");
+                    let mut setup_action = AgentsPanelAction::default();
+                    let missing_rows = agent_rows(&Default::default(), None);
+                    agents_panel::agents_setup_ui(
+                        ui,
+                        &missing_rows,
+                        false,
+                        None,
+                        None,
+                        &palette,
+                        &mut setup_action,
                     );
                     ui.add_space(18.0);
                     ui.separator();
@@ -149,6 +166,8 @@ impl eframe::App for Preview {
                                 ui,
                                 &rows,
                                 self.live.scanning(),
+                                self.live.installing(),
+                                self.live.last_install(),
                                 &palette,
                                 &mut live_action,
                             );
@@ -166,6 +185,8 @@ impl eframe::App for Preview {
                     if let Some(command) = live_action.copy_install {
                         ui.ctx().copy_text(command.to_owned());
                     }
+                    // The preview deliberately ignores live_action.install:
+                    // the example must never modify the host machine.
                 });
         });
     }

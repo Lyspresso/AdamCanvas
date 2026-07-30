@@ -1,6 +1,7 @@
 use crate::{
     agents_panel::{
-        self, AgentsPanelAction, AgentsPanelState, PreflightNotice, agent_rows, preflight_notice,
+        self, AgentRow, AgentsPanelAction, AgentsPanelState, InstallOutcome, PreflightNotice,
+        agent_rows, preflight_notice,
     },
     ai::{
         AiEngine, AiEvent, AiFailureKind, AiRunRequest, clamp_provider_preferences,
@@ -489,6 +490,18 @@ struct AiWorkspaceUiAction {
     toggle_all_outputs: bool,
     retry_turn: Option<RetryHint>,
     open_agents_panel: bool,
+    agents_action: AgentsPanelAction,
+}
+
+/// Per-frame owned snapshot of agents state for the chat page, so the render
+/// path never borrows `AgentsPanelState` directly.
+struct AgentsChatView {
+    preflight: Option<PreflightNotice>,
+    /// Some ⇒ the empty state renders as the agents setup screen.
+    setup_rows: Option<Vec<AgentRow>>,
+    scanning: bool,
+    installing: Option<&'static str>,
+    last_install: Option<InstallOutcome>,
 }
 
 struct AiTilePreview {
@@ -6107,11 +6120,39 @@ impl AdamApp {
             .cloned();
         let mut action = AiWorkspaceUiAction::default();
         self.agents.ensure_scanned();
-        let preflight = preflight_notice(
-            &settings.provider_id,
-            !settings.api_endpoint.trim().is_empty(),
-            self.agents.snapshot.as_ref(),
-        );
+        let setup_active = conversation.messages().is_empty()
+            && runtime.streamed_text.is_empty()
+            && !self.agents.setup_dismissed
+            && self
+                .agents
+                .snapshot
+                .as_ref()
+                .is_some_and(agents_panel::needs_setup);
+        let agents_view = AgentsChatView {
+            // The setup screen already carries the install affordances; the
+            // banner would only repeat it.
+            preflight: if setup_active {
+                None
+            } else {
+                preflight_notice(
+                    &settings.provider_id,
+                    !settings.api_endpoint.trim().is_empty(),
+                    self.agents.snapshot.as_ref(),
+                )
+            },
+            setup_rows: setup_active.then(|| {
+                agent_rows(
+                    self.agents
+                        .snapshot
+                        .as_ref()
+                        .expect("setup requires a snapshot"),
+                    Some(&settings.provider_id),
+                )
+            }),
+            scanning: self.agents.scanning(),
+            installing: self.agents.installing(),
+            last_install: self.agents.last_install().cloned(),
+        };
         let show_inspector = runtime.show_inspector && root.available_width() >= 720.0;
 
         if show_inspector {
@@ -6163,9 +6204,32 @@ impl AdamApp {
                 });
         }
 
+        // Dot-shader background behind the setup screen: the shader draws
+        // opaquely inside its scissor rect, so it must be the first shape in
+        // the panel and the fill must be transparent only while it paints
+        // (falling back to the opaque desk fill whenever dots are off).
+        let dots_seconds = self.dots_seconds();
+        let setup_dots = setup_active && dots_seconds.is_some();
         egui::CentralPanel::default()
-            .frame(Frame::NONE.fill(colors.desk))
+            .frame(Frame::NONE.fill(if setup_dots {
+                Color32::TRANSPARENT
+            } else {
+                colors.desk
+            }))
             .show(root, |ui| {
+                if let (true, Some(seconds)) = (setup_dots, dots_seconds) {
+                    let rect = ui.max_rect();
+                    ui.painter().add(dots::paint_callback(
+                        rect,
+                        ChromeRects {
+                            toolbar: rect,
+                            sidebar: Rect::NOTHING,
+                        },
+                        seconds,
+                        colors.dots_tint,
+                        colors.dots_background,
+                    ));
+                }
                 render_ai_chat_page(
                     ui,
                     &conversation,
@@ -6173,7 +6237,7 @@ impl AdamApp {
                     &mut permission,
                     &mut runtime,
                     pending_action.as_ref(),
-                    preflight.as_ref(),
+                    &agents_view,
                     &mut action,
                     &mut self.markdown_cache,
                     colors,
@@ -6218,6 +6282,7 @@ impl AdamApp {
             self.agents.open = true;
             self.agents.ensure_scanned();
         }
+        self.apply_agents_panel_action(action.agents_action, context);
         if action.add_attachments {
             self.add_ai_attachments(conversation_id);
         }
@@ -8464,6 +8529,8 @@ impl AdamApp {
                         ui,
                         &rows,
                         self.agents.scanning(),
+                        self.agents.installing(),
+                        self.agents.last_install(),
                         &agents_panel_palette(colors),
                         &mut action,
                     );
@@ -8478,8 +8545,19 @@ impl AdamApp {
                     });
                 }
             });
+        self.apply_agents_panel_action(action, context);
+        self.agents.open = open;
+    }
+
+    /// Shared handler for panel-, banner-, and setup-screen actions.
+    fn apply_agents_panel_action(&mut self, action: AgentsPanelAction, context: &Context) {
         if action.refresh {
             self.agents.request_scan(true);
+        }
+        if let Some(provider_id) = action.install
+            && !self.agents.request_install(provider_id)
+        {
+            self.toast("Couldn't start the install", context);
         }
         if let Some(command) = action.copy_install {
             context.copy_text(command.to_owned());
@@ -8488,7 +8566,12 @@ impl AdamApp {
         if let Some(url) = action.open_docs {
             platform::open_url(url);
         }
-        self.agents.open = open;
+        if action.clear_install_log {
+            self.agents.clear_install_log();
+        }
+        if action.dismiss_setup {
+            self.agents.setup_dismissed = true;
+        }
     }
 
     fn handle_external_drops(&mut self, context: &Context) {
@@ -9694,6 +9777,9 @@ impl eframe::App for AdamApp {
         self.poll_asset_imports(context);
         self.poll_ai_events(context);
         self.agents.poll();
+        if self.agents.take_install_notice().is_some() {
+            self.toast("Agent installed and detected", context);
+        }
         self.handle_shortcuts(context);
         self.handle_external_drops(context);
         self.poll_automation(context);
@@ -13709,7 +13795,7 @@ fn render_ai_chat_page(
     permission: &mut PermissionMode,
     runtime: &mut AiChatRuntime,
     pending_action: Option<&AiActionRequest>,
-    preflight: Option<&PreflightNotice>,
+    agents_view: &AgentsChatView,
     action: &mut AiWorkspaceUiAction,
     markdown_cache: &mut CommonMarkCache,
     colors: Theme,
@@ -13734,7 +13820,19 @@ fn render_ai_chat_page(
             ui.add_space(22.0);
             ui.set_max_width(880.0);
             if conversation.messages().is_empty() && runtime.streamed_text.is_empty() {
-                render_ai_empty_state(ui, settings.workspace_mode, runtime, colors);
+                if let Some(rows) = agents_view.setup_rows.as_ref() {
+                    agents_panel::agents_setup_ui(
+                        ui,
+                        rows,
+                        agents_view.scanning,
+                        agents_view.installing,
+                        agents_view.last_install.as_ref(),
+                        &agents_panel_palette(colors),
+                        &mut action.agents_action,
+                    );
+                } else {
+                    render_ai_empty_state(ui, settings.workspace_mode, runtime, colors);
+                }
             }
             for message in conversation.messages() {
                 render_ai_message(ui, message, action, markdown_cache, colors);
@@ -13826,7 +13924,7 @@ fn render_ai_chat_page(
         ui.add_space(inset);
         ui.vertical(|ui| {
             ui.set_width((available - inset * 2.0).clamp(320.0, 880.0));
-            render_ai_preflight_banner(ui, preflight, action, colors);
+            render_ai_preflight_banner(ui, agents_view.preflight.as_ref(), action, colors);
             render_ai_chat_progress_pill(ui, runtime, colors);
             render_ai_queue_bar(ui, conversation, runtime, action, colors);
             render_ai_composer(
@@ -13853,6 +13951,8 @@ fn render_ai_preflight_banner(
     let Some(notice) = preflight else {
         return;
     };
+    // Rendered from AgentsChatView.preflight; suppressed while the setup
+    // screen is active because that screen carries the same affordances.
     Frame::NONE
         .fill(if notice.danger {
             colors
