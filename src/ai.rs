@@ -6,9 +6,10 @@
 
 use crate::{
     chat_core::{
-        ActivityEvent, ActivityKind, ActivityStatus, FileChange, FileChangeKind, PlanItem,
-        PlanItemOrigin, PlanItemStatus, ProviderKind, ResumeStrategy, SystemPromptChannel,
-        TaskMutationKind, capability_profile,
+        ActivityEvent, ActivityKind, ActivityStatus, FileChange, FileChangeKind,
+        PermissionResolution, PlanItem, PlanItemOrigin, PlanItemStatus, ProviderKind,
+        ResumeStrategy, RetryHint, SubagentStatus, SystemPromptChannel, TaskMutationKind,
+        TurnStatus, capability_profile,
     },
     domain::{
         AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_THINKING,
@@ -42,6 +43,9 @@ const MAX_JSON_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RAW_SALVAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ACTIVITY_OUTPUT_BYTES: usize = 4 * 1024;
+const MAX_GROK_SESSION_LINE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_GROK_SESSION_UPDATES: usize = 2_048;
+const MAX_GROK_SUBAGENTS: usize = 256;
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const CHAT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const TASK_TIMEOUT: Duration = Duration::from_secs(60 * 60);
@@ -99,6 +103,14 @@ impl fmt::Debug for AiRunRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AiFailureKind {
+    PermissionBlocked,
+    TimedOut,
+    MaxTurnsReached,
+    ProviderError,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum AiEvent {
     Started {
@@ -132,6 +144,7 @@ pub enum AiEvent {
     Failed {
         turn_id: Uuid,
         conversation_id: Uuid,
+        kind: AiFailureKind,
         message: String,
     },
     Cancelled {
@@ -279,6 +292,13 @@ impl AiEngine {
                     }
                 };
 
+                if let Some(status) = run_outcome_status(&outcome) {
+                    let _ = events.send(AiEvent::Activity {
+                        turn_id,
+                        conversation_id,
+                        event: activity_event(status),
+                    });
+                }
                 let terminal = match outcome {
                     RunOutcome::Completed { text, session_id } => Some(AiEvent::Completed {
                         turn_id,
@@ -286,9 +306,10 @@ impl AiEngine {
                         text,
                         session_id,
                     }),
-                    RunOutcome::Failed(message) => Some(AiEvent::Failed {
+                    RunOutcome::Failed { kind, message, .. } => Some(AiEvent::Failed {
                         turn_id,
                         conversation_id,
+                        kind,
                         message,
                     }),
                     RunOutcome::Cancelled => Some(AiEvent::Cancelled {
@@ -653,12 +674,23 @@ fn preset_process_spec(
             if !model.is_empty() {
                 push_args(&mut arguments, &["--model", model]);
             }
-            if let Some(effort) = allowlisted_reasoning_effort(request, &["low", "medium", "high"])
-            {
+            if let Some(effort) = allowlisted_reasoning_effort(
+                request,
+                &["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+            ) {
                 push_args(&mut arguments, &["--reasoning-effort", effort]);
             }
             if request.provider_preferences.feature(AI_FEATURE_WEB_SEARCH) == Some(false) {
                 arguments.push("--disable-web-search".into());
+            } else {
+                // Grok's WebSearch tool is built-in read-only, but WebFetch
+                // otherwise reaches the prompt policy. A headless prompt is
+                // cancelled immediately because Adam has no interactive
+                // responder on this process transport. Grant only these two
+                // read-only web tools; the read-only Chat sandbox and normal
+                // prompt policy continue to gate mutations.
+                push_args(&mut arguments, &["--allow", "WebSearch"]);
+                push_args(&mut arguments, &["--allow", "WebFetch"]);
             }
             if request.provider_preferences.feature(AI_FEATURE_PLANNING) == Some(false) {
                 arguments.push("--no-plan".into());
@@ -945,16 +977,12 @@ fn claude_permission(request: &AiRunRequest) -> &'static str {
     }
 }
 
-fn grok_permission(request: &AiRunRequest) -> &'static str {
-    if matches!(
-        request.permission_mode,
-        PermissionMode::Auto | PermissionMode::Bypass
-    ) && request.workspace_mode != AiWorkspaceMode::Chat
-    {
-        "acceptEdits"
-    } else {
-        "plan"
-    }
+fn grok_permission(_request: &AiRunRequest) -> &'static str {
+    // Grok accepts Claude-compatible spellings such as `plan` and
+    // `acceptEdits` on argv, but its documented CLI contract treats both as
+    // the normal prompting policy. Be explicit about that policy and add only
+    // narrow per-tool grants above.
+    "default"
 }
 
 fn canonical_working_directory(path: Option<&Path>) -> Result<Option<PathBuf>, AiEngineError> {
@@ -1078,11 +1106,74 @@ enum RunOutcome {
         text: String,
         session_id: Option<String>,
     },
-    Failed(String),
+    Failed {
+        kind: AiFailureKind,
+        message: String,
+        tool: Option<String>,
+        retry: Option<RetryHint>,
+    },
     Cancelled,
     /// The runner sent its user-facing terminal event before its underlying
     /// worker exited, then retained the engine slot until cleanup completed.
     TerminalAlreadyEmitted,
+}
+
+impl RunOutcome {
+    fn provider_error(message: impl Into<String>) -> Self {
+        Self::Failed {
+            kind: AiFailureKind::ProviderError,
+            message: message.into(),
+            tool: None,
+            retry: Some(RetryHint::Retry),
+        }
+    }
+
+    fn timed_out(message: impl Into<String>) -> Self {
+        Self::Failed {
+            kind: AiFailureKind::TimedOut,
+            message: message.into(),
+            tool: None,
+            retry: Some(RetryHint::Retry),
+        }
+    }
+}
+
+fn run_outcome_status(outcome: &RunOutcome) -> Option<ActivityKind> {
+    let (status, message, retry) = match outcome {
+        RunOutcome::Completed { .. } => (TurnStatus::Completed, None, None),
+        RunOutcome::Failed {
+            kind,
+            message,
+            tool,
+            retry,
+        } => {
+            let status = match kind {
+                AiFailureKind::PermissionBlocked => TurnStatus::PermissionBlocked,
+                AiFailureKind::TimedOut => TurnStatus::TimedOut,
+                AiFailureKind::MaxTurnsReached => TurnStatus::MaxTurnsReached,
+                AiFailureKind::ProviderError => TurnStatus::ProviderError,
+            };
+            let retry = (*retry).or(Some(if *kind == AiFailureKind::PermissionBlocked {
+                RetryHint::AllowWebAndRetry
+            } else {
+                RetryHint::Retry
+            }));
+            return Some(ActivityKind::TurnStatus {
+                status,
+                message: Some(message.clone()),
+                tool: tool.clone(),
+                retry,
+            });
+        }
+        RunOutcome::Cancelled => (TurnStatus::UserCancelled, None, None),
+        RunOutcome::TerminalAlreadyEmitted => return None,
+    };
+    Some(ActivityKind::TurnStatus {
+        status,
+        message,
+        tool: None,
+        retry,
+    })
 }
 
 fn run_process(
@@ -1118,7 +1209,7 @@ fn run_process_with_timeout(
                 Some(file)
             }
             Err(error) => {
-                return RunOutcome::Failed(format!(
+                return RunOutcome::provider_error(format!(
                     "could not create a private prompt file: {error}"
                 ));
             }
@@ -1151,7 +1242,7 @@ fn run_process_with_timeout(
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            return RunOutcome::Failed(format!(
+            return RunOutcome::provider_error(format!(
                 "could not start {}: {error}",
                 specification.provider_id
             ));
@@ -1265,6 +1356,13 @@ fn run_process_with_timeout(
     }
 
     decoder.finish(|decoded| emit_decoded(request, event_sender, decoded));
+    if decoder.provider_kind == ProviderKind::Grok
+        && let Some(session_id) = decoder.session_id.clone()
+    {
+        harvest_grok_session(&mut decoder, &session_id, &mut |decoded| {
+            emit_decoded(request, event_sender, decoded)
+        });
+    }
     let status = exit_status.or_else(|| {
         lock_unpoison(&control.child)
             .as_mut()
@@ -1277,13 +1375,18 @@ fn run_process_with_timeout(
         return RunOutcome::Cancelled;
     }
     if timed_out {
-        return RunOutcome::Failed(timeout_failure_message(timeout));
+        return RunOutcome::timed_out(timeout_failure_message(timeout));
     }
     if let Some(error) = process_error.or(decoder.protocol_error) {
-        return RunOutcome::Failed(error);
+        return RunOutcome::Failed {
+            kind: decoder.failure_kind.unwrap_or(AiFailureKind::ProviderError),
+            message: error,
+            tool: decoder.failure_tool,
+            retry: decoder.failure_retry,
+        };
     }
     if status.as_ref().is_none_or(|status| !status.success()) {
-        return RunOutcome::Failed(process_failure_message(
+        return RunOutcome::provider_error(process_failure_message(
             &specification.provider_id,
             status.as_ref(),
             &stderr_tail,
@@ -1411,6 +1514,14 @@ struct PendingTaskUpdate {
     active_form: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct KnownSubagent {
+    parent_id: Option<String>,
+    label: String,
+    model: Option<String>,
+    detail: Option<String>,
+}
+
 struct OutputDecoder {
     provider_kind: ProviderKind,
     mode: OutputMode,
@@ -1424,6 +1535,9 @@ struct OutputDecoder {
     saw_text_delta: bool,
     saw_thinking_delta: bool,
     protocol_error: Option<String>,
+    failure_kind: Option<AiFailureKind>,
+    failure_tool: Option<String>,
+    failure_retry: Option<RetryHint>,
     non_empty_lines: usize,
     non_json_in_first_two: usize,
     consecutive_non_json: usize,
@@ -1437,6 +1551,9 @@ struct OutputDecoder {
     pending_task_creates: HashMap<String, String>,
     pending_task_updates: HashMap<String, PendingTaskUpdate>,
     task_subjects: HashMap<String, String>,
+    subagents: HashMap<String, KnownSubagent>,
+    subagent_aliases: HashMap<String, String>,
+    grok_tool_names: HashMap<String, String>,
     codex_streamed_items: HashSet<String>,
 }
 
@@ -1466,6 +1583,9 @@ impl OutputDecoder {
             saw_text_delta: false,
             saw_thinking_delta: false,
             protocol_error: None,
+            failure_kind: None,
+            failure_tool: None,
+            failure_retry: None,
             non_empty_lines: 0,
             non_json_in_first_two: 0,
             consecutive_non_json: 0,
@@ -1479,6 +1599,9 @@ impl OutputDecoder {
             pending_task_creates: HashMap::new(),
             pending_task_updates: HashMap::new(),
             task_subjects: HashMap::new(),
+            subagents: HashMap::new(),
+            subagent_aliases: HashMap::new(),
+            grok_tool_names: HashMap::new(),
             codex_streamed_items: HashSet::new(),
         }
     }
@@ -1609,6 +1732,10 @@ impl OutputDecoder {
                 if let Some(error) = result.fatal_error {
                     self.protocol_error.get_or_insert(error);
                 }
+                if let Some(kind) = result.fatal_kind {
+                    self.failure_kind.get_or_insert(kind);
+                }
+                let subagent_duration_ms = result.subagent_duration_ms;
                 for kind in result.kinds {
                     self.recognized_events = self.recognized_events.saturating_add(1);
                     match kind {
@@ -1630,7 +1757,13 @@ impl OutputDecoder {
                             }
                             emit(Decoded::Activity(activity_event(kind)));
                         }
-                        _ => emit(Decoded::Activity(activity_event(kind))),
+                        _ => {
+                            let mut event = activity_event(kind);
+                            if let ActivityKind::Subagent { id, .. } = &event.kind {
+                                event.duration_ms = subagent_duration_ms.get(id).copied();
+                            }
+                            emit(Decoded::Activity(event));
+                        }
                     }
                 }
             }
@@ -1766,7 +1899,9 @@ enum Decoded {
 #[derive(Default)]
 struct JsonDecodeResult {
     kinds: Vec<ActivityKind>,
+    subagent_duration_ms: HashMap<String, i64>,
     fatal_error: Option<String>,
+    fatal_kind: Option<AiFailureKind>,
     recognized: bool,
     text_delta: bool,
     thinking_delta: bool,
@@ -1786,27 +1921,46 @@ impl OutputDecoder {
 
     fn decode_codex(&mut self, value: &Value) -> JsonDecodeResult {
         let mut decoded = JsonDecodeResult::default();
-        let Some(event_type) = value.get("type").and_then(Value::as_str) else {
+        let Some(raw_event_type) = value
+            .get("type")
+            .or_else(|| value.get("method"))
+            .and_then(Value::as_str)
+        else {
             return decoded;
+        };
+        let envelope = value.get("params").unwrap_or(value);
+        let event_type = match raw_event_type {
+            "thread/started" => "thread.started",
+            "turn/started" => "turn.started",
+            "turn/completed" => "turn.completed",
+            "turn/failed" => "turn.failed",
+            "item/started" => "item.started",
+            "item/updated" => "item.updated",
+            "item/completed" => "item.completed",
+            other => other,
         };
         match event_type {
             "thread.started" => {
                 decoded.recognized = true;
                 decoded.kinds.push(ActivityKind::SessionInfo {
                     model: None,
-                    session_id: string_at(value, &["thread_id"]),
+                    session_id: string_at(envelope, &["thread_id", "threadId"]).or_else(|| {
+                        envelope
+                            .get("thread")
+                            .and_then(|thread| string_at(thread, &["id"]))
+                    }),
                 });
             }
             "turn.started" => decoded.recognized = true,
             "turn.completed" => {
                 decoded.recognized = true;
-                decoded.kinds.push(usage_kind(value.get("usage"), None));
+                decoded.kinds.push(usage_kind(envelope.get("usage"), None));
             }
             "turn.failed" | "error" => {
                 decoded.recognized = true;
-                let message = value
+                let message = envelope
                     .pointer("/error/message")
-                    .or_else(|| value.get("message"))
+                    .or_else(|| envelope.get("message"))
                     .and_then(Value::as_str)
                     .unwrap_or("the agent reported an error")
                     .to_owned();
@@ -1816,7 +1970,7 @@ impl OutputDecoder {
                 decoded.fatal_error = Some(message);
             }
             "item.started" | "item.updated" | "item.completed" => {
-                let Some(item) = value.get("item") else {
+                let Some(item) = envelope.get("item") else {
                     return decoded;
                 };
                 let Some(item_type) = item.get("type").and_then(Value::as_str) else {
@@ -1879,7 +2033,7 @@ impl OutputDecoder {
                         .push(ActivityKind::Thinking { text: text.into() });
                 }
             }
-            "todo_list" => {
+            "todo_list" | "todoList" => {
                 decoded.recognized = true;
                 let tasks = item
                     .get("items")
@@ -1908,20 +2062,24 @@ impl OutputDecoder {
                     replaces_native: false,
                 });
             }
-            "command_execution" => {
+            "command_execution" | "commandExecution" => {
                 decoded.recognized = true;
                 decoded.kinds.push(ActivityKind::Command {
                     id: id.into(),
                     command: string_at(item, &["command"]).unwrap_or_default(),
-                    output_tail: tail_text(item.get("aggregated_output").and_then(Value::as_str)),
+                    output_tail: tail_text(
+                        value_at(item, &["aggregated_output", "aggregatedOutput"])
+                            .and_then(Value::as_str),
+                    ),
                     exit_code: item
                         .get("exit_code")
+                        .or_else(|| item.get("exitCode"))
                         .and_then(Value::as_i64)
                         .and_then(|code| i32::try_from(code).ok()),
                     status: lifecycle_status(item, phase),
                 });
             }
-            "file_change" => {
+            "file_change" | "fileChange" => {
                 decoded.recognized = true;
                 let changes = item
                     .get("changes")
@@ -1949,14 +2107,14 @@ impl OutputDecoder {
                     status: lifecycle_status(item, phase),
                 });
             }
-            "web_search" => {
+            "web_search" | "webSearch" => {
                 decoded.recognized = true;
                 decoded.kinds.push(ActivityKind::WebSearch {
                     id: id.into(),
                     query: string_at(item, &["query"]).unwrap_or_default(),
                 });
             }
-            "mcp_tool_call" => {
+            "mcp_tool_call" | "mcpToolCall" => {
                 decoded.recognized = true;
                 if phase == "item.completed" {
                     decoded.kinds.push(ActivityKind::ToolResult {
@@ -1973,9 +2131,187 @@ impl OutputDecoder {
                     });
                 }
             }
+            "collab_agent_tool_call" | "collabAgentToolCall" => {
+                decoded.recognized = true;
+                self.decode_codex_collab_item(phase, item, &mut decoded);
+            }
+            "sub_agent_activity" | "subagent_activity" | "subAgentActivity" => {
+                decoded.recognized = true;
+                self.decode_codex_subagent_activity(item, &mut decoded);
+            }
             _ => {}
         }
         decoded
+    }
+
+    fn decode_codex_collab_item(
+        &mut self,
+        phase: &str,
+        item: &Value,
+        decoded: &mut JsonDecodeResult,
+    ) {
+        let tool = string_at(item, &["tool"]).unwrap_or_else(|| "spawnAgent".into());
+        let tool_token = normalized_token(&tool);
+        let sender = string_at(item, &["sender_thread_id", "senderThreadId"]);
+        let prompt = string_at(item, &["prompt"]);
+        let model = string_at(item, &["model"]);
+        let effort = string_at(item, &["reasoning_effort", "reasoningEffort"]);
+        let states = value_at(item, &["agents_states", "agentsStates"]).and_then(Value::as_object);
+        let mut receivers = string_list_at(item, &["receiver_thread_ids", "receiverThreadIds"]);
+        if receivers.is_empty() {
+            receivers.extend(states.into_iter().flat_map(|states| states.keys().cloned()));
+        }
+        receivers.sort();
+        receivers.dedup();
+
+        let call_status = string_at(item, &["status"]);
+        let duration_ms = i64_at(item, &["duration_ms", "durationMs"]);
+        for receiver in receivers {
+            if receiver.trim().is_empty() {
+                continue;
+            }
+            let canonical_id = self.canonical_subagent_id(&receiver);
+            self.bind_subagent_alias(receiver, canonical_id.clone());
+            let state = states.and_then(|states| {
+                states.get(&canonical_id).or_else(|| {
+                    self.subagent_aliases.iter().find_map(|(alias, target)| {
+                        (target == &canonical_id)
+                            .then(|| states.get(alias))
+                            .flatten()
+                    })
+                })
+            });
+            let state_status = state.and_then(|state| string_at(state, &["status"]));
+            let state_message = state.and_then(|state| string_at(state, &["message", "detail"]));
+            let status = codex_subagent_status(
+                state_status.as_deref(),
+                call_status.as_deref(),
+                &tool_token,
+                phase,
+            );
+            let label = if tool_token == "spawnagent" {
+                prompt
+                    .as_deref()
+                    .and_then(compact_subagent_label)
+                    .unwrap_or_else(|| "Subagent".into())
+            } else {
+                String::new()
+            };
+            let detail = state_message.or_else(|| {
+                effort
+                    .as_deref()
+                    .map(|effort| format!("Reasoning: {effort}"))
+            });
+            let metadata = self.remember_subagent(
+                &canonical_id,
+                KnownSubagent {
+                    parent_id: sender.clone(),
+                    label,
+                    model: model.clone(),
+                    detail,
+                },
+            );
+            decoded.kinds.push(ActivityKind::Subagent {
+                id: canonical_id.clone(),
+                parent_id: metadata.parent_id,
+                label: metadata.label,
+                status,
+                model: metadata.model,
+                detail: metadata.detail,
+                tool_calls: None,
+            });
+            if let Some(duration_ms) = duration_ms {
+                decoded
+                    .subagent_duration_ms
+                    .insert(canonical_id, duration_ms);
+            }
+        }
+    }
+
+    fn decode_codex_subagent_activity(&mut self, item: &Value, decoded: &mut JsonDecodeResult) {
+        let Some(provider_id) =
+            string_at(item, &["agent_thread_id", "agentThreadId"]).filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        let canonical_id = self.canonical_subagent_id(&provider_id);
+        self.bind_subagent_alias(provider_id, canonical_id.clone());
+        let kind = string_at(item, &["kind"]).unwrap_or_default();
+        let status = match normalized_token(&kind).as_str() {
+            "interrupted" | "cancelled" | "canceled" => SubagentStatus::Cancelled,
+            "failed" | "errored" => SubagentStatus::Failed,
+            "completed" => SubagentStatus::Completed,
+            "started" | "interacted" | "running" | "inprogress" | "" => SubagentStatus::InProgress,
+            _ => SubagentStatus::InProgress,
+        };
+        let path_detail = self
+            .subagents
+            .get(&canonical_id)
+            .and_then(|metadata| metadata.detail.as_ref())
+            .is_none()
+            .then(|| string_at(item, &["agent_path", "agentPath"]))
+            .flatten();
+        let metadata = self.remember_subagent(
+            &canonical_id,
+            KnownSubagent {
+                detail: path_detail,
+                ..KnownSubagent::default()
+            },
+        );
+        decoded.kinds.push(ActivityKind::Subagent {
+            id: canonical_id.clone(),
+            parent_id: metadata.parent_id,
+            label: metadata.label,
+            status,
+            model: metadata.model,
+            detail: metadata.detail,
+            tool_calls: None,
+        });
+        if let Some(duration_ms) = i64_at(item, &["duration_ms", "durationMs"]) {
+            decoded
+                .subagent_duration_ms
+                .insert(canonical_id, duration_ms);
+        }
+    }
+
+    fn canonical_subagent_id(&self, provider_id: &str) -> String {
+        let mut current = provider_id.to_owned();
+        for _ in 0..8 {
+            let Some(next) = self.subagent_aliases.get(&current) else {
+                break;
+            };
+            if next == &current {
+                break;
+            }
+            current = next.clone();
+        }
+        current
+    }
+
+    fn bind_subagent_alias(&mut self, alias: String, canonical_id: String) {
+        if !alias.is_empty() && alias != canonical_id {
+            self.subagent_aliases.insert(alias, canonical_id);
+        }
+    }
+
+    fn remember_subagent(&mut self, canonical_id: &str, incoming: KnownSubagent) -> KnownSubagent {
+        let metadata = self.subagents.entry(canonical_id.to_owned()).or_default();
+        if incoming.parent_id.is_some() {
+            metadata.parent_id = incoming.parent_id;
+        }
+        if !incoming.label.trim().is_empty() {
+            metadata.label = incoming.label;
+        }
+        if incoming.model.is_some() {
+            metadata.model = incoming.model;
+        }
+        if incoming.detail.is_some() {
+            metadata.detail = incoming.detail;
+        }
+        if metadata.label.trim().is_empty() {
+            metadata.label = "Subagent".into();
+        }
+        metadata.clone()
     }
 
     fn decode_grok(&mut self, value: &Value) -> JsonDecodeResult {
@@ -2011,21 +2347,160 @@ impl OutputDecoder {
                 });
                 decoded.kinds.push(usage_kind(value.get("usage"), None));
                 if let Some(reason) = value.get("stopReason").and_then(Value::as_str)
-                    && reason != "EndTurn"
+                    && !reason.eq_ignore_ascii_case("EndTurn")
                 {
+                    let category =
+                        string_at(value, &["cancellation_category", "cancellationCategory"]);
+                    let (kind, message) = classify_grok_failure(reason, category.as_deref(), None);
                     decoded.kinds.push(ActivityKind::TurnError {
-                        message: format!("Stopped: {reason}"),
+                        message: message.clone(),
                     });
+                    decoded.fatal_kind = Some(kind);
+                    decoded.fatal_error = Some(message);
                 }
             }
             Some("error") => {
                 decoded.recognized = true;
                 let message = string_at(value, &["message"])
                     .unwrap_or_else(|| "the agent reported an error".into());
+                let category = string_at(value, &["cancellation_category", "cancellationCategory"]);
+                let (kind, friendly_message) =
+                    classify_grok_failure(&message, category.as_deref(), Some(&message));
                 decoded.kinds.push(ActivityKind::TurnError {
-                    message: message.clone(),
+                    message: friendly_message.clone(),
                 });
-                decoded.fatal_error = Some(message);
+                decoded.fatal_kind = Some(kind);
+                decoded.fatal_error = Some(friendly_message);
+            }
+            _ => {}
+        }
+        decoded
+    }
+
+    fn decode_grok_session_update(&mut self, envelope: &Value) -> JsonDecodeResult {
+        let mut decoded = JsonDecodeResult::default();
+        let update = envelope.pointer("/params/update").unwrap_or(envelope);
+        let Some(update_type) = update.get("sessionUpdate").and_then(Value::as_str) else {
+            return decoded;
+        };
+        match update_type {
+            "subagent_spawned" => {
+                let Some(id) = string_at(update, &["subagent_id", "child_session_id"])
+                    .filter(|id| !id.is_empty())
+                else {
+                    return decoded;
+                };
+                decoded.recognized = true;
+                let label = string_at(update, &["description", "subagent_type"])
+                    .unwrap_or_else(|| "Subagent".into());
+                self.task_subjects.insert(id.clone(), label.clone());
+                decoded.kinds.push(ActivityKind::Subagent {
+                    id: id.clone(),
+                    parent_id: string_at(update, &["parent_session_id"]),
+                    label: label.clone(),
+                    status: SubagentStatus::InProgress,
+                    model: string_at(update, &["model"]),
+                    detail: string_at(update, &["capability_mode"]),
+                    tool_calls: None,
+                });
+            }
+            "subagent_finished" => {
+                let Some(id) = string_at(update, &["subagent_id", "child_session_id"])
+                    .filter(|id| !id.is_empty())
+                else {
+                    return decoded;
+                };
+                decoded.recognized = true;
+                let provider_status = update
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let detail = string_at(update, &["error"]);
+                let subagent_status = match provider_status {
+                    "completed" | "success" | "succeeded" => SubagentStatus::Completed,
+                    "cancelled" | "canceled" => SubagentStatus::Cancelled,
+                    "failed" | "error" => SubagentStatus::Failed,
+                    _ => SubagentStatus::InProgress,
+                };
+                let label = self.task_subjects.get(&id).cloned().unwrap_or_default();
+                decoded.kinds.push(ActivityKind::Subagent {
+                    id: id.clone(),
+                    parent_id: string_at(update, &["parent_session_id"]),
+                    label: label.clone(),
+                    status: subagent_status,
+                    model: string_at(update, &["model"]),
+                    detail: detail.clone(),
+                    tool_calls: update.get("tool_calls").and_then(Value::as_u64),
+                });
+            }
+            "tool_call" => {
+                let Some(id) = string_at(update, &["toolCallId", "tool_call_id"]) else {
+                    return decoded;
+                };
+                let provider_name = string_at(update, &["title"]).unwrap_or_else(|| "tool".into());
+                let normalized = normalize_grok_tool_name(&provider_name);
+                self.grok_tool_names.insert(id.clone(), normalized.clone());
+                if normalized == "spawn_subagent" {
+                    // The dedicated subagent lifecycle update carries the
+                    // durable child id and authoritative status.
+                    decoded.recognized = true;
+                    return decoded;
+                }
+                let input = update.get("rawInput").cloned().unwrap_or(Value::Null);
+                if normalized == "web_search" && string_at(&input, &["query"]).is_none() {
+                    // Backend web-search starts omit their query. The
+                    // completion update below contains the structured query.
+                    decoded.recognized = true;
+                    return decoded;
+                }
+                decoded.recognized = true;
+                if let Some(kind) = self.map_tool_call(id, activity_tool_name(&normalized), input) {
+                    decoded.kinds.push(kind);
+                }
+            }
+            "tool_call_update" => {
+                let Some(id) = string_at(update, &["toolCallId", "tool_call_id"]) else {
+                    return decoded;
+                };
+                decoded.recognized = true;
+                let provider_name = self
+                    .grok_tool_names
+                    .get(&id)
+                    .cloned()
+                    .or_else(|| {
+                        string_at(update, &["title"]).map(|name| normalize_grok_tool_name(&name))
+                    })
+                    .unwrap_or_else(|| "tool".into());
+                if provider_name == "web_search"
+                    && let Some(query) = update
+                        .pointer("/rawOutput/action/query")
+                        .and_then(Value::as_str)
+                        .or_else(|| update.pointer("/rawInput/query").and_then(Value::as_str))
+                {
+                    decoded.kinds.push(ActivityKind::WebSearch {
+                        id,
+                        query: query.into(),
+                    });
+                    return decoded;
+                }
+                if update.get("status").and_then(Value::as_str).is_none() {
+                    return decoded;
+                }
+                if provider_name == "todo_write" || provider_name == "spawn_subagent" {
+                    return decoded;
+                }
+                let status = update
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let result = json!({
+                    "tool_call_id": id,
+                    "is_error": matches!(status, "failed" | "error" | "cancelled" | "canceled"),
+                    "content": grok_update_output(update),
+                });
+                if let Some(kind) = self.decode_tool_result(&result, Some(update)) {
+                    decoded.kinds.push(kind);
+                }
             }
             _ => {}
         }
@@ -2035,12 +2510,13 @@ impl OutputDecoder {
     fn decode_claude(&mut self, value: &Value) -> JsonDecodeResult {
         let mut decoded = JsonDecodeResult::default();
         match value.get("type").and_then(Value::as_str) {
-            Some("system") if value.get("subtype").and_then(Value::as_str) == Some("init") => {
+            Some("system") => {
                 decoded.recognized = true;
-                decoded.kinds.push(ActivityKind::SessionInfo {
-                    model: string_at(value, &["model"]),
-                    session_id: string_at(value, &["session_id"]),
-                });
+                self.decode_claude_system(value, &mut decoded);
+            }
+            Some("tool_progress") | Some("toolProgress") => {
+                decoded.recognized = true;
+                self.decode_claude_tool_progress(value, &mut decoded);
             }
             Some("stream_event") => {
                 let delta = value.pointer("/event/delta");
@@ -2101,7 +2577,13 @@ impl OutputDecoder {
                             }
                         }
                         Some("tool_use") => {
-                            if let Some(kind) = self.decode_tool_use(block) {
+                            let name = string_at(block, &["name"]).unwrap_or_default();
+                            let kind = if matches!(name.as_str(), "Agent" | "Task") {
+                                self.decode_claude_agent_tool_use(block, value)
+                            } else {
+                                self.decode_tool_use(block)
+                            };
+                            if let Some(kind) = kind {
                                 decoded.kinds.push(kind);
                             }
                         }
@@ -2115,6 +2597,12 @@ impl OutputDecoder {
                     if block.get("type").and_then(Value::as_str) == Some("tool_result")
                         && let Some(kind) = self.decode_tool_result(block, Some(value))
                     {
+                        if let ActivityKind::Subagent { id, .. } = &kind
+                            && let Some(duration_ms) =
+                                claude_subagent_duration_ms(block, Some(value))
+                        {
+                            decoded.subagent_duration_ms.insert(id.clone(), duration_ms);
+                        }
                         decoded.kinds.push(kind);
                     }
                 }
@@ -2150,6 +2638,312 @@ impl OutputDecoder {
             _ => {}
         }
         decoded
+    }
+
+    fn decode_claude_system(&mut self, value: &Value, decoded: &mut JsonDecodeResult) {
+        let subtype = string_at(value, &["subtype"]).unwrap_or_default();
+        match normalized_token(&subtype).as_str() {
+            "init" => decoded.kinds.push(ActivityKind::SessionInfo {
+                model: string_at(value, &["model"]),
+                session_id: string_at(value, &["session_id", "sessionId"]),
+            }),
+            "taskstarted" | "taskprogress" | "tasknotification" | "taskupdated" => {
+                self.decode_claude_task_lifecycle(value, &subtype, decoded);
+            }
+            _ => {}
+        }
+    }
+
+    fn decode_claude_task_lifecycle(
+        &mut self,
+        value: &Value,
+        subtype: &str,
+        decoded: &mut JsonDecodeResult,
+    ) {
+        let task_id = string_at(value, &["task_id", "taskId"]).unwrap_or_default();
+        let tool_use_id = string_at(value, &["tool_use_id", "toolUseId"]);
+        let subagent_type = string_at(value, &["subagent_type", "subagentType"]);
+        let known = self.is_known_subagent(&task_id)
+            || tool_use_id
+                .as_deref()
+                .is_some_and(|id| self.is_known_subagent(id));
+        if subagent_type.is_none() && !known {
+            return;
+        }
+        let seed_id = tool_use_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .unwrap_or(task_id.as_str());
+        if seed_id.is_empty() {
+            return;
+        }
+        let canonical_id = self.canonical_subagent_id(seed_id);
+        if !task_id.is_empty() {
+            self.bind_subagent_alias(task_id, canonical_id.clone());
+        }
+        if let Some(tool_use_id) = tool_use_id {
+            self.bind_subagent_alias(tool_use_id, canonical_id.clone());
+        }
+
+        let subtype = normalized_token(subtype);
+        let patch = value.get("patch").filter(|patch| patch.is_object());
+        let provider_status = if subtype == "taskupdated" {
+            patch.and_then(|patch| string_at(patch, &["status"]))
+        } else {
+            string_at(value, &["status"])
+        };
+        let status = match subtype.as_str() {
+            "taskstarted" | "taskprogress" => SubagentStatus::InProgress,
+            "taskupdated" if provider_status.is_none() => SubagentStatus::InProgress,
+            "tasknotification" | "taskupdated" => {
+                claude_subagent_status(provider_status.as_deref())
+            }
+            _ => SubagentStatus::InProgress,
+        };
+        let label = string_at(
+            value,
+            &["description", "task_description", "taskDescription", "name"],
+        )
+        .or_else(|| patch.and_then(|patch| string_at(patch, &["description"])))
+        .unwrap_or_default();
+        let detail = match subtype.as_str() {
+            "taskstarted" => subagent_type.clone(),
+            "taskprogress" => string_at(value, &["summary", "last_tool_name", "lastToolName"])
+                .or(subagent_type.clone()),
+            "tasknotification" => string_at(value, &["summary", "output_file", "outputFile"]),
+            "taskupdated" => {
+                patch.and_then(|patch| string_at(patch, &["error", "description", "status"]))
+            }
+            _ => None,
+        };
+        let parent_id = string_at(
+            value,
+            &[
+                "parent_tool_use_id",
+                "parentToolUseId",
+                "parent_agent_id",
+                "parentAgentId",
+            ],
+        )
+        .map(|parent| self.canonical_subagent_id(&parent))
+        .or_else(|| {
+            self.subagents
+                .get(&canonical_id)
+                .and_then(|metadata| metadata.parent_id.clone())
+        })
+        .or_else(|| string_at(value, &["session_id", "sessionId"]))
+        .or_else(|| self.session_id.clone());
+        let metadata = self.remember_subagent(
+            &canonical_id,
+            KnownSubagent {
+                parent_id,
+                label,
+                model: string_at(value, &["resolved_model", "resolvedModel", "model"]),
+                detail,
+            },
+        );
+        let usage = value.get("usage");
+        let tool_calls = usage
+            .and_then(|usage| {
+                u64_at(
+                    usage,
+                    &[
+                        "tool_uses",
+                        "toolUses",
+                        "total_tool_use_count",
+                        "totalToolUseCount",
+                    ],
+                )
+            })
+            .or_else(|| {
+                u64_at(
+                    value,
+                    &[
+                        "tool_uses",
+                        "toolUses",
+                        "total_tool_use_count",
+                        "totalToolUseCount",
+                    ],
+                )
+            });
+        decoded.kinds.push(ActivityKind::Subagent {
+            id: canonical_id.clone(),
+            parent_id: metadata.parent_id,
+            label: metadata.label,
+            status,
+            model: metadata.model,
+            detail: metadata.detail,
+            tool_calls,
+        });
+        if let Some(duration_ms) =
+            usage.and_then(|usage| i64_at(usage, &["duration_ms", "durationMs"]))
+        {
+            decoded
+                .subagent_duration_ms
+                .insert(canonical_id, duration_ms);
+        }
+    }
+
+    fn decode_claude_tool_progress(&mut self, value: &Value, decoded: &mut JsonDecodeResult) {
+        let provider_id = string_at(value, &["task_id", "taskId", "tool_use_id", "toolUseId"])
+            .unwrap_or_default();
+        let subagent_type = string_at(value, &["subagent_type", "subagentType"]);
+        if provider_id.is_empty()
+            || (subagent_type.is_none() && !self.is_known_subagent(&provider_id))
+        {
+            return;
+        }
+        let canonical_id = self.canonical_subagent_id(&provider_id);
+        self.bind_subagent_alias(provider_id, canonical_id.clone());
+        if let Some(agent_id) = value
+            .get("subagent_retry")
+            .or_else(|| value.get("subagentRetry"))
+            .and_then(|retry| string_at(retry, &["agent_id", "agentId"]))
+        {
+            self.bind_subagent_alias(agent_id, canonical_id.clone());
+        }
+        let retry_detail = value
+            .get("subagent_retry")
+            .or_else(|| value.get("subagentRetry"))
+            .and_then(|retry| {
+                string_at(retry, &["error_category", "errorCategory"]).map(|category| {
+                    let attempt = u64_at(retry, &["attempt"]).unwrap_or(0);
+                    let maximum = u64_at(retry, &["max_retries", "maxRetries"]).unwrap_or(0);
+                    if attempt > 0 && maximum > 0 {
+                        format!("{category} · retry {attempt}/{maximum}")
+                    } else {
+                        category
+                    }
+                })
+            });
+        let parent_id = string_at(value, &["parent_tool_use_id", "parentToolUseId"])
+            .map(|parent| self.canonical_subagent_id(&parent))
+            .or_else(|| {
+                self.subagents
+                    .get(&canonical_id)
+                    .and_then(|metadata| metadata.parent_id.clone())
+            })
+            .or_else(|| string_at(value, &["session_id", "sessionId"]))
+            .or_else(|| self.session_id.clone());
+        let metadata = self.remember_subagent(
+            &canonical_id,
+            KnownSubagent {
+                parent_id,
+                label: string_at(
+                    value,
+                    &["task_description", "taskDescription", "description"],
+                )
+                .unwrap_or_default(),
+                model: string_at(value, &["resolved_model", "resolvedModel", "model"]),
+                detail: retry_detail.or_else(|| {
+                    string_at(
+                        value,
+                        &[
+                            "summary",
+                            "last_tool_name",
+                            "lastToolName",
+                            "tool_name",
+                            "toolName",
+                        ],
+                    )
+                }),
+            },
+        );
+        decoded.kinds.push(ActivityKind::Subagent {
+            id: canonical_id.clone(),
+            parent_id: metadata.parent_id,
+            label: metadata.label,
+            status: SubagentStatus::InProgress,
+            model: metadata.model,
+            detail: metadata.detail,
+            tool_calls: u64_at(value, &["tool_uses", "toolUses"]),
+        });
+        let duration_ms = i64_at(value, &["duration_ms", "durationMs"]).or_else(|| {
+            value_at(value, &["elapsed_time_seconds", "elapsedTimeSeconds"])
+                .and_then(Value::as_f64)
+                .and_then(seconds_to_milliseconds)
+        });
+        if let Some(duration_ms) = duration_ms {
+            decoded
+                .subagent_duration_ms
+                .insert(canonical_id, duration_ms);
+        }
+    }
+
+    fn decode_claude_agent_tool_use(
+        &mut self,
+        block: &Value,
+        envelope: &Value,
+    ) -> Option<ActivityKind> {
+        let tool_use_id = string_at(block, &["id", "tool_use_id", "toolUseId"])
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let input = block.get("input").cloned().unwrap_or(Value::Null);
+        let resumed_id = string_at(
+            &input,
+            &[
+                "resume",
+                "agent_id",
+                "agentId",
+                "resume_agent_id",
+                "resumeAgentId",
+            ],
+        );
+        let canonical_id = resumed_id
+            .as_deref()
+            .map(|id| self.canonical_subagent_id(id))
+            .unwrap_or_else(|| self.canonical_subagent_id(&tool_use_id));
+        self.bind_subagent_alias(tool_use_id, canonical_id.clone());
+        if let Some(resumed_id) = resumed_id {
+            self.bind_subagent_alias(resumed_id, canonical_id.clone());
+        }
+        let subagent_type = string_at(&input, &["subagent_type", "subagentType"]);
+        let detail = subagent_type.clone().map(|agent_type| {
+            if input
+                .get("run_in_background")
+                .or_else(|| input.get("runInBackground"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                format!("{agent_type} · background")
+            } else {
+                agent_type
+            }
+        });
+        let parent_id = string_at(envelope, &["parent_tool_use_id", "parentToolUseId"])
+            .map(|parent| self.canonical_subagent_id(&parent))
+            .or_else(|| string_at(envelope, &["session_id", "sessionId"]))
+            .or_else(|| self.session_id.clone());
+        let metadata = self.remember_subagent(
+            &canonical_id,
+            KnownSubagent {
+                parent_id,
+                label: string_at(
+                    &input,
+                    &["description", "name", "subagent_type", "subagentType"],
+                )
+                .unwrap_or_else(|| "Subagent".into()),
+                model: string_at(&input, &["model"]),
+                detail,
+            },
+        );
+        Some(ActivityKind::Subagent {
+            id: canonical_id,
+            parent_id: metadata.parent_id,
+            label: metadata.label,
+            status: SubagentStatus::InProgress,
+            model: metadata.model,
+            detail: metadata.detail,
+            tool_calls: None,
+        })
+    }
+
+    fn is_known_subagent(&self, provider_id: &str) -> bool {
+        if provider_id.is_empty() {
+            return false;
+        }
+        let canonical_id = self.canonical_subagent_id(provider_id);
+        self.subagents.contains_key(&canonical_id)
+            || self.subagent_aliases.contains_key(provider_id)
     }
 
     fn decode_kimi(&mut self, value: &Value) -> JsonDecodeResult {
@@ -2447,9 +3241,16 @@ impl OutputDecoder {
         let id = string_at(block, &["tool_use_id", "tool_call_id", "id"]).unwrap_or_default();
         let is_error = block
             .get("is_error")
+            .or_else(|| block.get("isError"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let output = tail_text(flattened_content(block.get("content")).as_deref());
+        if self.provider_kind == ProviderKind::Claude
+            && (self.is_known_subagent(&id)
+                || claude_tool_result_payload(block, envelope).is_some_and(is_claude_agent_output))
+        {
+            return self.decode_claude_subagent_result(id, block, envelope, is_error, output);
+        }
         if let Some(command) = self.command_calls.remove(&id) {
             return Some(ActivityKind::Command {
                 id,
@@ -2546,6 +3347,104 @@ impl OutputDecoder {
         })
     }
 
+    fn decode_claude_subagent_result(
+        &mut self,
+        tool_use_id: String,
+        block: &Value,
+        envelope: Option<&Value>,
+        is_error: bool,
+        fallback_output: Option<String>,
+    ) -> Option<ActivityKind> {
+        let payload = claude_tool_result_payload(block, envelope);
+        let provider_agent_id = payload
+            .and_then(|payload| string_at(payload, &["agent_id", "agentId", "task_id", "taskId"]));
+        let canonical_id = if self.is_known_subagent(&tool_use_id) {
+            self.canonical_subagent_id(&tool_use_id)
+        } else if let Some(provider_agent_id) = provider_agent_id.as_deref() {
+            self.canonical_subagent_id(provider_agent_id)
+        } else {
+            return None;
+        };
+        self.bind_subagent_alias(tool_use_id, canonical_id.clone());
+        if let Some(provider_agent_id) = provider_agent_id {
+            self.bind_subagent_alias(provider_agent_id, canonical_id.clone());
+        }
+
+        let non_execution_kind = envelope
+            .and_then(|envelope| {
+                envelope
+                    .get("tool_result_meta")
+                    .or_else(|| envelope.get("toolResultMeta"))
+            })
+            .and_then(|meta| string_at(meta, &["non_execution_kind", "nonExecutionKind"]));
+        let provider_status = payload.and_then(|payload| string_at(payload, &["status"]));
+        let status = if let Some(non_execution_kind) = non_execution_kind.as_deref() {
+            match normalized_token(non_execution_kind).as_str() {
+                "denied" | "permissiondenied" => SubagentStatus::PermissionBlocked,
+                "interrupted" | "cancelled" | "canceled" => SubagentStatus::Cancelled,
+                _ if is_error => SubagentStatus::Failed,
+                _ => claude_subagent_status(provider_status.as_deref()),
+            }
+        } else if is_error {
+            SubagentStatus::Failed
+        } else {
+            claude_subagent_status(provider_status.as_deref())
+        };
+        let payload_detail = payload.and_then(|payload| {
+            flattened_content(payload.get("content"))
+                .or_else(|| string_at(payload, &["summary", "description"]))
+        });
+        let parent_id = envelope
+            .and_then(|envelope| string_at(envelope, &["parent_tool_use_id", "parentToolUseId"]))
+            .map(|parent| self.canonical_subagent_id(&parent))
+            .or_else(|| {
+                self.subagents
+                    .get(&canonical_id)
+                    .and_then(|metadata| metadata.parent_id.clone())
+            })
+            .or_else(|| {
+                envelope.and_then(|envelope| string_at(envelope, &["session_id", "sessionId"]))
+            })
+            .or_else(|| self.session_id.clone());
+        let metadata = self.remember_subagent(
+            &canonical_id,
+            KnownSubagent {
+                parent_id,
+                label: payload
+                    .and_then(|payload| {
+                        string_at(
+                            payload,
+                            &["description", "task_description", "taskDescription"],
+                        )
+                    })
+                    .unwrap_or_default(),
+                model: payload.and_then(|payload| {
+                    string_at(payload, &["resolved_model", "resolvedModel", "model"])
+                }),
+                detail: payload_detail.or(fallback_output),
+            },
+        );
+        Some(ActivityKind::Subagent {
+            id: canonical_id,
+            parent_id: metadata.parent_id,
+            label: metadata.label,
+            status,
+            model: metadata.model,
+            detail: metadata.detail,
+            tool_calls: payload.and_then(|payload| {
+                u64_at(
+                    payload,
+                    &[
+                        "total_tool_use_count",
+                        "totalToolUseCount",
+                        "tool_calls",
+                        "toolCalls",
+                    ],
+                )
+            }),
+        })
+    }
+
     fn resolve_path(&self, path: &str) -> String {
         let path = Path::new(path);
         if path.is_absolute() {
@@ -2556,6 +3455,392 @@ impl OutputDecoder {
             .map(|directory| directory.join(path).to_string_lossy().into_owned())
             .unwrap_or_else(|| path.to_string_lossy().into_owned())
     }
+}
+
+fn classify_grok_failure(
+    reason: &str,
+    cancellation_category: Option<&str>,
+    provider_message: Option<&str>,
+) -> (AiFailureKind, String) {
+    let reason_lower = reason.to_ascii_lowercase();
+    let category_lower = cancellation_category
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let combined = format!("{reason_lower} {category_lower}");
+
+    if combined.contains("permission") {
+        return (
+            AiFailureKind::PermissionBlocked,
+            "Grok needed approval for a tool, but Adam could not answer the permission request in this non-interactive run."
+                .into(),
+        );
+    }
+    if combined.contains("max_turn")
+        || combined.contains("maxturn")
+        || combined.contains("maximum turn")
+    {
+        return (
+            AiFailureKind::MaxTurnsReached,
+            "Grok reached the configured maximum number of turns before completing.".into(),
+        );
+    }
+    if combined.contains("timeout") || combined.contains("timed out") {
+        return (
+            AiFailureKind::TimedOut,
+            "Grok timed out before completing the turn.".into(),
+        );
+    }
+    let message = provider_message
+        .filter(|message| !message.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if reason.eq_ignore_ascii_case("cancelled") || reason.eq_ignore_ascii_case("canceled") {
+                "Grok cancelled the turn before completion.".into()
+            } else {
+                format!("Grok stopped before completing: {reason}")
+            }
+        });
+    (AiFailureKind::ProviderError, message)
+}
+
+fn normalize_grok_tool_name(name: &str) -> String {
+    let normalized = name.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+    if normalized.starts_with("web_search:") {
+        "web_search".into()
+    } else if normalized.starts_with("fetch:") {
+        "web_fetch".into()
+    } else {
+        normalized
+    }
+}
+
+fn activity_tool_name(name: &str) -> String {
+    match name {
+        "todo_write" => "TodoWrite",
+        "run_terminal_command" | "run_terminal_cmd" | "bash" => "Bash",
+        "search_replace" | "edit" => "Edit",
+        "write" => "Write",
+        "web_search" => "WebSearch",
+        "web_fetch" => "WebFetch",
+        _ => name,
+    }
+    .into()
+}
+
+fn grok_update_output(update: &Value) -> String {
+    if let Some(text) = update
+        .pointer("/rawOutput/text")
+        .or_else(|| update.pointer("/rawOutput/output"))
+        .or_else(|| update.get("rawOutput"))
+        .and_then(Value::as_str)
+    {
+        return text.into();
+    }
+    if let Some(text) = flattened_content(update.get("content")) {
+        return text;
+    }
+    update
+        .get("rawOutput")
+        .filter(|output| !output.is_null())
+        .and_then(|output| serde_json::to_string(output).ok())
+        .unwrap_or_default()
+}
+
+#[derive(Default)]
+struct GrokTerminalDiagnostic {
+    permission_tool: Option<String>,
+    permission_resolution: Option<PermissionResolution>,
+    outcome: Option<String>,
+    cancellation_category: Option<String>,
+}
+
+fn harvest_grok_session(
+    decoder: &mut OutputDecoder,
+    session_id: &str,
+    emit: &mut impl FnMut(Decoded),
+) {
+    let Some(directory) = grok_session_directory(session_id) else {
+        return;
+    };
+    harvest_grok_session_directory(decoder, session_id, &directory, emit);
+}
+
+fn harvest_grok_session_directory(
+    decoder: &mut OutputDecoder,
+    session_id: &str,
+    directory: &Path,
+    emit: &mut impl FnMut(Decoded),
+) {
+    for update in grok_current_turn_updates(&directory.join("updates.jsonl")) {
+        let result = decoder.decode_grok_session_update(&update);
+        for kind in result.kinds {
+            decoder.recognized_events = decoder.recognized_events.saturating_add(1);
+            let is_subagent = matches!(kind, ActivityKind::Subagent { .. });
+            let mut event = activity_event(kind);
+            if is_subagent {
+                event.duration_ms = update
+                    .pointer("/params/update/duration_ms")
+                    .or_else(|| update.get("duration_ms"))
+                    .and_then(Value::as_i64);
+                if let Some(at) = update
+                    .pointer("/_meta/agentTimestampMs")
+                    .and_then(Value::as_i64)
+                {
+                    event.at = UnixMillis(at);
+                }
+            }
+            emit(Decoded::Activity(event));
+        }
+    }
+    harvest_grok_subagent_metadata(decoder, session_id, directory, emit);
+
+    let diagnostic = grok_terminal_diagnostic(&directory.join("events.jsonl"));
+    if let (Some(tool), Some(resolution)) = (
+        diagnostic.permission_tool.as_deref(),
+        diagnostic.permission_resolution,
+    ) {
+        emit(Decoded::Activity(activity_event(
+            ActivityKind::PermissionPrompt {
+                id: format!("grok-permission-{session_id}-{tool}"),
+                tool: tool.into(),
+                summary: format!("Grok requested permission to use {tool}."),
+                resolution: Some(resolution),
+            },
+        )));
+    }
+
+    let permission_cancelled = diagnostic
+        .cancellation_category
+        .as_deref()
+        .is_some_and(|category| category.eq_ignore_ascii_case("permission_cancelled"));
+    if permission_cancelled {
+        let tool = diagnostic.permission_tool.clone();
+        let is_web = tool
+            .as_deref()
+            .is_some_and(|tool| matches!(tool, "web_fetch" | "web_search"));
+        decoder.failure_kind = Some(AiFailureKind::PermissionBlocked);
+        decoder.failure_tool = tool;
+        decoder.failure_retry = Some(if is_web {
+            RetryHint::AllowWebAndRetry
+        } else {
+            RetryHint::Retry
+        });
+        decoder.protocol_error = Some(if is_web {
+            "Web access approval could not be answered in this non-interactive Grok run.".into()
+        } else {
+            "Grok needed approval for a tool, but Adam could not answer the permission request in this non-interactive run."
+                .into()
+        });
+    } else if let Some(outcome) = diagnostic
+        .outcome
+        .as_deref()
+        .filter(|outcome| !outcome.eq_ignore_ascii_case("completed"))
+    {
+        let (kind, message) =
+            classify_grok_failure(outcome, diagnostic.cancellation_category.as_deref(), None);
+        decoder.failure_kind = Some(kind);
+        decoder.failure_retry = Some(RetryHint::Retry);
+        decoder.protocol_error = Some(message);
+    }
+}
+
+fn harvest_grok_subagent_metadata(
+    decoder: &mut OutputDecoder,
+    parent_session_id: &str,
+    parent_directory: &Path,
+    emit: &mut impl FnMut(Decoded),
+) {
+    let Ok(entries) = fs::read_dir(parent_directory.join("subagents")) else {
+        return;
+    };
+    for entry in entries.flatten().take(MAX_GROK_SUBAGENTS) {
+        let meta_path = entry.path().join("meta.json");
+        let Ok(metadata) = fs::metadata(&meta_path) else {
+            continue;
+        };
+        if metadata.len() > MAX_GROK_SESSION_LINE_BYTES as u64 {
+            continue;
+        }
+        let Ok(bytes) = fs::read(meta_path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if string_at(&meta, &["parent_session_id"]).as_deref() != Some(parent_session_id) {
+            continue;
+        }
+        let Some(id) =
+            string_at(&meta, &["subagent_id", "child_session_id"]).filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let label = string_at(&meta, &["description", "subagent_type"])
+            .unwrap_or_else(|| "Subagent".into());
+        decoder.task_subjects.insert(id.clone(), label.clone());
+
+        let child_diagnostic = parent_directory
+            .parent()
+            .map(|workspace_sessions| {
+                grok_terminal_diagnostic(&workspace_sessions.join(&id).join("events.jsonl"))
+            })
+            .unwrap_or_default();
+        let permission_blocked = child_diagnostic
+            .cancellation_category
+            .as_deref()
+            .is_some_and(|category| category.eq_ignore_ascii_case("permission_cancelled"));
+        let provider_status = meta
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let status = if permission_blocked {
+            SubagentStatus::PermissionBlocked
+        } else {
+            match provider_status {
+                "pending" => SubagentStatus::Pending,
+                "running" | "in_progress" => SubagentStatus::InProgress,
+                "completed" | "success" | "succeeded" => SubagentStatus::Completed,
+                "cancelled" | "canceled" => SubagentStatus::Cancelled,
+                "failed" | "error" => SubagentStatus::Failed,
+                _ => SubagentStatus::InProgress,
+            }
+        };
+        let mut event = activity_event(ActivityKind::Subagent {
+            id: id.clone(),
+            parent_id: Some(parent_session_id.into()),
+            label: label.clone(),
+            status,
+            model: string_at(&meta, &["effective_model_id", "model"]),
+            detail: string_at(&meta, &["error"]),
+            tool_calls: meta.get("tool_calls").and_then(Value::as_u64),
+        });
+        event.duration_ms = meta.get("duration_ms").and_then(Value::as_i64);
+        emit(Decoded::Activity(event));
+    }
+}
+
+fn grok_session_directory(session_id: &str) -> Option<PathBuf> {
+    if Uuid::parse_str(session_id).is_err() {
+        return None;
+    }
+    let grok_home = env::var_os("GROK_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".grok")))?;
+    grok_session_directory_under(&grok_home, session_id)
+}
+
+fn grok_session_directory_under(grok_home: &Path, session_id: &str) -> Option<PathBuf> {
+    let roots = fs::read_dir(grok_home.join("sessions")).ok()?;
+    for root in roots.flatten() {
+        let candidate = root.path().join(session_id);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn grok_current_turn_updates(path: &Path) -> Vec<Value> {
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut updates = Vec::new();
+    loop {
+        line.clear();
+        let Ok(read) = reader.read_until(b'\n', &mut line) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        if line.len() > MAX_GROK_SESSION_LINE_BYTES {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        let update = value.pointer("/params/update").unwrap_or(&value);
+        let Some(update_type) = update.get("sessionUpdate").and_then(Value::as_str) else {
+            continue;
+        };
+        if update_type == "user_message_chunk" {
+            updates.clear();
+            continue;
+        }
+        if matches!(
+            update_type,
+            "subagent_spawned" | "subagent_finished" | "tool_call" | "tool_call_update"
+        ) {
+            if updates.len() == MAX_GROK_SESSION_UPDATES {
+                let remove = MAX_GROK_SESSION_UPDATES / 2;
+                updates.drain(..remove);
+            }
+            updates.push(value);
+        }
+    }
+    updates
+}
+
+fn grok_terminal_diagnostic(path: &Path) -> GrokTerminalDiagnostic {
+    let Ok(file) = fs::File::open(path) else {
+        return GrokTerminalDiagnostic::default();
+    };
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut diagnostic = GrokTerminalDiagnostic::default();
+    loop {
+        line.clear();
+        let Ok(read) = reader.read_until(b'\n', &mut line) else {
+            break;
+        };
+        if read == 0 {
+            break;
+        }
+        if line.len() > MAX_GROK_SESSION_LINE_BYTES {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("turn_started") => diagnostic = GrokTerminalDiagnostic::default(),
+            Some("permission_requested") => {
+                diagnostic.permission_tool = string_at(&value, &["tool_name", "toolName"]);
+                diagnostic.permission_resolution = None;
+            }
+            Some("permission_resolved") => {
+                if diagnostic.permission_tool.is_none() {
+                    diagnostic.permission_tool = string_at(&value, &["tool_name", "toolName"]);
+                }
+                diagnostic.permission_resolution = match value
+                    .get("decision")
+                    .and_then(Value::as_str)
+                {
+                    Some("allowed" | "allow" | "approved") => Some(PermissionResolution::Allowed),
+                    Some("denied" | "declined" | "cancelled" | "canceled") => {
+                        Some(PermissionResolution::Denied)
+                    }
+                    _ => None,
+                };
+            }
+            Some("turn_ended") => {
+                diagnostic.outcome = string_at(&value, &["outcome"]);
+                diagnostic.cancellation_category =
+                    string_at(&value, &["cancellation_category", "cancellationCategory"]).or_else(
+                        || {
+                            value
+                                .pointer("/cancellation_context/reason")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        },
+                    );
+            }
+            _ => {}
+        }
+    }
+    diagnostic
 }
 
 fn content_text(content: Option<&Value>) -> Option<String> {
@@ -2590,6 +3875,179 @@ fn string_at(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
         .map(str::to_owned)
+}
+
+fn value_at<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter().find_map(|key| value.get(*key))
+}
+
+fn u64_at(value: &Value, keys: &[&str]) -> Option<u64> {
+    value_at(value, keys).and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_i64().and_then(|value| u64::try_from(value).ok()))
+    })
+}
+
+fn i64_at(value: &Value, keys: &[&str]) -> Option<i64> {
+    value_at(value, keys).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+    })
+}
+
+fn string_list_at(value: &Value, keys: &[&str]) -> Vec<String> {
+    value_at(value, keys)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn normalized_token(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn compact_subagent_label(value: &str) -> Option<String> {
+    let label = value.lines().find(|line| !line.trim().is_empty())?.trim();
+    if label.is_empty() {
+        return None;
+    }
+    const MAXIMUM: usize = 120;
+    if label.len() <= MAXIMUM {
+        Some(label.into())
+    } else {
+        Some(format!("{}…", truncate_utf8(label, MAXIMUM)))
+    }
+}
+
+fn codex_subagent_status(
+    agent_status: Option<&str>,
+    call_status: Option<&str>,
+    tool: &str,
+    phase: &str,
+) -> SubagentStatus {
+    if let Some(status) = agent_status {
+        return match normalized_token(status).as_str() {
+            "pendinginit" | "pending" => SubagentStatus::Pending,
+            "running" | "inprogress" | "started" => SubagentStatus::InProgress,
+            "completed" | "success" | "succeeded" => SubagentStatus::Completed,
+            "interrupted" | "shutdown" | "cancelled" | "canceled" => SubagentStatus::Cancelled,
+            "errored" | "failed" | "error" | "notfound" => SubagentStatus::Failed,
+            _ => SubagentStatus::InProgress,
+        };
+    }
+    if call_status.is_some_and(|status| {
+        matches!(
+            normalized_token(status).as_str(),
+            "failed" | "error" | "errored"
+        )
+    }) {
+        return SubagentStatus::Failed;
+    }
+    if tool == "closeagent" && phase == "item.completed" {
+        return SubagentStatus::Cancelled;
+    }
+    SubagentStatus::InProgress
+}
+
+fn claude_subagent_status(status: Option<&str>) -> SubagentStatus {
+    match status.map(normalized_token).as_deref() {
+        Some("pending" | "paused") => SubagentStatus::Pending,
+        Some("running" | "inprogress" | "asynclaunched" | "remotelaunched") => {
+            SubagentStatus::InProgress
+        }
+        Some("failed" | "error" | "errored") => SubagentStatus::Failed,
+        Some("stopped" | "killed" | "cancelled" | "canceled" | "interrupted") => {
+            SubagentStatus::Cancelled
+        }
+        Some("permissionblocked" | "permissiondenied" | "denied") => {
+            SubagentStatus::PermissionBlocked
+        }
+        Some("completed" | "success" | "succeeded") | None => SubagentStatus::Completed,
+        Some(_) => SubagentStatus::InProgress,
+    }
+}
+
+fn seconds_to_milliseconds(seconds: f64) -> Option<i64> {
+    if !seconds.is_finite() || seconds.is_sign_negative() {
+        return None;
+    }
+    let milliseconds = seconds * 1000.0;
+    (milliseconds <= i64::MAX as f64).then(|| milliseconds.round() as i64)
+}
+
+fn claude_tool_result_payload<'a>(
+    block: &'a Value,
+    envelope: Option<&'a Value>,
+) -> Option<&'a Value> {
+    if let Some(envelope) = envelope {
+        for payload in [
+            envelope.get("tool_use_result"),
+            envelope.get("toolUseResult"),
+            envelope.pointer("/message/tool_use_result"),
+            envelope.pointer("/message/toolUseResult"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !payload.is_null() {
+                return Some(payload);
+            }
+        }
+    }
+    value_at(block, &["tool_use_result", "toolUseResult"]).filter(|payload| !payload.is_null())
+}
+
+fn is_claude_agent_output(payload: &Value) -> bool {
+    string_at(payload, &["agent_id", "agentId"]).is_some()
+        || string_at(payload, &["status"]).is_some_and(|status| {
+            matches!(
+                normalized_token(&status).as_str(),
+                "asynclaunched" | "remotelaunched"
+            )
+        })
+        || value_at(
+            payload,
+            &[
+                "total_tool_use_count",
+                "totalToolUseCount",
+                "resolved_model",
+                "resolvedModel",
+            ],
+        )
+        .is_some()
+}
+
+fn claude_subagent_duration_ms(block: &Value, envelope: Option<&Value>) -> Option<i64> {
+    let payload = claude_tool_result_payload(block, envelope);
+    payload
+        .and_then(|payload| {
+            i64_at(
+                payload,
+                &[
+                    "total_duration_ms",
+                    "totalDurationMs",
+                    "duration_ms",
+                    "durationMs",
+                ],
+            )
+            .or_else(|| {
+                payload
+                    .get("usage")
+                    .and_then(|usage| i64_at(usage, &["duration_ms", "durationMs"]))
+            })
+        })
+        .or_else(|| i64_at(block, &["duration_ms", "durationMs"]))
+        .or_else(|| envelope.and_then(|envelope| i64_at(envelope, &["duration_ms", "durationMs"])))
 }
 
 fn task_identity_from_result(
@@ -2789,13 +4247,23 @@ fn run_http(
     let worker = match spawn {
         Ok(worker) => worker,
         Err(error) => {
-            return RunOutcome::Failed(format!("could not start AI API request: {error}"));
+            return RunOutcome::provider_error(format!("could not start AI API request: {error}"));
         }
     };
 
     let started_at = Instant::now();
     loop {
         if control.cancelled.load(Ordering::Acquire) {
+            let _ = event_sender.send(AiEvent::Activity {
+                turn_id: request.turn_id,
+                conversation_id: request.conversation_id,
+                event: activity_event(ActivityKind::TurnStatus {
+                    status: TurnStatus::UserCancelled,
+                    message: None,
+                    tool: None,
+                    retry: None,
+                }),
+            });
             let _ = event_sender.send(AiEvent::Cancelled {
                 turn_id: request.turn_id,
                 conversation_id: request.conversation_id,
@@ -2804,10 +4272,22 @@ fn run_http(
             return RunOutcome::TerminalAlreadyEmitted;
         }
         if started_at.elapsed() >= timeout {
+            let message = timeout_failure_message(timeout);
+            let _ = event_sender.send(AiEvent::Activity {
+                turn_id: request.turn_id,
+                conversation_id: request.conversation_id,
+                event: activity_event(ActivityKind::TurnStatus {
+                    status: TurnStatus::TimedOut,
+                    message: Some(message.clone()),
+                    tool: None,
+                    retry: Some(RetryHint::Retry),
+                }),
+            });
             let _ = event_sender.send(AiEvent::Failed {
                 turn_id: request.turn_id,
                 conversation_id: request.conversation_id,
-                message: timeout_failure_message(timeout),
+                kind: AiFailureKind::TimedOut,
+                message,
             });
             wait_for_http_worker(result_receiver, worker);
             return RunOutcome::TerminalAlreadyEmitted;
@@ -2820,7 +4300,7 @@ fn run_http(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = worker.join();
-                return RunOutcome::Failed("AI API worker stopped unexpectedly".into());
+                return RunOutcome::provider_error("AI API worker stopped unexpectedly");
             }
         }
     }
@@ -2889,14 +4369,17 @@ fn run_http_blocking(
             if control.cancelled.load(Ordering::Acquire) {
                 return RunOutcome::Cancelled;
             }
-            return RunOutcome::Failed(format!("AI API request failed: {error}"));
+            return RunOutcome::provider_error(format!("AI API request failed: {error}"));
         }
     };
     if control.cancelled.load(Ordering::Acquire) {
         return RunOutcome::Cancelled;
     }
     if !response.status().is_success() {
-        return RunOutcome::Failed(format!("AI API returned HTTP status {}", response.status()));
+        return RunOutcome::provider_error(format!(
+            "AI API returned HTTP status {}",
+            response.status()
+        ));
     }
 
     let response_body = response.body_mut();
@@ -2970,13 +4453,13 @@ fn run_http_blocking(
                 if control.cancelled.load(Ordering::Acquire) {
                     return RunOutcome::Cancelled;
                 }
-                return RunOutcome::Failed(format!("AI API stream failed: {error}"));
+                return RunOutcome::provider_error(format!("AI API stream failed: {error}"));
             }
         }
     }
 
     if let Some(error) = protocol_error {
-        RunOutcome::Failed(error)
+        RunOutcome::provider_error(error)
     } else {
         RunOutcome::Completed {
             text: output,
@@ -3344,6 +4827,13 @@ mod tests {
             preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &run).unwrap();
         let arguments = argument_strings(&specification);
         assert!(has_argument_pair(&arguments, "--sandbox", "read-only"));
+        assert!(has_argument_pair(
+            &arguments,
+            "--permission-mode",
+            "default"
+        ));
+        assert!(has_argument_pair(&arguments, "--allow", "WebSearch"));
+        assert!(has_argument_pair(&arguments, "--allow", "WebFetch"));
         assert!(!arguments.contains(&"--disable-web-search".into()));
 
         let mut configured = run;
@@ -3374,6 +4864,7 @@ mod tests {
         ] {
             assert!(arguments.contains(&flag.into()));
         }
+        assert!(!arguments.contains(&"--allow".into()));
 
         set_feature(&mut configured, AI_FEATURE_WEB_SEARCH, true);
         set_feature(&mut configured, AI_FEATURE_MEMORY, true);
@@ -3381,6 +4872,12 @@ mod tests {
             preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &configured).unwrap();
         let enabled_arguments = argument_strings(&enabled);
         assert!(!enabled_arguments.contains(&"--disable-web-search".into()));
+        assert!(has_argument_pair(
+            &enabled_arguments,
+            "--allow",
+            "WebSearch"
+        ));
+        assert!(has_argument_pair(&enabled_arguments, "--allow", "WebFetch"));
         assert!(enabled_arguments.contains(&"--experimental-memory".into()));
         assert!(!enabled_arguments.contains(&"--no-memory".into()));
 
@@ -3392,6 +4889,30 @@ mod tests {
             "--sandbox",
             "read-only"
         ));
+    }
+
+    #[test]
+    fn grok_accepts_every_documented_reasoning_tier_and_rejects_unknown_values() {
+        for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            let mut run = request("grok_cli");
+            run.provider_preferences.reasoning_effort = effort.into();
+            let specification =
+                preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &run).unwrap();
+            assert!(
+                has_argument_pair(
+                    &argument_strings(&specification),
+                    "--reasoning-effort",
+                    effort
+                ),
+                "missing documented Grok effort {effort}"
+            );
+        }
+
+        let mut unsupported = request("grok_cli");
+        unsupported.provider_preferences.reasoning_effort = "ultra".into();
+        let specification =
+            preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &unsupported).unwrap();
+        assert!(!argument_strings(&specification).contains(&"--reasoning-effort".into()));
     }
 
     #[test]
@@ -3763,6 +5284,79 @@ mod tests {
     }
 
     #[test]
+    fn codex_native_collab_items_project_one_stable_subagent_with_aliases() {
+        let stream = concat!(
+            "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"root-thread\"}}}\n",
+            "{\"method\":\"item/started\",\"params\":{\"item\":{\"id\":\"collab-1\",\"type\":\"collabAgentToolCall\",\"tool\":\"spawnAgent\",\"status\":\"inProgress\",\"senderThreadId\":\"root-thread\",\"receiverThreadIds\":[\"child-thread\"],\"prompt\":\"Audit authentication flows\\nReturn concise findings\",\"model\":\"gpt-5.6\",\"reasoningEffort\":\"high\",\"agentsStates\":{\"child-thread\":{\"status\":\"running\",\"message\":\"Reading auth files\"}}}}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"activity-1\",\"type\":\"sub_agent_activity\",\"kind\":\"interacted\",\"agent_thread_id\":\"child-thread\",\"agent_path\":\"root/child-thread\"}}\n",
+            "{\"method\":\"item/completed\",\"params\":{\"item\":{\"id\":\"collab-1\",\"type\":\"collabAgentToolCall\",\"tool\":\"wait\",\"status\":\"completed\",\"senderThreadId\":\"root-thread\",\"receiverThreadIds\":[\"child-thread\"],\"durationMs\":3125,\"agentsStates\":{\"child-thread\":{\"status\":\"completed\",\"message\":\"Audit complete\"}}}}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("codex_cli", stream, 9);
+        assert_eq!(decoder.session_id.as_deref(), Some("root-thread"));
+        let accumulator = accumulated(&decoded);
+        let subagents = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0].id, "child-thread");
+        assert_eq!(subagents[0].parent_id.as_deref(), Some("root-thread"));
+        assert_eq!(subagents[0].label, "Audit authentication flows");
+        assert_eq!(subagents[0].status, SubagentStatus::Completed);
+        assert_eq!(subagents[0].model.as_deref(), Some("gpt-5.6"));
+        assert_eq!(subagents[0].detail.as_deref(), Some("Audit complete"));
+        assert_eq!(subagents[0].duration_ms, Some(3_125));
+        assert!(!accumulator.events.iter().any(|event| matches!(
+            event.kind,
+            ActivityKind::TaskMutation { .. } | ActivityKind::PlanUpdate { .. }
+        )));
+    }
+
+    #[test]
+    fn claude_agent_and_task_events_share_one_lifecycle_without_becoming_progress() {
+        let stream = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"model\":\"claude-opus\",\"session_id\":\"claude-root\"}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"claude-root\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"agent-call-1\",\"name\":\"Agent\",\"input\":{\"description\":\"Audit auth module\",\"prompt\":\"Inspect authentication and report findings\",\"subagent_type\":\"Explore\",\"model\":\"sonnet\",\"run_in_background\":true}}]}}\n",
+            "{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"background-agent-7\",\"tool_use_id\":\"agent-call-1\",\"description\":\"Audit auth module\",\"subagent_type\":\"Explore\",\"session_id\":\"claude-root\"}\n",
+            "{\"type\":\"system\",\"subtype\":\"task_progress\",\"task_id\":\"background-agent-7\",\"toolUseId\":\"agent-call-1\",\"description\":\"Audit auth module\",\"subagentType\":\"Explore\",\"summary\":\"Checking token validation\",\"usage\":{\"tool_uses\":4,\"duration_ms\":2100},\"sessionId\":\"claude-root\"}\n",
+            "{\"type\":\"tool_progress\",\"tool_use_id\":\"agent-call-1\",\"tool_name\":\"Agent\",\"parent_tool_use_id\":null,\"elapsed_time_seconds\":3.5,\"subagent_type\":\"Explore\",\"session_id\":\"claude-root\"}\n",
+            "{\"type\":\"user\",\"session_id\":\"claude-root\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"agent-call-1\",\"content\":\"Agent completed\"}]},\"tool_use_result\":{\"agentId\":\"claude-agent-real\",\"content\":[{\"type\":\"text\",\"text\":\"Found two validation gaps\"}],\"resolvedModel\":\"claude-sonnet\",\"totalToolUseCount\":7,\"totalDurationMs\":4200,\"status\":\"completed\"}}\n",
+            "{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"claude-agent-real\",\"status\":\"completed\",\"output_file\":\"/tmp/agent-output\",\"summary\":\"Auth audit delivered\",\"usage\":{\"tool_uses\":8,\"duration_ms\":5000},\"session_id\":\"claude-root\"}\n",
+            "{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"background-shell\",\"description\":\"Run build\",\"task_type\":\"local_bash\",\"session_id\":\"claude-root\"}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 13);
+        assert_eq!(decoder.session_id.as_deref(), Some("claude-root"));
+        let accumulator = accumulated(&decoded);
+        let subagents = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0].id, "agent-call-1");
+        assert_eq!(subagents[0].parent_id.as_deref(), Some("claude-root"));
+        assert_eq!(subagents[0].label, "Audit auth module");
+        assert_eq!(subagents[0].status, SubagentStatus::Completed);
+        assert_eq!(subagents[0].model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(subagents[0].detail.as_deref(), Some("Auth audit delivered"));
+        assert_eq!(subagents[0].tool_calls, Some(8));
+        assert_eq!(subagents[0].duration_ms, Some(5_000));
+        assert!(!accumulator.events.iter().any(|event| matches!(
+            event.kind,
+            ActivityKind::TaskMutation { .. } | ActivityKind::PlanUpdate { .. }
+        )));
+    }
+
+    #[test]
+    fn claude_agent_denial_uses_structured_tool_result_metadata() {
+        let stream = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"sessionId\":\"claude-root\"}\n",
+            "{\"type\":\"assistant\",\"sessionId\":\"claude-root\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"agent-call-denied\",\"name\":\"Agent\",\"input\":{\"description\":\"Inspect protected files\",\"prompt\":\"Inspect the protected area\",\"subagentType\":\"Explore\"}}]}}\n",
+            "{\"type\":\"user\",\"sessionId\":\"claude-root\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"agent-call-denied\",\"content\":\"not executed\",\"isError\":true}]},\"toolResultMeta\":{\"nonExecutionKind\":\"denied\"}}\n"
+        );
+        let (_, decoded) = decode_in_chunks("claude_cli", stream, 17);
+        let accumulator = accumulated(&decoded);
+        let subagents = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0].id, "agent-call-denied");
+        assert_eq!(subagents[0].status, SubagentStatus::PermissionBlocked);
+        assert_eq!(subagents[0].label, "Inspect protected files");
+    }
+
+    #[test]
     fn claude_task_update_commits_status_and_active_work_label_after_success() {
         let mut decoder = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
         let created = decoder
@@ -4090,6 +5684,178 @@ mod tests {
     }
 
     #[test]
+    fn grok_stop_reasons_become_typed_failures_instead_of_generic_cancellation() {
+        let permission_stream = concat!(
+            "{\"type\":\"end\",\"stopReason\":\"Cancelled\",",
+            "\"cancellation_category\":\"permission_cancelled\",",
+            "\"sessionId\":\"019fb2fe-9145-7522-adb1-81fa62d02ede\"}\n"
+        );
+        let (permission, decoded) = decode_in_chunks("grok_cli", permission_stream, 9);
+        assert_eq!(
+            permission.failure_kind,
+            Some(AiFailureKind::PermissionBlocked)
+        );
+        assert!(
+            permission
+                .protocol_error
+                .as_deref()
+                .is_some_and(|message| message.contains("permission request"))
+        );
+        assert!(decoded.iter().any(|event| matches!(
+            event,
+            Decoded::Activity(ActivityEvent {
+                kind: ActivityKind::TurnError { message },
+                ..
+            }) if !message.contains("Stopped: Cancelled")
+        )));
+
+        let max_turns_stream = "{\"type\":\"end\",\"stopReason\":\"MaxTurnsReached\",\"sessionId\":\"019fb2fe-9145-7522-adb1-81fa62d02ede\"}\n";
+        let (max_turns, _) = decode_in_chunks("grok_cli", max_turns_stream, 7);
+        assert_eq!(max_turns.failure_kind, Some(AiFailureKind::MaxTurnsReached));
+        assert!(
+            max_turns
+                .protocol_error
+                .as_deref()
+                .is_some_and(|message| message.contains("maximum number of turns"))
+        );
+    }
+
+    #[test]
+    fn grok_session_harvest_projects_native_plan_subagents_tools_and_permission_failure() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session_id = "019fb2fe-9145-7522-adb1-81fa62d02ede";
+        let directory = temporary
+            .path()
+            .join("sessions")
+            .join("encoded-workspace")
+            .join(session_id);
+        fs::create_dir_all(&directory).unwrap();
+        let updates = concat!(
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"subagent_spawned\",\"subagent_id\":\"old\",\"description\":\"Old turn\"}}}\n",
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"user_message_chunk\"}}}\n",
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"todo-1\",\"title\":\"todo_write\",\"rawInput\":{\"todos\":[{\"id\":\"p1\",\"content\":\"Collect sources\",\"status\":\"in_progress\"},{\"id\":\"p2\",\"content\":\"Write report\",\"status\":\"pending\"}]}}}}\n",
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"subagent_spawned\",\"subagent_id\":\"child-1\",\"parent_session_id\":\"019fb2fe-9145-7522-adb1-81fa62d02ede\",\"description\":\"Research sources\",\"model\":\"grok-4.5\",\"capability_mode\":\"read-only\"}},\"_meta\":{\"agentTimestampMs\":1000}}\n",
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"search-1\",\"title\":\"Web search:\",\"rawInput\":{\"variant\":\"WebSearch\",\"backend\":true}}}}\n",
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":\"search-1\",\"status\":\"completed\",\"rawOutput\":{\"action\":{\"type\":\"search\",\"query\":\"AI games news\"}}}}}\n",
+            "{\"params\":{\"update\":{\"sessionUpdate\":\"subagent_finished\",\"subagent_id\":\"child-1\",\"status\":\"cancelled\",\"error\":\"Subagent turn was cancelled: user cancelled a permission prompt\",\"tool_calls\":14,\"duration_ms\":13747}},\"_meta\":{\"agentTimestampMs\":14747}}\n"
+        );
+        fs::write(directory.join("updates.jsonl"), updates).unwrap();
+        let subagent_meta_directory = directory.join("subagents").join("child-1");
+        fs::create_dir_all(&subagent_meta_directory).unwrap();
+        fs::write(
+            subagent_meta_directory.join("meta.json"),
+            concat!(
+                "{\"subagent_id\":\"child-1\",",
+                "\"parent_session_id\":\"019fb2fe-9145-7522-adb1-81fa62d02ede\",",
+                "\"description\":\"Research sources\",\"status\":\"cancelled\",",
+                "\"effective_model_id\":\"grok-4.5\",\"duration_ms\":13747,",
+                "\"tool_calls\":14,\"error\":\"permission prompt was cancelled\"}"
+            ),
+        )
+        .unwrap();
+        let child_session_directory = directory.parent().unwrap().join("child-1");
+        fs::create_dir_all(&child_session_directory).unwrap();
+        fs::write(
+            child_session_directory.join("events.jsonl"),
+            concat!(
+                "{\"type\":\"turn_started\"}\n",
+                "{\"type\":\"turn_ended\",\"outcome\":\"cancelled\",",
+                "\"cancellation_category\":\"permission_cancelled\"}\n"
+            ),
+        )
+        .unwrap();
+        let events = concat!(
+            "{\"type\":\"turn_started\"}\n",
+            "{\"type\":\"permission_requested\",\"tool_name\":\"web_fetch\"}\n",
+            "{\"type\":\"permission_resolved\",\"tool_name\":\"web_fetch\",\"decision\":\"cancelled\",\"wait_ms\":0}\n",
+            "{\"type\":\"turn_ended\",\"outcome\":\"cancelled\",\"cancellation_category\":\"permission_cancelled\"}\n"
+        );
+        fs::write(directory.join("events.jsonl"), events).unwrap();
+
+        let root = temporary.path();
+        assert_eq!(
+            grok_session_directory_under(root, session_id),
+            Some(directory.clone())
+        );
+        let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
+        let mut decoded = Vec::new();
+        harvest_grok_session_directory(&mut decoder, session_id, &directory, &mut |event| {
+            decoded.push(event)
+        });
+        let accumulator = accumulated(&decoded);
+
+        let subagents = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0].id, "child-1");
+        assert_eq!(subagents[0].label, "Research sources");
+        assert_eq!(subagents[0].status, SubagentStatus::PermissionBlocked);
+        assert_eq!(subagents[0].tool_calls, Some(14));
+        assert_eq!(subagents[0].duration_ms, Some(13_747));
+        assert!(accumulator.events.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::PlanUpdate { tasks, .. }
+                if tasks.len() == 2
+                    && tasks[0].content == "Collect sources"
+                    && tasks[0].status == PlanItemStatus::InProgress
+        )));
+        assert!(!accumulator.events.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::TaskMutation {
+                task_id: Some(task_id),
+                ..
+            } if task_id == "child-1"
+        )));
+        let progress = crate::chat_core::newest_plan(&accumulator.events).unwrap();
+        assert_eq!(progress.total(), 2);
+        assert_eq!(progress.in_progress, 1);
+        assert_eq!(progress.pending, 1);
+        assert_eq!(progress.cancelled, 0);
+        assert!(accumulator.events.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::WebSearch { query, .. } if query == "AI games news"
+        )));
+        assert!(accumulator.events.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::PermissionPrompt {
+                tool,
+                resolution: Some(PermissionResolution::Denied),
+                ..
+            } if tool == "web_fetch"
+        )));
+        assert_eq!(decoder.failure_kind, Some(AiFailureKind::PermissionBlocked));
+        assert_eq!(decoder.failure_tool.as_deref(), Some("web_fetch"));
+        assert_eq!(decoder.failure_retry, Some(RetryHint::AllowWebAndRetry));
+        assert_eq!(
+            decoder.protocol_error.as_deref(),
+            Some("Web access approval could not be answered in this non-interactive Grok run.")
+        );
+    }
+
+    #[test]
+    fn grok_session_harvest_recognizes_nested_max_turns_diagnostic() {
+        let temporary = tempfile::tempdir().unwrap();
+        let session_id = "029a1994-0d93-4107-904f-53179b3a6d29";
+        fs::write(
+            temporary.path().join("events.jsonl"),
+            concat!(
+                "{\"type\":\"turn_started\"}\n",
+                "{\"type\":\"turn_ended\",\"outcome\":\"cancelled\",",
+                "\"cancellation_context\":{\"reason\":\"max_turns_reached\",\"limit\":3}}\n"
+            ),
+        )
+        .unwrap();
+        let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
+        harvest_grok_session_directory(&mut decoder, session_id, temporary.path(), &mut |_| {});
+        assert_eq!(decoder.failure_kind, Some(AiFailureKind::MaxTurnsReached));
+        assert!(
+            decoder
+                .protocol_error
+                .as_deref()
+                .is_some_and(|message| message.contains("maximum number of turns"))
+        );
+    }
+
+    #[test]
     fn kimi_fixture_shape_maps_text_tool_call_result_and_usage() {
         let stream = concat!(
             "{\"role\":\"assistant\",\"content\":\"Checking\",\"tool_calls\":[{\"id\":\"read-1\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"file_path\\\":\\\"README.md\\\"}\"}}]}\n",
@@ -4327,7 +6093,11 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(matches!(
             outcome,
-            RunOutcome::Failed(message) if message.contains("timed out")
+            RunOutcome::Failed {
+                kind: AiFailureKind::TimedOut,
+                message,
+                ..
+            } if message.contains("timed out")
         ));
     }
 

@@ -1,16 +1,24 @@
-use crate::model::Workspace;
+use crate::{domain::ConversationStore, model::Workspace};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 use uuid::Uuid;
 
 const LIBRARY_FILE: &str = "library.json";
+const LIBRARY_LOCK_FILE: &str = ".library.lock";
+const LIBRARY_PREVIOUS_FILE: &str = "library.previous.json";
 const MIGRATION_MARKER: &str = ".adam-migration-complete";
+static LIBRARY_PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct AppPaths {
@@ -218,6 +226,7 @@ fn directory_is_file_subset_of(candidate: &Path, source: &Path) -> std::io::Resu
         let candidate_path = entry.path();
         let file_name = entry.file_name();
         if file_name == MIGRATION_MARKER
+            || file_name == LIBRARY_LOCK_FILE
             || file_name.to_string_lossy() == format!("{MIGRATION_MARKER}.tmp")
         {
             continue;
@@ -294,19 +303,118 @@ fn files_equal(left: &Path, right: &Path) -> std::io::Result<bool> {
     Ok(fs::read(left)? == fs::read(right)?)
 }
 
+/// Serializes read/merge/write transactions across Adam processes.
+///
+/// Atomic rename prevents a torn JSON file, but it cannot prevent an older
+/// process from replacing a newer complete snapshot. Every writer therefore
+/// holds this advisory lock while it reads the live library, merges, backs up,
+/// and commits.
+struct LibraryLock {
+    file: fs::File,
+    _process_guard: MutexGuard<'static, ()>,
+}
+
+impl LibraryLock {
+    fn acquire(paths: &AppPaths) -> std::io::Result<Self> {
+        let process_guard = LIBRARY_PROCESS_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(paths.root.join(LIBRARY_LOCK_FILE))?;
+        #[cfg(unix)]
+        loop {
+            // SAFETY: `file` owns a valid descriptor for the lifetime of this
+            // guard. `flock` does not take ownership of the descriptor.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+        Ok(Self {
+            file,
+            _process_guard: process_guard,
+        })
+    }
+}
+
+impl Drop for LibraryLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            // SAFETY: the descriptor remains valid until this guard finishes
+            // dropping. Unlock failure is not actionable during cleanup.
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
 pub fn load_workspace(paths: &AppPaths) -> anyhow::Result<Workspace> {
     paths.ensure()?;
     match fs::read(&paths.library) {
         Ok(bytes) => {
-            let mut workspace = serde_json::from_slice::<Workspace>(&bytes)?;
+            let mut workspace = match serde_json::from_slice::<Workspace>(&bytes) {
+                Ok(workspace) => workspace,
+                Err(error) => match recover_previous_library(paths, &bytes)? {
+                    Some(workspace) => workspace,
+                    None => return Err(error.into()),
+                },
+            };
+            let base = workspace.clone();
             if rebase_legacy_paths(paths, &mut workspace) {
-                save_workspace_atomic(paths, &workspace)?;
+                workspace = save_workspace_merged(paths, &base, &workspace)?;
             }
             Ok(workspace.normalized())
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Workspace::default()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn recover_previous_library(
+    paths: &AppPaths,
+    unreadable_bytes: &[u8],
+) -> anyhow::Result<Option<Workspace>> {
+    let _lock = LibraryLock::acquire(paths)?;
+    let live_bytes = match fs::read(&paths.library) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    // Another process may have repaired the file between the failed read and
+    // lock acquisition. Prefer that valid live value.
+    if live_bytes != unreadable_bytes
+        && let Ok(workspace) = serde_json::from_slice::<Workspace>(&live_bytes)
+    {
+        return Ok(Some(workspace.normalized()));
+    }
+
+    let previous_path = paths.root.join(LIBRARY_PREVIOUS_FILE);
+    let previous_bytes = match fs::read(&previous_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let previous = match serde_json::from_slice::<Workspace>(&previous_bytes) {
+        Ok(workspace) => workspace,
+        Err(_) => return Ok(None),
+    };
+
+    let backup = write_recovery_copy_locked(paths, &live_bytes)?;
+    write_file_atomic(&paths.library, &previous_bytes, "restore")?;
+    log::error!(
+        "restored Adam library from {} after preserving unreadable bytes at {}",
+        previous_path.display(),
+        backup.display()
+    );
+    Ok(Some(previous.normalized()))
 }
 
 fn rebase_legacy_paths(paths: &AppPaths, workspace: &mut Workspace) -> bool {
@@ -334,31 +442,122 @@ fn rebase_legacy_paths(paths: &AppPaths, workspace: &mut Workspace) -> bool {
 
 pub fn backup_unreadable_library(paths: &AppPaths) -> anyhow::Result<Option<PathBuf>> {
     paths.ensure()?;
-    if !paths.library.exists() {
-        return Ok(None);
-    }
-    let backup = paths
-        .root
-        .join(format!("library.recovery-{}.json", Uuid::new_v4()));
-    fs::copy(&paths.library, &backup)?;
-    sync_parent(&backup);
-    Ok(Some(backup))
+    let _lock = LibraryLock::acquire(paths)?;
+    let bytes = match fs::read(&paths.library) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    Ok(Some(write_recovery_copy_locked(paths, &bytes)?))
 }
 
 pub fn save_workspace_atomic(paths: &AppPaths, workspace: &Workspace) -> anyhow::Result<()> {
     paths.ensure()?;
-    let bytes = serde_json::to_vec_pretty(workspace)?;
-    let temporary = paths.library.with_extension("json.tmp");
+    let _lock = LibraryLock::acquire(paths)?;
+    write_workspace_locked(paths, workspace)
+}
 
-    {
-        let mut file = fs::File::create(&temporary)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+/// Commit a local snapshot while retaining conversation changes that another
+/// Adam process saved after `base` was loaded.
+fn save_workspace_merged(
+    paths: &AppPaths,
+    base: &Workspace,
+    local: &Workspace,
+) -> anyhow::Result<Workspace> {
+    paths.ensure()?;
+    let _lock = LibraryLock::acquire(paths)?;
+    let remote = read_workspace_for_merge_locked(paths, base)?;
+    let mut merged = local.clone();
+    merged.domain.conversations = ConversationStore::merge_persisted(
+        &base.domain.conversations,
+        &local.domain.conversations,
+        &remote.domain.conversations,
+    );
+    write_workspace_locked(paths, &merged)?;
+    Ok(merged)
+}
+
+fn read_workspace_for_merge_locked(
+    paths: &AppPaths,
+    base: &Workspace,
+) -> anyhow::Result<Workspace> {
+    match fs::read(&paths.library) {
+        Ok(bytes) => match serde_json::from_slice::<Workspace>(&bytes) {
+            Ok(workspace) => Ok(workspace.normalized()),
+            Err(error) => {
+                let backup = write_recovery_copy_locked(paths, &bytes)?;
+                log::error!(
+                    "preserved an unreadable live Adam library at {} before saving: {error}",
+                    backup.display()
+                );
+                // The current process has a decoded baseline, so use that for
+                // the merge after preserving the damaged on-disk bytes.
+                Ok(base.clone())
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Workspace::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn write_workspace_locked(paths: &AppPaths, workspace: &Workspace) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(workspace)?;
+    let previous = match fs::read(&paths.library) {
+        Ok(previous) if previous == bytes => return Ok(()),
+        Ok(previous) => Some(previous),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    if let Some(previous) = previous {
+        if serde_json::from_slice::<Workspace>(&previous).is_ok() {
+            write_file_atomic(
+                &paths.root.join(LIBRARY_PREVIOUS_FILE),
+                &previous,
+                "previous",
+            )?;
+        } else {
+            let backup = write_recovery_copy_locked(paths, &previous)?;
+            log::warn!(
+                "preserved unreadable Adam library bytes at {} before replacing them",
+                backup.display()
+            );
+        }
     }
 
-    fs::rename(&temporary, &paths.library)?;
-    sync_parent(&paths.library);
+    write_file_atomic(&paths.library, &bytes, "write")?;
     Ok(())
+}
+
+fn write_recovery_copy_locked(paths: &AppPaths, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let backup = paths
+        .root
+        .join(format!("library.recovery-{}.json", Uuid::new_v4()));
+    write_file_atomic(&backup, bytes, "recovery")?;
+    Ok(backup)
+}
+
+fn write_file_atomic(destination: &Path, bytes: &[u8], label: &str) -> std::io::Result<()> {
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Adam library file has no parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".library-{label}-{}.tmp", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = fs::File::create(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, destination)?;
+        sync_parent(destination);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn sync_parent(path: &Path) {
@@ -410,11 +609,19 @@ pub struct SaveWorker {
 
 impl SaveWorker {
     pub fn start(paths: AppPaths) -> Self {
+        let base = load_workspace(&paths).unwrap_or_default();
+        Self::start_with_base(paths, base)
+    }
+
+    /// Starts a worker whose merge baseline is the exact snapshot loaded by
+    /// this Adam process. Passing the loaded value closes the otherwise unsafe
+    /// gap between startup load and worker creation.
+    pub fn start_with_base(paths: AppPaths, base: Workspace) -> Self {
         let (sender, receiver) = bounded(2);
         let (completion_sender, completions) = unbounded();
         let handle = thread::Builder::new()
             .name("adam-save".into())
-            .spawn(move || save_loop(paths, receiver, completion_sender))
+            .spawn(move || save_loop(paths, base, receiver, completion_sender))
             .expect("failed to start persistence worker");
         Self {
             sender,
@@ -479,6 +686,7 @@ impl Drop for SaveWorker {
 
 fn save_loop(
     paths: AppPaths,
+    mut base: Workspace,
     receiver: Receiver<SaveCommand>,
     completions: Sender<SaveCompletion>,
 ) {
@@ -525,7 +733,14 @@ fn save_loop(
                         }
                     }
                 }
-                save_and_acknowledge(&paths, &workspace, request_id, &completions, false);
+                save_and_acknowledge(
+                    &paths,
+                    &mut base,
+                    &workspace,
+                    request_id,
+                    &completions,
+                    false,
+                );
                 if shutdown {
                     break;
                 }
@@ -534,7 +749,14 @@ fn save_loop(
                 request_id,
                 workspace,
             } => {
-                save_and_acknowledge(&paths, &workspace, request_id, &completions, true);
+                save_and_acknowledge(
+                    &paths,
+                    &mut base,
+                    &workspace,
+                    request_id,
+                    &completions,
+                    true,
+                );
                 break;
             }
             SaveCommand::Stop => break,
@@ -544,13 +766,20 @@ fn save_loop(
 
 fn save_and_acknowledge(
     paths: &AppPaths,
+    base: &mut Workspace,
     workspace: &Workspace,
     request_id: u64,
     completions: &Sender<SaveCompletion>,
     during_shutdown: bool,
 ) {
-    let outcome = match save_workspace_atomic(paths, workspace) {
-        Ok(()) => SaveOutcome::Saved,
+    let outcome = match save_workspace_merged(paths, base, workspace) {
+        Ok(_) => {
+            // Keep the baseline at what this process actually knows. Any
+            // concurrently merged remote records remain remote changes during
+            // the next three-way merge instead of looking locally deleted.
+            base.clone_from(workspace);
+            SaveOutcome::Saved
+        }
         Err(error) => {
             if during_shutdown {
                 log::error!("could not save Adam library during shutdown: {error:#}");
@@ -569,6 +798,7 @@ fn save_and_acknowledge(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{AiConversation, MessageRole, PermissionMode, UnixMillis};
 
     #[test]
     fn workspace_round_trips_atomically() {
@@ -752,6 +982,33 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_live_library_recovers_from_the_last_valid_snapshot() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let mut first = Workspace::default();
+        first.active_page_mut().name = "recover me".into();
+        save_workspace_atomic(&paths, &first).unwrap();
+        let mut second = first.clone();
+        second.active_page_mut().name = "newer".into();
+        save_workspace_atomic(&paths, &second).unwrap();
+        fs::write(&paths.library, b"interrupted bytes").unwrap();
+
+        let recovered = load_workspace(&paths).unwrap();
+
+        assert_eq!(recovered.active_page().name, "recover me");
+        assert_eq!(
+            load_workspace(&paths).unwrap().active_page().name,
+            "recover me"
+        );
+        assert!(fs::read_dir(&paths.root).unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("library.recovery-")
+        }));
+    }
+
+    #[test]
     fn save_worker_acknowledges_durable_completion() {
         let temporary = tempfile::tempdir().unwrap();
         let paths = AppPaths::at(temporary.path());
@@ -784,6 +1041,176 @@ mod tests {
     }
 
     #[test]
+    fn stale_writer_cannot_replace_a_newer_conversation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let conversation_id = Uuid::from_u128(100);
+        let base = workspace_with_conversation(conversation_id);
+        save_workspace_atomic(&paths, &base).unwrap();
+
+        // Model the exact failure mode: two Adam processes load the same
+        // library, the first completes a turn, and the stale process later
+        // saves an unrelated canvas edit.
+        let mut fresh = load_workspace(&paths).unwrap();
+        let mut stale = load_workspace(&paths).unwrap();
+        fresh
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&conversation_id)
+            .unwrap()
+            .append_message(
+                Uuid::from_u128(102),
+                MessageRole::Assistant,
+                "new provider response",
+                UnixMillis(2_000),
+                Vec::new(),
+            )
+            .unwrap();
+        stale.active_page_mut().name = "saved by stale process".into();
+
+        let mut fresh_worker = SaveWorker::start_with_base(paths.clone(), base.clone());
+        let fresh_request = fresh_worker.request_tracked(fresh).unwrap();
+        assert_eq!(
+            wait_for_completion(&fresh_worker, fresh_request).outcome,
+            SaveOutcome::Saved
+        );
+
+        let mut stale_worker = SaveWorker::start_with_base(paths.clone(), base);
+        let stale_request = stale_worker.request_tracked(stale).unwrap();
+        assert_eq!(
+            wait_for_completion(&stale_worker, stale_request).outcome,
+            SaveOutcome::Saved
+        );
+        fresh_worker.stop();
+        stale_worker.stop();
+
+        let persisted = load_workspace(&paths).unwrap();
+        let conversation = &persisted.domain.conversations.conversations[&conversation_id];
+        assert_eq!(conversation.messages().len(), 2);
+        assert_eq!(
+            conversation.messages().last().unwrap().text,
+            "new provider response"
+        );
+        assert_eq!(persisted.active_page().name, "saved by stale process");
+
+        // The immediately previous complete library remains independently
+        // recoverable even though the merged write succeeded.
+        let backup: Workspace =
+            serde_json::from_slice(&fs::read(paths.root.join(LIBRARY_PREVIOUS_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(
+            backup.domain.conversations.conversations[&conversation_id]
+                .messages()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn concurrent_turns_in_one_conversation_merge_by_record_id() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let conversation_id = Uuid::from_u128(200);
+        let base = workspace_with_conversation(conversation_id);
+        save_workspace_atomic(&paths, &base).unwrap();
+        let mut left = base.clone();
+        let mut right = base.clone();
+        left.domain
+            .conversations
+            .conversations
+            .get_mut(&conversation_id)
+            .unwrap()
+            .append_message(
+                Uuid::from_u128(202),
+                MessageRole::Assistant,
+                "left branch",
+                UnixMillis(2_000),
+                Vec::new(),
+            )
+            .unwrap();
+        right
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&conversation_id)
+            .unwrap()
+            .append_message(
+                Uuid::from_u128(203),
+                MessageRole::Assistant,
+                "right branch",
+                UnixMillis(3_000),
+                Vec::new(),
+            )
+            .unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let left_barrier = barrier.clone();
+        let left_paths = paths.clone();
+        let left_base = base.clone();
+        let left_save = thread::spawn(move || {
+            left_barrier.wait();
+            save_workspace_merged(&left_paths, &left_base, &left).unwrap();
+        });
+        let right_barrier = barrier.clone();
+        let right_paths = paths.clone();
+        let right_base = base;
+        let right_save = thread::spawn(move || {
+            right_barrier.wait();
+            save_workspace_merged(&right_paths, &right_base, &right).unwrap();
+        });
+        barrier.wait();
+        left_save.join().unwrap();
+        right_save.join().unwrap();
+
+        let persisted = load_workspace(&paths).unwrap();
+        let messages = persisted.domain.conversations.conversations[&conversation_id].messages();
+        assert_eq!(messages.len(), 3);
+        assert!(messages.iter().any(|message| message.text == "left branch"));
+        assert!(
+            messages
+                .iter()
+                .any(|message| message.text == "right branch")
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn ordinary_conversation_deletion_is_not_resurrected_by_a_stale_save() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let conversation_id = Uuid::from_u128(300);
+        let base = workspace_with_conversation(conversation_id);
+        save_workspace_atomic(&paths, &base).unwrap();
+        let mut deleting_process = base.clone();
+        deleting_process
+            .domain
+            .conversations
+            .conversations
+            .remove(&conversation_id);
+        save_workspace_merged(&paths, &base, &deleting_process).unwrap();
+
+        let mut stale = base.clone();
+        stale.active_page_mut().name = "stale but unrelated".into();
+        save_workspace_merged(&paths, &base, &stale).unwrap();
+
+        let persisted = load_workspace(&paths).unwrap();
+        assert!(
+            !persisted
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&conversation_id)
+        );
+    }
+
+    #[test]
     fn coalesced_save_receipts_identify_the_durable_snapshot() {
         let temporary = tempfile::tempdir().unwrap();
         let paths = AppPaths::at(temporary.path());
@@ -807,7 +1234,12 @@ mod tests {
             .unwrap();
         commands.send(SaveCommand::Stop).unwrap();
 
-        save_loop(paths.clone(), receiver, completion_sender);
+        save_loop(
+            paths.clone(),
+            Workspace::default(),
+            receiver,
+            completion_sender,
+        );
 
         assert_eq!(
             completions.try_recv().unwrap(),
@@ -836,5 +1268,26 @@ mod tests {
             thread::sleep(std::time::Duration::from_millis(5));
         }
         panic!("timed out waiting for save completion");
+    }
+
+    fn workspace_with_conversation(conversation_id: Uuid) -> Workspace {
+        let mut workspace = Workspace::default();
+        let mut conversation = AiConversation::new(
+            conversation_id,
+            "Persistence",
+            PermissionMode::Ask,
+            UnixMillis(1_000),
+        );
+        conversation
+            .append_message(
+                Uuid::from_u128(conversation_id.as_u128().saturating_add(1)),
+                MessageRole::User,
+                "base prompt",
+                UnixMillis(1_000),
+                Vec::new(),
+            )
+            .unwrap();
+        workspace.domain.conversations.add(conversation).unwrap();
+        workspace
     }
 }

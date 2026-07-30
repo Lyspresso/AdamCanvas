@@ -113,7 +113,12 @@ AI-chat tiles open a dedicated full-page workspace with Chat, Cowork, and Code
 modes. Each saved conversation keeps its history, mode, provider, model, and
 working-folder choice. Cowork and Code use the selected working folder, while
 Chat is ready for general conversation. Responses stream into a Markdown
-transcript, and the composer supports attachments and stopping an active turn.
+transcript with a compact work chronology, coalesced provider activity, inline
+child-agent status chips, and genuine checklist progress. The right-side
+workspace separates Progress, Subagents, Outputs, the working-folder tree, and
+Context; Subagents can open into a wider Active/Done detail panel. The composer
+supports attachments, provider-specific model and reasoning controls, narrow
+abilities, and stopping an active turn.
 
 The provider menu supports the locally installed Claude, Codex, Grok, and Kimi
 CLIs; LM Studio; Ollama; OpenAI-compatible APIs; and a configurable Custom CLI.
@@ -126,9 +131,10 @@ require approval when appropriate, and protected tiles remain guarded from
 destructive actions.
 
 The expanded harness also includes provider capability profiles, normalized
-typed activity, plan/output/context/usage projections, bounded prompt replay,
-safe native-session resume, durable per-conversation queues, parked recovery,
-and visible failure turns. The exact contracts and current honest limitations
+typed activity, task/subagent/output/context/usage projections, explicit
+terminal states and retries, bounded prompt replay, safe native-session resume,
+durable per-conversation queues, parked recovery, and revision-aware
+conversation persistence. The exact contracts and current honest limitations
 are documented in [docs/AI-HARNESS.md](docs/AI-HARNESS.md).
 
 ## Build the app

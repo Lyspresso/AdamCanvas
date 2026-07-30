@@ -131,10 +131,73 @@ pub enum PermissionResolution {
     Denied,
 }
 
+/// Provider-neutral state for a child agent linked to the current turn.
+///
+/// Providers use different names for these workers (subagents, collaborators,
+/// delegated tasks, child threads). Adam normalizes all of them to this one
+/// lifecycle so the UI never has to infer agent work from prose.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum SubagentStatus {
+    Pending,
+    #[default]
+    InProgress,
+    Completed,
+    Failed,
+    Cancelled,
+    PermissionBlocked,
+}
+
+impl SubagentStatus {
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Pending | Self::InProgress)
+    }
+}
+
+/// Normalized terminal state for a provider turn.
+///
+/// This deliberately keeps provider cancellation categories richer than a
+/// generic "cancelled" string. `UserCancelled` is reserved for Adam's Stop
+/// action; a headless permission denial is `PermissionBlocked`.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnStatus {
+    InProgress,
+    #[default]
+    Completed,
+    UserCancelled,
+    PermissionBlocked,
+    TimedOut,
+    MaxTurnsReached,
+    ProviderError,
+}
+
+impl TurnStatus {
+    pub fn is_successful(self) -> bool {
+        self == Self::Completed
+    }
+
+    pub fn is_terminal(self) -> bool {
+        self != Self::InProgress
+    }
+}
+
+/// A safe, UI-owned retry choice attached to a normalized terminal state.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RetryHint {
+    Retry,
+    AllowWebAndRetry,
+}
+
 /// The single activity vocabulary shared by every CLI, API, host tool, and
 /// permission producer.
 ///
-/// `type` and the fifteen camel-cased case values form the persisted wire
+/// `type` and the camel-cased case values form the persisted wire
 /// format. Additions should therefore be treated as schema changes.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -250,6 +313,22 @@ pub enum ActivityKind {
         #[serde(default)]
         resolution: Option<PermissionResolution>,
     },
+    Subagent {
+        #[serde(default)]
+        id: String,
+        #[serde(default)]
+        parent_id: Option<String>,
+        #[serde(default)]
+        label: String,
+        #[serde(default)]
+        status: SubagentStatus,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default)]
+        detail: Option<String>,
+        #[serde(default)]
+        tool_calls: Option<u64>,
+    },
     Usage {
         #[serde(default)]
         input: Option<u64>,
@@ -265,6 +344,16 @@ pub enum ActivityKind {
     TurnError {
         #[serde(default)]
         message: String,
+    },
+    TurnStatus {
+        #[serde(default)]
+        status: TurnStatus,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        tool: Option<String>,
+        #[serde(default)]
+        retry: Option<RetryHint>,
     },
     SessionInfo {
         #[serde(default)]
@@ -298,13 +387,15 @@ impl ActivityKind {
             Self::HostMutation { .. } => "hostMutation",
             Self::HostRead { .. } => "hostRead",
             Self::PermissionPrompt { .. } => "permissionPrompt",
+            Self::Subagent { .. } => "subagent",
             Self::Usage { .. } => "usage",
             Self::TurnError { .. } => "turnError",
+            Self::TurnStatus { .. } => "turnStatus",
             Self::SessionInfo { .. } => "sessionInfo",
         }
     }
 
-    /// Identity for the six started → updated → completed lifecycle cases.
+    /// Identity for the started → updated → completed lifecycle cases.
     ///
     /// The case prefix prevents, for example, a generic tool result from
     /// resolving a richer command record that happens to share its id.
@@ -316,6 +407,7 @@ impl ActivityKind {
             Self::FileChange { id, .. } => ("fileChange", id),
             Self::WebSearch { id, .. } => ("webSearch", id),
             Self::PermissionPrompt { id, .. } => ("permissionPrompt", id),
+            Self::Subagent { id, .. } => ("subagent", id),
             _ => return None,
         };
         Some(format!("{case_name}:{id}"))
@@ -323,7 +415,10 @@ impl ActivityKind {
 
     /// Errors and permission prompts must remain visible at every verbosity.
     pub const fn is_foldable(&self) -> bool {
-        !matches!(self, Self::TurnError { .. } | Self::PermissionPrompt { .. })
+        !matches!(
+            self,
+            Self::TurnError { .. } | Self::TurnStatus { .. } | Self::PermissionPrompt { .. }
+        )
     }
 
     pub const fn is_plan_snapshot(&self) -> bool {
@@ -356,7 +451,9 @@ impl ActivityKind {
                 | Self::TaskMutation { .. }
                 | Self::HostMutation { .. }
                 | Self::PermissionPrompt { .. }
+                | Self::Subagent { .. }
                 | Self::TurnError { .. }
+                | Self::TurnStatus { .. }
         )
     }
 }
@@ -514,8 +611,46 @@ impl ActivityAccumulator {
                 .position(|event| event.kind.lifecycle_key().as_deref() == Some(key.as_str()))
         {
             let original_at = self.events[index].at;
-            self.events[index].duration_ms = Some(incoming.at.elapsed_since(original_at));
+            let previous_kind = self.events[index].kind.clone();
+            self.events[index].duration_ms = incoming
+                .duration_ms
+                .or_else(|| Some(incoming.at.elapsed_since(original_at)));
             self.events[index].kind = incoming.kind;
+            if let (
+                ActivityKind::Subagent {
+                    parent_id: previous_parent,
+                    label: previous_label,
+                    model: previous_model,
+                    detail: previous_detail,
+                    tool_calls: previous_tool_calls,
+                    ..
+                },
+                ActivityKind::Subagent {
+                    parent_id,
+                    label,
+                    model,
+                    detail,
+                    tool_calls,
+                    ..
+                },
+            ) = (previous_kind, &mut self.events[index].kind)
+            {
+                if parent_id.is_none() {
+                    *parent_id = previous_parent;
+                }
+                if label.trim().is_empty() {
+                    *label = previous_label;
+                }
+                if model.is_none() {
+                    *model = previous_model;
+                }
+                if detail.is_none() {
+                    *detail = previous_detail;
+                }
+                if tool_calls.is_none() {
+                    *tool_calls = previous_tool_calls;
+                }
+            }
             return;
         }
 
@@ -754,6 +889,117 @@ impl ProgressProjection {
     pub fn total(&self) -> usize {
         self.items.len()
     }
+}
+
+/// Newest-known state for one provider child agent.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SubagentProjection {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub label: String,
+    pub status: SubagentStatus,
+    pub model: Option<String>,
+    pub detail: Option<String>,
+    pub tool_calls: Option<u64>,
+    pub at: UnixMillis,
+    pub duration_ms: Option<i64>,
+}
+
+/// Folds child-agent lifecycle records without inventing tasks from prose.
+///
+/// First-seen order is stable. Later records replace status and any supplied
+/// metadata while retaining an earlier label/parent/model when a provider
+/// sends a sparse completion event.
+pub fn project_subagents(events: &[ActivityEvent]) -> Vec<SubagentProjection> {
+    let mut projected = Vec::<SubagentProjection>::new();
+    let mut indices = BTreeMap::<String, usize>::new();
+
+    for event in events {
+        let ActivityKind::Subagent {
+            id,
+            parent_id,
+            label,
+            status,
+            model,
+            detail,
+            tool_calls,
+        } = &event.kind
+        else {
+            continue;
+        };
+        if id.trim().is_empty() {
+            continue;
+        }
+        if let Some(index) = indices.get(id).copied() {
+            let existing = &mut projected[index];
+            if parent_id.is_some() {
+                existing.parent_id.clone_from(parent_id);
+            }
+            if !label.trim().is_empty() {
+                existing.label.clone_from(label);
+            }
+            existing.status = *status;
+            if model.is_some() {
+                existing.model.clone_from(model);
+            }
+            if detail.is_some() {
+                existing.detail.clone_from(detail);
+            }
+            if tool_calls.is_some() {
+                existing.tool_calls = *tool_calls;
+            }
+            existing.duration_ms = event.duration_ms.or(existing.duration_ms);
+        } else {
+            indices.insert(id.clone(), projected.len());
+            projected.push(SubagentProjection {
+                id: id.clone(),
+                parent_id: parent_id.clone(),
+                label: label.clone(),
+                status: *status,
+                model: model.clone(),
+                detail: detail.clone(),
+                tool_calls: *tool_calls,
+                at: event.at,
+                duration_ms: event.duration_ms,
+            });
+        }
+    }
+    projected
+}
+
+/// Last normalized provider-turn state in an event stream.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TurnStatusProjection {
+    pub event_id: Uuid,
+    pub at: UnixMillis,
+    pub status: TurnStatus,
+    pub message: Option<String>,
+    pub tool: Option<String>,
+    pub retry: Option<RetryHint>,
+}
+
+pub fn latest_turn_status(events: &[ActivityEvent]) -> Option<TurnStatusProjection> {
+    events.iter().rev().find_map(|event| {
+        let ActivityKind::TurnStatus {
+            status,
+            message,
+            tool,
+            retry,
+        } = &event.kind
+        else {
+            return None;
+        };
+        Some(TurnStatusProjection {
+            event_id: event.id,
+            at: event.at,
+            status: *status,
+            message: message.clone(),
+            tool: tool.clone(),
+            retry: *retry,
+        })
+    })
 }
 
 /// Folds whole-plan snapshots and the task mutations that follow them.
@@ -1119,6 +1365,11 @@ pub fn current_work_label(
                     return format!("Waiting for permission · {tool}");
                 }
             }
+            ActivityKind::Subagent {
+                label,
+                status: SubagentStatus::InProgress,
+                ..
+            } if !label.trim().is_empty() => return format!("Agent · {label}"),
             ActivityKind::Thinking { text } if !text.trim().is_empty() => {
                 return "Thinking".into();
             }
@@ -2974,7 +3225,88 @@ mod tests {
     }
 
     #[test]
-    fn all_fifteen_cases_round_trip_through_the_wire_format() {
+    fn subagent_lifecycle_keeps_identity_metadata_and_terminal_duration() {
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest(event(
+            1,
+            100,
+            ActivityKind::Subagent {
+                id: "child-1".into(),
+                parent_id: Some("parent-1".into()),
+                label: "Research current sources".into(),
+                status: SubagentStatus::InProgress,
+                model: Some("grok-4.5".into()),
+                detail: None,
+                tool_calls: Some(2),
+            },
+        ));
+        accumulator.ingest(event(
+            2,
+            1_600,
+            ActivityKind::Subagent {
+                id: "child-1".into(),
+                parent_id: None,
+                label: String::new(),
+                status: SubagentStatus::PermissionBlocked,
+                model: None,
+                detail: Some("WebFetch approval required".into()),
+                tool_calls: Some(8),
+            },
+        ));
+
+        assert_eq!(accumulator.events.len(), 1);
+        assert_eq!(accumulator.events[0].id, Uuid::from_u128(1));
+        assert_eq!(accumulator.events[0].duration_ms, Some(1_500));
+        let agents = project_subagents(&accumulator.events);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].parent_id.as_deref(), Some("parent-1"));
+        assert_eq!(agents[0].label, "Research current sources");
+        assert_eq!(agents[0].model.as_deref(), Some("grok-4.5"));
+        assert_eq!(agents[0].status, SubagentStatus::PermissionBlocked);
+        assert_eq!(
+            agents[0].detail.as_deref(),
+            Some("WebFetch approval required")
+        );
+        assert_eq!(agents[0].tool_calls, Some(8));
+        assert!(
+            newest_plan(&accumulator.events).is_none(),
+            "child-agent lifecycle must not manufacture Progress checklist rows"
+        );
+    }
+
+    #[test]
+    fn latest_turn_status_preserves_permission_retry_semantics() {
+        let events = vec![
+            event(
+                1,
+                10,
+                ActivityKind::TurnStatus {
+                    status: TurnStatus::InProgress,
+                    message: None,
+                    tool: None,
+                    retry: None,
+                },
+            ),
+            event(
+                2,
+                20,
+                ActivityKind::TurnStatus {
+                    status: TurnStatus::PermissionBlocked,
+                    message: Some("Web access approval could not be answered".into()),
+                    tool: Some("WebFetch".into()),
+                    retry: Some(RetryHint::AllowWebAndRetry),
+                },
+            ),
+        ];
+        let terminal = latest_turn_status(&events).expect("terminal status");
+        assert_eq!(terminal.event_id, Uuid::from_u128(2));
+        assert_eq!(terminal.status, TurnStatus::PermissionBlocked);
+        assert_eq!(terminal.tool.as_deref(), Some("WebFetch"));
+        assert_eq!(terminal.retry, Some(RetryHint::AllowWebAndRetry));
+    }
+
+    #[test]
+    fn all_seventeen_cases_round_trip_through_the_wire_format() {
         let kinds = vec![
             ActivityKind::AssistantText { text: "a".into() },
             ActivityKind::Thinking { text: "t".into() },
@@ -3029,6 +3361,15 @@ mod tests {
                 summary: "Delete?".into(),
                 resolution: Some(PermissionResolution::Denied),
             },
+            ActivityKind::Subagent {
+                id: "child-1".into(),
+                parent_id: Some("parent-1".into()),
+                label: "Research sources".into(),
+                status: SubagentStatus::PermissionBlocked,
+                model: Some("grok-4.5".into()),
+                detail: Some("WebFetch approval required".into()),
+                tool_calls: Some(8),
+            },
             ActivityKind::Usage {
                 input: Some(1),
                 output: Some(2),
@@ -3039,12 +3380,18 @@ mod tests {
             ActivityKind::TurnError {
                 message: "error".into(),
             },
+            ActivityKind::TurnStatus {
+                status: TurnStatus::PermissionBlocked,
+                message: Some("Web access approval could not be answered".into()),
+                tool: Some("WebFetch".into()),
+                retry: Some(RetryHint::AllowWebAndRetry),
+            },
             ActivityKind::SessionInfo {
                 model: Some("model".into()),
                 session_id: Some("session".into()),
             },
         ];
-        assert_eq!(kinds.len(), 15);
+        assert_eq!(kinds.len(), 17);
         let events: Vec<_> = kinds
             .into_iter()
             .enumerate()
@@ -3064,8 +3411,10 @@ mod tests {
             "hostMutation",
             "hostRead",
             "permissionPrompt",
+            "subagent",
             "usage",
             "turnError",
+            "turnStatus",
             "sessionInfo",
         ] {
             assert!(encoded.contains(&format!("\"type\":\"{name}\"")));
@@ -3078,6 +3427,8 @@ mod tests {
             "resultSummary",
             "entityId",
             "containerName",
+            "parentId",
+            "toolCalls",
             "cachedInput",
             "costUsd",
             "sessionId",

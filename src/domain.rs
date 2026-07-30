@@ -2760,6 +2760,139 @@ impl AiConversation {
         }
         Ok(())
     }
+
+    /// Three-way merge for snapshots written by different Adam processes.
+    ///
+    /// Scalar fields retain independent edits relative to `base`. Append-only
+    /// history is merged by stable record ID, while a deletion is honored when
+    /// the other side did not concurrently modify the same record.
+    pub(crate) fn merge_persisted(base: Option<&Self>, local: &Self, remote: &Self) -> Self {
+        let prefer_local = local.updated_at >= remote.updated_at;
+        let mut merged = if prefer_local {
+            local.clone()
+        } else {
+            remote.clone()
+        };
+
+        merged.title = merge_persisted_value(
+            base.map(|conversation| &conversation.title),
+            &local.title,
+            &remote.title,
+            prefer_local,
+        );
+        merged.permission_mode = merge_persisted_value(
+            base.map(|conversation| &conversation.permission_mode),
+            &local.permission_mode,
+            &remote.permission_mode,
+            prefer_local,
+        );
+        merged.settings = merge_persisted_value(
+            base.map(|conversation| &conversation.settings),
+            &local.settings,
+            &remote.settings,
+            prefer_local,
+        );
+        merged.kind = merge_persisted_value(
+            base.map(|conversation| &conversation.kind),
+            &local.kind,
+            &remote.kind,
+            prefer_local,
+        );
+        merged.pinned = merge_persisted_value(
+            base.map(|conversation| &conversation.pinned),
+            &local.pinned,
+            &remote.pinned,
+            prefer_local,
+        );
+        merged.unread = merge_persisted_value(
+            base.map(|conversation| &conversation.unread),
+            &local.unread,
+            &remote.unread,
+            prefer_local,
+        );
+        merged.tools_enabled = merge_persisted_value(
+            base.map(|conversation| &conversation.tools_enabled),
+            &local.tools_enabled,
+            &remote.tools_enabled,
+            prefer_local,
+        );
+        merged.project_id = merge_persisted_value(
+            base.map(|conversation| &conversation.project_id),
+            &local.project_id,
+            &remote.project_id,
+            prefer_local,
+        );
+        merged.character_id = merge_persisted_value(
+            base.map(|conversation| &conversation.character_id),
+            &local.character_id,
+            &remote.character_id,
+            prefer_local,
+        );
+        merged.queue_paused = merge_persisted_value(
+            base.map(|conversation| &conversation.queue_paused),
+            &local.queue_paused,
+            &remote.queue_paused,
+            prefer_local,
+        );
+
+        merged.queued_turns = merge_persisted_records(
+            base.map(|conversation| conversation.queued_turns.as_slice()),
+            &local.queued_turns,
+            &remote.queued_turns,
+            |turn| turn.id,
+            prefer_local,
+        );
+        merged
+            .queued_turns
+            .sort_by_key(|turn| (turn.queued_at, turn.id));
+
+        merged.messages = merge_persisted_records(
+            base.map(|conversation| conversation.messages.as_slice()),
+            &local.messages,
+            &remote.messages,
+            |message| message.id,
+            prefer_local,
+        );
+        merged
+            .messages
+            .sort_by_key(|message| (message.at, message.sequence, message.id));
+        for (index, message) in merged.messages.iter_mut().enumerate() {
+            message.sequence = (index as u64).saturating_add(1);
+        }
+
+        merged.actions = merge_persisted_records(
+            base.map(|conversation| conversation.actions.as_slice()),
+            &local.actions,
+            &remote.actions,
+            |action| action.id,
+            prefer_local,
+        );
+        merged
+            .actions
+            .sort_by_key(|action| (action.at, action.sequence, action.id));
+        for (index, action) in merged.actions.iter_mut().enumerate() {
+            action.sequence = (index as u64).saturating_add(1);
+        }
+
+        merged.checkpoints = merge_persisted_records(
+            base.map(|conversation| conversation.checkpoints.as_slice()),
+            &local.checkpoints,
+            &remote.checkpoints,
+            |checkpoint| checkpoint.id,
+            prefer_local,
+        );
+        merged
+            .checkpoints
+            .sort_by_key(|checkpoint| (checkpoint.created_at, checkpoint.id));
+        if merged.checkpoints.len() > AI_CHECKPOINT_LIMIT {
+            let excess = merged.checkpoints.len() - AI_CHECKPOINT_LIMIT;
+            merged.checkpoints.drain(..excess);
+        }
+
+        merged.created_at = local.created_at.min(remote.created_at);
+        merged.updated_at = local.updated_at.max(remote.updated_at);
+        merged
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -2776,6 +2909,65 @@ impl ConversationStore {
         }
         self.conversations.insert(conversation.id, conversation);
         Ok(())
+    }
+
+    /// Merge the conversation portion of independently edited workspace
+    /// snapshots without resurrecting an ordinary one-sided deletion.
+    pub(crate) fn merge_persisted(base: &Self, local: &Self, remote: &Self) -> Self {
+        let mut conversation_ids = BTreeSet::new();
+        conversation_ids.extend(base.conversations.keys().copied());
+        conversation_ids.extend(local.conversations.keys().copied());
+        conversation_ids.extend(remote.conversations.keys().copied());
+
+        let mut conversations = BTreeMap::new();
+        for id in conversation_ids {
+            let base_value = base.conversations.get(&id);
+            let local_value = local.conversations.get(&id);
+            let remote_value = remote.conversations.get(&id);
+            let merged = if local_value == remote_value {
+                local_value.cloned()
+            } else if local_value == base_value {
+                remote_value.cloned()
+            } else if remote_value == base_value {
+                local_value.cloned()
+            } else {
+                match (local_value, remote_value) {
+                    (Some(local), Some(remote)) => {
+                        Some(AiConversation::merge_persisted(base_value, local, remote))
+                    }
+                    // A concurrent edit and deletion cannot be safely ordered
+                    // without a tombstone. Preserve the edited record; the
+                    // rolling library backup keeps either branch recoverable.
+                    (Some(value), None) | (None, Some(value)) => Some(value.clone()),
+                    (None, None) => None,
+                }
+            };
+            if let Some(conversation) = merged {
+                conversations.insert(id, conversation);
+            }
+        }
+
+        let mut tile_ids = BTreeSet::new();
+        tile_ids.extend(base.tile_links.keys().copied());
+        tile_ids.extend(local.tile_links.keys().copied());
+        tile_ids.extend(remote.tile_links.keys().copied());
+        let mut tile_links = BTreeMap::new();
+        for tile_id in tile_ids {
+            let base_value = base.tile_links.get(&tile_id);
+            let local_value = local.tile_links.get(&tile_id);
+            let remote_value = remote.tile_links.get(&tile_id);
+            let merged = merge_persisted_option(base_value, local_value, remote_value, true);
+            if let Some(conversation_id) = merged
+                && conversations.contains_key(&conversation_id)
+            {
+                tile_links.insert(tile_id, conversation_id);
+            }
+        }
+
+        Self {
+            conversations,
+            tile_links,
+        }
     }
 
     pub fn link_tile(
@@ -2805,6 +2997,90 @@ impl ConversationStore {
         self.add(empty_conversation)?;
         self.link_tile(new_tile_id, conversation_id)
     }
+}
+
+fn merge_persisted_value<T: Clone + PartialEq>(
+    base: Option<&T>,
+    local: &T,
+    remote: &T,
+    prefer_local: bool,
+) -> T {
+    if local == remote {
+        return local.clone();
+    }
+    if Some(local) == base {
+        return remote.clone();
+    }
+    if Some(remote) == base {
+        return local.clone();
+    }
+    if prefer_local {
+        local.clone()
+    } else {
+        remote.clone()
+    }
+}
+
+fn merge_persisted_option<T: Clone + PartialEq>(
+    base: Option<&T>,
+    local: Option<&T>,
+    remote: Option<&T>,
+    prefer_local: bool,
+) -> Option<T> {
+    if local == remote {
+        return local.cloned();
+    }
+    if local == base {
+        return remote.cloned();
+    }
+    if remote == base {
+        return local.cloned();
+    }
+    match (local, remote) {
+        (Some(local), Some(remote)) => Some(if prefer_local {
+            local.clone()
+        } else {
+            remote.clone()
+        }),
+        // Preserve the existing value for an irreducible edit/delete conflict.
+        (Some(value), None) | (None, Some(value)) => Some(value.clone()),
+        (None, None) => None,
+    }
+}
+
+fn merge_persisted_records<T, K>(
+    base: Option<&[T]>,
+    local: &[T],
+    remote: &[T],
+    key: impl Fn(&T) -> K,
+    prefer_local: bool,
+) -> Vec<T>
+where
+    T: Clone + PartialEq,
+    K: Copy + Ord,
+{
+    let base_by_id: BTreeMap<_, _> = base
+        .unwrap_or_default()
+        .iter()
+        .map(|record| (key(record), record))
+        .collect();
+    let local_by_id: BTreeMap<_, _> = local.iter().map(|record| (key(record), record)).collect();
+    let remote_by_id: BTreeMap<_, _> = remote.iter().map(|record| (key(record), record)).collect();
+    let mut ids = BTreeSet::new();
+    ids.extend(base_by_id.keys().copied());
+    ids.extend(local_by_id.keys().copied());
+    ids.extend(remote_by_id.keys().copied());
+
+    ids.into_iter()
+        .filter_map(|id| {
+            merge_persisted_option(
+                base_by_id.get(&id).copied(),
+                local_by_id.get(&id).copied(),
+                remote_by_id.get(&id).copied(),
+                prefer_local,
+            )
+        })
+        .collect()
 }
 
 // MARK: - Trash metadata
