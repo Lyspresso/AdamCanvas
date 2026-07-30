@@ -10,13 +10,13 @@ use std::{
     collections::HashMap,
     ffi::OsString,
     fmt,
-    io::{self, BufWriter, Read, Write},
+    io::{self, Read, Write},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, SyncSender},
+        mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -45,6 +45,10 @@ const PROCESS_TERM_GRACE: Duration = Duration::from_millis(500);
 const PROCESS_WAIT_POLL: Duration = Duration::from_millis(10);
 const PIPE_READ_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const WIRE_CHANNEL_CAPACITY: usize = 16;
+const STDIN_CHANNEL_CAPACITY: usize = 1;
+const STDIN_WRITE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const CANCEL_WRITE_GRACE: Duration = Duration::from_millis(100);
+const STDIN_WRITER_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 
 /// One HTTP MCP endpoint supplied to the Grok session.
 ///
@@ -437,6 +441,10 @@ where
         .stderr
         .take()
         .ok_or(GrokAcpError::MissingPipe("stderr"))?;
+    set_pipe_nonblocking(&stdin).map_err(|source| GrokAcpError::Io {
+        operation: "configuring Grok ACP stdin",
+        source,
+    })?;
     set_pipe_nonblocking(&stdout).map_err(|source| GrokAcpError::Io {
         operation: "configuring Grok ACP stdout",
         source,
@@ -455,8 +463,15 @@ where
         Arc::clone(&readers_stopping),
     );
     let stderr_reader = spawn_stderr_drain(stderr, Arc::clone(&readers_stopping));
-    let mut stdin = BufWriter::new(stdin);
     let started_at = Instant::now();
+    let (stdin_sender, stdin_writer) = spawn_stdin_writer(stdin);
+    let mut stdin = ProtocolStdin::new(
+        stdin_sender,
+        cancelled,
+        started_at,
+        request.limits.wall_timeout,
+        request.limits.max_protocol_bytes,
+    );
 
     let result = drive_protocol(
         request,
@@ -477,9 +492,18 @@ where
     // before process shutdown and thread joining.
     drop(wire_receiver);
     if completed_normally {
+        // Every acknowledged write is complete, so disconnecting the queue
+        // closes the child's stdin before its normal-exit grace period.
+        stdin_writer.join();
         child.finish_normally();
     } else {
+        // Stop the writer before killing Grok. On Unix its nonblocking pipe
+        // observes this flag even if an escaped descendant inherited stdin.
+        // Other platforms receive the same bounded grace and detach a still
+        // blocked worker rather than wedging Stop, timeout, or cleanup.
+        stdin_writer.request_stop();
         child.stop();
+        stdin_writer.join_bounded();
     }
     readers_stopping.store(true, Ordering::Release);
     let _ = stdout_reader.join();
@@ -684,6 +708,249 @@ fn command_arguments(request: &GrokAcpRequest) -> Vec<OsString> {
     arguments
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StdinWriteDisposition {
+    Written,
+    Cancelled,
+}
+
+struct StdinWriteRequest {
+    bytes: Vec<u8>,
+    result: mpsc::Sender<io::Result<()>>,
+}
+
+struct StdinWriter {
+    stopping: Arc<AtomicBool>,
+    finished: Receiver<()>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl StdinWriter {
+    fn request_stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+    }
+
+    fn join(mut self) {
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn join_bounded(mut self) {
+        self.request_stop();
+        let finished = match self.finished.recv_timeout(STDIN_WRITER_SHUTDOWN_GRACE) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => true,
+            Err(RecvTimeoutError::Timeout) => false,
+        };
+        if finished && let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct ProtocolStdin<'a> {
+    sender: SyncSender<StdinWriteRequest>,
+    cancelled: &'a AtomicBool,
+    wall_deadline: Instant,
+    wall_timeout: Duration,
+    max_message_bytes: usize,
+}
+
+impl<'a> ProtocolStdin<'a> {
+    fn new(
+        sender: SyncSender<StdinWriteRequest>,
+        cancelled: &'a AtomicBool,
+        started_at: Instant,
+        wall_timeout: Duration,
+        max_message_bytes: usize,
+    ) -> Self {
+        Self {
+            sender,
+            cancelled,
+            wall_deadline: started_at.checked_add(wall_timeout).unwrap_or(started_at),
+            wall_timeout,
+            max_message_bytes,
+        }
+    }
+
+    fn write_json_line(&mut self, value: &Value) -> Result<StdinWriteDisposition, GrokAcpError> {
+        self.write_json_line_until(value, self.wall_deadline, true)
+    }
+
+    fn try_write_cancel(&mut self, value: &Value) {
+        let grace_deadline = Instant::now()
+            .checked_add(CANCEL_WRITE_GRACE)
+            .unwrap_or_else(Instant::now);
+        let deadline = std::cmp::min(self.wall_deadline, grace_deadline);
+        let _ = self.write_json_line_until(value, deadline, false);
+    }
+
+    fn write_json_line_until(
+        &mut self,
+        value: &Value,
+        deadline: Instant,
+        honor_cancellation: bool,
+    ) -> Result<StdinWriteDisposition, GrokAcpError> {
+        let mut bytes = serde_json::to_vec(value).map_err(|source| GrokAcpError::Io {
+            operation: "encoding a Grok ACP request",
+            source: io::Error::other(source),
+        })?;
+        bytes.push(b'\n');
+        if bytes.len() > self.max_message_bytes {
+            return Err(GrokAcpError::ProtocolByteLimit {
+                limit: self.max_message_bytes,
+            });
+        }
+
+        let (result_sender, result_receiver) = mpsc::channel();
+        let mut pending = Some(StdinWriteRequest {
+            bytes,
+            result: result_sender,
+        });
+        loop {
+            if honor_cancellation && self.cancelled.load(Ordering::Acquire) {
+                return Ok(StdinWriteDisposition::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(self.timeout_error());
+            }
+            let request = pending
+                .take()
+                .expect("pending Grok ACP stdin request must remain available");
+            match self.sender.try_send(request) {
+                Ok(()) => break,
+                Err(TrySendError::Full(request)) => {
+                    pending = Some(request);
+                    thread::park_timeout(STDIN_WRITE_POLL_INTERVAL);
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(GrokAcpError::Io {
+                        operation: "queueing a Grok ACP request",
+                        source: io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "the Grok ACP stdin writer stopped",
+                        ),
+                    });
+                }
+            }
+        }
+
+        loop {
+            if honor_cancellation && self.cancelled.load(Ordering::Acquire) {
+                return Ok(StdinWriteDisposition::Cancelled);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(self.timeout_error());
+            }
+            let wait = std::cmp::min(
+                STDIN_WRITE_POLL_INTERVAL,
+                deadline.saturating_duration_since(now),
+            );
+            match result_receiver.recv_timeout(wait) {
+                Ok(Ok(())) => return Ok(StdinWriteDisposition::Written),
+                Ok(Err(source)) => {
+                    return Err(GrokAcpError::Io {
+                        operation: "writing a Grok ACP request",
+                        source,
+                    });
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(GrokAcpError::Io {
+                        operation: "waiting for a Grok ACP stdin write",
+                        source: io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "the Grok ACP stdin writer stopped",
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    fn timeout_error(&self) -> GrokAcpError {
+        GrokAcpError::TimedOut {
+            seconds: self.wall_timeout.as_secs(),
+        }
+    }
+}
+
+fn spawn_stdin_writer(mut stdin: ChildStdin) -> (SyncSender<StdinWriteRequest>, StdinWriter) {
+    let (sender, receiver) = mpsc::sync_channel::<StdinWriteRequest>(STDIN_CHANNEL_CAPACITY);
+    let stopping = Arc::new(AtomicBool::new(false));
+    let worker_stopping = Arc::clone(&stopping);
+    let (finished_sender, finished) = mpsc::channel();
+    let writer = thread::Builder::new()
+        .name("adam-grok-acp-stdin".into())
+        .spawn(move || {
+            while let Ok(request) = receiver.recv() {
+                let result = write_stdin_bytes(&mut stdin, &request.bytes, &worker_stopping);
+                let _ = request.result.send(result);
+                if worker_stopping.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            let _ = finished_sender.send(());
+        })
+        .expect("the Grok ACP stdin writer thread should start");
+    (
+        sender,
+        StdinWriter {
+            stopping,
+            finished,
+            handle: Some(writer),
+        },
+    )
+}
+
+fn write_stdin_bytes(
+    stdin: &mut ChildStdin,
+    bytes: &[u8],
+    stopping: &AtomicBool,
+) -> io::Result<()> {
+    let mut written = 0;
+    while written < bytes.len() {
+        if stopping.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Grok ACP stdin writer stopped",
+            ));
+        }
+        match stdin.write(&bytes[written..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "could not write the complete Grok ACP request",
+                ));
+            }
+            Ok(count) => written += count,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::park_timeout(STDIN_WRITE_POLL_INTERVAL);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    loop {
+        if stopping.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Grok ACP stdin writer stopped",
+            ));
+        }
+        match stdin.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::park_timeout(STDIN_WRITE_POLL_INTERVAL);
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drive_protocol<P, E>(
     request: &GrokAcpRequest,
@@ -691,7 +958,7 @@ fn drive_protocol<P, E>(
     permission: &mut P,
     emit: &mut E,
     child: &mut Child,
-    stdin: &mut BufWriter<ChildStdin>,
+    stdin: &mut ProtocolStdin<'_>,
     wire_receiver: &Receiver<WireEvent>,
     started_at: Instant,
 ) -> Result<GrokAcpOutcome, GrokAcpError>
@@ -709,7 +976,9 @@ where
         state.session_id = Some(session_id.clone());
     }
 
-    write_json_line(stdin, &initialize_request())?;
+    if stdin.write_json_line(&initialize_request())? == StdinWriteDisposition::Cancelled {
+        return Ok(state.cancelled_outcome());
+    }
     let initialize = match await_response(
         INITIALIZE_REQUEST_ID,
         "initialize",
@@ -728,7 +997,10 @@ where
     };
     validate_initialize_response(&initialize, request.resume_session_id.is_some())?;
 
-    write_json_line(stdin, &session_request(request))?;
+    if stdin.write_json_line(&session_request(request))? == StdinWriteDisposition::Cancelled {
+        return Ok(state.cancelled_outcome());
+    }
+    state.session_load_pending = request.resume_session_id.is_some();
     let session_result = match await_response(
         SESSION_REQUEST_ID,
         if request.resume_session_id.is_some() {
@@ -757,6 +1029,7 @@ where
     };
     validate_session_id(&session_id, state.authorization)?;
     state.session_id = Some(session_id.clone());
+    state.session_load_pending = false;
     state.session_negotiated = true;
     state.emit(
         emit,
@@ -766,7 +1039,11 @@ where
         },
     )?;
 
-    write_json_line(stdin, &prompt_request(&session_id, &request.prompt))?;
+    if stdin.write_json_line(&prompt_request(&session_id, &request.prompt))?
+        == StdinWriteDisposition::Cancelled
+    {
+        return Ok(state.cancelled_outcome());
+    }
     let prompt_result = match await_response(
         PROMPT_REQUEST_ID,
         "session/prompt",
@@ -819,7 +1096,7 @@ fn await_response<P, E>(
     permission: &mut P,
     emit: &mut E,
     child: &mut Child,
-    stdin: &mut BufWriter<ChildStdin>,
+    stdin: &mut ProtocolStdin<'_>,
     wire_receiver: &Receiver<WireEvent>,
     started_at: Instant,
     state: &mut ProtocolState<'_>,
@@ -830,11 +1107,11 @@ where
 {
     loop {
         if cancelled.load(Ordering::Acquire) {
-            state.send_cancel(stdin)?;
+            state.send_cancel(stdin);
             return Ok(AwaitedResponse::Cancelled);
         }
         if started_at.elapsed() >= request.limits.wall_timeout {
-            state.send_cancel(stdin)?;
+            state.send_cancel(stdin);
             return Err(GrokAcpError::TimedOut {
                 seconds: request.limits.wall_timeout.as_secs(),
             });
@@ -886,11 +1163,11 @@ where
             )? {
                 AgentMessageDisposition::Continue => continue,
                 AgentMessageDisposition::Cancelled => {
-                    state.send_cancel(stdin)?;
+                    state.send_cancel(stdin);
                     return Ok(AwaitedResponse::Cancelled);
                 }
                 AgentMessageDisposition::WebAccessDisabled { tool } => {
-                    state.send_cancel(stdin)?;
+                    state.send_cancel(stdin);
                     return Err(GrokAcpError::WebAccessDisabled { tool });
                 }
             }
@@ -930,14 +1207,14 @@ fn handle_agent_message<P, E>(
     web_enabled: bool,
     permission: &mut P,
     emit: &mut E,
-    stdin: &mut BufWriter<ChildStdin>,
+    stdin: &mut ProtocolStdin<'_>,
     state: &mut ProtocolState<'_>,
 ) -> Result<AgentMessageDisposition, GrokAcpError>
 where
     P: FnMut(&GrokAcpPermissionRequest) -> GrokAcpPermissionDecision,
     E: FnMut(GrokAcpEvent),
 {
-    validate_session_message_phase(method, state.session_negotiated)?;
+    validate_session_message_phase(method, state.session_negotiated, state.session_load_pending)?;
     match method {
         "session/update" => {
             let params = value
@@ -967,14 +1244,14 @@ where
                 permission_decision_with_policy(&permission_request, web_enabled, permission);
             let (response, resolution, disposition) =
                 permission_response(&permission_request, decision)?;
-            write_json_line(
-                stdin,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": response,
-                }),
-            )?;
+            if stdin.write_json_line(&json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": response,
+            }))? == StdinWriteDisposition::Cancelled
+            {
+                return Ok(AgentMessageDisposition::Cancelled);
+            }
             state.emit(
                 emit,
                 GrokAcpEvent::PermissionResolved {
@@ -988,17 +1265,17 @@ where
                 .unwrap_or(disposition))
         }
         _ if value.get("id").is_some() => {
-            write_json_line(
-                stdin,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": value.get("id").cloned().unwrap_or(Value::Null),
-                    "error": {
-                        "code": -32601,
-                        "message": "Method not supported by Adam's Grok ACP adapter",
-                    }
-                }),
-            )?;
+            if stdin.write_json_line(&json!({
+                "jsonrpc": "2.0",
+                "id": value.get("id").cloned().unwrap_or(Value::Null),
+                "error": {
+                    "code": -32601,
+                    "message": "Method not supported by Adam's Grok ACP adapter",
+                }
+            }))? == StdinWriteDisposition::Cancelled
+            {
+                return Ok(AgentMessageDisposition::Cancelled);
+            }
             Ok(AgentMessageDisposition::Continue)
         }
         _ => Ok(AgentMessageDisposition::Continue),
@@ -1008,8 +1285,13 @@ where
 fn validate_session_message_phase(
     method: &str,
     session_negotiated: bool,
+    session_load_pending: bool,
 ) -> Result<(), GrokAcpError> {
-    if matches!(method, "session/update" | "session/request_permission") && !session_negotiated {
+    let load_replay = method == "session/update" && session_load_pending;
+    if matches!(method, "session/update" | "session/request_permission")
+        && !session_negotiated
+        && !load_replay
+    {
         Err(GrokAcpError::Protocol(format!(
             "{method} arrived before session negotiation completed"
         )))
@@ -1213,8 +1495,17 @@ impl StreamingSecretRedactor {
     }
 
     fn finish(&mut self) -> String {
-        String::from_utf8(std::mem::take(&mut self.pending))
-            .expect("streaming redaction buffers valid UTF-8")
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty()
+            && self
+                .secrets
+                .iter()
+                .any(|secret| secret.starts_with(&pending))
+        {
+            "[REDACTED]".into()
+        } else {
+            String::from_utf8(pending).expect("streaming redaction buffers valid UTF-8")
+        }
     }
 }
 
@@ -1231,6 +1522,7 @@ struct ProtocolState<'a> {
     authorization: &'a str,
     session_id: Option<String>,
     session_negotiated: bool,
+    session_load_pending: bool,
     response_text: String,
     event_count: usize,
     text_bytes: usize,
@@ -1240,10 +1532,10 @@ struct ProtocolState<'a> {
     max_protocol_bytes: usize,
     fallback_agent_message_id: Option<String>,
     fallback_thought_message_id: Option<String>,
-    agent_message_redactor: StreamingSecretRedactor,
-    thought_message_redactor: StreamingSecretRedactor,
-    latest_agent_message_id: Option<String>,
-    latest_thought_message_id: Option<String>,
+    agent_message_redactors: HashMap<String, StreamingSecretRedactor>,
+    thought_message_redactors: HashMap<String, StreamingSecretRedactor>,
+    agent_message_order: Vec<String>,
+    thought_message_order: Vec<String>,
     tool_calls: HashMap<String, GrokAcpToolCall>,
     cancel_sent: bool,
 }
@@ -1259,6 +1551,7 @@ impl<'a> ProtocolState<'a> {
             authorization,
             session_id: None,
             session_negotiated: false,
+            session_load_pending: false,
             response_text: String::new(),
             event_count: 0,
             text_bytes: 0,
@@ -1268,10 +1561,10 @@ impl<'a> ProtocolState<'a> {
             max_protocol_bytes,
             fallback_agent_message_id: None,
             fallback_thought_message_id: None,
-            agent_message_redactor: StreamingSecretRedactor::new(authorization),
-            thought_message_redactor: StreamingSecretRedactor::new(authorization),
-            latest_agent_message_id: None,
-            latest_thought_message_id: None,
+            agent_message_redactors: HashMap::new(),
+            thought_message_redactors: HashMap::new(),
+            agent_message_order: Vec::new(),
+            thought_message_order: Vec::new(),
             tool_calls: HashMap::new(),
             cancel_sent: false,
         }
@@ -1338,15 +1631,33 @@ impl<'a> ProtocolState<'a> {
             .get("update")
             .and_then(Value::as_object)
             .ok_or_else(|| GrokAcpError::Protocol("session/update omitted update".into()))?;
-        if is_replay_update(params, update) {
-            return Ok(());
-        }
         let update_kind = update
             .get("sessionUpdate")
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 GrokAcpError::Protocol("session/update omitted its discriminator".into())
             })?;
+        // ACP session/load replays prior session updates before its response.
+        // Grok 0.2.114 does not consistently mark those updates isReplay, so
+        // the request phase itself is the authoritative replay boundary.
+        if self.session_load_pending || is_replay_update(params, update) {
+            // Replay is not user-visible, but tool-call seed data is required
+            // to normalize a later sparse live update without losing its
+            // title, kind, canonical identity, or locations.
+            match update_kind {
+                "tool_call" => {
+                    let tool_call = parse_tool_call_object(update, self.authorization, true)?;
+                    self.tool_calls.insert(tool_call.id.clone(), tool_call);
+                }
+                "tool_call_update" => {
+                    let patch = parse_tool_call_patch(update, self.authorization, false)?;
+                    let tool_call = merge_tool_call(self.tool_calls.get(&patch.id), patch);
+                    self.tool_calls.insert(tool_call.id.clone(), tool_call);
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
 
         match update_kind {
             "agent_message_chunk" => {
@@ -1361,8 +1672,25 @@ impl<'a> ProtocolState<'a> {
                             .get_or_insert_with(|| format!("{session_id}:agent-message:1"))
                             .clone()
                     });
-                self.latest_agent_message_id = Some(message_id.clone());
-                let text = self.agent_message_redactor.push(text);
+                if !self.agent_message_redactors.contains_key(&message_id) {
+                    if self.agent_message_redactors.len() + self.thought_message_redactors.len()
+                        >= self.max_events
+                    {
+                        return Err(GrokAcpError::EventLimit {
+                            limit: self.max_events,
+                        });
+                    }
+                    self.agent_message_redactors.insert(
+                        message_id.clone(),
+                        StreamingSecretRedactor::new(self.authorization),
+                    );
+                    self.agent_message_order.push(message_id.clone());
+                }
+                let text = self
+                    .agent_message_redactors
+                    .get_mut(&message_id)
+                    .expect("agent message redactor was just inserted")
+                    .push(text);
                 if text.is_empty() {
                     return Ok(());
                 }
@@ -1388,8 +1716,25 @@ impl<'a> ProtocolState<'a> {
                             .get_or_insert_with(|| format!("{session_id}:agent-thought:1"))
                             .clone()
                     });
-                self.latest_thought_message_id = Some(message_id.clone());
-                let text = self.thought_message_redactor.push(text);
+                if !self.thought_message_redactors.contains_key(&message_id) {
+                    if self.agent_message_redactors.len() + self.thought_message_redactors.len()
+                        >= self.max_events
+                    {
+                        return Err(GrokAcpError::EventLimit {
+                            limit: self.max_events,
+                        });
+                    }
+                    self.thought_message_redactors.insert(
+                        message_id.clone(),
+                        StreamingSecretRedactor::new(self.authorization),
+                    );
+                    self.thought_message_order.push(message_id.clone());
+                }
+                let text = self
+                    .thought_message_redactors
+                    .get_mut(&message_id)
+                    .expect("thought message redactor was just inserted")
+                    .push(text);
                 if text.is_empty() {
                     return Ok(());
                 }
@@ -1448,34 +1793,40 @@ impl<'a> ProtocolState<'a> {
         let Some(session_id) = self.session_id.clone() else {
             return Ok(());
         };
-        let agent_text = self.agent_message_redactor.finish();
-        if !agent_text.is_empty() {
-            self.response_text.push_str(&agent_text);
-            self.emit(
-                emit,
-                GrokAcpEvent::AgentMessageChunk {
-                    session_id: session_id.clone(),
-                    message_id: self
-                        .latest_agent_message_id
-                        .clone()
-                        .unwrap_or_else(|| format!("{session_id}:agent-message:1")),
-                    text: agent_text,
-                },
-            )?;
+        for message_id in self.agent_message_order.clone() {
+            let agent_text = self
+                .agent_message_redactors
+                .get_mut(&message_id)
+                .expect("agent message order must reference a redactor")
+                .finish();
+            if !agent_text.is_empty() {
+                self.response_text.push_str(&agent_text);
+                self.emit(
+                    emit,
+                    GrokAcpEvent::AgentMessageChunk {
+                        session_id: session_id.clone(),
+                        message_id,
+                        text: agent_text,
+                    },
+                )?;
+            }
         }
-        let thought_text = self.thought_message_redactor.finish();
-        if !thought_text.is_empty() {
-            self.emit(
-                emit,
-                GrokAcpEvent::AgentThoughtChunk {
-                    session_id: session_id.clone(),
-                    message_id: self
-                        .latest_thought_message_id
-                        .clone()
-                        .unwrap_or_else(|| format!("{session_id}:agent-thought:1")),
-                    text: thought_text,
-                },
-            )?;
+        for message_id in self.thought_message_order.clone() {
+            let thought_text = self
+                .thought_message_redactors
+                .get_mut(&message_id)
+                .expect("thought message order must reference a redactor")
+                .finish();
+            if !thought_text.is_empty() {
+                self.emit(
+                    emit,
+                    GrokAcpEvent::AgentThoughtChunk {
+                        session_id: session_id.clone(),
+                        message_id,
+                        text: thought_text,
+                    },
+                )?;
+            }
         }
         Ok(())
     }
@@ -1516,23 +1867,19 @@ impl<'a> ProtocolState<'a> {
         })
     }
 
-    fn send_cancel(&mut self, stdin: &mut BufWriter<ChildStdin>) -> Result<(), GrokAcpError> {
+    fn send_cancel(&mut self, stdin: &mut ProtocolStdin<'_>) {
         if self.cancel_sent {
-            return Ok(());
+            return;
         }
         let Some(session_id) = &self.session_id else {
-            return Ok(());
+            return;
         };
-        write_json_line(
-            stdin,
-            &json!({
-                "jsonrpc": "2.0",
-                "method": "session/cancel",
-                "params": {"sessionId": session_id},
-            }),
-        )?;
         self.cancel_sent = true;
-        Ok(())
+        stdin.try_write_cancel(&json!({
+            "jsonrpc": "2.0",
+            "method": "session/cancel",
+            "params": {"sessionId": session_id},
+        }));
     }
 
     fn outcome(self, stop_reason: GrokAcpStopReason) -> GrokAcpOutcome {
@@ -1942,6 +2289,11 @@ fn parse_permission_option(
     authorization: &str,
 ) -> Result<GrokAcpPermissionOption, GrokAcpError> {
     let id = required_string(value, "optionId", "permission option")?;
+    if contains_authorization_secret(&id, authorization) {
+        return Err(GrokAcpError::Protocol(
+            "Grok supplied a permission option ID containing protected credential material".into(),
+        ));
+    }
     let name = redact_text(
         &required_string(value, "name", "permission option")?,
         authorization,
@@ -1997,21 +2349,6 @@ fn validate_session_id(session_id: &str, authorization: &str) -> Result<(), Grok
 fn contains_authorization_secret(text: &str, authorization: &str) -> bool {
     (!authorization.is_empty() && text.contains(authorization))
         || bearer_token(authorization).is_some_and(|token| text.contains(token))
-}
-
-fn write_json_line(stdin: &mut BufWriter<ChildStdin>, value: &Value) -> Result<(), GrokAcpError> {
-    serde_json::to_writer(&mut *stdin, value).map_err(|source| GrokAcpError::Io {
-        operation: "encoding a Grok ACP request",
-        source: io::Error::other(source),
-    })?;
-    stdin.write_all(b"\n").map_err(|source| GrokAcpError::Io {
-        operation: "writing a Grok ACP request",
-        source,
-    })?;
-    stdin.flush().map_err(|source| GrokAcpError::Io {
-        operation: "flushing a Grok ACP request",
-        source,
-    })
 }
 
 fn redact_text(text: &str, authorization: &str) -> String {
@@ -2570,6 +2907,80 @@ mod tests {
     }
 
     #[test]
+    fn captured_session_load_update_is_accepted_before_the_load_response() {
+        let fixture = include_str!("../tests/fixtures/ai/grok/0.2.114/acp-session-load.jsonl");
+        let mut lines = fixture.lines();
+        let update: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let response: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(update["method"], "session/update");
+        assert!(update["params"].get("_meta").is_some());
+        assert!(update["params"]["_meta"].get("isReplay").is_none());
+        assert_eq!(response["id"], SESSION_REQUEST_ID);
+        assert!(lines.next().is_none());
+
+        let mut state = ProtocolState::new("Bearer secret", 100, 10_000, 100_000);
+        state.session_id = Some("<SESSION_ID>".into());
+        state.session_load_pending = true;
+        validate_session_message_phase("session/update", false, true).unwrap();
+        let mut events = Vec::new();
+        state
+            .apply_session_update(&update["params"], &mut |event| events.push(event))
+            .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(state.event_count, 0);
+        assert_eq!(state.text_bytes, 0);
+    }
+
+    #[test]
+    fn session_load_replay_seeds_sparse_live_tool_updates_without_emitting_history() {
+        let mut state = ProtocolState::new("Bearer secret", 100, 10_000, 100_000);
+        state.session_id = Some("s1".into());
+        state.session_load_pending = true;
+        let mut events = Vec::new();
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "s1",
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tool-1",
+                        "title": "Search sources",
+                        "kind": "search",
+                        "status": "in_progress",
+                        "locations": [{"path": "/tmp/reference", "line": 9}]
+                    }
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        assert!(events.is_empty(), "session history must remain invisible");
+
+        state.session_load_pending = false;
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "s1",
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": "tool-1",
+                        "status": "completed"
+                    }
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [GrokAcpEvent::ToolCallUpdate { tool_call, .. }]
+                if tool_call.title.as_deref() == Some("Search sources")
+                    && tool_call.kind == Some(GrokAcpToolKind::Search)
+                    && tool_call.status == Some(GrokAcpToolStatus::Completed)
+                    && tool_call.locations.first().is_some_and(|location|
+                        location.path == "/tmp/reference" && location.line == Some(9))
+        ));
+    }
+
+    #[test]
     fn sparse_tool_updates_merge_without_losing_prior_state() {
         let mut state = ProtocolState::new("Bearer secret", 100, 10_000, 100_000);
         state.session_id = Some("s1".into());
@@ -2741,7 +3152,7 @@ mod tests {
 
     #[test]
     fn permission_kind_mismatch_is_rejected() {
-        let request = GrokAcpPermissionRequest {
+        let mut request = GrokAcpPermissionRequest {
             session_id: "s1".into(),
             tool_call: GrokAcpToolCall {
                 id: "tool-1".into(),
@@ -2766,6 +3177,40 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, GrokAcpError::InvalidPermissionSelection));
+
+        request.options[0].kind = GrokAcpPermissionOptionKind::Other("future_kind".into());
+        assert!(request.first_allow_once_option().is_none());
+        assert!(request.first_reject_once_option().is_none());
+        assert!(matches!(
+            permission_response(
+                &request,
+                GrokAcpPermissionDecision::Reject {
+                    option_id: "reject".into()
+                }
+            ),
+            Err(GrokAcpError::InvalidPermissionSelection)
+        ));
+    }
+
+    #[test]
+    fn permission_option_ids_cannot_expose_bridge_credentials_to_the_callback() {
+        for option_id in ["allow-Bearer very-secret", "reject-token-very-secret"] {
+            let error = parse_permission_option(
+                &json!({
+                    "optionId": option_id,
+                    "name": "Allow once",
+                    "kind": "allow_once"
+                }),
+                "Bearer very-secret",
+            )
+            .unwrap_err();
+            let display = error.to_string();
+            assert!(!display.contains("very-secret"), "{display}");
+            assert!(
+                display.contains("protected credential material"),
+                "{display}"
+            );
+        }
     }
 
     #[test]
@@ -2861,13 +3306,16 @@ mod tests {
     fn session_messages_are_rejected_before_negotiation() {
         for method in ["session/update", "session/request_permission"] {
             assert!(matches!(
-                validate_session_message_phase(method, false),
+                validate_session_message_phase(method, false, false),
                 Err(GrokAcpError::Protocol(message))
                     if message.contains("before session negotiation")
             ));
-            validate_session_message_phase(method, true).unwrap();
+            validate_session_message_phase(method, true, false).unwrap();
         }
-        validate_session_message_phase("initialize", false).unwrap();
+        // Only update replay is valid while session/load is pending.
+        validate_session_message_phase("session/update", false, true).unwrap();
+        assert!(validate_session_message_phase("session/request_permission", false, true).is_err());
+        validate_session_message_phase("initialize", false, false).unwrap();
     }
 
     #[test]
@@ -3005,6 +3453,120 @@ mod tests {
         let persisted = format!("{split_events:?} {}", split_state.response_text);
         assert!(!persisted.contains("very-secret"), "{persisted}");
         assert!(!persisted.contains("Bearer very-secret"), "{persisted}");
+
+        let mut partial = StreamingSecretRedactor::new("Bearer very-secret");
+        assert_eq!(partial.push("safe very-sec"), "safe ");
+        assert_eq!(partial.finish(), "[REDACTED]");
+    }
+
+    #[test]
+    fn alternating_message_ids_keep_independent_agent_and_thought_redaction_state() {
+        fn apply_text_chunk(
+            state: &mut ProtocolState<'_>,
+            update_kind: &str,
+            message_id: &str,
+            text: &str,
+            events: &mut Vec<GrokAcpEvent>,
+        ) {
+            state
+                .apply_session_update(
+                    &json!({
+                        "sessionId": "s1",
+                        "update": {
+                            "sessionUpdate": update_kind,
+                            "messageId": message_id,
+                            "content": {"type": "text", "text": text}
+                        }
+                    }),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+        }
+
+        let mut state = ProtocolState::new("Bearer very-secret", 20, 10_000, 100_000);
+        state.session_id = Some("s1".into());
+        let mut events = Vec::new();
+
+        apply_text_chunk(
+            &mut state,
+            "agent_message_chunk",
+            "agent-a",
+            "A very-",
+            &mut events,
+        );
+        apply_text_chunk(
+            &mut state,
+            "agent_message_chunk",
+            "agent-b",
+            "B safe",
+            &mut events,
+        );
+        apply_text_chunk(
+            &mut state,
+            "agent_message_chunk",
+            "agent-a",
+            "secret!",
+            &mut events,
+        );
+        apply_text_chunk(
+            &mut state,
+            "agent_thought_chunk",
+            "thought-a",
+            "T very-",
+            &mut events,
+        );
+        apply_text_chunk(
+            &mut state,
+            "agent_thought_chunk",
+            "thought-b",
+            "other",
+            &mut events,
+        );
+        apply_text_chunk(
+            &mut state,
+            "agent_thought_chunk",
+            "thought-a",
+            "secret?",
+            &mut events,
+        );
+
+        let agent_chunks = events
+            .iter()
+            .filter_map(|event| match event {
+                GrokAcpEvent::AgentMessageChunk {
+                    message_id, text, ..
+                } => Some((message_id.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            agent_chunks,
+            [
+                ("agent-a", "A "),
+                ("agent-b", "B safe"),
+                ("agent-a", "[REDACTED]!")
+            ]
+        );
+        let thought_chunks = events
+            .iter()
+            .filter_map(|event| match event {
+                GrokAcpEvent::AgentThoughtChunk {
+                    message_id, text, ..
+                } => Some((message_id.as_str(), text.as_str())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            thought_chunks,
+            [
+                ("thought-a", "T "),
+                ("thought-b", "other"),
+                ("thought-a", "[REDACTED]?")
+            ]
+        );
+        let persisted = format!("{events:?} {}", state.response_text);
+        assert!(!persisted.contains("very-secret"), "{persisted}");
+        assert_eq!(state.response_text, "A B safe[REDACTED]!");
     }
 
     #[test]
@@ -3093,6 +3655,337 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn session_load_accepts_unmarked_replay_before_responding() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("fake-grok-resume.py");
+        std::fs::write(
+            &executable,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+def receive():
+    line = sys.stdin.readline()
+    if not line:
+        raise RuntimeError("Adam closed ACP stdin")
+    return json.loads(line)
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+initialize = receive()
+send({
+    "jsonrpc": "2.0",
+    "id": initialize["id"],
+    "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+            "loadSession": True,
+            "mcpCapabilities": {"http": True}
+        }
+    }
+})
+load = receive()
+send({
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+        "sessionId": load["params"]["sessionId"],
+        "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "historical answer"}
+        }
+    }
+})
+send({
+    "jsonrpc": "2.0",
+    "id": load["id"],
+    "result": {"models": {"currentModelId": "grok-4.5", "availableModels": []}}
+})
+prompt = receive()
+send({
+    "jsonrpc": "2.0",
+    "id": prompt["id"],
+    "result": {"stopReason": "end_turn"}
+})
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+
+        let mut request = request();
+        request.executable = executable;
+        request.cwd = temporary.path().to_path_buf();
+        request.resume_session_id = Some("resume-session".into());
+        request.rules.clear();
+        let cancelled = AtomicBool::new(false);
+        let mut events = Vec::new();
+        let outcome = run_grok_acp(
+            &request,
+            &cancelled,
+            |_| GrokAcpPermissionDecision::Cancel,
+            |event| events.push(event),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.stop_reason, GrokAcpStopReason::EndTurn);
+        assert!(outcome.response_text.is_empty());
+        assert!(matches!(
+            events.as_slice(),
+            [
+                GrokAcpEvent::SessionStarted { resumed: true, .. },
+                GrokAcpEvent::Terminal { .. }
+            ]
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn blocked_stdin_write_honors_cancellation_and_wall_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn assert_process_gone(pid_file: &std::path::Path) {
+            let pid = std::fs::read_to_string(pid_file)
+                .unwrap()
+                .trim()
+                .parse::<i32>()
+                .unwrap();
+            // SAFETY: signal 0 performs an existence check and does not signal
+            // the process. ManagedChild must already have reaped this PID.
+            assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("fake-grok-blocked-stdin.py");
+        std::fs::write(
+            &executable,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+import time
+
+def receive():
+    line = sys.stdin.readline()
+    if not line:
+        raise RuntimeError("Adam closed ACP stdin")
+    return json.loads(line)
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+initialize = receive()
+send({
+    "jsonrpc": "2.0",
+    "id": initialize["id"],
+    "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {"mcpCapabilities": {"http": True}}
+    }
+})
+session = receive()
+send({
+    "jsonrpc": "2.0",
+    "id": session["id"],
+    "result": {"sessionId": "blocked-stdin-session"}
+})
+pathlib.Path(__file__ + ".ready").write_text(str(os.getpid()))
+time.sleep(30)
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let ready = executable.with_extension("py.ready");
+
+        let mut cancelled_request = request();
+        cancelled_request.executable = executable.clone();
+        cancelled_request.cwd = temporary.path().to_path_buf();
+        cancelled_request.prompt = "x".repeat(4 * 1024 * 1024);
+        cancelled_request.rules.clear();
+        cancelled_request.limits.wall_timeout = Duration::from_secs(5);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = {
+            let cancelled = Arc::clone(&cancelled);
+            let ready = ready.clone();
+            thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !ready.exists() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert!(ready.exists(), "fake child never stopped reading stdin");
+                thread::sleep(Duration::from_millis(25));
+                cancelled.store(true, Ordering::Release);
+            })
+        };
+        let started = Instant::now();
+        let outcome = run_grok_acp(
+            &cancelled_request,
+            cancelled.as_ref(),
+            |_| GrokAcpPermissionDecision::Cancel,
+            |_| {},
+        )
+        .unwrap();
+        cancellation.join().unwrap();
+        assert_eq!(outcome.stop_reason, GrokAcpStopReason::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_process_gone(&ready);
+
+        let _ = std::fs::remove_file(&ready);
+        let mut timed_request = cancelled_request;
+        timed_request.limits.wall_timeout = Duration::from_secs(1);
+        let started = Instant::now();
+        let error = run_grok_acp(
+            &timed_request,
+            &AtomicBool::new(false),
+            |_| GrokAcpPermissionDecision::Cancel,
+            |_| {},
+        )
+        .unwrap_err();
+        assert!(matches!(error, GrokAcpError::TimedOut { .. }));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_process_gone(&ready);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaped_stdin_reader_cannot_wedge_cancel_cleanup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        struct ProcessKiller(i32);
+
+        impl Drop for ProcessKiller {
+            fn drop(&mut self) {
+                // SAFETY: the recorded PID belongs to the fixture's escaped
+                // child. SIGKILL is best-effort test cleanup.
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                }
+            }
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("fake-grok-escaped-reader.py");
+        std::fs::write(
+            &executable,
+            r#"#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import sys
+import time
+
+def receive():
+    line = sys.stdin.readline()
+    if not line:
+        raise RuntimeError("Adam closed ACP stdin")
+    return json.loads(line)
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+initialize = receive()
+send({
+    "jsonrpc": "2.0",
+    "id": initialize["id"],
+    "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {"mcpCapabilities": {"http": True}}
+    }
+})
+session = receive()
+send({
+    "jsonrpc": "2.0",
+    "id": session["id"],
+    "result": {"sessionId": "escaped-reader-session"}
+})
+escaped = os.fork()
+if escaped == 0:
+    os.setsid()
+    pathlib.Path(__file__ + ".escaped").write_text(str(os.getpid()))
+    time.sleep(30)
+    os._exit(0)
+pathlib.Path(__file__ + ".ready").write_text(str(os.getpid()))
+time.sleep(30)
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let ready = executable.with_extension("py.ready");
+        let escaped = executable.with_extension("py.escaped");
+
+        let mut request = request();
+        request.executable = executable;
+        request.cwd = temporary.path().to_path_buf();
+        request.prompt = "x".repeat(4 * 1024 * 1024);
+        request.rules.clear();
+        request.limits.wall_timeout = Duration::from_secs(5);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = {
+            let cancelled = Arc::clone(&cancelled);
+            let ready = ready.clone();
+            let escaped = escaped.clone();
+            thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while (!ready.exists() || !escaped.exists()) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert!(
+                    ready.exists() && escaped.exists(),
+                    "fixture did not create its escaped stdin reader"
+                );
+                thread::sleep(Duration::from_millis(25));
+                cancelled.store(true, Ordering::Release);
+            })
+        };
+
+        let started = Instant::now();
+        let outcome = run_grok_acp(
+            &request,
+            cancelled.as_ref(),
+            |_| GrokAcpPermissionDecision::Cancel,
+            |_| {},
+        )
+        .unwrap();
+        cancellation.join().unwrap();
+        assert_eq!(outcome.stop_reason, GrokAcpStopReason::Cancelled);
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let parent_pid = std::fs::read_to_string(&ready)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        // SAFETY: signal 0 only checks whether the direct fixture process was
+        // reaped by ManagedChild.
+        assert_eq!(unsafe { libc::kill(parent_pid, 0) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+
+        let escaped_pid = std::fs::read_to_string(&escaped)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let _escaped_cleanup = ProcessKiller(escaped_pid);
+        // SAFETY: signal 0 proves the escaped descendant retained the pipe
+        // after Grok's process group was killed.
+        assert_eq!(unsafe { libc::kill(escaped_pid, 0) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn normal_completion_allows_a_child_to_exit_after_stdin_closes() {
         use std::os::unix::process::CommandExt;
 
@@ -3124,8 +4017,19 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("start installed Grok");
-        let mut stdin = BufWriter::new(child.stdin.take().unwrap());
-        write_json_line(&mut stdin, &initialize_request()).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let (stdin_sender, stdin_writer) = spawn_stdin_writer(child.stdin.take().unwrap());
+        let mut stdin = ProtocolStdin::new(
+            stdin_sender,
+            &cancelled,
+            Instant::now(),
+            Duration::from_secs(10),
+            DEFAULT_MAX_PROTOCOL_BYTES,
+        );
+        assert_eq!(
+            stdin.write_json_line(&initialize_request()).unwrap(),
+            StdinWriteDisposition::Written
+        );
         let stdout = child.stdout.take().unwrap();
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
@@ -3142,7 +4046,9 @@ mod tests {
             response["result"]["protocolVersion"],
             GROK_ACP_PROTOCOL_VERSION
         );
+        drop(stdin);
         terminate_child_tree(&mut child);
         let _ = child.wait();
+        stdin_writer.join();
     }
 }

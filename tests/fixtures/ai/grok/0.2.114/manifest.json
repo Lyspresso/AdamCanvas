@@ -4,12 +4,15 @@
   "build": "0c785038798",
   "capturedAt": "2026-07-30",
   "command": "grok agent --no-leader stdio",
-  "exchange": "ACP initialize request only; no model prompt was sent",
+  "exchange": "ACP initialize and session/load requests; no model prompt was sent",
   "redactions": [
     "workspace path replaced",
     "agent and instance ids replaced",
     "hostname replaced",
     "pre-existing local MCP server name and port replaced",
-    "unrelated command catalogue and provider extension metadata omitted"
+    "session and event ids replaced",
+    "agent timestamp normalized",
+    "available command and tool catalogues omitted",
+    "unrelated provider extension metadata omitted"
   ]
 }
