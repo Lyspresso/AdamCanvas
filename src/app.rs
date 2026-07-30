@@ -1,5 +1,8 @@
 use crate::{
-    ai::{AiEngine, AiEvent, AiFailureKind, AiRunRequest},
+    ai::{
+        AiEngine, AiEvent, AiFailureKind, AiRunRequest, clamp_provider_preferences,
+        installed_runtime_tuning,
+    },
     ai_prompt::{
         BuiltPrompt, HistoricalTurn, HistoryRole, PromptAttachment, PromptBudget, PromptContinuity,
         PromptInput as HarnessPromptInput, PromptNotices, SystemDelivery, SystemInstructions,
@@ -10,10 +13,10 @@ use crate::{
     automation::{ReconcileRequest, canvas_objects_from_workspace, reconcile_workspace},
     chat_core::{
         ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, PlanItemStatus,
-        ProgressSource, RetryHint, StreamDialect, SubagentStatus, SystemPromptChannel, TurnStatus,
-        assistant_flat_text, capability_profile, current_work_label, latest_turn_status,
-        newest_plan, project_artifacts, project_context, project_progress, project_subagents,
-        project_usage,
+        ProgressSource, RetryHint, RuntimeTuningProfile, StreamDialect, SubagentStatus,
+        SystemPromptChannel, TurnStatus, assistant_flat_text, capability_profile,
+        current_work_label, latest_turn_status, newest_plan, project_artifacts, project_context,
+        project_progress, project_subagents, project_usage,
     },
     clipboard::{self, PasteContent},
     domain::{
@@ -6717,7 +6720,35 @@ impl AdamApp {
                 provider_profile.model = model;
             }
         }
-        let provider_profile = provider_profile.normalized();
+        let mut provider_profile = provider_profile.normalized();
+        let tuning = installed_runtime_tuning(
+            &provider_id,
+            &provider_profile.model,
+            conversation
+                .settings
+                .working_directory
+                .as_deref()
+                .map(Path::new),
+        );
+        let healed_profile =
+            clamp_provider_preferences(&provider_id, &mut provider_profile, &tuning);
+        if healed_profile
+            && provider_id != "auto"
+            && let Some(stored) = self
+                .workspace
+                .domain
+                .conversations
+                .conversations
+                .get_mut(&conversation_id)
+        {
+            stored
+                .settings
+                .set_profile_for(&provider_id, provider_profile.clone());
+            stored.updated_at = unix_now();
+        }
+        if healed_profile {
+            self.changed(false);
+        }
         let model = provider_profile.model.clone();
         let resume_gate = self.ai_resume_gate(&conversation, &provider_id);
         let mut invalidated_resume = false;
@@ -14329,6 +14360,12 @@ fn render_ai_composer(
     let provider_id = settings.provider_id.clone();
     let mut provider_profile = settings.profile_for(&provider_id);
     let original_profile = provider_profile.clone();
+    let tuning = installed_runtime_tuning(
+        &provider_id,
+        &provider_profile.model,
+        settings.working_directory.as_deref().map(Path::new),
+    );
+    clamp_provider_preferences(&provider_id, &mut provider_profile, &tuning);
     let running = runtime.active_turn.is_some();
 
     Frame::NONE
@@ -14391,6 +14428,7 @@ fn render_ai_composer(
                                 ui,
                                 &provider_id,
                                 &mut provider_profile,
+                                &tuning,
                                 colors,
                             );
                         });
@@ -14452,8 +14490,8 @@ fn render_ai_composer(
                         render_ai_reasoning_selector(
                             ui,
                             conversation_id,
-                            &provider_id,
                             &mut provider_profile,
+                            &tuning,
                         );
                     }
                 });
@@ -14575,23 +14613,6 @@ fn render_ai_model_selector(
         });
 }
 
-fn ai_reasoning_options(provider_id: &str, model: &str) -> &'static [&'static str] {
-    match provider_id {
-        "codex_cli" if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") => {
-            &["", "low", "medium", "high", "xhigh", "max", "ultra"]
-        }
-        "codex_cli" if model == "gpt-5.6-luna" => &["", "low", "medium", "high", "xhigh", "max"],
-        "codex_cli" => &["", "low", "medium", "high", "xhigh"],
-        "claude_cli" => &["", "low", "medium", "high", "xhigh", "max"],
-        "grok_cli" => &[
-            "", "none", "minimal", "low", "medium", "high", "xhigh", "max",
-        ],
-        "ollama" => &["", "low", "medium", "high"],
-        "custom_cli" => &["", "low", "medium", "high", "xhigh", "max", "ultra"],
-        _ => &[],
-    }
-}
-
 fn reasoning_effort_label(value: &str) -> String {
     match value {
         "" => "Default".into(),
@@ -14609,24 +14630,26 @@ fn reasoning_effort_label(value: &str) -> String {
 fn render_ai_reasoning_selector(
     ui: &mut Ui,
     conversation_id: Uuid,
-    provider_id: &str,
     profile: &mut AiProviderPreferences,
+    tuning: &RuntimeTuningProfile,
 ) {
-    let options = ai_reasoning_options(provider_id, &profile.model);
-    if options.is_empty() {
+    if tuning.reasoning_efforts.is_empty() {
+        profile.reasoning_effort.clear();
         return;
     }
-    if !options.contains(&profile.reasoning_effort.as_str()) {
-        profile.reasoning_effort.clear();
-    }
-    egui::ComboBox::from_id_salt(("ai-composer-reasoning", conversation_id, provider_id))
+    egui::ComboBox::from_id_salt(("ai-composer-reasoning", conversation_id))
         .selected_text(format!(
             "Reasoning · {}",
             reasoning_effort_label(&profile.reasoning_effort)
         ))
         .width(150.0)
         .show_ui(ui, |ui| {
-            for effort in options {
+            ui.selectable_value(
+                &mut profile.reasoning_effort,
+                String::new(),
+                reasoning_effort_label(""),
+            );
+            for effort in tuning.reasoning_efforts {
                 ui.selectable_value(
                     &mut profile.reasoning_effort,
                     (*effort).to_owned(),
@@ -14679,6 +14702,7 @@ fn render_ai_provider_abilities(
     ui: &mut Ui,
     provider_id: &str,
     profile: &mut AiProviderPreferences,
+    tuning: &RuntimeTuningProfile,
     colors: Theme,
 ) {
     ui.set_min_width(290.0);
@@ -14711,7 +14735,28 @@ fn render_ai_provider_abilities(
         "grok_cli" => {
             render_ai_feature_choice(ui, profile, AI_FEATURE_WEB_SEARCH, "Web search", true, true);
             render_ai_feature_choice(ui, profile, AI_FEATURE_PLANNING, "Planning", false, true);
-            render_ai_feature_choice(ui, profile, AI_FEATURE_SUBAGENTS, "Subagents", false, true);
+            if tuning.supports_scoped_child_text {
+                render_ai_feature_choice(
+                    ui,
+                    profile,
+                    AI_FEATURE_SUBAGENTS,
+                    "Subagents",
+                    false,
+                    true,
+                );
+            } else {
+                profile.set_feature(AI_FEATURE_SUBAGENTS, Some(false));
+                ui.label(
+                    RichText::new("Subagents · Off for this CLI version")
+                        .size(10.5)
+                        .color(colors.secondary_text),
+                );
+                ui.label(
+                    RichText::new("Its stream does not identify child prose safely.")
+                        .size(9.0)
+                        .color(colors.tertiary_text),
+                );
+            }
             render_ai_feature_choice(ui, profile, AI_FEATURE_MEMORY, "Memory", true, true);
         }
         "kimi_cli" | "ollama" => {
@@ -16667,37 +16712,6 @@ mod tests {
         assert_eq!(profile.stream_dialect, StreamDialect::PlainText);
         assert!(!profile.supports_native_resume());
         assert_eq!(profile.system_prompt, SystemPromptChannel::InPrompt);
-    }
-
-    #[test]
-    fn reasoning_options_follow_provider_and_codex_model_capabilities() {
-        assert_eq!(
-            ai_reasoning_options("codex_cli", "gpt-5.6-sol"),
-            &["", "low", "medium", "high", "xhigh", "max", "ultra"]
-        );
-        assert_eq!(
-            ai_reasoning_options("codex_cli", "gpt-5.6-luna"),
-            &["", "low", "medium", "high", "xhigh", "max"]
-        );
-        assert_eq!(
-            ai_reasoning_options("codex_cli", "gpt-5.4"),
-            &["", "low", "medium", "high", "xhigh"]
-        );
-        assert_eq!(
-            ai_reasoning_options("codex_cli", ""),
-            &["", "low", "medium", "high", "xhigh"]
-        );
-        assert_eq!(
-            ai_reasoning_options("claude_cli", "sonnet"),
-            &["", "low", "medium", "high", "xhigh", "max"]
-        );
-        assert_eq!(
-            ai_reasoning_options("grok_cli", "grok-4.5"),
-            &[
-                "", "none", "minimal", "low", "medium", "high", "xhigh", "max"
-            ]
-        );
-        assert!(ai_reasoning_options("openai_compatible", "custom").is_empty());
     }
 
     #[test]

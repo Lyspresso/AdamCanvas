@@ -6,10 +6,11 @@
 
 use crate::{
     chat_core::{
-        ActivityEvent, ActivityKind, ActivityStatus, FileChange, FileChangeKind,
+        ActivityEvent, ActivityKind, ActivityStatus, CliVersion, FileChange, FileChangeKind,
         PermissionResolution, PlanItem, PlanItemOrigin, PlanItemStatus, ProviderKind,
-        ResumeStrategy, RetryHint, SubagentStatus, SystemPromptChannel, TaskMutationKind,
-        TurnStatus, capability_profile,
+        ResumeStrategy, RetryHint, RuntimeTuningProfile, SubagentStatus, SystemPromptChannel,
+        TaskMutationKind, TurnStatus, capability_profile, capability_profile_for_runtime,
+        runtime_tuning_profile,
     },
     domain::{
         AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_THINKING,
@@ -28,7 +29,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -49,7 +50,10 @@ const MAX_GROK_SUBAGENTS: usize = 256;
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const CHAT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const TASK_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_CONCURRENT_AI_RUNS: usize = 4;
+
+static CLI_VERSION_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<CliVersion>>>> = OnceLock::new();
 
 /// One provider turn. The API key value is deliberately memory-only and its
 /// custom `Debug` implementation never prints it.
@@ -437,6 +441,121 @@ struct ProcessSpec {
     output_mode: OutputMode,
 }
 
+fn built_in_cli_executable(provider_id: &str) -> Option<&'static str> {
+    match provider_id.trim().to_ascii_lowercase().as_str() {
+        "claude_cli" => Some("claude"),
+        "codex_cli" => Some("codex"),
+        "grok_cli" => Some("grok"),
+        "kimi_cli" => Some("kimi"),
+        "lm_studio" => Some("lms"),
+        "ollama" => Some("ollama"),
+        _ => None,
+    }
+}
+
+/// Runtime controls for the installed provider. The version probe is cached by
+/// resolved executable path and Custom CLI executables are never probed.
+pub fn installed_runtime_tuning(
+    provider_id: &str,
+    model: &str,
+    cwd: Option<&Path>,
+) -> RuntimeTuningProfile {
+    let Some(executable) = built_in_cli_executable(provider_id) else {
+        return runtime_tuning_profile(ProviderKind::Custom, None, model);
+    };
+    let Some(program) = resolve_executable(executable, cwd) else {
+        let profile = capability_profile(provider_id, executable, &[]);
+        return runtime_tuning_profile(profile.runtime_family, None, model);
+    };
+    runtime_tuning_for_program(provider_id, &program, model)
+}
+
+/// Clamp saved controls to the verified runtime table. Returns true when the
+/// caller should persist the healed profile.
+pub fn clamp_provider_preferences(
+    provider_id: &str,
+    preferences: &mut AiProviderPreferences,
+    tuning: &RuntimeTuningProfile,
+) -> bool {
+    let original = preferences.clone();
+    let requested = preferences.reasoning_effort.trim();
+    if requested.is_empty() {
+        preferences.reasoning_effort.clear();
+    } else if let Some(effort) = tuning.normalized_reasoning_effort(requested) {
+        preferences.reasoning_effort = effort.to_owned();
+    } else {
+        preferences.reasoning_effort.clear();
+    }
+    if provider_id == "grok_cli" && !tuning.supports_scoped_child_text {
+        preferences.set_feature(AI_FEATURE_SUBAGENTS, Some(false));
+    }
+    *preferences != original
+}
+
+fn runtime_tuning_for_program(
+    provider_id: &str,
+    program: &Path,
+    model: &str,
+) -> RuntimeTuningProfile {
+    let version = cached_cli_version(program);
+    let profile = capability_profile_for_runtime(
+        provider_id,
+        &program.to_string_lossy(),
+        &[],
+        version.as_ref(),
+        model,
+    );
+    runtime_tuning_profile(
+        profile.runtime_family,
+        profile.runtime_version.as_ref(),
+        model,
+    )
+}
+
+fn cached_cli_version(program: &Path) -> Option<CliVersion> {
+    let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(version) = lock_unpoison(cache).get(&key).cloned() {
+        return version;
+    }
+    let version = probe_cli_version(&key);
+    lock_unpoison(cache).insert(key, version.clone());
+    version
+}
+
+fn probe_cli_version(program: &Path) -> Option<CliVersion> {
+    let mut child = Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + CLI_VERSION_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = child.wait_with_output().ok()?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    CliVersion::parse(&combined)
+}
+
 fn prepare_run(request: &AiRunRequest) -> Result<PreparedRun, AiEngineError> {
     let provider = request.provider_id.trim().to_ascii_lowercase();
     match provider.as_str() {
@@ -530,32 +649,20 @@ fn effective_model(request: &AiRunRequest) -> &str {
     }
 }
 
-fn allowlisted_reasoning_effort(
-    request: &AiRunRequest,
-    allowed: &[&'static str],
-) -> Option<&'static str> {
-    let requested = request.provider_preferences.reasoning_effort.trim();
-    allowed
-        .iter()
-        .copied()
-        .find(|candidate| requested.eq_ignore_ascii_case(candidate))
-}
-
-fn codex_reasoning_effort(model: &str, request: &AiRunRequest) -> Option<&'static str> {
-    let requested =
-        allowlisted_reasoning_effort(request, &["low", "medium", "high", "xhigh", "max", "ultra"])?;
-    match requested {
-        "ultra" if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") => Some("ultra"),
-        "max" if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna") => Some("max"),
-        "low" | "medium" | "high" | "xhigh" => Some(requested),
-        _ => None,
-    }
-}
-
 fn preset_process_spec(
     provider_id: &str,
     program: PathBuf,
     request: &AiRunRequest,
+) -> Result<ProcessSpec, AiEngineError> {
+    let tuning = runtime_tuning_for_program(provider_id, &program, effective_model(request));
+    preset_process_spec_with_tuning(provider_id, program, request, &tuning)
+}
+
+fn preset_process_spec_with_tuning(
+    provider_id: &str,
+    program: PathBuf,
+    request: &AiRunRequest,
+    tuning: &RuntimeTuningProfile,
 ) -> Result<ProcessSpec, AiEngineError> {
     let cwd = canonical_working_directory(request.cwd.as_deref())?;
     let model = effective_model(request);
@@ -580,7 +687,7 @@ fn preset_process_spec(
                 push_args(&mut arguments, &["--model", model]);
             }
             if let Some(effort) =
-                allowlisted_reasoning_effort(request, &["low", "medium", "high", "xhigh", "max"])
+                tuning.normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
             {
                 push_args(&mut arguments, &["--effort", effort]);
             }
@@ -631,7 +738,9 @@ fn preset_process_spec(
             if !model.is_empty() {
                 push_args(&mut arguments, &["--model", model]);
             }
-            if let Some(effort) = codex_reasoning_effort(model, request) {
+            if let Some(effort) =
+                tuning.normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
+            {
                 arguments.push("-c".into());
                 arguments
                     .push(format!("model_reasoning_effort={}", toml_basic_string(effort)).into());
@@ -674,10 +783,9 @@ fn preset_process_spec(
             if !model.is_empty() {
                 push_args(&mut arguments, &["--model", model]);
             }
-            if let Some(effort) = allowlisted_reasoning_effort(
-                request,
-                &["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-            ) {
+            if let Some(effort) =
+                tuning.normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
+            {
                 push_args(&mut arguments, &["--reasoning-effort", effort]);
             }
             if request.provider_preferences.feature(AI_FEATURE_WEB_SEARCH) == Some(false) {
@@ -695,7 +803,9 @@ fn preset_process_spec(
             if request.provider_preferences.feature(AI_FEATURE_PLANNING) == Some(false) {
                 arguments.push("--no-plan".into());
             }
-            if request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) == Some(false) {
+            if !tuning.supports_scoped_child_text
+                || request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) == Some(false)
+            {
                 arguments.push("--no-subagents".into());
             }
             match request.provider_preferences.feature(AI_FEATURE_MEMORY) {
@@ -761,7 +871,8 @@ fn preset_process_spec(
                 ));
             }
             push_args(&mut arguments, &["run", model]);
-            if let Some(effort) = allowlisted_reasoning_effort(request, &["low", "medium", "high"])
+            if let Some(effort) =
+                tuning.normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
             {
                 push_args(&mut arguments, &["--think", effort]);
             } else {
@@ -796,6 +907,23 @@ fn preset_process_spec(
         prompt_input,
         output_mode,
     })
+}
+
+#[cfg(test)]
+fn preset_process_spec_for_version(
+    provider_id: &str,
+    program: PathBuf,
+    request: &AiRunRequest,
+    version: &str,
+) -> Result<ProcessSpec, AiEngineError> {
+    let profile = capability_profile(provider_id, &program.to_string_lossy(), &[]);
+    let version = CliVersion::parse(version);
+    let tuning = runtime_tuning_profile(
+        profile.runtime_family,
+        version.as_ref(),
+        effective_model(request),
+    );
+    preset_process_spec_with_tuning(provider_id, program, request, &tuning)
 }
 
 fn apply_system_prompt_arguments(
@@ -932,9 +1060,7 @@ fn custom_process_spec(
     let mut has_prompt_argument = false;
     let mut arguments = Vec::with_capacity(request.custom_arguments.len());
     let model = effective_model(request);
-    let reasoning_effort =
-        allowlisted_reasoning_effort(request, &["low", "medium", "high", "xhigh", "max", "ultra"])
-            .unwrap_or_default();
+    let reasoning_effort = "";
 
     ensure_safe_argument_templates(&request.custom_arguments)?;
     for template in &request.custom_arguments {
@@ -4745,8 +4871,13 @@ mod tests {
         run.provider_preferences.reasoning_effort = "ultra".into();
         set_feature(&mut run, AI_FEATURE_WEB_SEARCH, true);
 
-        let specification =
-            preset_process_spec("codex_cli", PathBuf::from("/tmp/codex"), &run).unwrap();
+        let specification = preset_process_spec_for_version(
+            "codex_cli",
+            PathBuf::from("/tmp/codex"),
+            &run,
+            "codex-cli 0.144.1",
+        )
+        .unwrap();
         let arguments = argument_strings(&specification);
         assert!(has_argument_pair(&arguments, "--model", "gpt-5.6-sol"));
         assert!(has_argument_pair(
@@ -4757,8 +4888,13 @@ mod tests {
         assert!(arguments.contains(&"--search".into()));
 
         run.provider_preferences.model = "gpt-5.6-luna".into();
-        let unsupported =
-            preset_process_spec("codex_cli", PathBuf::from("/tmp/codex"), &run).unwrap();
+        let unsupported = preset_process_spec_for_version(
+            "codex_cli",
+            PathBuf::from("/tmp/codex"),
+            &run,
+            "codex-cli 0.144.1",
+        )
+        .unwrap();
         assert!(
             !argument_strings(&unsupported)
                 .iter()
@@ -4766,8 +4902,13 @@ mod tests {
         );
 
         run.provider_preferences.reasoning_effort = "max".into();
-        let supported =
-            preset_process_spec("codex_cli", PathBuf::from("/tmp/codex"), &run).unwrap();
+        let supported = preset_process_spec_for_version(
+            "codex_cli",
+            PathBuf::from("/tmp/codex"),
+            &run,
+            "codex-cli 0.144.1",
+        )
+        .unwrap();
         assert!(has_argument_pair(
             &argument_strings(&supported),
             "-c",
@@ -4775,7 +4916,13 @@ mod tests {
         ));
 
         run.provider_preferences.reasoning_effort = "high\" --search".into();
-        let invalid = preset_process_spec("codex_cli", PathBuf::from("/tmp/codex"), &run).unwrap();
+        let invalid = preset_process_spec_for_version(
+            "codex_cli",
+            PathBuf::from("/tmp/codex"),
+            &run,
+            "codex-cli 0.144.1",
+        )
+        .unwrap();
         assert!(
             !argument_strings(&invalid)
                 .iter()
@@ -4792,8 +4939,13 @@ mod tests {
         run.provider_preferences.max_turns = Some(7);
         set_feature(&mut run, AI_FEATURE_WEB_SEARCH, true);
 
-        let specification =
-            preset_process_spec("claude_cli", PathBuf::from("/tmp/claude"), &run).unwrap();
+        let specification = preset_process_spec_for_version(
+            "claude_cli",
+            PathBuf::from("/tmp/claude"),
+            &run,
+            "2.1.128 (Claude Code)",
+        )
+        .unwrap();
         let arguments = argument_strings(&specification);
         for (flag, value) in [
             ("--model", "opus"),
@@ -4808,8 +4960,13 @@ mod tests {
 
         set_feature(&mut run, AI_FEATURE_WEB_SEARCH, false);
         run.provider_preferences.reasoning_effort = "ultra".into();
-        let restricted =
-            preset_process_spec("claude_cli", PathBuf::from("/tmp/claude"), &run).unwrap();
+        let restricted = preset_process_spec_for_version(
+            "claude_cli",
+            PathBuf::from("/tmp/claude"),
+            &run,
+            "2.1.128 (Claude Code)",
+        )
+        .unwrap();
         let restricted_arguments = argument_strings(&restricted);
         assert!(has_argument_pair(
             &restricted_arguments,
@@ -4823,8 +4980,13 @@ mod tests {
     #[test]
     fn grok_preferences_shape_sandbox_capabilities_and_turn_limit() {
         let run = request("grok_cli");
-        let specification =
-            preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &run).unwrap();
+        let specification = preset_process_spec_for_version(
+            "grok_cli",
+            PathBuf::from("/tmp/grok"),
+            &run,
+            "grok 0.2.111 (94172f2aa4e5)",
+        )
+        .unwrap();
         let arguments = argument_strings(&specification);
         assert!(has_argument_pair(&arguments, "--sandbox", "read-only"));
         assert!(has_argument_pair(
@@ -4835,6 +4997,7 @@ mod tests {
         assert!(has_argument_pair(&arguments, "--allow", "WebSearch"));
         assert!(has_argument_pair(&arguments, "--allow", "WebFetch"));
         assert!(!arguments.contains(&"--disable-web-search".into()));
+        assert!(arguments.contains(&"--no-subagents".into()));
 
         let mut configured = run;
         configured.permission_mode = PermissionMode::Auto;
@@ -4845,8 +5008,13 @@ mod tests {
         set_feature(&mut configured, AI_FEATURE_PLANNING, false);
         set_feature(&mut configured, AI_FEATURE_SUBAGENTS, false);
         set_feature(&mut configured, AI_FEATURE_MEMORY, false);
-        let specification =
-            preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &configured).unwrap();
+        let specification = preset_process_spec_for_version(
+            "grok_cli",
+            PathBuf::from("/tmp/grok"),
+            &configured,
+            "grok 0.2.111 (94172f2aa4e5)",
+        )
+        .unwrap();
         let arguments = argument_strings(&specification);
         for (flag, value) in [
             ("--sandbox", "workspace"),
@@ -4868,8 +5036,13 @@ mod tests {
 
         set_feature(&mut configured, AI_FEATURE_WEB_SEARCH, true);
         set_feature(&mut configured, AI_FEATURE_MEMORY, true);
-        let enabled =
-            preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &configured).unwrap();
+        let enabled = preset_process_spec_for_version(
+            "grok_cli",
+            PathBuf::from("/tmp/grok"),
+            &configured,
+            "grok 0.2.111 (94172f2aa4e5)",
+        )
+        .unwrap();
         let enabled_arguments = argument_strings(&enabled);
         assert!(!enabled_arguments.contains(&"--disable-web-search".into()));
         assert!(has_argument_pair(
@@ -4882,8 +5055,13 @@ mod tests {
         assert!(!enabled_arguments.contains(&"--no-memory".into()));
 
         configured.workspace_mode = AiWorkspaceMode::Chat;
-        let chat =
-            preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &configured).unwrap();
+        let chat = preset_process_spec_for_version(
+            "grok_cli",
+            PathBuf::from("/tmp/grok"),
+            &configured,
+            "grok 0.2.111 (94172f2aa4e5)",
+        )
+        .unwrap();
         assert!(has_argument_pair(
             &argument_strings(&chat),
             "--sandbox",
@@ -4892,27 +5070,87 @@ mod tests {
     }
 
     #[test]
-    fn grok_accepts_every_documented_reasoning_tier_and_rejects_unknown_values() {
-        for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+    fn grok_0_2_111_accepts_only_captured_reasoning_tiers() {
+        for effort in ["low", "medium", "high"] {
             let mut run = request("grok_cli");
             run.provider_preferences.reasoning_effort = effort.into();
-            let specification =
-                preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &run).unwrap();
+            let specification = preset_process_spec_for_version(
+                "grok_cli",
+                PathBuf::from("/tmp/grok"),
+                &run,
+                "grok 0.2.111 (94172f2aa4e5)",
+            )
+            .unwrap();
             assert!(
                 has_argument_pair(
                     &argument_strings(&specification),
                     "--reasoning-effort",
                     effort
                 ),
-                "missing documented Grok effort {effort}"
+                "missing captured Grok effort {effort}"
             );
         }
 
-        let mut unsupported = request("grok_cli");
-        unsupported.provider_preferences.reasoning_effort = "ultra".into();
-        let specification =
-            preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &unsupported).unwrap();
-        assert!(!argument_strings(&specification).contains(&"--reasoning-effort".into()));
+        for effort in ["none", "minimal", "xhigh", "max", "ultra"] {
+            let mut unsupported = request("grok_cli");
+            unsupported.provider_preferences.reasoning_effort = effort.into();
+            let specification = preset_process_spec_for_version(
+                "grok_cli",
+                PathBuf::from("/tmp/grok"),
+                &unsupported,
+                "grok 0.2.111 (94172f2aa4e5)",
+            )
+            .unwrap();
+            assert!(
+                !argument_strings(&specification).contains(&"--reasoning-effort".into()),
+                "{effort}"
+            );
+        }
+
+        let mut unknown = request("grok_cli");
+        unknown.provider_preferences.reasoning_effort = "high".into();
+        let specification = preset_process_spec(
+            "grok_cli",
+            PathBuf::from("/definitely/missing/grok"),
+            &unknown,
+        )
+        .unwrap();
+        let arguments = argument_strings(&specification);
+        assert!(!arguments.contains(&"--reasoning-effort".into()));
+        assert!(arguments.contains(&"--no-subagents".into()));
+    }
+
+    #[test]
+    fn saved_grok_controls_self_heal_to_the_verified_runtime_contract() {
+        let grok = CliVersion::parse("grok 0.2.111 (94172f2aa4e5)").unwrap();
+        let tuning = runtime_tuning_profile(ProviderKind::Grok, Some(&grok), "grok-4.5");
+        let mut preferences = AiProviderPreferences {
+            reasoning_effort: "MAX".into(),
+            ..AiProviderPreferences::default()
+        };
+        preferences.set_feature(AI_FEATURE_SUBAGENTS, Some(true));
+
+        assert!(clamp_provider_preferences(
+            "grok_cli",
+            &mut preferences,
+            &tuning
+        ));
+        assert!(preferences.reasoning_effort.is_empty());
+        assert_eq!(preferences.feature(AI_FEATURE_SUBAGENTS), Some(false));
+
+        preferences.reasoning_effort = " HIGH ".into();
+        assert!(clamp_provider_preferences(
+            "grok_cli",
+            &mut preferences,
+            &tuning
+        ));
+        assert_eq!(preferences.reasoning_effort, "high");
+        assert_eq!(preferences.feature(AI_FEATURE_SUBAGENTS), Some(false));
+        assert!(!clamp_provider_preferences(
+            "grok_cli",
+            &mut preferences,
+            &tuning
+        ));
     }
 
     #[test]
@@ -4932,7 +5170,13 @@ mod tests {
 
         let mut ollama = request("ollama");
         ollama.provider_preferences.reasoning_effort = "medium".into();
-        let effort = preset_process_spec("ollama", PathBuf::from("/tmp/ollama"), &ollama).unwrap();
+        let effort = preset_process_spec_for_version(
+            "ollama",
+            PathBuf::from("/tmp/ollama"),
+            &ollama,
+            "Warning: client version is 0.32.1",
+        )
+        .unwrap();
         assert!(has_argument_pair(
             &argument_strings(&effort),
             "--think",
@@ -4941,8 +5185,13 @@ mod tests {
 
         ollama.provider_preferences.reasoning_effort.clear();
         set_feature(&mut ollama, AI_FEATURE_THINKING, false);
-        let disabled =
-            preset_process_spec("ollama", PathBuf::from("/tmp/ollama"), &ollama).unwrap();
+        let disabled = preset_process_spec_for_version(
+            "ollama",
+            PathBuf::from("/tmp/ollama"),
+            &ollama,
+            "Warning: client version is 0.32.1",
+        )
+        .unwrap();
         assert!(has_argument_pair(
             &argument_strings(&disabled),
             "--think",
@@ -4987,7 +5236,6 @@ mod tests {
                     "--reasoning-effort",
                     "--disable-web-search",
                     "--no-plan",
-                    "--no-subagents",
                     "--experimental-memory",
                     "--no-memory",
                     "--max-turns",
@@ -5001,6 +5249,9 @@ mod tests {
                     !arguments.iter().any(|argument| argument == flag),
                     "{provider} unexpectedly emitted {flag}: {arguments:?}"
                 );
+            }
+            if provider == "grok_cli" {
+                assert!(arguments.contains(&"--no-subagents".into()));
             }
         }
     }
@@ -5136,7 +5387,7 @@ mod tests {
         let specification = custom_process_spec(PathBuf::from("/tmp/custom"), &run).unwrap();
         let arguments = argument_strings(&specification);
         assert_eq!(arguments[0], "--model=test-model");
-        assert_eq!(arguments[1], "--effort=high");
+        assert_eq!(arguments[1], "--effort=");
         assert_eq!(arguments[2], "Explain this code");
         assert_eq!(arguments[3], "--root");
         assert_eq!(

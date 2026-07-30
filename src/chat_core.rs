@@ -1803,6 +1803,118 @@ pub enum SandboxStrategy {
     GrokSandboxProfile,
 }
 
+/// Parsed CLI version used to select only controls verified against a captured
+/// provider contract.
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CliVersion {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+    pub raw: String,
+}
+
+impl CliVersion {
+    pub fn parse(output: &str) -> Option<Self> {
+        for candidate in
+            output.split(|character: char| !(character.is_ascii_digit() || character == '.'))
+        {
+            let mut components = candidate.split('.');
+            let (Some(major), Some(minor), Some(patch), None) = (
+                components.next(),
+                components.next(),
+                components.next(),
+                components.next(),
+            ) else {
+                continue;
+            };
+            let (Ok(major), Ok(minor), Ok(patch)) = (major.parse(), minor.parse(), patch.parse())
+            else {
+                continue;
+            };
+            return Some(Self {
+                major,
+                minor,
+                patch,
+                raw: output.trim().to_owned(),
+            });
+        }
+        None
+    }
+
+    fn is(&self, major: u32, minor: u32, patch: u32) -> bool {
+        (self.major, self.minor, self.patch) == (major, minor, patch)
+    }
+}
+
+/// Version- and model-specific controls verified by captured provider output.
+///
+/// Unknown versions deliberately expose no tuning values. Provider default is
+/// always safe; new rows are added only alongside a fixture or equivalent
+/// provider proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeTuningProfile {
+    pub version: Option<CliVersion>,
+    pub reasoning_efforts: &'static [&'static str],
+    pub supports_scoped_child_text: bool,
+}
+
+impl RuntimeTuningProfile {
+    pub fn normalized_reasoning_effort(&self, requested: &str) -> Option<&'static str> {
+        let requested = requested.trim();
+        self.reasoning_efforts
+            .iter()
+            .copied()
+            .find(|candidate| requested.eq_ignore_ascii_case(candidate))
+    }
+}
+
+const CODEX_DEFAULT_REASONING: &[&str] = &["low", "medium", "high", "xhigh"];
+const CODEX_MAX_REASONING: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const CODEX_ULTRA_REASONING: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+const CLAUDE_REASONING: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const GROK_REASONING_0_2_111: &[&str] = &["low", "medium", "high"];
+const OLLAMA_REASONING_0_32_1: &[&str] = &["low", "medium", "high"];
+const NO_REASONING: &[&str] = &[];
+
+/// Single source of truth for provider controls consumed by both launch
+/// shaping and settings UI.
+pub fn runtime_tuning_profile(
+    family: ProviderKind,
+    version: Option<&CliVersion>,
+    model: &str,
+) -> RuntimeTuningProfile {
+    let (reasoning_efforts, supports_scoped_child_text) = match (family, version) {
+        (ProviderKind::Codex, Some(version)) if version.is(0, 144, 1) => {
+            let efforts = if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") {
+                CODEX_ULTRA_REASONING
+            } else if model == "gpt-5.6-luna" {
+                CODEX_MAX_REASONING
+            } else {
+                CODEX_DEFAULT_REASONING
+            };
+            (efforts, true)
+        }
+        (ProviderKind::Claude, Some(version)) if version.is(2, 1, 128) => (CLAUDE_REASONING, true),
+        (ProviderKind::Grok, Some(version)) if version.is(0, 2, 111) => {
+            // The captured multiplex stream carries parent and child prose in
+            // indistinguishable type=text envelopes. Subagents must stay off
+            // until a scoped channel is available.
+            (GROK_REASONING_0_2_111, false)
+        }
+        (ProviderKind::Kimi, Some(version)) if version.is(1, 49, 0) => (NO_REASONING, true),
+        (ProviderKind::Ollama, Some(version)) if version.is(0, 32, 1) => {
+            (OLLAMA_REASONING_0_32_1, true)
+        }
+        _ => (NO_REASONING, false),
+    };
+    RuntimeTuningProfile {
+        version: version.cloned(),
+        reasoning_efforts,
+        supports_scoped_child_text,
+    }
+}
+
 /// Declarative, derived-only description of a provider runtime.
 ///
 /// `provider` preserves the configured identity. Built-in and internally
@@ -1816,6 +1928,9 @@ pub struct CapabilityProfile {
     pub provider: ProviderKind,
     pub runtime_family: ProviderKind,
     pub executable_basename: String,
+    pub runtime_version: Option<CliVersion>,
+    pub supported_reasoning_efforts: Vec<String>,
+    pub supports_scoped_child_text: bool,
     pub transport: TransportKind,
     pub stream_dialect: StreamDialect,
     pub plan_channel: PlanChannel,
@@ -1841,6 +1956,10 @@ impl CapabilityProfile {
     pub fn supports_native_resume(&self) -> bool {
         self.resume != ResumeStrategy::None
     }
+
+    pub fn tuning(&self, version: Option<&CliVersion>, model: &str) -> RuntimeTuningProfile {
+        runtime_tuning_profile(self.runtime_family, version, model)
+    }
 }
 
 /// Pure capability derivation from configured provider identity, executable
@@ -1849,6 +1968,16 @@ pub fn capability_profile(
     provider_id: &str,
     executable: &str,
     arguments: &[String],
+) -> CapabilityProfile {
+    capability_profile_for_runtime(provider_id, executable, arguments, None, "")
+}
+
+pub fn capability_profile_for_runtime(
+    provider_id: &str,
+    executable: &str,
+    arguments: &[String],
+    version: Option<&CliVersion>,
+    model: &str,
 ) -> CapabilityProfile {
     let basename = executable_basename(executable);
     let configured = provider_from_id(provider_id);
@@ -1925,11 +2054,19 @@ pub fn capability_profile(
         ProviderKind::Grok => SandboxStrategy::GrokSandboxProfile,
         _ => SandboxStrategy::None,
     };
+    let tuning = runtime_tuning_profile(runtime_family, version, model);
 
     CapabilityProfile {
         provider,
         runtime_family,
         executable_basename: basename,
+        runtime_version: tuning.version,
+        supported_reasoning_efforts: tuning
+            .reasoning_efforts
+            .iter()
+            .map(|effort| (*effort).to_owned())
+            .collect(),
+        supports_scoped_child_text: tuning.supports_scoped_child_text,
         transport,
         stream_dialect,
         plan_channel,
@@ -3540,5 +3677,74 @@ mod tests {
         assert!(decoded.has_structured_stream());
         assert!(decoded.has_native_plan());
         assert!(decoded.supports_native_resume());
+    }
+
+    #[test]
+    fn cli_versions_parse_captured_provider_outputs() {
+        for (raw, expected) in [
+            ("codex-cli 0.144.1", (0, 144, 1)),
+            ("2.1.128 (Claude Code)", (2, 1, 128)),
+            ("grok 0.2.111 (94172f2aa4e5)", (0, 2, 111)),
+            ("warning\nkimi, version 1.49.0", (1, 49, 0)),
+            ("Warning: client version is 0.32.1", (0, 32, 1)),
+        ] {
+            let version = CliVersion::parse(raw).unwrap();
+            assert_eq!(
+                (version.major, version.minor, version.patch),
+                expected,
+                "{raw}"
+            );
+        }
+        assert!(CliVersion::parse("provider version unknown").is_none());
+        assert!(CliVersion::parse("1.2").is_none());
+    }
+
+    #[test]
+    fn runtime_tuning_is_version_and_model_pinned() {
+        let codex = CliVersion::parse("codex-cli 0.144.1").unwrap();
+        assert_eq!(
+            runtime_tuning_profile(ProviderKind::Codex, Some(&codex), "gpt-5.6-sol")
+                .reasoning_efforts,
+            CODEX_ULTRA_REASONING
+        );
+        assert_eq!(
+            runtime_tuning_profile(ProviderKind::Codex, Some(&codex), "gpt-5.6-luna")
+                .reasoning_efforts,
+            CODEX_MAX_REASONING
+        );
+        assert_eq!(
+            runtime_tuning_profile(ProviderKind::Codex, Some(&codex), "gpt-5.4").reasoning_efforts,
+            CODEX_DEFAULT_REASONING
+        );
+
+        let claude = CliVersion::parse("2.1.128 (Claude Code)").unwrap();
+        assert_eq!(
+            runtime_tuning_profile(ProviderKind::Claude, Some(&claude), "sonnet").reasoning_efforts,
+            CLAUDE_REASONING
+        );
+
+        let grok = CliVersion::parse("grok 0.2.111 (94172f2aa4e5)").unwrap();
+        let grok_tuning = runtime_tuning_profile(ProviderKind::Grok, Some(&grok), "grok-4.5");
+        assert_eq!(grok_tuning.reasoning_efforts, GROK_REASONING_0_2_111);
+        assert!(!grok_tuning.supports_scoped_child_text);
+        assert_eq!(
+            grok_tuning.normalized_reasoning_effort(" HIGH "),
+            Some("high")
+        );
+        for unsupported in ["none", "minimal", "xhigh", "max", "ultra"] {
+            assert_eq!(
+                grok_tuning.normalized_reasoning_effort(unsupported),
+                None,
+                "{unsupported}"
+            );
+        }
+
+        let unknown = runtime_tuning_profile(
+            ProviderKind::Grok,
+            CliVersion::parse("grok 9.9.9").as_ref(),
+            "grok-4.5",
+        );
+        assert!(unknown.reasoning_efforts.is_empty());
+        assert!(!unknown.supports_scoped_child_text);
     }
 }
