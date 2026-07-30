@@ -68,9 +68,9 @@ login shell just to discover commands.
 
 ## Detection preflight (Agents panel)
 
-The Agents panel (quick-bar `◎`, module `src/agents_panel.rs`) shows every
-provider with a live availability status so a missing CLI is visible before
-Send instead of after it fails. Statuses:
+The Agent Harness section (sidebar entry under AI chats, module
+`src/agents_panel.rs`) shows every provider with a live availability status
+so a missing CLI is visible before Send instead of after it fails. Statuses:
 
 - **Not detected** — the binary was not found on the discovery paths above.
 - **Detected vX.Y.Z** — found, but no captured runtime contract covers this
