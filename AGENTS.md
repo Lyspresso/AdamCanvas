@@ -1,30 +1,37 @@
 # Multi-agent coordination
 
-Two AI agents work on this repo in parallel, each in its own checkout on its own branch:
+This repo (`~/Developer/AdamCanvas`) coordinates parallel work by Claude Code and OpenAI Codex on the Adam canvas app. Codex works **outside** this repo (remote workspace; it never reads this file) — its finished source gets snapshotted in.
 
-| Directory | Branch | Who works here |
+## Layout
+
+| Ref | Checked out at | Meaning |
 |---|---|---|
-| `~/Developer/AdamCanvas` (this one) | `work/agent-a` | The non-Claude agent harness |
-| `~/Developer/AdamCanvas-claude` | `work/claude` | Claude Code |
+| `main` | `~/Developer/AdamCanvas` | Canonical copy: pre-AI-chat baseline + the `src/ai/` chat implementation. Integration happens here. |
+| `work/claude` | `~/Developer/AdamCanvas-claude` | Claude Code's task branch, forked from `main`. |
+| `work/codex` | *(nowhere)* | Codex's AI-harness work, forked from the pre-AI-chat root commit. |
 
-`main` is the integration branch. It is deliberately not checked out in any worktree and only advances when the two branches are merged at the end ("convergence").
+History shape: root `5d5c708` (pre-AI-chat baseline) has two children — `main` (with the `src/ai/` implementation) and `work/codex` (with Codex's flat `src/ai*.rs` + `chat_core.rs` harness). **The two AI implementations overlap and must be reconciled at convergence.**
+
+## Codex ingestion (read-only!)
+
+Codex's deliverables land in `~/Documents/Codex/<date>/tanbiralam-claude-code-https-github-com/outputs/` (source exports + built .app bundles). The copy in `~/Documents/adam canvas hub/` is a stale intermediate. Never edit anything under `Documents/` — to ingest, stage the **newest** source export onto `work/codex` with the temp-index recipe (see `git log work/codex` commit for provenance) or a temporary worktree.
 
 ## Rules
 
-1. Work only inside your own directory. Never edit files under the other agent's directory.
-2. Stay on your branch. Do not `git switch`/`git checkout` to another branch, and never commit to `main`.
-3. Commit early and often on your branch — small, compiling commits. This is what makes the final merge tractable.
-4. Stick to the modules your assigned task owns. Avoid drive-by edits (refactors, formatting sweeps, renames) in shared files — `src/app.rs`, `src/lib.rs`, `src/main.rs`, `Cargo.toml` — beyond the minimum wiring your task needs. Widespread edits there guarantee merge conflicts.
-5. Adding a dependency to `Cargo.toml` is fine; append to the end of the `[dependencies]` block rather than re-sorting it.
-6. Before declaring your task done: `cargo fmt`, `cargo clippy`, `cargo test`, make sure `cargo build` succeeds, and commit everything (no dirty working tree).
+1. Claude edits only `~/Developer/AdamCanvas-claude` on `work/claude`.
+2. Agents don't commit to `main` outside convergence (the user may; it's their canonical copy).
+3. Small, compiling commits on task branches — that's what makes merges tractable.
+4. Shared hot files (`src/app.rs`, `src/lib.rs`, `src/main.rs`, `Cargo.toml`): minimum wiring only, no drive-by refactors. Append new deps at the end of `[dependencies]`.
+5. Task done = `cargo fmt` + `cargo clippy` + `cargo test` + `cargo build` pass, everything committed.
 
 ## Build
 
-- `cargo check` — fast validation
-- `cargo run` — run the app (macOS)
-- `cargo test` — tests live in `Tests/` and inline
-- `scripts/build_app.sh` — produce the `Adam.app` bundle in `build/`
+- `cargo check` / `cargo run` / `cargo test`
+- `scripts/build_app.sh` → `Adam.app` bundle in `build/`
 
 ## Convergence
 
-At the end, both branches get merged into `main` (Claude/user handles this): merge `work/agent-a`, then `work/claude`, resolve conflicts, then run fmt + clippy + test + build as the gate.
+1. Re-snapshot the newest Codex export onto `work/codex` (if newer than the last snapshot).
+2. Decide the AI-implementation reconciliation (which harness is canonical, what gets ported from the other).
+3. Merge `work/codex` and `work/claude` into `main`; resolve conflicts.
+4. Gate: `cargo fmt` + `clippy` + `test` + full build.
