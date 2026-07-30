@@ -35,7 +35,6 @@ const WRITE_DEADLINE: Duration = Duration::from_secs(1);
 const IDLE_POLL: Duration = Duration::from_millis(2);
 const SERVER_POLL: Duration = Duration::from_millis(5);
 const READ_CHUNK_BYTES: usize = 4 * 1024;
-const SUPPORTED_PROTOCOL_VERSIONS: [&str; 3] = [MCP_PROTOCOL_VERSION, "2025-03-26", "2024-11-05"];
 const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
 /// Event-delivery boundary for committed task mutations.
@@ -390,14 +389,15 @@ fn initialize_result(params: Option<&Value>) -> Result<(&'static str, Value), (i
     let Some(params) = params.and_then(Value::as_object) else {
         return Err((-32602, "Invalid params"));
     };
-    let Some(requested) = params.get("protocolVersion").and_then(Value::as_str) else {
+    let Some(_requested) = params.get("protocolVersion").and_then(Value::as_str) else {
         return Err((-32602, "Invalid params"));
     };
-    let protocol_version = SUPPORTED_PROTOCOL_VERSIONS
-        .iter()
-        .copied()
-        .find(|supported| *supported == requested)
-        .unwrap_or(MCP_PROTOCOL_VERSION);
+    // This transport implements only the 2025-06-18 Streamable HTTP
+    // contract, including its required MCP-Protocol-Version header on every
+    // request after initialization. When a client proposes another version,
+    // return Adam's sole supported version so the client can either adopt it
+    // or disconnect as required by MCP version negotiation.
+    let protocol_version = MCP_PROTOCOL_VERSION;
     Ok((
         protocol_version,
         json!({
@@ -1160,7 +1160,7 @@ mod tests {
                 "id": "init",
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": "2099-01-01",
+                    "protocolVersion": "2024-11-05",
                     "capabilities": {},
                     "clientInfo": {"name": "test", "version": "1"}
                 }
@@ -1217,7 +1217,7 @@ mod tests {
         assert_eq!(
             versioned_post(
                 &bridge,
-                "2025-03-26",
+                "2024-11-05",
                 &json!({"jsonrpc": "2.0", "id": 4, "method": "tools/list"})
             )
             .status,

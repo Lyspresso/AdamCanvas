@@ -250,6 +250,9 @@ receives the ephemeral `ADAM_TASK_MCP_URL` and
 `ADAM_TASK_MCP_AUTHORIZATION` environment variables. The endpoint is a
 loopback-only MCP server with a per-run bearer token. Adam never puts that
 token in the prompt or saved configuration, and it expires when the run ends.
+The bridge implements the MCP `2025-06-18` Streamable HTTP contract only:
+initialization negotiates clients onto that version, and every later request
+must carry the matching `MCP-Protocol-Version` header.
 As with any arbitrary executable, a hostile Custom CLI could still echo its
 own environment into provider output, so Custom CLI wrappers remain trusted
 local integrations.
