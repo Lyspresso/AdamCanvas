@@ -1,5 +1,8 @@
 use crate::{
-    ai::{AiEngine, AiEvent, AiFailureKind, AiRunRequest},
+    ai::{
+        AiEngine, AiEvent, AiFailureKind, AiRunRequest, clamp_provider_preferences,
+        installed_runtime_tuning,
+    },
     ai_prompt::{
         BuiltPrompt, HistoricalTurn, HistoryRole, PromptAttachment, PromptBudget, PromptContinuity,
         PromptInput as HarnessPromptInput, PromptNotices, SystemDelivery, SystemInstructions,
@@ -10,10 +13,10 @@ use crate::{
     automation::{ReconcileRequest, canvas_objects_from_workspace, reconcile_workspace},
     chat_core::{
         ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, PlanItemStatus,
-        ProgressSource, RetryHint, StreamDialect, SubagentStatus, SystemPromptChannel, TurnStatus,
-        assistant_flat_text, capability_profile, current_work_label, latest_turn_status,
-        newest_plan, project_artifacts, project_context, project_progress, project_subagents,
-        project_usage,
+        ProgressSource, RetryHint, RuntimeTuningProfile, StreamDialect, SubagentStatus,
+        SystemPromptChannel, TurnStatus, assistant_flat_text, capability_profile,
+        current_work_label, latest_turn_status, newest_plan, project_artifacts, project_context,
+        project_progress, project_subagents, project_usage,
     },
     clipboard::{self, PasteContent},
     domain::{
@@ -1036,12 +1039,35 @@ impl AdamApp {
                 .last()
                 .is_some_and(|message| message.role == MessageRole::User)
             {
-                let _ = conversation.append_message(
+                let turn_id = Uuid::new_v4();
+                let message = "This turn was interrupted before the provider finished.";
+                let _ = conversation.append_message_with_activity(
                     Uuid::new_v4(),
                     MessageRole::Assistant,
                     "_This turn was interrupted before the provider finished._",
                     recovery_time,
                     Vec::new(),
+                    Vec::new(),
+                    vec![
+                        HarnessActivityEvent::new(
+                            Uuid::new_v4(),
+                            recovery_time,
+                            ActivityKind::TurnError {
+                                message: message.into(),
+                            },
+                        ),
+                        HarnessActivityEvent::new(
+                            Uuid::new_v4(),
+                            recovery_time,
+                            ActivityKind::TurnStatus {
+                                status: TurnStatus::ProviderError,
+                                message: Some(message.into()),
+                                tool: None,
+                                retry: Some(RetryHint::Retry),
+                            },
+                        ),
+                    ],
+                    Some(turn_id),
                 );
                 conversation.unread = true;
                 ai_recovery_changed = true;
@@ -6717,7 +6743,35 @@ impl AdamApp {
                 provider_profile.model = model;
             }
         }
-        let provider_profile = provider_profile.normalized();
+        let mut provider_profile = provider_profile.normalized();
+        let tuning = installed_runtime_tuning(
+            &provider_id,
+            &provider_profile.model,
+            conversation
+                .settings
+                .working_directory
+                .as_deref()
+                .map(Path::new),
+        );
+        let healed_profile =
+            clamp_provider_preferences(&provider_id, &mut provider_profile, &tuning);
+        if healed_profile
+            && provider_id != "auto"
+            && let Some(stored) = self
+                .workspace
+                .domain
+                .conversations
+                .conversations
+                .get_mut(&conversation_id)
+        {
+            stored
+                .settings
+                .set_profile_for(&provider_id, provider_profile.clone());
+            stored.updated_at = unix_now();
+        }
+        if healed_profile {
+            self.changed(false);
+        }
         let model = provider_profile.model.clone();
         let resume_gate = self.ai_resume_gate(&conversation, &provider_id);
         let mut invalidated_resume = false;
@@ -6961,13 +7015,25 @@ impl AdamApp {
                 .unwrap_or_else(|| "the safe replay could not be started".into());
             let at = unix_now();
             let turn_id = Uuid::new_v4();
-            let activities = vec![HarnessActivityEvent::new(
-                Uuid::new_v4(),
-                at,
-                ActivityKind::TurnError {
-                    message: error.clone(),
-                },
-            )];
+            let activities = vec![
+                HarnessActivityEvent::new(
+                    Uuid::new_v4(),
+                    at,
+                    ActivityKind::TurnError {
+                        message: error.clone(),
+                    },
+                ),
+                HarnessActivityEvent::new(
+                    Uuid::new_v4(),
+                    at,
+                    ActivityKind::TurnStatus {
+                        status: TurnStatus::ProviderError,
+                        message: Some(error.clone()),
+                        tool: None,
+                        retry: Some(RetryHint::Retry),
+                    },
+                ),
+            ];
             if let Some(conversation) = self
                 .workspace
                 .domain
@@ -7119,6 +7185,12 @@ impl AdamApp {
                                 format!("Provider session {}", truncate(&session_id, 18)),
                             );
                         }
+                        ensure_terminal_status(
+                            &mut runtime.activity_trace,
+                            TurnStatus::Completed,
+                            None,
+                            None,
+                        );
                         push_ai_activity(runtime, "Completed".into());
                         if !provider_returned_text {
                             push_ai_activity(runtime, "No assistant text was returned".into());
@@ -7226,6 +7298,12 @@ impl AdamApp {
                                 message: message.clone(),
                             },
                         ));
+                        ensure_terminal_status(
+                            &mut runtime.activity_trace,
+                            turn_status_for_failure(kind),
+                            Some(message.clone()),
+                            Some(RetryHint::Retry),
+                        );
                         let terminal_label = match kind {
                             AiFailureKind::PermissionBlocked => "Permission needed",
                             AiFailureKind::TimedOut => "Turn timed out",
@@ -7302,6 +7380,12 @@ impl AdamApp {
                                 message: "Stopped by the user".into(),
                             },
                         ));
+                        ensure_terminal_status(
+                            &mut runtime.activity_trace,
+                            TurnStatus::UserCancelled,
+                            Some("Stopped by the user".into()),
+                            None,
+                        );
                         push_ai_activity(runtime, "Stopped".into());
                         let partial = std::mem::take(&mut runtime.streamed_text);
                         if assistant_flat_text(&runtime.activity_trace.events)
@@ -11957,6 +12041,36 @@ fn ai_trace_has_productive_activity(events: &[HarnessActivityEvent]) -> bool {
     })
 }
 
+fn ensure_terminal_status(
+    trace: &mut ActivityAccumulator,
+    status: TurnStatus,
+    message: Option<String>,
+    retry: Option<RetryHint>,
+) {
+    if latest_turn_status(&trace.events).is_some_and(|terminal| terminal.status == status) {
+        return;
+    }
+    trace.ingest(HarnessActivityEvent::new(
+        Uuid::new_v4(),
+        unix_now(),
+        ActivityKind::TurnStatus {
+            status,
+            message,
+            tool: None,
+            retry,
+        },
+    ));
+}
+
+fn turn_status_for_failure(kind: AiFailureKind) -> TurnStatus {
+    match kind {
+        AiFailureKind::PermissionBlocked => TurnStatus::PermissionBlocked,
+        AiFailureKind::TimedOut => TurnStatus::TimedOut,
+        AiFailureKind::MaxTurnsReached => TurnStatus::MaxTurnsReached,
+        AiFailureKind::ProviderError => TurnStatus::ProviderError,
+    }
+}
+
 fn should_replay_failed_native_session(runtime: &AiChatRuntime) -> bool {
     runtime.active_used_resume && !runtime.active_had_productive_activity
 }
@@ -14329,6 +14443,12 @@ fn render_ai_composer(
     let provider_id = settings.provider_id.clone();
     let mut provider_profile = settings.profile_for(&provider_id);
     let original_profile = provider_profile.clone();
+    let tuning = installed_runtime_tuning(
+        &provider_id,
+        &provider_profile.model,
+        settings.working_directory.as_deref().map(Path::new),
+    );
+    clamp_provider_preferences(&provider_id, &mut provider_profile, &tuning);
     let running = runtime.active_turn.is_some();
 
     Frame::NONE
@@ -14391,6 +14511,7 @@ fn render_ai_composer(
                                 ui,
                                 &provider_id,
                                 &mut provider_profile,
+                                &tuning,
                                 colors,
                             );
                         });
@@ -14452,8 +14573,8 @@ fn render_ai_composer(
                         render_ai_reasoning_selector(
                             ui,
                             conversation_id,
-                            &provider_id,
                             &mut provider_profile,
+                            &tuning,
                         );
                     }
                 });
@@ -14575,23 +14696,6 @@ fn render_ai_model_selector(
         });
 }
 
-fn ai_reasoning_options(provider_id: &str, model: &str) -> &'static [&'static str] {
-    match provider_id {
-        "codex_cli" if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") => {
-            &["", "low", "medium", "high", "xhigh", "max", "ultra"]
-        }
-        "codex_cli" if model == "gpt-5.6-luna" => &["", "low", "medium", "high", "xhigh", "max"],
-        "codex_cli" => &["", "low", "medium", "high", "xhigh"],
-        "claude_cli" => &["", "low", "medium", "high", "xhigh", "max"],
-        "grok_cli" => &[
-            "", "none", "minimal", "low", "medium", "high", "xhigh", "max",
-        ],
-        "ollama" => &["", "low", "medium", "high"],
-        "custom_cli" => &["", "low", "medium", "high", "xhigh", "max", "ultra"],
-        _ => &[],
-    }
-}
-
 fn reasoning_effort_label(value: &str) -> String {
     match value {
         "" => "Default".into(),
@@ -14609,24 +14713,26 @@ fn reasoning_effort_label(value: &str) -> String {
 fn render_ai_reasoning_selector(
     ui: &mut Ui,
     conversation_id: Uuid,
-    provider_id: &str,
     profile: &mut AiProviderPreferences,
+    tuning: &RuntimeTuningProfile,
 ) {
-    let options = ai_reasoning_options(provider_id, &profile.model);
-    if options.is_empty() {
+    if tuning.reasoning_efforts.is_empty() {
+        profile.reasoning_effort.clear();
         return;
     }
-    if !options.contains(&profile.reasoning_effort.as_str()) {
-        profile.reasoning_effort.clear();
-    }
-    egui::ComboBox::from_id_salt(("ai-composer-reasoning", conversation_id, provider_id))
+    egui::ComboBox::from_id_salt(("ai-composer-reasoning", conversation_id))
         .selected_text(format!(
             "Reasoning · {}",
             reasoning_effort_label(&profile.reasoning_effort)
         ))
         .width(150.0)
         .show_ui(ui, |ui| {
-            for effort in options {
+            ui.selectable_value(
+                &mut profile.reasoning_effort,
+                String::new(),
+                reasoning_effort_label(""),
+            );
+            for effort in tuning.reasoning_efforts {
                 ui.selectable_value(
                     &mut profile.reasoning_effort,
                     (*effort).to_owned(),
@@ -14679,6 +14785,7 @@ fn render_ai_provider_abilities(
     ui: &mut Ui,
     provider_id: &str,
     profile: &mut AiProviderPreferences,
+    tuning: &RuntimeTuningProfile,
     colors: Theme,
 ) {
     ui.set_min_width(290.0);
@@ -14711,7 +14818,28 @@ fn render_ai_provider_abilities(
         "grok_cli" => {
             render_ai_feature_choice(ui, profile, AI_FEATURE_WEB_SEARCH, "Web search", true, true);
             render_ai_feature_choice(ui, profile, AI_FEATURE_PLANNING, "Planning", false, true);
-            render_ai_feature_choice(ui, profile, AI_FEATURE_SUBAGENTS, "Subagents", false, true);
+            if tuning.supports_scoped_child_text {
+                render_ai_feature_choice(
+                    ui,
+                    profile,
+                    AI_FEATURE_SUBAGENTS,
+                    "Subagents",
+                    false,
+                    true,
+                );
+            } else {
+                profile.set_feature(AI_FEATURE_SUBAGENTS, Some(false));
+                ui.label(
+                    RichText::new("Subagents · Off for this CLI version")
+                        .size(10.5)
+                        .color(colors.secondary_text),
+                );
+                ui.label(
+                    RichText::new("Its stream does not identify child prose safely.")
+                        .size(9.0)
+                        .color(colors.tertiary_text),
+                );
+            }
             render_ai_feature_choice(ui, profile, AI_FEATURE_MEMORY, "Memory", true, true);
         }
         "kimi_cli" | "ollama" => {
@@ -16653,6 +16781,40 @@ mod tests {
     }
 
     #[test]
+    fn terminal_fallback_preserves_rich_status_and_corrects_mismatches() {
+        let mut trace = ActivityAccumulator::new();
+        trace.ingest(HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(1),
+            ActivityKind::TurnStatus {
+                status: TurnStatus::PermissionBlocked,
+                message: Some("Web access approval could not be answered".into()),
+                tool: Some("WebFetch".into()),
+                retry: Some(RetryHint::AllowWebAndRetry),
+            },
+        ));
+        ensure_terminal_status(
+            &mut trace,
+            TurnStatus::PermissionBlocked,
+            Some("generic fallback".into()),
+            Some(RetryHint::Retry),
+        );
+        let terminal = latest_turn_status(&trace.events).unwrap();
+        assert_eq!(terminal.tool.as_deref(), Some("WebFetch"));
+        assert_eq!(terminal.retry, Some(RetryHint::AllowWebAndRetry));
+
+        ensure_terminal_status(
+            &mut trace,
+            TurnStatus::ProviderError,
+            Some("provider failed".into()),
+            Some(RetryHint::Retry),
+        );
+        let terminal = latest_turn_status(&trace.events).unwrap();
+        assert_eq!(terminal.status, TurnStatus::ProviderError);
+        assert_eq!(terminal.retry, Some(RetryHint::Retry));
+    }
+
+    #[test]
     fn provider_profile_inputs_match_the_transport_adam_will_launch() {
         let (http_executable, _) =
             ai_provider_profile_inputs("lm_studio", "", &[], "http://127.0.0.1:1234/v1");
@@ -16667,37 +16829,6 @@ mod tests {
         assert_eq!(profile.stream_dialect, StreamDialect::PlainText);
         assert!(!profile.supports_native_resume());
         assert_eq!(profile.system_prompt, SystemPromptChannel::InPrompt);
-    }
-
-    #[test]
-    fn reasoning_options_follow_provider_and_codex_model_capabilities() {
-        assert_eq!(
-            ai_reasoning_options("codex_cli", "gpt-5.6-sol"),
-            &["", "low", "medium", "high", "xhigh", "max", "ultra"]
-        );
-        assert_eq!(
-            ai_reasoning_options("codex_cli", "gpt-5.6-luna"),
-            &["", "low", "medium", "high", "xhigh", "max"]
-        );
-        assert_eq!(
-            ai_reasoning_options("codex_cli", "gpt-5.4"),
-            &["", "low", "medium", "high", "xhigh"]
-        );
-        assert_eq!(
-            ai_reasoning_options("codex_cli", ""),
-            &["", "low", "medium", "high", "xhigh"]
-        );
-        assert_eq!(
-            ai_reasoning_options("claude_cli", "sonnet"),
-            &["", "low", "medium", "high", "xhigh", "max"]
-        );
-        assert_eq!(
-            ai_reasoning_options("grok_cli", "grok-4.5"),
-            &[
-                "", "none", "minimal", "low", "medium", "high", "xhigh", "max"
-            ]
-        );
-        assert!(ai_reasoning_options("openai_compatible", "custom").is_empty());
     }
 
     #[test]

@@ -6,10 +6,11 @@
 
 use crate::{
     chat_core::{
-        ActivityEvent, ActivityKind, ActivityStatus, FileChange, FileChangeKind,
+        ActivityEvent, ActivityKind, ActivityStatus, CliVersion, FileChange, FileChangeKind,
         PermissionResolution, PlanItem, PlanItemOrigin, PlanItemStatus, ProviderKind,
-        ResumeStrategy, RetryHint, SubagentStatus, SystemPromptChannel, TaskMutationKind,
-        TurnStatus, capability_profile,
+        ResumeStrategy, RetryHint, RuntimeTuningProfile, SubagentStatus, SystemPromptChannel,
+        TaskMutationKind, TurnStatus, capability_profile, capability_profile_for_runtime,
+        runtime_tuning_profile,
     },
     domain::{
         AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_THINKING,
@@ -28,7 +29,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -49,7 +50,10 @@ const MAX_GROK_SUBAGENTS: usize = 256;
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const CHAT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const TASK_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_CONCURRENT_AI_RUNS: usize = 4;
+
+static CLI_VERSION_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<CliVersion>>>> = OnceLock::new();
 
 /// One provider turn. The API key value is deliberately memory-only and its
 /// custom `Debug` implementation never prints it.
@@ -437,6 +441,121 @@ struct ProcessSpec {
     output_mode: OutputMode,
 }
 
+fn built_in_cli_executable(provider_id: &str) -> Option<&'static str> {
+    match provider_id.trim().to_ascii_lowercase().as_str() {
+        "claude_cli" => Some("claude"),
+        "codex_cli" => Some("codex"),
+        "grok_cli" => Some("grok"),
+        "kimi_cli" => Some("kimi"),
+        "lm_studio" => Some("lms"),
+        "ollama" => Some("ollama"),
+        _ => None,
+    }
+}
+
+/// Runtime controls for the installed provider. The version probe is cached by
+/// resolved executable path and Custom CLI executables are never probed.
+pub fn installed_runtime_tuning(
+    provider_id: &str,
+    model: &str,
+    cwd: Option<&Path>,
+) -> RuntimeTuningProfile {
+    let Some(executable) = built_in_cli_executable(provider_id) else {
+        return runtime_tuning_profile(ProviderKind::Custom, None, model);
+    };
+    let Some(program) = resolve_executable(executable, cwd) else {
+        let profile = capability_profile(provider_id, executable, &[]);
+        return runtime_tuning_profile(profile.runtime_family, None, model);
+    };
+    runtime_tuning_for_program(provider_id, &program, model)
+}
+
+/// Clamp saved controls to the verified runtime table. Returns true when the
+/// caller should persist the healed profile.
+pub fn clamp_provider_preferences(
+    provider_id: &str,
+    preferences: &mut AiProviderPreferences,
+    tuning: &RuntimeTuningProfile,
+) -> bool {
+    let original = preferences.clone();
+    let requested = preferences.reasoning_effort.trim();
+    if requested.is_empty() {
+        preferences.reasoning_effort.clear();
+    } else if let Some(effort) = tuning.normalized_reasoning_effort(requested) {
+        preferences.reasoning_effort = effort.to_owned();
+    } else {
+        preferences.reasoning_effort.clear();
+    }
+    if provider_id == "grok_cli" && !tuning.supports_scoped_child_text {
+        preferences.set_feature(AI_FEATURE_SUBAGENTS, Some(false));
+    }
+    *preferences != original
+}
+
+fn runtime_tuning_for_program(
+    provider_id: &str,
+    program: &Path,
+    model: &str,
+) -> RuntimeTuningProfile {
+    let version = cached_cli_version(program);
+    let profile = capability_profile_for_runtime(
+        provider_id,
+        &program.to_string_lossy(),
+        &[],
+        version.as_ref(),
+        model,
+    );
+    runtime_tuning_profile(
+        profile.runtime_family,
+        profile.runtime_version.as_ref(),
+        model,
+    )
+}
+
+fn cached_cli_version(program: &Path) -> Option<CliVersion> {
+    let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(version) = lock_unpoison(cache).get(&key).cloned() {
+        return version;
+    }
+    let version = probe_cli_version(&key);
+    lock_unpoison(cache).insert(key, version.clone());
+    version
+}
+
+fn probe_cli_version(program: &Path) -> Option<CliVersion> {
+    let mut child = Command::new(program)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + CLI_VERSION_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let output = child.wait_with_output().ok()?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    CliVersion::parse(&combined)
+}
+
 fn prepare_run(request: &AiRunRequest) -> Result<PreparedRun, AiEngineError> {
     let provider = request.provider_id.trim().to_ascii_lowercase();
     match provider.as_str() {
@@ -530,32 +649,20 @@ fn effective_model(request: &AiRunRequest) -> &str {
     }
 }
 
-fn allowlisted_reasoning_effort(
-    request: &AiRunRequest,
-    allowed: &[&'static str],
-) -> Option<&'static str> {
-    let requested = request.provider_preferences.reasoning_effort.trim();
-    allowed
-        .iter()
-        .copied()
-        .find(|candidate| requested.eq_ignore_ascii_case(candidate))
-}
-
-fn codex_reasoning_effort(model: &str, request: &AiRunRequest) -> Option<&'static str> {
-    let requested =
-        allowlisted_reasoning_effort(request, &["low", "medium", "high", "xhigh", "max", "ultra"])?;
-    match requested {
-        "ultra" if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") => Some("ultra"),
-        "max" if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna") => Some("max"),
-        "low" | "medium" | "high" | "xhigh" => Some(requested),
-        _ => None,
-    }
-}
-
 fn preset_process_spec(
     provider_id: &str,
     program: PathBuf,
     request: &AiRunRequest,
+) -> Result<ProcessSpec, AiEngineError> {
+    let tuning = runtime_tuning_for_program(provider_id, &program, effective_model(request));
+    preset_process_spec_with_tuning(provider_id, program, request, &tuning)
+}
+
+fn preset_process_spec_with_tuning(
+    provider_id: &str,
+    program: PathBuf,
+    request: &AiRunRequest,
+    tuning: &RuntimeTuningProfile,
 ) -> Result<ProcessSpec, AiEngineError> {
     let cwd = canonical_working_directory(request.cwd.as_deref())?;
     let model = effective_model(request);
@@ -580,7 +687,7 @@ fn preset_process_spec(
                 push_args(&mut arguments, &["--model", model]);
             }
             if let Some(effort) =
-                allowlisted_reasoning_effort(request, &["low", "medium", "high", "xhigh", "max"])
+                tuning.normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
             {
                 push_args(&mut arguments, &["--effort", effort]);
             }
@@ -631,7 +738,9 @@ fn preset_process_spec(
             if !model.is_empty() {
                 push_args(&mut arguments, &["--model", model]);
             }
-            if let Some(effort) = codex_reasoning_effort(model, request) {
+            if let Some(effort) =
+                tuning.normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
+            {
                 arguments.push("-c".into());
                 arguments
                     .push(format!("model_reasoning_effort={}", toml_basic_string(effort)).into());
@@ -674,10 +783,9 @@ fn preset_process_spec(
             if !model.is_empty() {
                 push_args(&mut arguments, &["--model", model]);
             }
-            if let Some(effort) = allowlisted_reasoning_effort(
-                request,
-                &["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-            ) {
+            if let Some(effort) =
+                tuning.normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
+            {
                 push_args(&mut arguments, &["--reasoning-effort", effort]);
             }
             if request.provider_preferences.feature(AI_FEATURE_WEB_SEARCH) == Some(false) {
@@ -695,7 +803,9 @@ fn preset_process_spec(
             if request.provider_preferences.feature(AI_FEATURE_PLANNING) == Some(false) {
                 arguments.push("--no-plan".into());
             }
-            if request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) == Some(false) {
+            if !tuning.supports_scoped_child_text
+                || request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) == Some(false)
+            {
                 arguments.push("--no-subagents".into());
             }
             match request.provider_preferences.feature(AI_FEATURE_MEMORY) {
@@ -761,7 +871,8 @@ fn preset_process_spec(
                 ));
             }
             push_args(&mut arguments, &["run", model]);
-            if let Some(effort) = allowlisted_reasoning_effort(request, &["low", "medium", "high"])
+            if let Some(effort) =
+                tuning.normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
             {
                 push_args(&mut arguments, &["--think", effort]);
             } else {
@@ -796,6 +907,23 @@ fn preset_process_spec(
         prompt_input,
         output_mode,
     })
+}
+
+#[cfg(test)]
+fn preset_process_spec_for_version(
+    provider_id: &str,
+    program: PathBuf,
+    request: &AiRunRequest,
+    version: &str,
+) -> Result<ProcessSpec, AiEngineError> {
+    let profile = capability_profile(provider_id, &program.to_string_lossy(), &[]);
+    let version = CliVersion::parse(version);
+    let tuning = runtime_tuning_profile(
+        profile.runtime_family,
+        version.as_ref(),
+        effective_model(request),
+    );
+    preset_process_spec_with_tuning(provider_id, program, request, &tuning)
 }
 
 fn apply_system_prompt_arguments(
@@ -932,9 +1060,7 @@ fn custom_process_spec(
     let mut has_prompt_argument = false;
     let mut arguments = Vec::with_capacity(request.custom_arguments.len());
     let model = effective_model(request);
-    let reasoning_effort =
-        allowlisted_reasoning_effort(request, &["low", "medium", "high", "xhigh", "max", "ultra"])
-            .unwrap_or_default();
+    let reasoning_effort = "";
 
     ensure_safe_argument_templates(&request.custom_arguments)?;
     for template in &request.custom_arguments {
@@ -1153,11 +1279,16 @@ fn run_outcome_status(outcome: &RunOutcome) -> Option<ActivityKind> {
                 AiFailureKind::MaxTurnsReached => TurnStatus::MaxTurnsReached,
                 AiFailureKind::ProviderError => TurnStatus::ProviderError,
             };
-            let retry = (*retry).or(Some(if *kind == AiFailureKind::PermissionBlocked {
-                RetryHint::AllowWebAndRetry
-            } else {
-                RetryHint::Retry
-            }));
+            let retry = Some(match kind {
+                AiFailureKind::PermissionBlocked if is_explicit_web_tool(tool.as_deref()) => {
+                    match retry {
+                        Some(RetryHint::Retry) => RetryHint::Retry,
+                        Some(RetryHint::AllowWebAndRetry) | None => RetryHint::AllowWebAndRetry,
+                    }
+                }
+                AiFailureKind::PermissionBlocked => RetryHint::Retry,
+                _ => retry.unwrap_or(RetryHint::Retry),
+            });
             return Some(ActivityKind::TurnStatus {
                 status,
                 message: Some(message.clone()),
@@ -1174,6 +1305,16 @@ fn run_outcome_status(outcome: &RunOutcome) -> Option<ActivityKind> {
         tool: None,
         retry,
     })
+}
+
+fn is_explicit_web_tool(tool: Option<&str>) -> bool {
+    let normalized = tool
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    matches!(normalized.as_str(), "websearch" | "webfetch")
 }
 
 fn run_process(
@@ -1852,6 +1993,11 @@ impl OutputDecoder {
         if let Some(suffix) = salvage.strip_prefix(&self.output) {
             self.record_assistant_text(suffix.to_owned(), false, false, emit);
         } else {
+            // A poisoned provider can replace, rather than extend, the bounded
+            // raw salvage window. Reset every projection before replaying the
+            // replacement so stale text cannot be double-appended.
+            self.stream_reset_emitted = true;
+            emit(Decoded::StreamReset);
             self.output.clear();
             self.saw_assistant_text = false;
             self.record_assistant_text(salvage, false, false, emit);
@@ -2622,6 +2768,10 @@ impl OutputDecoder {
                 {
                     let message = string_at(value, &["result"])
                         .unwrap_or_else(|| "the agent reported an error".into());
+                    let (kind, tool, retry) = classify_claude_result_failure(value);
+                    self.failure_kind = Some(kind);
+                    self.failure_tool = tool;
+                    self.failure_retry = Some(retry);
                     decoded.kinds.push(ActivityKind::TurnError {
                         message: message.clone(),
                     });
@@ -3977,6 +4127,47 @@ fn claude_subagent_status(status: Option<&str>) -> SubagentStatus {
     }
 }
 
+fn classify_claude_result_failure(value: &Value) -> (AiFailureKind, Option<String>, RetryHint) {
+    let subtype = string_at(value, &["subtype"])
+        .map(|value| normalized_token(&value))
+        .unwrap_or_default();
+    let terminal_reason = string_at(value, &["terminal_reason", "terminalReason"])
+        .map(|value| normalized_token(&value))
+        .unwrap_or_default();
+    if matches!(
+        subtype.as_str(),
+        "errormaxturns" | "maxturns" | "maxturnsreached"
+    ) || matches!(
+        terminal_reason.as_str(),
+        "errormaxturns" | "maxturns" | "maxturnsreached" | "turnlimit"
+    ) {
+        return (AiFailureKind::MaxTurnsReached, None, RetryHint::Retry);
+    }
+
+    let permission_blocked = matches!(
+        subtype.as_str(),
+        "errorpermission"
+            | "errorpermissiondenied"
+            | "permissionblocked"
+            | "permissioncancelled"
+            | "permissiondenied"
+    ) || matches!(
+        terminal_reason.as_str(),
+        "permissionblocked" | "permissioncancelled" | "permissiondenied"
+    );
+    if permission_blocked {
+        let tool = string_at(value, &["tool", "tool_name", "toolName"]);
+        let retry = if is_explicit_web_tool(tool.as_deref()) {
+            RetryHint::AllowWebAndRetry
+        } else {
+            RetryHint::Retry
+        };
+        return (AiFailureKind::PermissionBlocked, tool, retry);
+    }
+
+    (AiFailureKind::ProviderError, None, RetryHint::Retry)
+}
+
 fn seconds_to_milliseconds(seconds: f64) -> Option<i64> {
     if !seconds.is_finite() || seconds.is_sign_negative() {
         return None;
@@ -4745,8 +4936,13 @@ mod tests {
         run.provider_preferences.reasoning_effort = "ultra".into();
         set_feature(&mut run, AI_FEATURE_WEB_SEARCH, true);
 
-        let specification =
-            preset_process_spec("codex_cli", PathBuf::from("/tmp/codex"), &run).unwrap();
+        let specification = preset_process_spec_for_version(
+            "codex_cli",
+            PathBuf::from("/tmp/codex"),
+            &run,
+            "codex-cli 0.144.1",
+        )
+        .unwrap();
         let arguments = argument_strings(&specification);
         assert!(has_argument_pair(&arguments, "--model", "gpt-5.6-sol"));
         assert!(has_argument_pair(
@@ -4757,8 +4953,13 @@ mod tests {
         assert!(arguments.contains(&"--search".into()));
 
         run.provider_preferences.model = "gpt-5.6-luna".into();
-        let unsupported =
-            preset_process_spec("codex_cli", PathBuf::from("/tmp/codex"), &run).unwrap();
+        let unsupported = preset_process_spec_for_version(
+            "codex_cli",
+            PathBuf::from("/tmp/codex"),
+            &run,
+            "codex-cli 0.144.1",
+        )
+        .unwrap();
         assert!(
             !argument_strings(&unsupported)
                 .iter()
@@ -4766,8 +4967,13 @@ mod tests {
         );
 
         run.provider_preferences.reasoning_effort = "max".into();
-        let supported =
-            preset_process_spec("codex_cli", PathBuf::from("/tmp/codex"), &run).unwrap();
+        let supported = preset_process_spec_for_version(
+            "codex_cli",
+            PathBuf::from("/tmp/codex"),
+            &run,
+            "codex-cli 0.144.1",
+        )
+        .unwrap();
         assert!(has_argument_pair(
             &argument_strings(&supported),
             "-c",
@@ -4775,7 +4981,13 @@ mod tests {
         ));
 
         run.provider_preferences.reasoning_effort = "high\" --search".into();
-        let invalid = preset_process_spec("codex_cli", PathBuf::from("/tmp/codex"), &run).unwrap();
+        let invalid = preset_process_spec_for_version(
+            "codex_cli",
+            PathBuf::from("/tmp/codex"),
+            &run,
+            "codex-cli 0.144.1",
+        )
+        .unwrap();
         assert!(
             !argument_strings(&invalid)
                 .iter()
@@ -4792,8 +5004,13 @@ mod tests {
         run.provider_preferences.max_turns = Some(7);
         set_feature(&mut run, AI_FEATURE_WEB_SEARCH, true);
 
-        let specification =
-            preset_process_spec("claude_cli", PathBuf::from("/tmp/claude"), &run).unwrap();
+        let specification = preset_process_spec_for_version(
+            "claude_cli",
+            PathBuf::from("/tmp/claude"),
+            &run,
+            "2.1.128 (Claude Code)",
+        )
+        .unwrap();
         let arguments = argument_strings(&specification);
         for (flag, value) in [
             ("--model", "opus"),
@@ -4808,8 +5025,13 @@ mod tests {
 
         set_feature(&mut run, AI_FEATURE_WEB_SEARCH, false);
         run.provider_preferences.reasoning_effort = "ultra".into();
-        let restricted =
-            preset_process_spec("claude_cli", PathBuf::from("/tmp/claude"), &run).unwrap();
+        let restricted = preset_process_spec_for_version(
+            "claude_cli",
+            PathBuf::from("/tmp/claude"),
+            &run,
+            "2.1.128 (Claude Code)",
+        )
+        .unwrap();
         let restricted_arguments = argument_strings(&restricted);
         assert!(has_argument_pair(
             &restricted_arguments,
@@ -4823,8 +5045,13 @@ mod tests {
     #[test]
     fn grok_preferences_shape_sandbox_capabilities_and_turn_limit() {
         let run = request("grok_cli");
-        let specification =
-            preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &run).unwrap();
+        let specification = preset_process_spec_for_version(
+            "grok_cli",
+            PathBuf::from("/tmp/grok"),
+            &run,
+            "grok 0.2.111 (94172f2aa4e5)",
+        )
+        .unwrap();
         let arguments = argument_strings(&specification);
         assert!(has_argument_pair(&arguments, "--sandbox", "read-only"));
         assert!(has_argument_pair(
@@ -4835,6 +5062,7 @@ mod tests {
         assert!(has_argument_pair(&arguments, "--allow", "WebSearch"));
         assert!(has_argument_pair(&arguments, "--allow", "WebFetch"));
         assert!(!arguments.contains(&"--disable-web-search".into()));
+        assert!(arguments.contains(&"--no-subagents".into()));
 
         let mut configured = run;
         configured.permission_mode = PermissionMode::Auto;
@@ -4845,8 +5073,13 @@ mod tests {
         set_feature(&mut configured, AI_FEATURE_PLANNING, false);
         set_feature(&mut configured, AI_FEATURE_SUBAGENTS, false);
         set_feature(&mut configured, AI_FEATURE_MEMORY, false);
-        let specification =
-            preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &configured).unwrap();
+        let specification = preset_process_spec_for_version(
+            "grok_cli",
+            PathBuf::from("/tmp/grok"),
+            &configured,
+            "grok 0.2.111 (94172f2aa4e5)",
+        )
+        .unwrap();
         let arguments = argument_strings(&specification);
         for (flag, value) in [
             ("--sandbox", "workspace"),
@@ -4868,8 +5101,13 @@ mod tests {
 
         set_feature(&mut configured, AI_FEATURE_WEB_SEARCH, true);
         set_feature(&mut configured, AI_FEATURE_MEMORY, true);
-        let enabled =
-            preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &configured).unwrap();
+        let enabled = preset_process_spec_for_version(
+            "grok_cli",
+            PathBuf::from("/tmp/grok"),
+            &configured,
+            "grok 0.2.111 (94172f2aa4e5)",
+        )
+        .unwrap();
         let enabled_arguments = argument_strings(&enabled);
         assert!(!enabled_arguments.contains(&"--disable-web-search".into()));
         assert!(has_argument_pair(
@@ -4882,8 +5120,13 @@ mod tests {
         assert!(!enabled_arguments.contains(&"--no-memory".into()));
 
         configured.workspace_mode = AiWorkspaceMode::Chat;
-        let chat =
-            preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &configured).unwrap();
+        let chat = preset_process_spec_for_version(
+            "grok_cli",
+            PathBuf::from("/tmp/grok"),
+            &configured,
+            "grok 0.2.111 (94172f2aa4e5)",
+        )
+        .unwrap();
         assert!(has_argument_pair(
             &argument_strings(&chat),
             "--sandbox",
@@ -4892,27 +5135,87 @@ mod tests {
     }
 
     #[test]
-    fn grok_accepts_every_documented_reasoning_tier_and_rejects_unknown_values() {
-        for effort in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+    fn grok_0_2_111_accepts_only_captured_reasoning_tiers() {
+        for effort in ["low", "medium", "high"] {
             let mut run = request("grok_cli");
             run.provider_preferences.reasoning_effort = effort.into();
-            let specification =
-                preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &run).unwrap();
+            let specification = preset_process_spec_for_version(
+                "grok_cli",
+                PathBuf::from("/tmp/grok"),
+                &run,
+                "grok 0.2.111 (94172f2aa4e5)",
+            )
+            .unwrap();
             assert!(
                 has_argument_pair(
                     &argument_strings(&specification),
                     "--reasoning-effort",
                     effort
                 ),
-                "missing documented Grok effort {effort}"
+                "missing captured Grok effort {effort}"
             );
         }
 
-        let mut unsupported = request("grok_cli");
-        unsupported.provider_preferences.reasoning_effort = "ultra".into();
-        let specification =
-            preset_process_spec("grok_cli", PathBuf::from("/tmp/grok"), &unsupported).unwrap();
-        assert!(!argument_strings(&specification).contains(&"--reasoning-effort".into()));
+        for effort in ["none", "minimal", "xhigh", "max", "ultra"] {
+            let mut unsupported = request("grok_cli");
+            unsupported.provider_preferences.reasoning_effort = effort.into();
+            let specification = preset_process_spec_for_version(
+                "grok_cli",
+                PathBuf::from("/tmp/grok"),
+                &unsupported,
+                "grok 0.2.111 (94172f2aa4e5)",
+            )
+            .unwrap();
+            assert!(
+                !argument_strings(&specification).contains(&"--reasoning-effort".into()),
+                "{effort}"
+            );
+        }
+
+        let mut unknown = request("grok_cli");
+        unknown.provider_preferences.reasoning_effort = "high".into();
+        let specification = preset_process_spec(
+            "grok_cli",
+            PathBuf::from("/definitely/missing/grok"),
+            &unknown,
+        )
+        .unwrap();
+        let arguments = argument_strings(&specification);
+        assert!(!arguments.contains(&"--reasoning-effort".into()));
+        assert!(arguments.contains(&"--no-subagents".into()));
+    }
+
+    #[test]
+    fn saved_grok_controls_self_heal_to_the_verified_runtime_contract() {
+        let grok = CliVersion::parse("grok 0.2.111 (94172f2aa4e5)").unwrap();
+        let tuning = runtime_tuning_profile(ProviderKind::Grok, Some(&grok), "grok-4.5");
+        let mut preferences = AiProviderPreferences {
+            reasoning_effort: "MAX".into(),
+            ..AiProviderPreferences::default()
+        };
+        preferences.set_feature(AI_FEATURE_SUBAGENTS, Some(true));
+
+        assert!(clamp_provider_preferences(
+            "grok_cli",
+            &mut preferences,
+            &tuning
+        ));
+        assert!(preferences.reasoning_effort.is_empty());
+        assert_eq!(preferences.feature(AI_FEATURE_SUBAGENTS), Some(false));
+
+        preferences.reasoning_effort = " HIGH ".into();
+        assert!(clamp_provider_preferences(
+            "grok_cli",
+            &mut preferences,
+            &tuning
+        ));
+        assert_eq!(preferences.reasoning_effort, "high");
+        assert_eq!(preferences.feature(AI_FEATURE_SUBAGENTS), Some(false));
+        assert!(!clamp_provider_preferences(
+            "grok_cli",
+            &mut preferences,
+            &tuning
+        ));
     }
 
     #[test]
@@ -4932,7 +5235,13 @@ mod tests {
 
         let mut ollama = request("ollama");
         ollama.provider_preferences.reasoning_effort = "medium".into();
-        let effort = preset_process_spec("ollama", PathBuf::from("/tmp/ollama"), &ollama).unwrap();
+        let effort = preset_process_spec_for_version(
+            "ollama",
+            PathBuf::from("/tmp/ollama"),
+            &ollama,
+            "Warning: client version is 0.32.1",
+        )
+        .unwrap();
         assert!(has_argument_pair(
             &argument_strings(&effort),
             "--think",
@@ -4941,8 +5250,13 @@ mod tests {
 
         ollama.provider_preferences.reasoning_effort.clear();
         set_feature(&mut ollama, AI_FEATURE_THINKING, false);
-        let disabled =
-            preset_process_spec("ollama", PathBuf::from("/tmp/ollama"), &ollama).unwrap();
+        let disabled = preset_process_spec_for_version(
+            "ollama",
+            PathBuf::from("/tmp/ollama"),
+            &ollama,
+            "Warning: client version is 0.32.1",
+        )
+        .unwrap();
         assert!(has_argument_pair(
             &argument_strings(&disabled),
             "--think",
@@ -4987,7 +5301,6 @@ mod tests {
                     "--reasoning-effort",
                     "--disable-web-search",
                     "--no-plan",
-                    "--no-subagents",
                     "--experimental-memory",
                     "--no-memory",
                     "--max-turns",
@@ -5001,6 +5314,9 @@ mod tests {
                     !arguments.iter().any(|argument| argument == flag),
                     "{provider} unexpectedly emitted {flag}: {arguments:?}"
                 );
+            }
+            if provider == "grok_cli" {
+                assert!(arguments.contains(&"--no-subagents".into()));
             }
         }
     }
@@ -5136,7 +5452,7 @@ mod tests {
         let specification = custom_process_spec(PathBuf::from("/tmp/custom"), &run).unwrap();
         let arguments = argument_strings(&specification);
         assert_eq!(arguments[0], "--model=test-model");
-        assert_eq!(arguments[1], "--effort=high");
+        assert_eq!(arguments[1], "--effort=");
         assert_eq!(arguments[2], "Explain this code");
         assert_eq!(arguments[3], "--root");
         assert_eq!(
@@ -5463,6 +5779,81 @@ mod tests {
         accumulator
     }
 
+    fn assert_jsonl_fixture(stream: &str) {
+        assert!(!stream.trim().is_empty());
+        for (index, line) in stream.lines().enumerate() {
+            serde_json::from_str::<Value>(line)
+                .unwrap_or_else(|error| panic!("fixture line {} is invalid: {error}", index + 1));
+        }
+    }
+
+    #[test]
+    fn captured_provider_fixtures_are_valid_and_chunk_stable() {
+        let fixtures = [
+            (
+                "codex_cli",
+                include_str!("../tests/fixtures/ai/codex/0.144.1/basic.jsonl"),
+                "FIXTURE_OK",
+            ),
+            (
+                "claude_cli",
+                include_str!("../tests/fixtures/ai/claude/2.1.128/auth-error.jsonl"),
+                "Not logged in · Please run /login",
+            ),
+            (
+                "grok_cli",
+                include_str!("../tests/fixtures/ai/grok/0.2.111/basic.jsonl"),
+                "FIXTURE_OK",
+            ),
+            (
+                "kimi_cli",
+                include_str!("../tests/fixtures/ai/kimi/1.49.0/basic-tool.jsonl"),
+                "Checking\n\nFinished",
+            ),
+        ];
+
+        for (provider, stream, expected) in fixtures {
+            assert_jsonl_fixture(stream);
+            for chunk_size in [1, 7, stream.len()] {
+                let (decoder, _) = decode_in_chunks(provider, stream, chunk_size);
+                assert_eq!(
+                    decoder.output, expected,
+                    "{provider} changed at chunk size {chunk_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn captured_grok_multiplex_stream_has_no_child_identity() {
+        let stream = include_str!("../tests/fixtures/ai/grok/0.2.111/parent-child.jsonl");
+        assert_jsonl_fixture(stream);
+        let text_events = stream
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value.get("type").and_then(Value::as_str) == Some("text"))
+            .collect::<Vec<_>>();
+        assert_eq!(text_events.len(), 3);
+        assert!(text_events.iter().all(|value| {
+            string_at(
+                value,
+                &[
+                    "subagent_id",
+                    "subagentId",
+                    "child_session_id",
+                    "childSessionId",
+                ],
+            )
+            .is_none()
+        }));
+
+        let (decoder, _) = decode_in_chunks("grok_cli", stream, 7);
+        assert_eq!(
+            decoder.output,
+            "Spawning one subagent to compute 2+2.4PARENT_DONE"
+        );
+    }
+
     #[test]
     fn claude_real_wire_task_result_correlates_subjectless_updates_into_one_plan_row() {
         let stream = concat!(
@@ -5721,6 +6112,108 @@ mod tests {
     }
 
     #[test]
+    fn terminal_outcomes_keep_web_retry_narrow_and_type_every_failure() {
+        let permission = |tool: Option<&str>, retry| RunOutcome::Failed {
+            kind: AiFailureKind::PermissionBlocked,
+            message: "permission required".into(),
+            tool: tool.map(str::to_owned),
+            retry,
+        };
+        for (outcome, expected_status, expected_retry) in [
+            (
+                permission(None, None),
+                TurnStatus::PermissionBlocked,
+                Some(RetryHint::Retry),
+            ),
+            (
+                permission(Some("Bash"), Some(RetryHint::AllowWebAndRetry)),
+                TurnStatus::PermissionBlocked,
+                Some(RetryHint::Retry),
+            ),
+            (
+                permission(Some("WebFetch"), None),
+                TurnStatus::PermissionBlocked,
+                Some(RetryHint::AllowWebAndRetry),
+            ),
+            (
+                RunOutcome::timed_out("slow"),
+                TurnStatus::TimedOut,
+                Some(RetryHint::Retry),
+            ),
+            (
+                RunOutcome::Failed {
+                    kind: AiFailureKind::MaxTurnsReached,
+                    message: "limit".into(),
+                    tool: None,
+                    retry: None,
+                },
+                TurnStatus::MaxTurnsReached,
+                Some(RetryHint::Retry),
+            ),
+            (
+                RunOutcome::provider_error("broken"),
+                TurnStatus::ProviderError,
+                Some(RetryHint::Retry),
+            ),
+        ] {
+            let Some(ActivityKind::TurnStatus { status, retry, .. }) = run_outcome_status(&outcome)
+            else {
+                panic!("missing terminal status");
+            };
+            assert_eq!(status, expected_status);
+            assert_eq!(retry, expected_retry);
+        }
+
+        assert!(matches!(
+            run_outcome_status(&RunOutcome::Completed {
+                text: String::new(),
+                session_id: None,
+            }),
+            Some(ActivityKind::TurnStatus {
+                status: TurnStatus::Completed,
+                ..
+            })
+        ));
+        assert!(matches!(
+            run_outcome_status(&RunOutcome::Cancelled),
+            Some(ActivityKind::TurnStatus {
+                status: TurnStatus::UserCancelled,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn claude_structured_result_distinguishes_turn_limit_and_permissions() {
+        let max_turns = "{\"type\":\"result\",\"subtype\":\"error_max_turns\",\"is_error\":true,\"result\":\"Stopped\"}\n";
+        let (decoder, _) = decode_in_chunks("claude_cli", max_turns, 5);
+        assert_eq!(decoder.failure_kind, Some(AiFailureKind::MaxTurnsReached));
+        assert_eq!(decoder.failure_retry, Some(RetryHint::Retry));
+
+        let terminal_reason = concat!(
+            "{\"type\":\"result\",\"subtype\":\"error_during_execution\",",
+            "\"terminal_reason\":\"max_turns\",\"is_error\":true,\"result\":\"Stopped\"}\n"
+        );
+        let (decoder, _) = decode_in_chunks("claude_cli", terminal_reason, 6);
+        assert_eq!(decoder.failure_kind, Some(AiFailureKind::MaxTurnsReached));
+
+        let web_permission = concat!(
+            "{\"type\":\"result\",\"subtype\":\"error_permission_denied\",",
+            "\"terminal_reason\":\"permission_denied\",\"tool_name\":\"WebSearch\",",
+            "\"is_error\":true,\"result\":\"Denied\"}\n"
+        );
+        let (decoder, _) = decode_in_chunks("claude_cli", web_permission, 7);
+        assert_eq!(decoder.failure_kind, Some(AiFailureKind::PermissionBlocked));
+        assert_eq!(decoder.failure_tool.as_deref(), Some("WebSearch"));
+        assert_eq!(decoder.failure_retry, Some(RetryHint::AllowWebAndRetry));
+
+        let auth_error = include_str!("../tests/fixtures/ai/claude/2.1.128/auth-error.jsonl");
+        let (decoder, _) = decode_in_chunks("claude_cli", auth_error, 11);
+        assert_eq!(decoder.failure_kind, Some(AiFailureKind::ProviderError));
+        assert_eq!(decoder.failure_retry, Some(RetryHint::Retry));
+    }
+
+    #[test]
     fn grok_session_harvest_projects_native_plan_subagents_tools_and_permission_failure() {
         let temporary = tempfile::tempdir().unwrap();
         let session_id = "019fb2fe-9145-7522-adb1-81fa62d02ede";
@@ -5962,6 +6455,55 @@ mod tests {
                 conversation_id
             } if turn_id == run.turn_id && conversation_id == run.conversation_id
         ));
+    }
+
+    #[test]
+    fn poison_salvage_replacement_resets_before_replay() {
+        let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
+        decoder.poisoned = true;
+        decoder.stream_reset_emitted = true;
+        decoder.output = "stale projection".into();
+        decoder.saw_assistant_text = true;
+        decoder.raw_mirror = b"replacement output\n".to_vec();
+
+        let mut decoded = vec![Decoded::Delta("stale projection".into())];
+        decoder.refresh_poison_salvage(&mut |event| decoded.push(event));
+
+        let reset = decoded
+            .iter()
+            .position(|event| matches!(event, Decoded::StreamReset))
+            .expect("replacement reset");
+        let replacement_activity = decoded
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    Decoded::Activity(ActivityEvent {
+                        kind: ActivityKind::AssistantText { text },
+                        ..
+                    }) if text == "replacement output\n"
+                )
+            })
+            .expect("replacement activity");
+        let replacement_delta = decoded
+            .iter()
+            .position(
+                |event| matches!(event, Decoded::Delta(text) if text == "replacement output\n"),
+            )
+            .expect("replacement delta");
+        assert!(reset < replacement_activity);
+        assert!(replacement_activity < replacement_delta);
+
+        let mut projected = String::new();
+        for event in &decoded {
+            match event {
+                Decoded::StreamReset => projected.clear(),
+                Decoded::Delta(text) => projected.push_str(text),
+                Decoded::Activity(_) => {}
+            }
+        }
+        assert_eq!(projected, decoder.output);
+        assert_eq!(projected, "replacement output\n");
     }
 
     #[test]

@@ -24,11 +24,20 @@ unread completion state, and appear both as tiles and in the AI-chat sidebar.
 ## Provider contract
 
 Provider support is derived from a capability profile rather than a single
-pile of provider conditionals. The profile identifies:
+pile of provider conditionals. Optional runtime controls are a second,
+version-pinned profile shared by launch shaping and the composer. Adam probes
+the exact installed built-in CLI version and exposes or emits a control only
+when that version has a captured, tested contract. An unknown, unparseable, or
+unlisted version falls back conservatively to provider defaults: no guessed
+reasoning flag is sent, and child-agent execution stays off when the stream
+cannot safely identify child text. Custom CLI executables are not probed.
+
+Together, the profiles identify:
 
 - transport: CLI process, local chat endpoint, or remote compatible endpoint;
 - stream dialect: structured provider events or plain text;
-- plan source: provider-native plan events or Adam’s task projection;
+- declared plan source: provider-native plan events or Adam-owned task tools;
+  only provider-native events are live in this PR1 baseline;
 - continuity: native provider session or bounded transcript replay;
 - system-instruction channel: a native flag/config/API system message or a
   fenced block inside the prompt;
@@ -67,34 +76,49 @@ effort, and abilities instead of sharing one global model field.
 An empty model or effort means **use the provider or model default**. Adam does
 not silently translate that into Medium or another guessed default.
 
+The rows below name the captured runtime contracts. Other installed versions
+keep the provider-default reasoning setting until a fixture verifies their
+accepted values.
+
 | Provider | Model control | Reasoning control | Additional abilities |
 | --- | --- | --- | --- |
-| Codex | Known GPT-5.6 Sol, Terra, and Luna choices plus custom model ID | Sol/Terra: Low through Ultra; Luna: Low through Max; older listed models: Low through XHigh | Explicit web-search enable |
-| Claude | Provider default, Opus, Sonnet, Haiku, or custom model ID | Low, Medium, High, XHigh, Max | Web tools on/off and optional fallback model |
-| Grok | Provider default, Grok 4.5, or custom model ID | None, Minimal, Low, Medium, High, XHigh, Max | Web search, planning, subagents, memory, and a 1–100 turn limit |
-| Kimi | Provider default or custom model ID | Provider default | Thinking on/off |
-| Ollama | Required local model ID | Low, Medium, High, or thinking on/off | Local model execution |
+| Codex 0.144.1 | Known GPT-5.6 Sol, Terra, and Luna choices plus custom model ID | Sol/Terra: Low through Ultra; Luna: Low through Max; other models: Low through XHigh | Explicit web-search enable |
+| Claude Code 2.1.128 | Provider default, Opus, Sonnet, Haiku, or custom model ID | Low, Medium, High, XHigh, Max | Web tools on/off and optional fallback model |
+| Grok 0.2.111 | Provider default, Grok 4.5, or custom model ID | Low, Medium, High | Web search, planning, memory, and a 1–100 turn limit; subagents forced off |
+| Kimi 1.49.0 | Provider default or custom model ID | Provider default | Thinking on/off |
+| Ollama 0.32.1 | Required local model ID | Low, Medium, High, or thinking on/off | Local model execution |
 | LM Studio | Required loaded model ID | Provider default | Local server endpoint and memory-only key |
 | OpenAI-compatible | Required endpoint model ID | Provider default | Endpoint, key environment variable, and memory-only key |
-| Custom CLI | Optional custom model ID | Low through Ultra for the safe placeholder | Direct whole-argument template |
+| Custom CLI | Optional custom model ID | Provider default; custom reasoning values are unverified | Direct whole-argument template |
 
 The visible choices map to real provider controls:
 
-- Codex receives `--model`, a TOML-escaped `model_reasoning_effort`, and
-  `--search` only when explicitly enabled.
-- Claude receives `--model`, `--effort`, `--fallback-model`, and explicit
-  WebSearch/WebFetch allow or deny filters. Adam does not emit a Claude
-  `--max-turns` flag because the supported installed CLI does not expose one.
-- Grok receives `--reasoning-effort`, supported ability-disable flags,
-  experimental memory enable when requested, `--max-turns`, and an exact
-  read-only or workspace sandbox. Unless web is explicitly switched off,
-  read-only Chat research grants only `WebSearch` and `WebFetch`; it never
-  turns that into blanket filesystem-mutation approval.
+- The captured Codex runtime receives `--model`, a TOML-escaped
+  `model_reasoning_effort`, and `--search` only when explicitly enabled.
+- The captured Claude runtime receives `--model`, `--effort`,
+  `--fallback-model`, and explicit WebSearch/WebFetch allow or deny filters.
+  Adam does not emit a Claude `--max-turns` flag because the supported
+  installed CLI does not expose one.
+- Grok 0.2.111 receives `--reasoning-effort` only for Low, Medium, or High,
+  plus supported ability-disable flags, experimental memory enable when
+  requested, `--max-turns`, and an exact read-only or workspace sandbox.
+  Its multiplexed stream does not attach child identity to text, so Adam
+  always sends `--no-subagents` for this version. Unless web is explicitly
+  switched off, read-only Chat research grants only `WebSearch` and
+  `WebFetch`; it never turns that into blanket filesystem-mutation approval.
 - Kimi receives `--thinking` or `--no-thinking`.
-- Ollama receives its supported `--think` level or boolean.
+- The captured Ollama runtime receives its supported `--think` level or
+  boolean.
 - Custom CLI may use `{prompt}`, `{model}`, `{reasoning_effort}`, and
-  `{workspace}` as whole safe placeholders. Unknown saved feature keys never
-  become arbitrary command-line arguments.
+  `{workspace}` as whole safe placeholders. The reasoning placeholder
+  currently expands to an empty provider-default value because Adam has no
+  verified contract for arbitrary executables. Unknown saved feature keys
+  never become arbitrary command-line arguments.
+
+When an installed version does not match a captured row, the composer omits
+unverified reasoning choices and launch shaping omits the corresponding flag.
+Unsupported saved values are cleared back to provider default rather than
+being forwarded optimistically.
 
 Generic OpenAI-compatible HTTP bodies intentionally remain limited to
 `model`, `messages`, and `stream`. Adam does not assume that every compatible
@@ -157,7 +181,7 @@ Progress is not a feed of log messages. It is the model’s structured task
 checklist: the work items the agent creates, starts, completes, cancels, or
 replaces while carrying out the request.
 
-Adam accepts two task-event shapes:
+From structured provider output, Adam accepts two task-event shapes:
 
 1. a whole-plan snapshot, where the new native list replaces prior native
    rows while task-tool rows retain their own lifecycle; and
@@ -168,6 +192,13 @@ Codex `todo_list` events become whole-plan snapshots. Claude `TodoWrite`
 becomes a snapshot, while Claude `TaskCreate` and `TaskUpdate` become
 incremental mutations with their status and active-form label retained. The
 projection is intentionally provider-neutral after parsing.
+
+This PR1 baseline does not yet expose Adam-owned task tools to the model and
+does not poll a live Adam task-session file. Consequently, it cannot promise a
+checklist for a provider that emits no native task events. Adam-owned
+whole-list task snapshots and their live polling contract are PR2 work; the
+task mutation and origin types already present in the normalized vocabulary do
+not make those tools callable.
 
 The inspector applies one strict precedence rule:
 
@@ -217,12 +248,15 @@ parent/child indentation. **View all** opens a wider Active/Done subagent
 panel without leaving the conversation. Repeated status updates replace the
 earlier state for that child rather than creating duplicate “agent” rows.
 
-Grok child-agent and task events are harvested from the matching provider
-session’s structured update stream after the turn. Codex collaboration calls
-and subagent-activity items join thread aliases into the same lifecycle.
-Claude Agent/legacy Task calls, task lifecycle notifications, and tool-progress
-events join tool-use, task, and provider-agent IDs. Unsupported providers
-simply show no Subagents section instead of an invented one.
+New Grok 0.2.111 runs are deliberately excluded from this projection. Its
+multiplexed stream uses identity-less text envelopes for parent and child
+prose, so Adam forces subagents off instead of leaking child responses into
+the parent transcript or inventing ownership. Scoped Grok child lifecycle and
+prose events are PR3 work. Codex collaboration calls and subagent-activity
+items join thread aliases into the same lifecycle. Claude Agent/legacy Task
+calls, task lifecycle notifications, and tool-progress events join tool-use,
+task, and provider-agent IDs. Unsupported providers simply show no Subagents
+section instead of an invented one.
 
 ## Inspector, outputs, files, and context
 
@@ -324,13 +358,18 @@ provides the file path for a capable workspace agent.
 - If Adam closed during a user turn, recovery adds a visible interrupted-turn
   marker rather than pretending the provider completed.
 
-Every terminal path commits a visible assistant turn. Failures and stops keep
-partial output and typed diagnostic activity. The transcript and inspector
-name the real terminal state instead of collapsing permission blocks, timeouts,
-turn limits, provider errors, and user cancellation into “Stopped:
-Cancelled.” A permission-blocked web run offers **Allow web for this run**,
-which retries the last request with a narrow one-run web grant. Background
-completions mark the conversation unread.
+Every started run commits one explicit terminal outcome and a visible
+assistant turn: completed, user-cancelled, permission-blocked, timed out,
+maximum turns reached, or provider error. Failures and stops keep partial
+output and typed diagnostic activity. Checklist completion is independent of
+the run outcome and cannot turn a failed run into a successful one. The
+transcript and inspector name the real terminal state instead of collapsing
+permission blocks, timeouts, turn limits, provider errors, and user
+cancellation into “Stopped: Cancelled.” **Allow web for this run** is offered
+only when the blocked permission explicitly identifies WebSearch or WebFetch;
+other permission blocks remain blocked or offer a non-privilege-widening
+retry. The web action retries the last request with a narrow one-run grant.
+Background completions mark the conversation unread.
 
 The transcript follows a compact work chronology: a Working/Worked/Blocked
 header with elapsed time, coalesced activity rows, live subagent chips,
@@ -395,6 +434,9 @@ model tools.
 The current harness does not claim:
 
 - a completed model-callable Adam host-tool server;
+- model-callable Adam task tools or live Adam task-snapshot polling, which are
+  PR2 work;
+- scoped child prose for identity-less Grok streams, which is PR3 work;
 - scheduled/background dispatch;
 - automatic long-history summary generation;
 - a finished Character editor and memory UI; or

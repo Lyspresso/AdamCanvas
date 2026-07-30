@@ -1,0 +1,3 @@
+{"type":"thought","data":"Reply exactly FIXTURE_OK."}
+{"type":"text","data":"FIXTURE_OK"}
+{"type":"end","stopReason":"EndTurn","sessionId":"grok-fixture-session","requestId":"grok-fixture-request","usage":{"input_tokens":2790,"cache_read_input_tokens":10496,"output_tokens":27,"reasoning_tokens":18,"total_tokens":13313},"num_turns":1,"modelUsage":{"grok-4.5-build":{"inputTokens":2790,"outputTokens":27,"cacheReadInputTokens":10496,"modelCalls":1}}}

@@ -1,0 +1,12 @@
+{
+  "provider": "Claude Code",
+  "version": "2.1.128",
+  "capturedAt": "2026-07-30",
+  "source": "https://github.com/anthropics/claude-code",
+  "command": "claude -p <prompt> --output-format stream-json --verbose --include-partial-messages --input-format text --permission-mode plan --model haiku",
+  "redactions": [
+    "session and event ids replaced",
+    "cwd, tools, commands, plugins, and memory paths omitted"
+  ],
+  "note": "The local CLI was signed out, so this fixture intentionally pins its structured authentication-failure terminal shape."
+}

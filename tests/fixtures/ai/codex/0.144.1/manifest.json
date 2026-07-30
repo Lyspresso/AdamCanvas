@@ -1,0 +1,11 @@
+{
+  "provider": "Codex CLI",
+  "version": "0.144.1",
+  "capturedAt": "2026-07-30",
+  "source": "https://github.com/openai/codex/blob/main/codex-rs/exec/src/exec_events.rs",
+  "command": "codex --sandbox read-only --ask-for-approval never exec --json --skip-git-repo-check <prompt>",
+  "redactions": [
+    "thread id replaced",
+    "prompt and response reduced to fixture sentinels"
+  ]
+}

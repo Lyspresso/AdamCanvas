@@ -1,0 +1,11 @@
+{
+  "provider": "Kimi CLI",
+  "version": "1.49.0",
+  "capturedAt": "2026-07-30",
+  "source": "https://github.com/MoonshotAI/kimi-cli/tree/main/examples/kimi-cli-stream-json",
+  "capture": "Local Kimi JsonPrinter fed TextPart, ToolCall, ToolCallPart, ToolResult, and final TextPart events",
+  "redactions": [
+    "fixture-only tool id and content used; no account or API credentials"
+  ],
+  "note": "This exercises the installed CLI's real stream-json serializer without contacting a model provider."
+}
