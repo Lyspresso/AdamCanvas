@@ -1,0 +1,14 @@
+{
+  "provider": "Grok CLI",
+  "version": "0.2.111",
+  "build": "94172f2aa4e5",
+  "capturedAt": "2026-07-30",
+  "command": "grok --single <prompt> --output-format streaming-json --permission-mode auto --sandbox read-only --disable-web-search --no-plan --no-memory --reasoning-effort low --max-turns 5",
+  "redactions": [
+    "session and request ids replaced",
+    "token usage and cost omitted",
+    "thought deltas omitted",
+    "text chunks coalesced without changing their envelope shape"
+  ],
+  "note": "The parent-child fixture proves that Grok 0.2.111 emits parent and child prose through indistinguishable, unscoped type=text envelopes."
+}

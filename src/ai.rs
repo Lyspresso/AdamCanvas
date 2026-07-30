@@ -5463,6 +5463,81 @@ mod tests {
         accumulator
     }
 
+    fn assert_jsonl_fixture(stream: &str) {
+        assert!(!stream.trim().is_empty());
+        for (index, line) in stream.lines().enumerate() {
+            serde_json::from_str::<Value>(line)
+                .unwrap_or_else(|error| panic!("fixture line {} is invalid: {error}", index + 1));
+        }
+    }
+
+    #[test]
+    fn captured_provider_fixtures_are_valid_and_chunk_stable() {
+        let fixtures = [
+            (
+                "codex_cli",
+                include_str!("../tests/fixtures/ai/codex/0.144.1/basic.jsonl"),
+                "FIXTURE_OK",
+            ),
+            (
+                "claude_cli",
+                include_str!("../tests/fixtures/ai/claude/2.1.128/auth-error.jsonl"),
+                "Not logged in · Please run /login",
+            ),
+            (
+                "grok_cli",
+                include_str!("../tests/fixtures/ai/grok/0.2.111/basic.jsonl"),
+                "FIXTURE_OK",
+            ),
+            (
+                "kimi_cli",
+                include_str!("../tests/fixtures/ai/kimi/1.49.0/basic-tool.jsonl"),
+                "Checking\n\nFinished",
+            ),
+        ];
+
+        for (provider, stream, expected) in fixtures {
+            assert_jsonl_fixture(stream);
+            for chunk_size in [1, 7, stream.len()] {
+                let (decoder, _) = decode_in_chunks(provider, stream, chunk_size);
+                assert_eq!(
+                    decoder.output, expected,
+                    "{provider} changed at chunk size {chunk_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn captured_grok_multiplex_stream_has_no_child_identity() {
+        let stream = include_str!("../tests/fixtures/ai/grok/0.2.111/parent-child.jsonl");
+        assert_jsonl_fixture(stream);
+        let text_events = stream
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|value| value.get("type").and_then(Value::as_str) == Some("text"))
+            .collect::<Vec<_>>();
+        assert_eq!(text_events.len(), 3);
+        assert!(text_events.iter().all(|value| {
+            string_at(
+                value,
+                &[
+                    "subagent_id",
+                    "subagentId",
+                    "child_session_id",
+                    "childSessionId",
+                ],
+            )
+            .is_none()
+        }));
+
+        let (decoder, _) = decode_in_chunks("grok_cli", stream, 7);
+        assert_eq!(
+            decoder.output,
+            "Spawning one subagent to compute 2+2.4PARENT_DONE"
+        );
+    }
+
     #[test]
     fn claude_real_wire_task_result_correlates_subjectless_updates_into_one_plan_row() {
         let stream = concat!(

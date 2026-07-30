@@ -1,0 +1,3 @@
+{"role":"assistant","content":"Checking","tool_calls":[{"type":"function","id":"read-1","function":{"name":"Read","arguments":"{\"file_path\":\"README.md\"}"}}]}
+{"role":"tool","content":[{"type":"text","text":"<system>Command completed</system>"},{"type":"text","text":"contents"}],"tool_call_id":"read-1"}
+{"role":"assistant","content":"Finished"}
