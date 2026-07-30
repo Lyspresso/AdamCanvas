@@ -1,3 +1,4 @@
+pub mod agents_panel;
 pub mod ai;
 pub mod ai_prompt;
 pub mod ai_state;
