@@ -1,0 +1,78 @@
+{
+  "fill" : {
+    "linear-gradient" : [
+      "srgb:0.44216,0.67459,1.00000,1.00000",
+      "srgb:0.08805,0.45316,0.91719,1.00000"
+    ],
+    "orientation" : {
+      "start" : {
+        "x" : 0.5,
+        "y" : 1
+      },
+      "stop" : {
+        "x" : 0.5,
+        "y" : 0.3
+      }
+    }
+  },
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "hidden" : false,
+          "image-name" : "earl test.png",
+          "name" : "earl test",
+          "opacity" : 1,
+          "position" : {
+            "scale" : 1.33,
+            "translation-in-points" : [
+              -3.324999999999932,
+              -9.974999999999909
+            ]
+          }
+        },
+        {
+          "glass" : false,
+          "hidden" : true,
+          "image-name" : "earl.png",
+          "name" : "earl",
+          "opacity" : 1,
+          "position" : {
+            "scale" : 1.48,
+            "translation-in-points" : [
+              0,
+              -61
+            ]
+          }
+        },
+        {
+          "hidden" : true,
+          "image-name" : "Image.png",
+          "name" : "Image",
+          "position" : {
+            "scale" : 1.39,
+            "translation-in-points" : [
+              1.1368683772161603e-13,
+              87.89749707725468
+            ]
+          }
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}

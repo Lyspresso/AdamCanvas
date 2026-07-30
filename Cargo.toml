@@ -1,0 +1,103 @@
+[package]
+name = "adam-canvas"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.92"
+description = "A fast, local-first spatial canvas for macOS"
+license = "MIT"
+
+[[bin]]
+name = "Adam"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+arboard = { version = "3.6", features = ["image-data"] }
+bytemuck = { version = "1.24", features = ["derive"] }
+crossbeam-channel = "0.5"
+dirs = "6.0"
+eframe = { version = "0.35", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "persistence",
+    "wgpu",
+] }
+egui = { version = "0.35", features = ["serde"] }
+env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
+image = { version = "0.25", default-features = false, features = [
+    "gif",
+    "jpeg",
+    "png",
+    "tiff",
+    "webp",
+] }
+log = "0.4"
+open = "5.3"
+rfd = "0.17"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+thiserror = "2.0"
+url = "2.5"
+uuid = { version = "1.18", features = ["serde", "v4"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSAccessibility",
+    "NSPasteboard",
+    "NSWorkspace",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+    "CFURL",
+] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGBitmapContext",
+    "CGColorSpace",
+    "CGContext",
+    "CGImage",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSString",
+    "NSURL",
+] }
+objc2-image-io = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGImageProperties",
+    "CGImageSource",
+    "objc2-core-graphics",
+] }
+objc2-vision = { version = "0.3", default-features = false, features = [
+    "std",
+    "VNClassifyImageRequest",
+    "VNObservation",
+    "VNRecognizeTextRequest",
+    "VNRequest",
+    "VNRequestHandler",
+    "VNTypes",
+    "objc2-core-foundation",
+] }
+winit = { version = "0.30", default-features = false }
+
+[dev-dependencies]
+tempfile = "3.20"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = "symbols"

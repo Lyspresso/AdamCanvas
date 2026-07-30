@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" aria-label="Adam app icon">
+  <defs>
+    <linearGradient id="background" x1="150" y1="92" x2="864" y2="930" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#58B8FF"/>
+      <stop offset="0.48" stop-color="#1687F8"/>
+      <stop offset="1" stop-color="#6157E8"/>
+    </linearGradient>
+    <linearGradient id="paper" x1="328" y1="268" x2="706" y2="770" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#ECF5FF"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="170%">
+      <feDropShadow dx="0" dy="24" stdDeviation="30" flood-color="#003A78" flood-opacity=".32"/>
+    </filter>
+  </defs>
+  <rect x="72" y="72" width="880" height="880" rx="202" fill="url(#background)"/>
+  <path d="M172 284C342 140 690 112 862 280" fill="none" stroke="#FFFFFF" stroke-opacity=".18" stroke-width="44" stroke-linecap="round"/>
+  <g filter="url(#shadow)">
+    <rect x="245" y="226" width="534" height="572" rx="72" fill="#D6E9FF" fill-opacity=".72" transform="rotate(-7 512 512)"/>
+    <rect x="245" y="226" width="534" height="572" rx="72" fill="url(#paper)"/>
+  </g>
+  <rect x="305" y="289" width="190" height="168" rx="34" fill="#FFD66D"/>
+  <rect x="529" y="289" width="190" height="250" rx="34" fill="#63D6B3"/>
+  <rect x="305" y="491" width="190" height="244" rx="34" fill="#FF8B9C"/>
+  <rect x="529" y="573" width="190" height="162" rx="34" fill="#7DB9FF"/>
+  <path d="M338 334h124M338 370h88" stroke="#8C6414" stroke-opacity=".62" stroke-width="18" stroke-linecap="round"/>
+  <circle cx="624" cy="384" r="49" fill="#FFFFFF" fill-opacity=".72"/>
+  <path d="m594 505 33-35 58 70" fill="none" stroke="#167B60" stroke-opacity=".72" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M341 548h118M341 586h91M341 624h105" stroke="#A93348" stroke-opacity=".52" stroke-width="18" stroke-linecap="round"/>
+  <path d="M573 650h103M573 688h71" stroke="#165DA8" stroke-opacity=".55" stroke-width="18" stroke-linecap="round"/>
+</svg>
