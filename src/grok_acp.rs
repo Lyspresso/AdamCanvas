@@ -1148,8 +1148,19 @@ where
         started_at,
         &mut state,
     );
+    finish_protocol_result(result, &mut state, emit)
+}
+
+fn finish_protocol_result<E>(
+    result: Result<GrokAcpOutcome, GrokAcpError>,
+    state: &mut ProtocolState<'_>,
+    emit: &mut E,
+) -> Result<GrokAcpOutcome, GrokAcpError>
+where
+    E: FnMut(GrokAcpEvent),
+{
     if result.is_err() {
-        let _ = state.close_active_children(emit);
+        state.flush_error_projection(emit);
     }
     result
 }
@@ -1898,6 +1909,7 @@ struct ProtocolState<'a> {
     sessions: HashMap<String, SessionStreamState>,
     children: HashMap<String, ChildRegistration>,
     child_order: Vec<String>,
+    child_tracking_degraded: bool,
     seen_event_ids: HashSet<(String, String)>,
     quarantined_event_ids: HashSet<(String, String)>,
     quarantine: VecDeque<QuarantinedUpdate>,
@@ -1934,6 +1946,7 @@ impl<'a> ProtocolState<'a> {
             sessions: HashMap::new(),
             children: HashMap::new(),
             child_order: Vec::new(),
+            child_tracking_degraded: false,
             seen_event_ids: HashSet::new(),
             quarantined_event_ids: HashSet::new(),
             quarantine: VecDeque::new(),
@@ -2199,6 +2212,9 @@ impl<'a> ProtocolState<'a> {
         let event_id = self.event_id(params, update)?;
 
         let scope = self.scope_for_session(&session_id)?;
+        if scope.is_none() && self.child_tracking_degraded && self.subagents_enabled {
+            return Ok(());
+        }
         let lifecycle_update = matches!(
             update_kind,
             "subagent_spawned" | "subagent_progress" | "subagent_finished"
@@ -2630,9 +2646,13 @@ impl<'a> ProtocolState<'a> {
                     return Ok(());
                 }
                 if self.children.len() >= MAX_TRACKED_CHILDREN {
-                    return Err(GrokAcpError::Protocol(format!(
-                        "Grok exceeded Adam's bounded {MAX_TRACKED_CHILDREN}-child registry"
-                    )));
+                    // Lifecycle projection is optional detail; the root turn is
+                    // authoritative. Once the bounded registry is full, stop
+                    // registering additional children and ignore their scoped
+                    // updates instead of aborting completed root work.
+                    self.child_tracking_degraded = true;
+                    self.clear_quarantine();
+                    return Ok(());
                 }
                 if self.sessions.contains_key(&spawned.child_session_id) {
                     return Err(GrokAcpError::Protocol(
@@ -2683,6 +2703,9 @@ impl<'a> ProtocolState<'a> {
                     self.authorization,
                 )?;
                 let Some(registration) = self.children.get(&child_session_id) else {
+                    if self.child_tracking_degraded {
+                        return Ok(());
+                    }
                     return Err(GrokAcpError::Protocol(
                         "subagent progress referenced an unregistered child".into(),
                     ));
@@ -2729,6 +2752,9 @@ impl<'a> ProtocolState<'a> {
                     self.authorization,
                 )?;
                 let Some(registration) = self.children.get(&child_session_id) else {
+                    if self.child_tracking_degraded {
+                        return Ok(());
+                    }
                     return Err(GrokAcpError::Protocol(
                         "subagent result referenced an unregistered child".into(),
                     ));
@@ -3196,6 +3222,23 @@ impl<'a> ProtocolState<'a> {
             }
         }
         first_flush_error.map_or(Ok(()), Err)
+    }
+
+    fn flush_error_projection<E>(&mut self, emit: &mut E)
+    where
+        E: FnMut(GrokAcpEvent),
+    {
+        // Preserve the original provider/protocol error while making every
+        // already-accepted piece of user-visible state observable. Each flush
+        // is independently best-effort so one malformed child cannot prevent
+        // the root's partial answer, tools, or plan from being recovered.
+        let _ = self.close_active_children(emit);
+        self.clear_quarantine();
+        let _ = self.flush_text_streams(emit);
+        if let Some(session_id) = self.session_id.clone() {
+            let _ = self.flush_pending_tool_calls(&session_id, emit);
+            let _ = self.flush_pending_plan(&session_id, emit);
+        }
     }
 
     fn outcome(&self, stop_reason: GrokAcpStopReason) -> GrokAcpOutcome {
@@ -5945,6 +5988,305 @@ mod tests {
             events
                 .iter()
                 .any(|event| matches!(event, GrokAcpEvent::Terminal { .. }))
+        );
+    }
+
+    #[test]
+    fn error_projection_recovers_suppressed_root_child_tool_and_plan_state_once() {
+        let mut state = ProtocolState::new("", 1, 100_000, 1_000_000).with_subagents(true);
+        state.set_root_session("root".into()).unwrap();
+        state.session_negotiated = true;
+        let mut events = Vec::new();
+        assert!(state.emit_detail(
+            "root",
+            &mut |event| events.push(event),
+            GrokAcpEvent::AgentThoughtChunk {
+                session_id: "root".into(),
+                message_id: "budget".into(),
+                text: "consume detail budget".into(),
+            },
+        ));
+        state
+            .apply_session_update(
+                &spawn_update("child-agent", "child-session", "spawn-child"),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        for (session_id, text, event_id) in [
+            ("root", "root partial answer", "root-message"),
+            ("child-session", "child partial answer", "child-message"),
+        ] {
+            state
+                .apply_session_update(
+                    &json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": "answer",
+                            "content": {"type": "text", "text": text}
+                        },
+                        "_meta": {"eventId": event_id}
+                    }),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+        }
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "root-tool",
+                        "title": "Inspect files",
+                        "kind": "read",
+                        "status": "completed"
+                    },
+                    "_meta": {"eventId": "root-tool-event"}
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "plan",
+                        "entries": [{
+                            "content": "Preserve partial work",
+                            "priority": "high",
+                            "status": "in_progress"
+                        }]
+                    },
+                    "_meta": {"eventId": "root-plan-event"}
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+
+        state.flush_error_projection(&mut |event| events.push(event));
+        state.flush_error_projection(&mut |event| events.push(event));
+
+        assert_eq!(state.response_text, "root partial answer");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GrokAcpEvent::AgentMessageChunk { text, .. }
+                        if text == "root partial answer"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GrokAcpEvent::ChildMessage { text, .. }
+                        if text == "child partial answer"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::ToolCallUpdate { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::PlanSnapshot { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::SubagentFinished { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn every_post_session_error_preserves_suppressed_root_text_and_original_cause() {
+        let errors = [
+            GrokAcpError::TimedOut { seconds: 60 },
+            GrokAcpError::UnexpectedEof,
+            GrokAcpError::Exited { code: Some(7) },
+            GrokAcpError::ProtocolByteLimit { limit: 64 },
+            GrokAcpError::TextLimit { limit: 32 },
+            GrokAcpError::Protocol("fixture protocol failure".into()),
+        ];
+        for error in errors {
+            let expected_error = error.to_string();
+            let mut state = ProtocolState::new("", 1, 100_000, 1_000_000);
+            state.set_root_session("root".into()).unwrap();
+            let mut events = Vec::new();
+            assert!(state.emit_detail(
+                "root",
+                &mut |event| events.push(event),
+                GrokAcpEvent::AgentThoughtChunk {
+                    session_id: "root".into(),
+                    message_id: "budget".into(),
+                    text: "consume budget".into(),
+                },
+            ));
+            state
+                .apply_session_update(
+                    &json!({
+                        "sessionId": "root",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": "answer",
+                            "content": {"type": "text", "text": "preserved partial answer"}
+                        }
+                    }),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+
+            let result =
+                finish_protocol_result(Err(error), &mut state, &mut |event| events.push(event));
+
+            assert_eq!(result.unwrap_err().to_string(), expected_error);
+            assert_eq!(state.response_text, "preserved partial answer");
+            assert!(events.iter().any(|event| matches!(
+                event,
+                GrokAcpEvent::AgentMessageChunk { text, .. }
+                    if text == "preserved partial answer"
+            )));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, GrokAcpEvent::Terminal { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn cumulative_child_registry_degrades_without_aborting_the_root_turn() {
+        let mut state = scoped_state();
+        let mut events = Vec::new();
+        for index in 0..MAX_TRACKED_CHILDREN {
+            let subagent_id = format!("agent-{index}");
+            let child_session_id = format!("child-{index}");
+            state
+                .apply_session_update(
+                    &spawn_update(&subagent_id, &child_session_id, &format!("spawn-{index}")),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+            state
+                .apply_session_update(
+                    &finish_update(&subagent_id, &child_session_id, &format!("finish-{index}")),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+        }
+        state
+            .apply_session_update(
+                &spawn_update("agent-overflow", "child-overflow", "spawn-overflow"),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        assert!(state.child_tracking_degraded);
+        assert_eq!(state.children.len(), MAX_TRACKED_CHILDREN);
+        assert_eq!(state.child_order.len(), MAX_TRACKED_CHILDREN);
+
+        // Updates from children beyond the projection bound are discarded,
+        // including malformed detail without an event ID, while root output
+        // remains live and the provider turn continues.
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "child-overflow",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "untracked child detail"}
+                    }
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        state
+            .apply_session_update(
+                &finish_update("agent-overflow", "child-overflow", "finish-overflow"),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        assert!(
+            state
+                .permission_scope(&json!({"sessionId": "child-overflow"}))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .parse_permission_request(&json!({
+                    "sessionId": "root",
+                    "toolCall": {
+                        "toolCallId": "untracked-child-tool",
+                        "title": "Write file",
+                        "kind": "edit"
+                    },
+                    "options": [{
+                        "optionId": "allow",
+                        "name": "Allow once",
+                        "kind": "allow_once"
+                    }]
+                }))
+                .unwrap()
+                .is_none()
+        );
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "root-answer",
+                        "content": {"type": "text", "text": "root still completes."}
+                    }
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        state
+            .flush_text_streams(&mut |event| events.push(event))
+            .unwrap();
+
+        assert_eq!(state.response_text, "root still completes.");
+        assert!(state.ensure_quarantine_resolved().is_ok());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::SubagentSpawned { .. }))
+                .count(),
+            MAX_TRACKED_CHILDREN
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::SubagentFinished { .. }))
+                .count(),
+            MAX_TRACKED_CHILDREN
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    GrokAcpEvent::AgentMessageChunk { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "root still completes."
         );
     }
 
