@@ -565,7 +565,50 @@ where
     E: FnMut(KimiAcpEvent),
 {
     let mut state = ProtocolState::new(request);
+    let result = drive_protocol_with_state(
+        request,
+        cancelled,
+        permission,
+        emit,
+        child,
+        stdin,
+        wire_receiver,
+        started_at,
+        &mut state,
+    );
+    finish_protocol_result(result, &mut state, emit)
+}
 
+fn finish_protocol_result<E>(
+    result: Result<KimiAcpOutcome, KimiAcpError>,
+    state: &mut ProtocolState,
+    emit: &mut E,
+) -> Result<KimiAcpOutcome, KimiAcpError>
+where
+    E: FnMut(KimiAcpEvent),
+{
+    if result.is_err() {
+        state.flush_error_projection(emit);
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_protocol_with_state<P, E>(
+    request: &KimiAcpRequest,
+    cancelled: &AtomicBool,
+    permission: &mut P,
+    emit: &mut E,
+    child: &mut Child,
+    stdin: &mut ProtocolStdin<'_>,
+    wire_receiver: &Receiver<WireEvent>,
+    started_at: Instant,
+    state: &mut ProtocolState,
+) -> Result<KimiAcpOutcome, KimiAcpError>
+where
+    P: FnMut(&KimiAcpPermissionRequest) -> KimiAcpPermissionDecision,
+    E: FnMut(KimiAcpEvent),
+{
     if stdin.write_json_line(&initialize_request())? == StdinWriteDisposition::Cancelled {
         return state.cancelled_outcome(emit);
     }
@@ -580,7 +623,7 @@ where
         stdin,
         wire_receiver,
         started_at,
-        &mut state,
+        state,
     )? {
         AwaitedResponse::Result(result) => result,
         AwaitedResponse::Cancelled => return state.cancelled_outcome(emit),
@@ -606,7 +649,7 @@ where
         stdin,
         wire_receiver,
         started_at,
-        &mut state,
+        state,
     )? {
         AwaitedResponse::Result(result) => result,
         AwaitedResponse::Cancelled => return state.cancelled_outcome(emit),
@@ -649,7 +692,7 @@ where
             stdin,
             wire_receiver,
             started_at,
-            &mut state,
+            state,
         )? {
             AwaitedResponse::Result(result) => result,
             AwaitedResponse::Cancelled => return state.cancelled_outcome(emit),
@@ -678,7 +721,7 @@ where
         stdin,
         wire_receiver,
         started_at,
-        &mut state,
+        state,
     )? {
         AwaitedResponse::Result(result) => result,
         AwaitedResponse::Cancelled => return state.cancelled_outcome(emit),
@@ -1566,6 +1609,17 @@ impl ProtocolState {
             )?;
         }
         Ok(())
+    }
+
+    fn flush_error_projection<E>(&mut self, emit: &mut E)
+    where
+        E: FnMut(KimiAcpEvent),
+    {
+        // Preserve the original provider/protocol error while making every
+        // already-accepted piece of user-visible root state observable. The
+        // projection is idempotent, so an error after a clean-path flush does
+        // not duplicate text, tool, or plan events.
+        let _ = self.flush_projection(emit);
     }
 
     fn account_text(&mut self, bytes: usize) -> Result<(), KimiAcpError> {
@@ -3195,6 +3249,209 @@ mod tests {
             .unwrap();
         assert!(tool_index < permission_index);
         assert!(plan_index < permission_index);
+    }
+
+    #[test]
+    fn error_projection_recovers_suppressed_root_swarm_and_latest_plan_once() {
+        let mut constrained = request();
+        constrained.limits.max_events = 1;
+        let mut state = ProtocolState::new(&constrained);
+        state.root_session_id = Some("session-1".into());
+        state.session_started = true;
+        let mut events = Vec::new();
+        assert!(state.emit_detail(
+            &mut |event| events.push(event),
+            KimiAcpEvent::AgentThoughtChunk {
+                session_id: "session-1".into(),
+                text: "consume detail budget".into(),
+            },
+        ));
+        for update in [
+            json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "preserved partial answer"}
+            }),
+            json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "swarm-1",
+                "title": "AgentSwarm",
+                "kind": "execute",
+                "status": "in_progress",
+                "rawInput": {"task": "research in parallel"}
+            }),
+            json!({
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "swarm-1",
+                "status": "completed",
+                "rawOutput": {
+                    "members": [
+                        {"id": "child-1", "output": "first result"},
+                        {"id": "child-2", "output": "second result"}
+                    ]
+                }
+            }),
+            json!({
+                "sessionUpdate": "plan",
+                "entries": [{
+                    "content": "Stale plan",
+                    "priority": "high",
+                    "status": "in_progress"
+                }]
+            }),
+            json!({
+                "sessionUpdate": "plan",
+                "entries": [{
+                    "content": "Final plan",
+                    "priority": "high",
+                    "status": "completed"
+                }]
+            }),
+        ] {
+            state
+                .apply_session_update(
+                    &json!({"sessionId": "session-1", "update": update}),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+        }
+
+        let result =
+            finish_protocol_result(Err(KimiAcpError::UnexpectedEof), &mut state, &mut |event| {
+                events.push(event)
+            });
+        state.flush_error_projection(&mut |event| events.push(event));
+
+        assert!(matches!(result, Err(KimiAcpError::UnexpectedEof)));
+        assert_eq!(state.response_text, "preserved partial answer");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    KimiAcpEvent::AgentMessageChunk { text, .. }
+                        if text == "preserved partial answer"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    KimiAcpEvent::ToolCallUpdate { tool_call, .. }
+                        if tool_call.id == "swarm-1"
+                            && tool_call.status == Some(KimiAcpToolStatus::Completed)
+                            && tool_call.raw_output.as_ref().and_then(|output| {
+                                output.pointer("/members/1/id").and_then(Value::as_str)
+                            }) == Some("child-2")
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    KimiAcpEvent::PlanSnapshot { entries, .. }
+                        if entries.first().is_some_and(|entry| {
+                            entry.content == "Final plan"
+                                && entry.status == KimiAcpPlanStatus::Completed
+                        })
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, KimiAcpEvent::Terminal { .. }))
+        );
+    }
+
+    #[test]
+    fn every_post_session_error_preserves_suppressed_root_text_and_original_cause() {
+        let errors = [
+            KimiAcpError::UnsupportedRuntime {
+                found: "0.32.0".into(),
+            },
+            KimiAcpError::Io {
+                operation: "reading Kimi ACP stdout",
+                source: io::Error::other("fixture I/O failure"),
+            },
+            KimiAcpError::InvalidJson(
+                serde_json::from_str::<Value>("{").expect_err("fixture must be invalid JSON"),
+            ),
+            KimiAcpError::Protocol("fixture protocol failure".into()),
+            KimiAcpError::Rpc {
+                method: "session/prompt",
+                code: -32_000,
+                message: "fixture RPC failure".into(),
+            },
+            KimiAcpError::Exited { code: Some(7) },
+            KimiAcpError::UnexpectedEof,
+            KimiAcpError::LineTooLarge { limit: 64 },
+            KimiAcpError::TextLimit { limit: 32 },
+            KimiAcpError::ProtocolByteLimit { limit: 128 },
+            KimiAcpError::TimedOut { seconds: 60 },
+            KimiAcpError::ProviderCancelled,
+            KimiAcpError::InvalidPermissionSelection,
+            KimiAcpError::UnsupportedConfigSelection {
+                config_id: "thinking",
+                value: "maximum".into(),
+            },
+        ];
+        for error in errors {
+            let expected_error = error.to_string();
+            let mut constrained = request();
+            constrained.limits.max_events = 1;
+            let mut state = ProtocolState::new(&constrained);
+            state.root_session_id = Some("session-1".into());
+            state.session_started = true;
+            let mut events = Vec::new();
+            assert!(state.emit_detail(
+                &mut |event| events.push(event),
+                KimiAcpEvent::AgentThoughtChunk {
+                    session_id: "session-1".into(),
+                    text: "consume detail budget".into(),
+                },
+            ));
+            state
+                .apply_session_update(
+                    &json!({
+                        "sessionId": "session-1",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "preserved partial answer"}
+                        }
+                    }),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+
+            let result =
+                finish_protocol_result(Err(error), &mut state, &mut |event| events.push(event));
+
+            assert_eq!(result.unwrap_err().to_string(), expected_error);
+            assert_eq!(state.response_text, "preserved partial answer");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        KimiAcpEvent::AgentMessageChunk { text, .. }
+                            if text == "preserved partial answer"
+                    ))
+                    .count(),
+                1
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, KimiAcpEvent::Terminal { .. }))
+            );
+        }
     }
 
     #[test]
