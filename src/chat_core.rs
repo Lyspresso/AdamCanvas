@@ -2284,6 +2284,7 @@ pub enum ChildEventChannel {
     Disabled,
     CodexExecCollabV1,
     ClaudeStreamJsonAgentV1,
+    GrokAcpScopedSessionV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2352,9 +2353,15 @@ pub fn runtime_tuning_profile(
         (ProviderKind::Grok, Some(version)) if version.is(0, 2, 114) => {
             // The installed 0.2.114 model metadata still advertises exactly
             // low/medium/high for grok-4.5. ACP makes task calls structured,
-            // but scoped child prose remains a PR 3 capability.
+            // but this runtime has no independently verified scoped child
+            // channel, so subagents remain disabled.
             (GROK_REASONING_0_2_111, ChildEventChannel::Disabled, true)
         }
+        (ProviderKind::Grok, Some(version)) if version.is(0, 2, 117) => (
+            GROK_REASONING_0_2_111,
+            ChildEventChannel::GrokAcpScopedSessionV1,
+            true,
+        ),
         (ProviderKind::Kimi, Some(version)) if version.is(1, 49, 0) => {
             (NO_REASONING, ChildEventChannel::Disabled, true)
         }
@@ -5263,6 +5270,7 @@ mod tests {
             ("2.1.128 (Claude Code)", (2, 1, 128)),
             ("grok 0.2.111 (94172f2aa4e5)", (0, 2, 111)),
             ("grok 0.2.114 (0c785038798)", (0, 2, 114)),
+            ("grok 0.2.117 (f1c06093089f)", (0, 2, 117)),
             ("warning\nkimi, version 1.49.0", (1, 49, 0)),
             ("Warning: client version is 0.32.1", (0, 32, 1)),
         ] {
@@ -5341,8 +5349,26 @@ mod tests {
             runtime_tuning_profile(ProviderKind::Grok, Some(&installed_grok), "grok-4.5");
         assert_eq!(
             installed_grok_tuning.child_event_channel,
-            ChildEventChannel::Disabled
+            ChildEventChannel::GrokAcpScopedSessionV1
         );
+        assert!(installed_grok_tuning.verified_runtime);
+        assert!(installed_grok_tuning.supports_scoped_child_text());
+        assert_eq!(
+            installed_grok_tuning.reasoning_efforts,
+            GROK_REASONING_0_2_111
+        );
+
+        for unverified in ["grok 0.2.116", "grok 0.2.118"] {
+            let version = CliVersion::parse(unverified).unwrap();
+            let tuning = runtime_tuning_profile(ProviderKind::Grok, Some(&version), "grok-4.5");
+            assert!(!tuning.verified_runtime, "{unverified}");
+            assert_eq!(
+                tuning.child_event_channel,
+                ChildEventChannel::Disabled,
+                "{unverified}"
+            );
+            assert!(!tuning.supports_scoped_child_text(), "{unverified}");
+        }
 
         let kimi = CliVersion::parse("kimi, version 1.49.0").unwrap();
         let kimi_tuning = runtime_tuning_profile(ProviderKind::Kimi, Some(&kimi), "kimi");
@@ -5357,5 +5383,142 @@ mod tests {
         assert!(!unknown.verified_runtime);
         assert!(unknown.reasoning_efforts.is_empty());
         assert!(!unknown.supports_scoped_child_text());
+
+        let missing_version = runtime_tuning_profile(ProviderKind::Grok, None, "grok-4.5");
+        assert!(!missing_version.verified_runtime);
+        assert_eq!(
+            missing_version.child_event_channel,
+            ChildEventChannel::Disabled
+        );
+        assert!(!missing_version.supports_scoped_child_text());
+    }
+
+    #[test]
+    fn captured_grok_0_2_117_scopes_child_prose_on_the_acp_session_id() {
+        fn update_kind(message: &serde_json::Value) -> Option<&str> {
+            message
+                .pointer("/params/update/sessionUpdate")
+                .and_then(serde_json::Value::as_str)
+        }
+
+        let fixture = include_str!("../tests/fixtures/ai/grok/0.2.117/acp-scoped-subagent.jsonl");
+        let messages = fixture
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        let initialize = &messages[0]["result"];
+        assert_eq!(initialize["_meta"]["agentVersion"], "0.2.117");
+        let efforts =
+            initialize["_meta"]["modelState"]["availableModels"][0]["_meta"]["reasoningEfforts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|effort| effort["value"].as_str().unwrap())
+                .collect::<Vec<_>>();
+        assert_eq!(efforts, ["high", "medium", "low"]);
+
+        let root_session_id = messages[1]["result"]["sessionId"].as_str().unwrap();
+        let spawned = messages
+            .iter()
+            .find(|message| update_kind(message) == Some("subagent_spawned"))
+            .unwrap();
+        let child_session_id = spawned
+            .pointer("/params/update/child_session_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert_eq!(spawned["method"], "_x.ai/session_notification");
+        assert_eq!(spawned["params"]["sessionId"], root_session_id);
+        assert_eq!(
+            spawned["params"]["update"]["parent_session_id"],
+            root_session_id
+        );
+        assert_eq!(spawned["params"]["update"]["subagent_id"], child_session_id);
+        assert_eq!(spawned["params"]["update"]["subagent_type"], "explore");
+        assert_eq!(spawned["params"]["update"]["role"], "explore");
+        assert!(
+            !spawned["params"]["_meta"]["eventId"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+
+        let model_changed = messages
+            .iter()
+            .find(|message| update_kind(message) == Some("model_changed"))
+            .unwrap();
+        assert_eq!(
+            model_changed["params"]["sessionId"].as_str(),
+            Some(child_session_id)
+        );
+        assert_eq!(model_changed["params"]["update"]["model_id"], "grok-4.5");
+        assert!(
+            model_changed["params"].get("_meta").is_none(),
+            "the captured status-only update is intentionally idless"
+        );
+
+        let child_messages = messages
+            .iter()
+            .filter(|message| {
+                update_kind(message) == Some("agent_message_chunk")
+                    && message["params"]["sessionId"] == child_session_id
+            })
+            .collect::<Vec<_>>();
+        assert!(!child_messages.is_empty());
+        assert!(child_messages.iter().all(|message| {
+            message["method"] == "session/update"
+                && !message["params"]["_meta"]["eventId"]
+                    .as_str()
+                    .unwrap()
+                    .is_empty()
+        }));
+        let child_text = child_messages
+            .iter()
+            .map(|message| {
+                message["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(child_text, "CHILD_OK_4");
+
+        let finished = messages
+            .iter()
+            .find(|message| update_kind(message) == Some("subagent_finished"))
+            .unwrap();
+        assert_eq!(finished["method"], "_x.ai/session_notification");
+        assert_eq!(finished["params"]["sessionId"], root_session_id);
+        assert_eq!(
+            finished["params"]["update"]["subagent_id"],
+            child_session_id
+        );
+        assert_eq!(
+            finished["params"]["update"]["child_session_id"],
+            child_session_id
+        );
+        assert_eq!(finished["params"]["update"]["output"], "CHILD_OK_4");
+
+        let parent_messages = messages
+            .iter()
+            .filter(|message| {
+                update_kind(message) == Some("agent_message_chunk")
+                    && message["params"]["sessionId"] == root_session_id
+            })
+            .collect::<Vec<_>>();
+        let parent_text = parent_messages
+            .iter()
+            .map(|message| {
+                message["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(parent_text, "PARENT_OK_4");
+        assert_eq!(
+            messages.last().unwrap()["result"]["_meta"]["sessionId"],
+            root_session_id
+        );
     }
 }

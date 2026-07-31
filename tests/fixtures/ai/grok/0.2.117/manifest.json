@@ -1,0 +1,25 @@
+{
+  "provider": "Grok CLI",
+  "version": "0.2.117",
+  "build": "f1c06093089f",
+  "capturedAt": "2026-07-31",
+  "captures": [
+    {
+      "files": [
+        "acp-scoped-subagent.jsonl"
+      ],
+      "transport": "ACP (Agent Client Protocol)",
+      "command": "grok --cwd <TEMP_WORKSPACE> --sandbox read-only --permission-mode default --disable-web-search --no-plan --no-memory --max-turns 8 agent --no-leader --model grok-4.5 --reasoning-effort low stdio",
+      "prompt": "Use spawn_subagent exactly once. Spawn one foreground explore subagent with read-only capability to compute 2+2 without web or files and return only CHILD_OK_4. Wait for it, then reply only PARENT_OK_4.",
+      "note": "Fresh live ACP exchange completed successfully. The root session emitted _x.ai/session_notification lifecycle records; subagent_id and child_session_id were the same provider id. Child session/update prose carried that id in params.sessionId, while PARENT_OK_4 stayed on the root session. The child also emitted an idless model_changed status update using model_id; it is retained as a schema-confirmed status-only shape."
+    }
+  ],
+  "redactions": [
+    "session, prompt, request and event ids replaced consistently; subagent_id and child_session_id deliberately share <CHILD_SESSION>",
+    "temporary workspace path, hostname and provider instance identifiers omitted",
+    "auth methods, local MCP servers, available commands and unrelated provider extension metadata omitted",
+    "timestamps normalized to zero; provider prose chunk boundaries retained exactly; the idless model_changed shape has no omitted _meta",
+    "terminal cost and aggregate usage fields omitted; per-update token counts retained as inert shape examples"
+  ],
+  "note": "This fixture proves only the exact Grok 0.2.117 scoped-child contract. Neighboring and unknown versions remain disabled until independently captured."
+}
