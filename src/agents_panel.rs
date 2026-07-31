@@ -51,7 +51,7 @@ pub enum AgentAvailability {
 const TESTED_VERSIONS: &[(&str, &str)] = &[
     ("claude_cli", "2.1.128"),
     ("codex_cli", "0.144.1"),
-    ("grok_cli", "0.2.111"),
+    ("grok_cli", "0.2.114"),
     ("kimi_cli", "1.49.0"),
     ("ollama", "0.32.1"),
 ];
@@ -1871,10 +1871,12 @@ mod tests {
 
     #[test]
     fn newer_patch_in_a_tested_series_classifies_as_series_tested() {
-        match classify_probe("grok_cli", &probe(Some("/bin/grok"), Some("0.2.114"))) {
+        // 0.2.114 itself is a contract row (PR 2), so the series badge is
+        // demonstrated with the next patch above the tested version.
+        match classify_probe("grok_cli", &probe(Some("/bin/grok"), Some("0.2.115"))) {
             AgentAvailability::DetectedSeriesTested { version, tested } => {
-                assert_eq!((version.major, version.minor, version.patch), (0, 2, 114));
-                assert_eq!((tested.major, tested.minor, tested.patch), (0, 2, 111));
+                assert_eq!((version.major, version.minor, version.patch), (0, 2, 115));
+                assert_eq!((tested.major, tested.minor, tested.patch), (0, 2, 114));
             }
             other => panic!("expected series-tested, got {other:?}"),
         }

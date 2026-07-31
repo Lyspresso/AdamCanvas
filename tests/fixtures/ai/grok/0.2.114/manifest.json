@@ -3,12 +3,32 @@
   "version": "0.2.114",
   "build": "0c785038798",
   "capturedAt": "2026-07-30",
-  "command": "grok --single <prompt> --output-format streaming-json --permission-mode auto --sandbox read-only --disable-web-search --no-plan --no-memory --reasoning-effort low --max-turns 5",
-  "redactions": [
-    "session and request ids replaced",
-    "cost values zeroed (keys retained — they are new in this version)",
-    "thought deltas coalesced",
-    "text chunks coalesced without changing their envelope shape"
+  "captures": [
+    {
+      "files": [
+        "basic.jsonl"
+      ],
+      "transport": "legacy streaming-json",
+      "command": "grok --single <prompt> --output-format streaming-json --permission-mode auto --sandbox read-only --disable-web-search --no-plan --no-memory --reasoning-effort low --max-turns 5",
+      "note": "Drift capture against the tested 0.2.111 grammar: identical envelope types (thought/text/end); text envelopes still carry NO child identity, so the subagents-off rule stands; the only change is additive cost keys on the end envelope."
+    },
+    {
+      "files": [
+        "acp-initialize.jsonl",
+        "acp-session-load.jsonl"
+      ],
+      "transport": "ACP (Agent Client Protocol)",
+      "command": "grok agent --no-leader stdio",
+      "exchange": "ACP initialize and session/load requests; no model prompt was sent"
+    }
   ],
-  "note": "Drift capture against the tested 0.2.111 grammar: identical envelope types (thought/text/end); text envelopes still carry NO child identity, so the subagents-off rule stands; the only change is additive cost keys on the end envelope. parent-child re-capture deliberately left for the contract-row landing (Codex lane)."
+  "redactions": [
+    "session, request, agent, instance and event ids replaced",
+    "workspace path and hostname replaced",
+    "pre-existing local MCP server name and port replaced",
+    "cost values zeroed (keys retained \u2014 they are new in this version)",
+    "thought deltas coalesced; text chunks coalesced without changing envelope shape",
+    "agent timestamp normalized; available command/tool catalogues and unrelated provider extension metadata omitted"
+  ],
+  "note": "Two independent captures of the same CLI version converged here: the legacy-grammar drift canary (Claude lane) and the ACP contract capture (Codex lane, PR 2). The 0.2.114 contract row in runtime_tuning_profile rests on the ACP capture; the drift canary documents that the legacy grammar did not change."
 }
