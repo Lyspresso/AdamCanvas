@@ -256,7 +256,13 @@ The visible choices map to real provider controls:
   blocked solely for dismissing the unsupported question. Background `Agent`
   jobs are refused: Adam’s
   per-turn ACP host cannot truthfully keep such a job alive or receive its
-  later notification after the root turn exits.
+  later notification after the root turn exits. Adam freshly re-probes Kimi
+  both at the resume gate and again at process preparation. If the executable
+  changes between those checks, preparation rejects the saved ACP session,
+  deletes its sidecar, and makes one explicitly session-free replay with the
+  full conversation context. The ACP ID is never passed into legacy print
+  mode. Only a detected legacy 1.x runtime receives the visible Cowork/Code
+  plus Automatic-access warning; unknown and unverified 0.x builds do not.
 - xAI Grok Heavy is a dedicated Responses API adapter, not the generic
   OpenAI-compatible path and not a Grok Build mode. It fixes the model to
   `grok-4.20-multi-agent`, sets `reasoning.effort`, and maps Low or Medium to
@@ -270,9 +276,11 @@ The visible choices map to real provider controls:
   `custom_tool_call` still fails closed because Adam exposed no such executor.
   The API exposes leader tool calls and the leader’s answer, so the only
   honest lifecycle is one aggregate 4- or 16-agent group. Stop wins a
-  serialized terminal race and releases the Adam run slot immediately; a
-  separately bounded cleanup count owns any blocking socket until it exits,
-  and late provider output is discarded.
+  serialized terminal race, cancels Adam’s HTTP transport, closes the live
+  connection, and joins the bounded worker before releasing the run slot.
+  xAI documents no synchronous Responses cancellation endpoint, so Adam does
+  not claim a server-side cancel: connection teardown is the truthful client
+  boundary. Late provider output cannot outlive that joined worker.
 - The captured Ollama runtime receives its supported `--think` level or
   boolean.
 - Custom CLI may use `{prompt}`, `{model}`, `{reasoning_effort}`, and
@@ -520,7 +528,11 @@ The four multi-agent contracts remain deliberately distinct:
   xAI’s servers. xAI returns only leader-visible tool calls and the leader’s
   final answer by default; intermediate child state is hidden. Adam therefore
   shows one aggregate group with the expected count and terminal state, with
-  no child tree, no per-child prose, and no made-up completed count.
+  no child tree, no per-child prose, and no made-up completed count. Adam keeps
+  a bounded registry of visible leader web searches; after it fills, further
+  searches continue at xAI but fine-grained Activity projection degrades
+  instead of aborting the root response. Every projected open tool row is
+  failed on cancellation, limits, malformed streams, or transport errors.
 
 Codex collaboration calls and subagent-activity items join thread aliases into
 the same child lifecycle. Claude Agent/legacy Task calls, task lifecycle
@@ -582,8 +594,10 @@ turn so the running agent’s scope cannot drift.
 Context deduplicates supplied files by path and shows provider-reported tool,
 command, web-search, and host-read use counts. Usage comes from the same typed
 event stream and keeps input, cached-input, reasoning, output, and cost fields
-separate. If older conversation turns are omitted from bounded replay, the
-replay meter says exactly how many.
+separate. For xAI, the exact integer `usage.cost_in_usd_ticks` value is retained
+and converted with 10,000,000,000 ticks per USD for the shared cost field. If
+older conversation turns are omitted from bounded replay, the replay meter
+says exactly how many.
 
 ## Prompt continuity
 
@@ -611,11 +625,16 @@ cancelled, or ID-less turn forgets the record, and a settings or permission
 change invalidates it. Adam never falls back to a provider’s vague “continue
 most recent” behavior.
 
-If a native resume fails before producing any text, thinking, tool, command,
-file, plan, or other substantive activity, Adam forgets the stale ID and makes
-one bounded-replay attempt without duplicating the committed user message.
-Once any substantive activity has appeared—even before a poisoned stream reset—
-Adam will not replay automatically, avoiding duplicated side effects.
+The existing CLI-native adapters can make one bounded fresh replay when a
+resumed process fails before any text, thinking, tool, command, file, plan, or
+other substantive activity begins. Grok Heavy is stricter because a generic
+network or provider failure is not proof that its paid server-side inference
+did no work: xAI fresh replay additionally requires the structured error code
+`previous_response_not_found` with `param` exactly `previous_response_id`.
+Lookalike free text, a timeout, a transport error, or any other provider error
+cannot launch a second xAI request. Adam then forgets the stale ID and replays
+without duplicating the committed user message. Once substantive activity has
+appeared, no provider replays automatically, avoiding duplicated side effects.
 
 xAI Grok Heavy uses the Responses API’s `previous_response_id` rather than a
 CLI session. Adam stores the last committed response ID only after a completed
@@ -623,6 +642,8 @@ turn and sends it on the next compatible turn. A changed provider, model,
 conversation generation, or failed response clears the chain. Adam never
 combines `previous_response_id` with a guessed transcript replay, and it does
 not interpret the opaque prior response as recoverable child-agent history.
+An xAI incomplete response is a provider error unless its exact reason is the
+known `max_output_tokens` terminal, which maps to Adam’s turn-limit outcome.
 
 ### Bounded replay
 
@@ -736,7 +757,8 @@ cannot revive a completed run.
 - The workspace stores conversations, messages, attachments, typed activity,
   queue state, settings, and checkpoints.
 - Provider session IDs, xAI response IDs, and future compaction summaries live
-  in versioned machine-local sidecars.
+  in versioned machine-local sidecars. Kimi projects model metadata without
+  copying its opaque ACP session ID into portable conversation activity.
 - Temporary API keys remain in memory and are scoped to the selected provider,
   so an xAI key cannot follow a later provider switch into a compatible HTTP
   endpoint. Grok Heavy may alternatively read `XAI_API_KEY`; the key is never
