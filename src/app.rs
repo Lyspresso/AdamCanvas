@@ -1567,11 +1567,15 @@ impl AdamApp {
         for (id, path) in files {
             let mtime = file_watch::modification_time(&path);
             if self.file_watch.observe(id, mtime) == file_watch::Observation::Changed {
-                self.previews.invalidate(id);
-                self.structured_previews.invalidate(id);
+                // Stale, not invalidated: the old picture keeps showing until
+                // its replacement is decoded, so an external save updates the
+                // tile without ever flashing the default placeholder.
+                self.previews.mark_stale(id);
+                self.structured_previews.mark_stale(id);
                 // Drop the parsed workbook but keep its view state, so a
                 // sheet open in the lightbox reloads in place with the same
-                // scroll position and selected cell.
+                // scroll position and selected cell. Its reload is a
+                // synchronous parse, so there is no blank frame to bridge.
                 self.sheets.remove(&id);
                 any_changed = true;
             }
@@ -3628,10 +3632,11 @@ impl AdamApp {
                         self.editing_focus_pending = Some(id);
                     } else {
                         self.activate_tile(id);
-                        // The file may come back changed, so the cached
-                        // thumbnail can no longer be trusted.
-                        self.previews.invalidate(id);
-                        self.structured_previews.invalidate(id);
+                        // The file may come back changed; keep showing the
+                        // old preview until the watcher notices and its
+                        // replacement is decoded.
+                        self.previews.mark_stale(id);
+                        self.structured_previews.mark_stale(id);
                     }
                 }
 

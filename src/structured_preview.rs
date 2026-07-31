@@ -132,8 +132,18 @@ struct PreviewResult {
 #[derive(Debug)]
 enum EntryState {
     Empty,
-    Queued { ticket: u64 },
+    Queued {
+        ticket: u64,
+    },
     Ready(StructuredPreview),
+    /// The source changed on disk; the old parse keeps showing until the
+    /// next request queues its replacement.
+    Stale(StructuredPreview),
+    /// A replacement parse is in flight; the old parse keeps showing.
+    Refreshing {
+        ticket: u64,
+        previous: StructuredPreview,
+    },
     Failed,
 }
 
@@ -203,8 +213,10 @@ impl StructuredPreviewCache {
             let Some(entry) = self.entries.get_mut(&result.id) else {
                 continue;
             };
-            let EntryState::Queued { ticket } = entry.state else {
-                continue;
+            let ticket = match &entry.state {
+                EntryState::Queued { ticket } => *ticket,
+                EntryState::Refreshing { ticket, .. } => *ticket,
+                _ => continue,
             };
             if ticket != result.ticket {
                 continue;
@@ -259,7 +271,7 @@ impl StructuredPreviewCache {
                 entry.state = EntryState::Empty;
                 entry.estimated_bytes = 0;
             }
-            matches!(entry.state, EntryState::Empty)
+            matches!(entry.state, EntryState::Empty | EntryState::Stale(_))
         };
 
         if should_queue {
@@ -274,16 +286,45 @@ impl StructuredPreviewCache {
                 && let Some(entry) = self.entries.get_mut(&id)
                 && entry.source == source
                 && entry.kind == kind
-                && matches!(entry.state, EntryState::Empty)
             {
-                entry.state = EntryState::Queued { ticket };
+                entry.state = match std::mem::replace(&mut entry.state, EntryState::Empty) {
+                    EntryState::Empty => EntryState::Queued { ticket },
+                    EntryState::Stale(previous) => EntryState::Refreshing { ticket, previous },
+                    other => other,
+                };
             }
         }
 
         self.entries.get(&id).and_then(|entry| match &entry.state {
-            EntryState::Ready(preview) => Some(preview),
+            EntryState::Ready(preview)
+            | EntryState::Stale(preview)
+            | EntryState::Refreshing {
+                previous: preview, ..
+            } => Some(preview),
             EntryState::Empty | EntryState::Queued { .. } | EntryState::Failed => None,
         })
+    }
+
+    /// The source changed on disk. The cached parse keeps being served while
+    /// a replacement is queued on the next request — the table never blinks
+    /// out to a placeholder mid-save.
+    pub fn mark_stale(&mut self, id: Uuid) {
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return;
+        };
+        entry.state = match std::mem::replace(&mut entry.state, EntryState::Empty) {
+            EntryState::Ready(previous) => EntryState::Stale(previous),
+            // A refresh already underway may have read the old content;
+            // dropping its ticket forces a fresh parse but keeps the picture.
+            EntryState::Refreshing { previous, .. } | EntryState::Stale(previous) => {
+                EntryState::Stale(previous)
+            }
+            // Nothing usable resident — start over entirely.
+            EntryState::Empty | EntryState::Queued { .. } | EntryState::Failed => {
+                entry.estimated_bytes = 0;
+                EntryState::Empty
+            }
+        };
     }
 
     pub fn is_loading(&self, id: Uuid) -> bool {
@@ -580,6 +621,76 @@ fn finish_row(rows: &mut Vec<Vec<String>>, row: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_cell(preview: &StructuredPreview) -> String {
+        match preview {
+            StructuredPreview::Table(table) => table
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .cloned()
+                .unwrap_or_default(),
+            StructuredPreview::Text(_) => String::from("<text>"),
+        }
+    }
+
+    fn wait_for<T>(mut attempt: impl FnMut() -> Option<T>) -> T {
+        for _ in 0..200 {
+            if let Some(value) = attempt() {
+                return value;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("worker did not deliver within five seconds");
+    }
+
+    #[test]
+    fn a_stale_table_keeps_showing_until_its_replacement_is_parsed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("rows.csv");
+        std::fs::write(&path, "old,1\n").expect("write csv");
+        let context = Context::default();
+        let mut cache = StructuredPreviewCache::start(context);
+        let id = Uuid::new_v4();
+
+        // Load the first parse through the real worker.
+        let old_cell = wait_for(|| {
+            cache.poll();
+            cache.preview(id, &path).map(first_cell)
+        });
+        assert_eq!(old_cell, "old");
+
+        // The file changes on disk; the watcher marks the entry stale.
+        std::fs::write(&path, "new,2\n").expect("rewrite csv");
+        cache.mark_stale(id);
+
+        // The very next request serves the OLD parse — no placeholder frame —
+        // while queueing the replacement.
+        let served = cache
+            .preview(id, &path)
+            .map(first_cell)
+            .expect("stale entry must keep serving");
+        assert_eq!(served, "old", "the old table bridges the reparse");
+
+        // And the replacement arrives without further prompting.
+        let refreshed = wait_for(|| {
+            cache.poll();
+            match cache.preview(id, &path).map(first_cell) {
+                Some(cell) if cell == "new" => Some(cell),
+                _ => None,
+            }
+        });
+        assert_eq!(refreshed, "new");
+    }
+
+    #[test]
+    fn marking_stale_without_content_or_entry_is_safe() {
+        let context = Context::default();
+        let mut cache = StructuredPreviewCache::start(context);
+        // Never-seen id: no panic, no entry conjured.
+        cache.mark_stale(Uuid::new_v4());
+        assert!(cache.entries.is_empty());
+    }
 
     #[test]
     fn csv_parser_handles_quotes_escapes_embedded_newlines_and_crlf() {
