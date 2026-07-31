@@ -590,7 +590,7 @@ fn install_outcome(
         success: false,
         still_missing: true,
         message: format!(
-            "The installer finished, but Adam still can't find `{binary}`. Adam checks PATH plus ~/.local/bin, ~/.codex/bin, ~/.grok/bin, ~/.lmstudio/bin, /opt/homebrew/bin and /usr/local/bin — if it was installed somewhere else (for example an nvm-managed npm), enter its absolute path as a Custom CLI or adjust PATH and press Refresh."
+            "The installer finished, but Adam still can't find `{binary}`. Adam checks PATH plus ~/.local/bin, ~/.codex/bin, ~/.grok/bin, ~/.kimi-code/bin, ~/.lmstudio/bin, /opt/homebrew/bin and /usr/local/bin — if it was installed somewhere else (for example an nvm-managed npm), enter its absolute path as a Custom CLI or adjust PATH and press Refresh."
         ),
         step,
     }
@@ -1302,20 +1302,23 @@ fn install_problem_ui(
         .corner_radius(3)
         .inner_margin(Margin::symmetric(10, 7))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(&outcome.message).size(11.0).color(
-                    if outcome.still_missing {
+            // Dismiss sits on its own row: inside a horizontal layout the
+            // message never wraps and long install diagnostics run off the
+            // card, past the panel edge.
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("Dismiss").clicked() {
+                    action.clear_install_log = true;
+                }
+            });
+            ui.label(
+                RichText::new(&outcome.message)
+                    .size(11.0)
+                    .color(if outcome.still_missing {
                         palette.text
                     } else {
                         palette.danger
-                    },
-                ));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("Dismiss").clicked() {
-                        action.clear_install_log = true;
-                    }
-                });
-            });
+                    }),
+            );
             egui::CollapsingHeader::new(RichText::new("Install log").size(10.5))
                 .id_salt(("agents-install-log", outcome.provider_id))
                 .default_open(false)

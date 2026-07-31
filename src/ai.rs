@@ -1511,6 +1511,11 @@ fn executable_search_paths(path: Option<&OsStr>, home: Option<&Path>) -> Vec<Pat
         search.push(home.join(".local/bin"));
         search.push(home.join(".codex/bin"));
         search.push(home.join(".grok/bin"));
+        // The vendor installer defaults to ~/.kimi-code and makes the binary
+        // reachable only by appending PATH to a shell rc, which a Finder-
+        // launched app never reads — so the one-click install appeared to
+        // fail even when it succeeded.
+        search.push(home.join(".kimi-code/bin"));
         search.push(home.join(".lmstudio/bin"));
     }
     search.push(PathBuf::from("/opt/homebrew/bin"));
@@ -9179,6 +9184,9 @@ send({
             home.join(".local/bin"),
             home.join(".codex/bin"),
             home.join(".grok/bin"),
+            // Every built-in CLI's vendor install location must be listed, or
+            // its one-click install reports failure after succeeding.
+            home.join(".kimi-code/bin"),
             home.join(".lmstudio/bin"),
             PathBuf::from("/opt/homebrew/bin"),
             PathBuf::from("/usr/local/bin"),
