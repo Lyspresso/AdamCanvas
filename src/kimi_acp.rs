@@ -2705,6 +2705,30 @@ mod tests {
     }
 
     #[test]
+    fn pinned_initialize_fixture_negotiates_runtime_and_resume_capability() {
+        let fixture = include_str!("../tests/fixtures/ai/kimi/0.31.0/acp-initialize.jsonl");
+        let envelope: Value = serde_json::from_str(fixture.trim()).unwrap();
+        assert_eq!(envelope["jsonrpc"], "2.0");
+        assert_eq!(envelope["id"], 1);
+
+        let result = envelope.get("result").unwrap();
+        let mut state = ProtocolState::new(&request());
+        state.apply_initialize_response(result, true).unwrap();
+
+        assert_eq!(state.agent_name.as_deref(), Some("Kimi Code CLI"));
+        assert_eq!(
+            state.agent_version.as_deref(),
+            Some(KIMI_ACP_RUNTIME_VERSION)
+        );
+        assert_eq!(
+            result
+                .pointer("/agentCapabilities/loadSession")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
     fn config_selection_uses_only_advertised_values() {
         let state = initialized_state();
         state
@@ -3002,6 +3026,80 @@ mod tests {
         assert_eq!(first, second);
         assert_ne!(first[1].id, first[2].id);
         assert_eq!(first[1].status, KimiAcpPlanStatus::InProgress);
+    }
+
+    #[test]
+    fn pinned_root_plan_fixture_emits_a_whole_list_snapshot() {
+        let fixture = include_str!("../tests/fixtures/ai/kimi/0.31.0/acp-root-plan.jsonl")
+            .replace("<ROOT_SESSION>", "session-1");
+        let envelope: Value = serde_json::from_str(fixture.trim()).unwrap();
+        assert_eq!(envelope["method"], "session/update");
+
+        let mut state = initialized_state();
+        let mut events = Vec::new();
+        state
+            .apply_session_update(envelope.get("params").unwrap(), &mut |event| {
+                events.push(event)
+            })
+            .unwrap();
+        let (session_id, entries) = events
+            .into_iter()
+            .find_map(|event| match event {
+                KimiAcpEvent::PlanSnapshot {
+                    session_id,
+                    entries,
+                } => Some((session_id, entries)),
+                _ => None,
+            })
+            .unwrap();
+
+        assert_eq!(session_id, "session-1");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.content.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "Inspect the relevant files",
+                "Delegate independent checks",
+                "Synthesize the result",
+            ]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| &entry.priority)
+                .collect::<Vec<_>>(),
+            vec![
+                &KimiAcpPlanPriority::Medium,
+                &KimiAcpPlanPriority::Medium,
+                &KimiAcpPlanPriority::Medium,
+            ]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| &entry.status)
+                .collect::<Vec<_>>(),
+            vec![
+                &KimiAcpPlanStatus::Completed,
+                &KimiAcpPlanStatus::InProgress,
+                &KimiAcpPlanStatus::Pending,
+            ]
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.id.starts_with("session-1:plan:"))
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            entries.len()
+        );
     }
 
     #[test]
