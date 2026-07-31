@@ -2613,6 +2613,25 @@ impl AiConversation {
         &self.messages
     }
 
+    /// Activities for the newest persisted provider turn only.
+    ///
+    /// Progress has its own cross-turn reducer and Artifacts intentionally
+    /// span the conversation. Child agents are turn-local, so callers must
+    /// not flatten every historical assistant turn before projecting them.
+    /// App-authored assistant notices have neither a turn id nor activities
+    /// and therefore do not hide the preceding provider turn.
+    pub fn latest_assistant_turn_activity(&self) -> &[ActivityEvent] {
+        self.messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == MessageRole::Assistant
+                    && (message.turn_id.is_some() || !message.activities.is_empty())
+            })
+            .map(|message| message.activities.as_slice())
+            .unwrap_or_default()
+    }
+
     pub fn actions(&self) -> &[AiActionRecord] {
         &self.actions
     }
@@ -3259,6 +3278,7 @@ pub struct DomainState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat_core::ActivityKind;
     use serde_json::json;
 
     fn id(value: u128) -> Uuid {
@@ -4195,6 +4215,117 @@ mod tests {
     }
 
     #[test]
+    fn latest_assistant_activity_keeps_subagents_turn_local_across_reload() {
+        let mut conversation =
+            AiConversation::new(id(1), "Child turns", PermissionMode::Ask, at(0));
+        let lifecycle = |event_id: Uuid, label: &str, status| {
+            ActivityEvent::new(
+                event_id,
+                at(1),
+                ActivityKind::Subagent {
+                    id: "reused-provider-child".into(),
+                    aliases: Vec::new(),
+                    parent_id: Some("root".into()),
+                    label: label.into(),
+                    status,
+                    model: None,
+                    detail: None,
+                    tool_calls: None,
+                },
+            )
+        };
+        conversation
+            .append_message_with_activity(
+                id(2),
+                MessageRole::Assistant,
+                "Old",
+                at(1),
+                Vec::new(),
+                Vec::new(),
+                vec![lifecycle(
+                    id(3),
+                    "Old child",
+                    crate::chat_core::SubagentStatus::Completed,
+                )],
+                Some(id(4)),
+            )
+            .unwrap();
+        let second_turn = vec![
+            lifecycle(
+                id(5),
+                "Current child",
+                crate::chat_core::SubagentStatus::Completed,
+            ),
+            ActivityEvent::child(
+                id(6),
+                at(2),
+                "reused-provider-child",
+                ActivityKind::AssistantText {
+                    text: "Scoped result".into(),
+                },
+            ),
+            ActivityEvent::child(
+                id(7),
+                at(2),
+                "reused-provider-child",
+                ActivityKind::PlanUpdate {
+                    tasks: vec![crate::chat_core::PlanItem {
+                        content: "Inspect files".into(),
+                        active_form: None,
+                        status: crate::chat_core::PlanItemStatus::Completed,
+                        task_id: Some("child-task".into()),
+                        origin: crate::chat_core::PlanItemOrigin::Native,
+                    }],
+                    authoritative: false,
+                    compacted: false,
+                    replaces_native: true,
+                },
+            ),
+        ];
+        conversation
+            .append_message_with_activity(
+                id(8),
+                MessageRole::Assistant,
+                "Current",
+                at(2),
+                Vec::new(),
+                Vec::new(),
+                second_turn,
+                Some(id(9)),
+            )
+            .unwrap();
+        conversation
+            .append_message(
+                id(10),
+                MessageRole::Assistant,
+                "Canvas action completed",
+                at(3),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(conversation.messages().last().unwrap().turn_id.is_none());
+
+        let before =
+            crate::chat_core::project_subagents(conversation.latest_assistant_turn_activity());
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].label, "Current child");
+        assert_eq!(before[0].prose_cells[0].text, "Scoped result");
+        assert_eq!(
+            before[0]
+                .checklist
+                .as_ref()
+                .and_then(|checklist| checklist.items.first())
+                .map(|item| item.content.as_str()),
+            Some("Inspect files")
+        );
+
+        let decoded: AiConversation =
+            serde_json::from_value(serde_json::to_value(&conversation).unwrap()).unwrap();
+        let after = crate::chat_core::project_subagents(decoded.latest_assistant_turn_activity());
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn future_ai_enums_fail_closed_without_blank_workspace_recovery() {
         let mut conversation =
             AiConversation::new(id(1), "Future safe", PermissionMode::Ask, at(0));
@@ -4229,6 +4360,12 @@ mod tests {
                 "type": "turnStatus",
                 "message": "status is required"
             }
+        }));
+        activities.push(json!({
+            "id": id(7),
+            "at": 4,
+            "scope": {"kind": "futureActor", "id": "child"},
+            "kind": {"type": "assistantText", "text": "must not become Main"}
         }));
 
         let decoded: AiConversation = serde_json::from_value(encoded).unwrap();

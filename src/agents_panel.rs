@@ -798,11 +798,9 @@ impl AgentsPanelState {
     }
 }
 
-/// Presence x verification -> availability. Verification means the tuning
-/// profile for (family, version) differs from the unknown-version baseline
-/// in either field — required because Kimi's verified row exposes no
-/// reasoning efforts. A future contract row identical to the baseline would
-/// read as unverified, which understates and never overstates.
+/// Presence x verification -> availability. Verification is an explicit
+/// property of an exact provider contract row; it must not be inferred from
+/// whichever optional controls that row happens to expose.
 pub fn classify_probe(provider_id: &str, probe: &ProviderProbe) -> AgentAvailability {
     if probe.program.is_none() {
         return AgentAvailability::NotDetected;
@@ -812,13 +810,8 @@ pub fn classify_probe(provider_id: &str, probe: &ProviderProbe) -> AgentAvailabi
     };
     let executable = probe.executable.unwrap_or_default();
     let family = capability_profile(provider_id, executable, &[]).runtime_family;
-    // The model only widens a verified Codex row's effort list; every model
-    // arm still differs from the baseline, so "" is safe here.
     let tuned = runtime_tuning_profile(family, Some(&version), "");
-    let baseline = runtime_tuning_profile(family, None, "");
-    let verified = tuned.reasoning_efforts != baseline.reasoning_efforts
-        || tuned.supports_scoped_child_text != baseline.supports_scoped_child_text;
-    if verified {
+    if tuned.verified_runtime {
         return AgentAvailability::DetectedVerified { version };
     }
     // Same major.minor as a tested version with only a newer patch: the

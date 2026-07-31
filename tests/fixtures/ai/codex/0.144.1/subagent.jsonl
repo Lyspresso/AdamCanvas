@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"codex-parent-thread"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"collab-1","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"codex-parent-thread","receiver_thread_ids":["codex-child-thread"],"prompt":"Return the fixture sentinel.","agents_states":{"codex-child-thread":{"status":"running","message":null}},"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"collab-1","type":"collab_tool_call","tool":"wait","sender_thread_id":"codex-parent-thread","receiver_thread_ids":["codex-child-thread"],"prompt":null,"agents_states":{"codex-child-thread":{"status":"completed","message":"CHILD_FIXTURE_OK"}},"status":"completed"}}
+{"type":"item.completed","item":{"id":"item-parent","type":"agent_message","text":"PARENT_FIXTURE_OK"}}
+{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":50,"output_tokens":10,"reasoning_output_tokens":5}}

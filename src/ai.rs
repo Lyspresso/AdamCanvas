@@ -8,11 +8,11 @@ use crate::{
     ai_task_bridge::TaskToolBridge,
     ai_task_tools::{TaskToolOutcome, TaskToolRegistry},
     chat_core::{
-        ActivityEvent, ActivityKind, ActivityStatus, CliVersion, FileChange, FileChangeKind,
-        PermissionResolution, PlanChannel, PlanItem, PlanItemOrigin, PlanItemStatus, ProviderKind,
-        ResumeStrategy, RetryHint, RuntimeTuningProfile, SubagentStatus, SystemPromptChannel,
-        TaskMutationKind, TurnStatus, capability_profile, capability_profile_for_runtime,
-        runtime_tuning_profile,
+        ActivityEvent, ActivityKind, ActivityStatus, AgentScope, CliVersion, FileChange,
+        FileChangeKind, PermissionResolution, PlanChannel, PlanItem, PlanItemOrigin,
+        PlanItemStatus, ProviderKind, ResumeStrategy, RetryHint, RuntimeTuningProfile,
+        SubagentStatus, SystemPromptChannel, TaskMutationKind, TurnStatus, capability_profile,
+        capability_profile_for_runtime, runtime_tuning_profile,
     },
     domain::{
         AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_THINKING,
@@ -53,6 +53,9 @@ const MAX_JSON_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RAW_SALVAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ACTIVITY_OUTPUT_BYTES: usize = 4 * 1024;
+const MAX_SUBAGENT_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_SUBAGENT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SUBAGENT_DETAIL_BYTES: usize = 1024;
 const MAX_GROK_SESSION_LINE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GROK_SESSION_UPDATES: usize = 2_048;
 const MAX_GROK_SESSION_POLL_LINES: usize = 256;
@@ -666,7 +669,7 @@ pub fn clamp_provider_preferences(
     } else {
         preferences.reasoning_effort.clear();
     }
-    if provider_id == "grok_cli" && !tuning.supports_scoped_child_text {
+    if provider_id == "grok_cli" && !tuning.supports_scoped_child_text() {
         preferences.set_feature(AI_FEATURE_SUBAGENTS, Some(false));
     }
     *preferences != original
@@ -1107,7 +1110,7 @@ fn preset_process_spec_with_tuning(
             if request.provider_preferences.feature(AI_FEATURE_PLANNING) == Some(false) {
                 arguments.push("--no-plan".into());
             }
-            if !tuning.supports_scoped_child_text
+            if !tuning.supports_scoped_child_text()
                 || request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) == Some(false)
             {
                 arguments.push("--no-subagents".into());
@@ -1725,7 +1728,7 @@ fn run_grok_acp_transport(
         .normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
         .map(str::to_owned);
     let mut rules = request.system_prompt.clone().unwrap_or_default();
-    if !tuning.supports_scoped_child_text
+    if !tuning.supports_scoped_child_text()
         || request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) == Some(false)
     {
         if !rules.is_empty() {
@@ -2490,11 +2493,15 @@ fn emit_decoded(request: &AiRunRequest, sender: &Sender<AiEvent>, decoded: Decod
 }
 
 fn activity_event(kind: ActivityKind) -> ActivityEvent {
+    scoped_activity_event(AgentScope::Main, kind)
+}
+
+fn scoped_activity_event(scope: AgentScope, kind: ActivityKind) -> ActivityEvent {
     let at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
-    ActivityEvent::new(Uuid::new_v4(), UnixMillis(at), kind)
+    ActivityEvent::scoped(Uuid::new_v4(), UnixMillis(at), scope, kind)
 }
 
 struct PendingTaskUpdate {
@@ -2510,6 +2517,7 @@ struct KnownSubagent {
     label: String,
     model: Option<String>,
     detail: Option<String>,
+    status: Option<SubagentStatus>,
 }
 
 struct OutputDecoder {
@@ -2543,6 +2551,11 @@ struct OutputDecoder {
     task_subjects: HashMap<String, String>,
     subagents: HashMap<String, KnownSubagent>,
     subagent_aliases: HashMap<String, String>,
+    subagent_messages: HashMap<String, String>,
+    subagent_output_bytes: usize,
+    claude_child_streamed_text: HashMap<String, String>,
+    claude_child_pending_text: Vec<(String, String)>,
+    claude_child_streamed_thinking_bytes: HashMap<String, usize>,
     grok_tool_names: HashMap<String, String>,
     grok_native_plan: Vec<PlanItem>,
     codex_streamed_items: HashSet<String>,
@@ -2592,6 +2605,11 @@ impl OutputDecoder {
             task_subjects: HashMap::new(),
             subagents: HashMap::new(),
             subagent_aliases: HashMap::new(),
+            subagent_messages: HashMap::new(),
+            subagent_output_bytes: 0,
+            claude_child_streamed_text: HashMap::new(),
+            claude_child_pending_text: Vec::new(),
+            claude_child_streamed_thinking_bytes: HashMap::new(),
             grok_tool_names: HashMap::new(),
             grok_native_plan: Vec::new(),
             codex_streamed_items: HashSet::new(),
@@ -2682,11 +2700,14 @@ impl OutputDecoder {
                 if self.poisoned {
                     self.emit_stream_reset(&mut emit);
                     self.refresh_poison_salvage(&mut emit);
-                } else if self.output.is_empty() && self.valid_json_lines == 0 {
-                    let salvage = self.cleaned_raw_salvage();
-                    if !salvage.is_empty() {
-                        self.record_assistant_text(salvage, false, false, &mut emit);
+                } else {
+                    if self.output.is_empty() && self.valid_json_lines == 0 {
+                        let salvage = self.cleaned_raw_salvage();
+                        if !salvage.is_empty() {
+                            self.record_assistant_text(salvage, false, false, &mut emit);
+                        }
                     }
+                    self.flush_claude_child_text(&mut emit);
                 }
             }
         }
@@ -2736,7 +2757,8 @@ impl OutputDecoder {
                 self.non_empty_lines = self.non_empty_lines.saturating_add(1);
                 self.valid_json_lines = self.valid_json_lines.saturating_add(1);
                 self.consecutive_non_json = 0;
-                let result = self.decode_provider_event(&value);
+                let mut result = self.decode_provider_event(&value);
+                self.prepend_claude_pending_child_text(&mut result.kinds);
                 if !result.recognized {
                     self.skipped_unknown = self.skipped_unknown.saturating_add(1);
                 }
@@ -2747,10 +2769,11 @@ impl OutputDecoder {
                     self.failure_kind.get_or_insert(kind);
                 }
                 let subagent_duration_ms = result.subagent_duration_ms;
-                for kind in result.kinds {
+                for activity in result.kinds {
                     self.recognized_events = self.recognized_events.saturating_add(1);
-                    match kind {
-                        ActivityKind::AssistantText { text } => {
+                    let scope = activity.scope;
+                    match activity.kind {
+                        ActivityKind::AssistantText { text } if scope.is_main() => {
                             self.record_assistant_text(
                                 text,
                                 result.text_delta,
@@ -2758,18 +2781,27 @@ impl OutputDecoder {
                                 emit,
                             );
                         }
-                        ActivityKind::Thinking { .. } => {
-                            self.saw_thinking_delta |= result.thinking_delta;
-                            emit(Decoded::Activity(activity_event(kind)));
+                        kind @ ActivityKind::AssistantText { .. } => {
+                            emit(Decoded::Activity(scoped_activity_event(scope, kind)));
                         }
-                        ActivityKind::SessionInfo { ref session_id, .. } => {
-                            if let Some(session_id) = session_id.as_ref() {
+                        kind @ ActivityKind::Thinking { .. } => {
+                            if scope.is_main() {
+                                self.saw_thinking_delta |= result.thinking_delta;
+                            }
+                            emit(Decoded::Activity(scoped_activity_event(scope, kind)));
+                        }
+                        kind @ ActivityKind::SessionInfo { .. } => {
+                            if let ActivityKind::SessionInfo {
+                                session_id: Some(session_id),
+                                ..
+                            } = &kind
+                            {
                                 self.session_id = Some(session_id.clone());
                             }
-                            emit(Decoded::Activity(activity_event(kind)));
+                            emit(Decoded::Activity(scoped_activity_event(scope, kind)));
                         }
-                        _ => {
-                            let mut event = activity_event(kind);
+                        kind => {
+                            let mut event = scoped_activity_event(scope, kind);
                             if let ActivityKind::Subagent { id, .. } = &event.kind {
                                 event.duration_ms = subagent_duration_ms.get(id).copied();
                             }
@@ -2912,9 +2944,55 @@ enum Decoded {
     StreamReset,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct DecodedActivity {
+    scope: AgentScope,
+    kind: ActivityKind,
+}
+
+#[derive(Default)]
+struct DecodedActivities(Vec<DecodedActivity>);
+
+impl DecodedActivities {
+    fn push(&mut self, kind: ActivityKind) {
+        self.0.push(DecodedActivity {
+            scope: AgentScope::Main,
+            kind,
+        });
+    }
+
+    fn push_scoped(&mut self, scope: AgentScope, kind: ActivityKind) {
+        self.0.push(DecodedActivity { scope, kind });
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[cfg(test)]
+    fn into_main_kinds(self) -> Vec<ActivityKind> {
+        self.0
+            .into_iter()
+            .map(|activity| {
+                assert!(activity.scope.is_main());
+                activity.kind
+            })
+            .collect()
+    }
+}
+
+impl IntoIterator for DecodedActivities {
+    type Item = DecodedActivity;
+    type IntoIter = std::vec::IntoIter<DecodedActivity>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 #[derive(Default)]
 struct JsonDecodeResult {
-    kinds: Vec<ActivityKind>,
+    kinds: DecodedActivities,
     subagent_duration_ms: HashMap<String, i64>,
     fatal_error: Option<String>,
     fatal_kind: Option<AiFailureKind>,
@@ -3148,7 +3226,10 @@ impl OutputDecoder {
                     });
                 }
             }
-            "collab_agent_tool_call" | "collabAgentToolCall" => {
+            "collab_tool_call"
+            | "collabToolCall"
+            | "collab_agent_tool_call"
+            | "collabAgentToolCall" => {
                 decoded.recognized = true;
                 self.decode_codex_collab_item(phase, item, &mut decoded);
             }
@@ -3169,7 +3250,8 @@ impl OutputDecoder {
     ) {
         let tool = string_at(item, &["tool"]).unwrap_or_else(|| "spawnAgent".into());
         let tool_token = normalized_token(&tool);
-        let sender = string_at(item, &["sender_thread_id", "senderThreadId"]);
+        let sender = string_at(item, &["sender_thread_id", "senderThreadId"])
+            .map(|sender| self.canonical_subagent_id(&sender));
         let prompt = string_at(item, &["prompt"]);
         let model = string_at(item, &["model"]);
         let effort = string_at(item, &["reasoning_effort", "reasoningEffort"]);
@@ -3214,11 +3296,18 @@ impl OutputDecoder {
             } else {
                 String::new()
             };
-            let detail = state_message.or_else(|| {
-                effort
-                    .as_deref()
-                    .map(|effort| format!("Reasoning: {effort}"))
-            });
+            let child_message = (status == SubagentStatus::Completed)
+                .then(|| state_message.clone())
+                .flatten();
+            let detail = if status.is_terminal() {
+                None
+            } else {
+                state_message.or_else(|| {
+                    effort
+                        .as_deref()
+                        .map(|effort| format!("Reasoning: {effort}"))
+                })
+            };
             let metadata = self.remember_subagent(
                 &canonical_id,
                 KnownSubagent {
@@ -3226,10 +3315,13 @@ impl OutputDecoder {
                     label,
                     model: model.clone(),
                     detail,
+                    status: None,
                 },
+                status,
             );
             decoded.kinds.push(ActivityKind::Subagent {
                 id: canonical_id.clone(),
+                aliases: self.subagent_aliases_for(&canonical_id),
                 parent_id: metadata.parent_id,
                 label: metadata.label,
                 status,
@@ -3237,6 +3329,16 @@ impl OutputDecoder {
                 detail: metadata.detail,
                 tool_calls: None,
             });
+            if let Some(text) =
+                child_message.and_then(|text| self.remember_subagent_message(&canonical_id, text))
+            {
+                decoded.kinds.push_scoped(
+                    AgentScope::Child {
+                        id: canonical_id.clone(),
+                    },
+                    ActivityKind::AssistantText { text },
+                );
+            }
             if let Some(duration_ms) = duration_ms {
                 decoded
                     .subagent_duration_ms
@@ -3274,9 +3376,11 @@ impl OutputDecoder {
                 detail: path_detail,
                 ..KnownSubagent::default()
             },
+            status,
         );
         decoded.kinds.push(ActivityKind::Subagent {
             id: canonical_id.clone(),
+            aliases: self.subagent_aliases_for(&canonical_id),
             parent_id: metadata.parent_id,
             label: metadata.label,
             status,
@@ -3305,14 +3409,48 @@ impl OutputDecoder {
         current
     }
 
+    fn claude_envelope_scope(&self, value: &Value) -> Option<AgentScope> {
+        let parent = value
+            .get("parent_tool_use_id")
+            .or_else(|| value.get("parentToolUseId"));
+        match parent {
+            None | Some(Value::Null) => Some(AgentScope::Main),
+            Some(Value::String(id)) if !id.trim().is_empty() => Some(AgentScope::Child {
+                id: self.canonical_subagent_id(id),
+            }),
+            Some(_) => None,
+        }
+    }
+
     fn bind_subagent_alias(&mut self, alias: String, canonical_id: String) {
         if !alias.is_empty() && alias != canonical_id {
             self.subagent_aliases.insert(alias, canonical_id);
         }
     }
 
-    fn remember_subagent(&mut self, canonical_id: &str, incoming: KnownSubagent) -> KnownSubagent {
+    fn remember_subagent(
+        &mut self,
+        canonical_id: &str,
+        incoming: KnownSubagent,
+        status: SubagentStatus,
+    ) -> KnownSubagent {
         let metadata = self.subagents.entry(canonical_id.to_owned()).or_default();
+        let resumed =
+            metadata.status.is_some_and(SubagentStatus::is_terminal) && !status.is_terminal();
+        if resumed {
+            self.subagent_messages.remove(canonical_id);
+            if let Some(buffered) = self.claude_child_streamed_text.remove(canonical_id) {
+                self.claude_child_pending_text
+                    .push((canonical_id.to_owned(), buffered));
+            }
+        }
+        if resumed || status.is_terminal() {
+            self.claude_child_streamed_thinking_bytes
+                .remove(canonical_id);
+        }
+        if incoming.detail.is_none() && (resumed || status.is_terminal()) {
+            metadata.detail = None;
+        }
         if incoming.parent_id.is_some() {
             metadata.parent_id = incoming.parent_id;
         }
@@ -3322,13 +3460,211 @@ impl OutputDecoder {
         if incoming.model.is_some() {
             metadata.model = incoming.model;
         }
-        if incoming.detail.is_some() {
-            metadata.detail = incoming.detail;
+        if let Some(detail) = incoming.detail {
+            metadata.detail = Some(compact_subagent_detail(detail));
         }
+        metadata.status = Some(status);
         if metadata.label.trim().is_empty() {
             metadata.label = "Subagent".into();
         }
         metadata.clone()
+    }
+
+    fn subagent_aliases_for(&self, canonical_id: &str) -> Vec<String> {
+        let mut aliases = self
+            .subagent_aliases
+            .keys()
+            .filter(|alias| self.canonical_subagent_id(alias) == canonical_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        aliases.sort();
+        aliases.dedup();
+        aliases
+    }
+
+    fn remember_subagent_message(&mut self, canonical_id: &str, text: String) -> Option<String> {
+        if text.trim().is_empty() || self.subagent_output_bytes >= MAX_SUBAGENT_OUTPUT_BYTES {
+            return None;
+        }
+        let per_message = truncate_utf8(&text, MAX_SUBAGENT_MESSAGE_BYTES);
+        let remaining = MAX_SUBAGENT_OUTPUT_BYTES - self.subagent_output_bytes;
+        let bounded = truncate_utf8(per_message, remaining);
+        if bounded.trim().is_empty()
+            || self
+                .subagent_messages
+                .get(canonical_id)
+                .is_some_and(|existing| existing == bounded)
+        {
+            return None;
+        }
+        let text = bounded.to_owned();
+        self.subagent_output_bytes = self.subagent_output_bytes.saturating_add(text.len());
+        self.subagent_messages
+            .insert(canonical_id.to_owned(), text.clone());
+        Some(text)
+    }
+
+    fn remember_claude_child_text_delta(
+        &mut self,
+        canonical_id: &str,
+        text: &str,
+    ) -> Option<String> {
+        if text.is_empty() || self.subagent_output_bytes >= MAX_SUBAGENT_OUTPUT_BYTES {
+            return None;
+        }
+        let message_bytes = self
+            .claude_child_streamed_text
+            .get(canonical_id)
+            .map_or(0, String::len);
+        let message_remaining = MAX_SUBAGENT_MESSAGE_BYTES.saturating_sub(message_bytes);
+        let total_remaining = MAX_SUBAGENT_OUTPUT_BYTES - self.subagent_output_bytes;
+        let bounded = truncate_utf8(text, message_remaining.min(total_remaining));
+        if bounded.is_empty() {
+            return None;
+        }
+        self.subagent_output_bytes = self.subagent_output_bytes.saturating_add(bounded.len());
+        let streamed = self
+            .claude_child_streamed_text
+            .entry(canonical_id.to_owned())
+            .or_default();
+        streamed.push_str(bounded);
+        Some(bounded.to_owned())
+    }
+
+    fn remember_claude_child_thinking_delta(
+        &mut self,
+        canonical_id: &str,
+        text: &str,
+    ) -> Option<String> {
+        if text.is_empty() || self.subagent_output_bytes >= MAX_SUBAGENT_OUTPUT_BYTES {
+            return None;
+        }
+        let message_bytes = self
+            .claude_child_streamed_thinking_bytes
+            .get(canonical_id)
+            .copied()
+            .unwrap_or_default();
+        let message_remaining = MAX_SUBAGENT_MESSAGE_BYTES.saturating_sub(message_bytes);
+        let total_remaining = MAX_SUBAGENT_OUTPUT_BYTES - self.subagent_output_bytes;
+        let bounded = truncate_utf8(text, message_remaining.min(total_remaining));
+        if bounded.is_empty() {
+            return None;
+        }
+        self.subagent_output_bytes = self.subagent_output_bytes.saturating_add(bounded.len());
+        self.claude_child_streamed_thinking_bytes
+            .insert(canonical_id.to_owned(), message_bytes + bounded.len());
+        Some(bounded.to_owned())
+    }
+
+    fn complete_claude_child_thinking(&mut self, canonical_id: &str, text: &str) -> Option<String> {
+        if self
+            .claude_child_streamed_thinking_bytes
+            .remove(canonical_id)
+            .is_some()
+            || text.is_empty()
+            || self.subagent_output_bytes >= MAX_SUBAGENT_OUTPUT_BYTES
+        {
+            return None;
+        }
+        let per_message = truncate_utf8(text, MAX_SUBAGENT_MESSAGE_BYTES);
+        let total_remaining = MAX_SUBAGENT_OUTPUT_BYTES - self.subagent_output_bytes;
+        let bounded = truncate_utf8(per_message, total_remaining);
+        if bounded.is_empty() {
+            return None;
+        }
+        self.subagent_output_bytes = self.subagent_output_bytes.saturating_add(bounded.len());
+        Some(bounded.to_owned())
+    }
+
+    fn complete_claude_child_text(&mut self, canonical_id: &str, text: String) -> Option<String> {
+        let streamed = self.claude_child_streamed_text.remove(canonical_id);
+        if let Some(streamed) = &streamed {
+            // Streamed child text is buffered, not emitted. Replace its
+            // provisional byte charge with the authoritative assistant
+            // snapshot so revised or multi-block snapshots remain bounded.
+            self.subagent_output_bytes = self.subagent_output_bytes.saturating_sub(streamed.len());
+        }
+        let candidate = if text.trim().is_empty() {
+            streamed.unwrap_or_default()
+        } else {
+            text
+        };
+        if candidate.trim().is_empty() || self.subagent_output_bytes >= MAX_SUBAGENT_OUTPUT_BYTES {
+            return None;
+        }
+        let per_message = truncate_utf8(&candidate, MAX_SUBAGENT_MESSAGE_BYTES);
+        let remaining = MAX_SUBAGENT_OUTPUT_BYTES - self.subagent_output_bytes;
+        let bounded = truncate_utf8(per_message, remaining);
+        if bounded.trim().is_empty() {
+            return None;
+        }
+        self.subagent_output_bytes = self.subagent_output_bytes.saturating_add(bounded.len());
+        let remembered = bounded.to_owned();
+        self.subagent_messages
+            .insert(canonical_id.to_owned(), remembered.clone());
+        Some(remembered)
+    }
+
+    fn complete_or_dedupe_claude_child_result(
+        &mut self,
+        canonical_id: &str,
+        text: String,
+    ) -> Option<String> {
+        if self.claude_child_streamed_text.contains_key(canonical_id) {
+            self.complete_claude_child_text(canonical_id, text)
+        } else if self
+            .subagent_messages
+            .get(canonical_id)
+            .is_some_and(|existing| claude_terminal_result_repeats(existing, &text))
+        {
+            None
+        } else {
+            self.remember_subagent_message(canonical_id, text)
+        }
+    }
+
+    fn prepend_claude_pending_child_text(&mut self, kinds: &mut DecodedActivities) {
+        if self.claude_child_pending_text.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.claude_child_pending_text);
+        let mut prefix = pending
+            .into_iter()
+            .filter(|(_, text)| !text.trim().is_empty())
+            .map(|(child_id, text)| DecodedActivity {
+                scope: AgentScope::Child { id: child_id },
+                kind: ActivityKind::AssistantText { text },
+            })
+            .collect::<Vec<_>>();
+        prefix.append(&mut kinds.0);
+        kinds.0 = prefix;
+    }
+
+    fn flush_claude_child_text(&mut self, emit: &mut impl FnMut(Decoded)) {
+        for (child_id, text) in std::mem::take(&mut self.claude_child_pending_text) {
+            if text.trim().is_empty() {
+                continue;
+            }
+            emit(Decoded::Activity(scoped_activity_event(
+                AgentScope::Child { id: child_id },
+                ActivityKind::AssistantText { text },
+            )));
+        }
+        let mut pending = std::mem::take(&mut self.claude_child_streamed_text)
+            .into_iter()
+            .collect::<Vec<_>>();
+        pending.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (child_id, text) in pending {
+            if text.trim().is_empty() {
+                continue;
+            }
+            self.subagent_messages
+                .insert(child_id.clone(), text.clone());
+            emit(Decoded::Activity(scoped_activity_event(
+                AgentScope::Child { id: child_id },
+                ActivityKind::AssistantText { text },
+            )));
+        }
     }
 
     fn decode_grok(&mut self, value: &Value) -> JsonDecodeResult {
@@ -3413,6 +3749,7 @@ impl OutputDecoder {
                 self.task_subjects.insert(id.clone(), label.clone());
                 decoded.kinds.push(ActivityKind::Subagent {
                     id: id.clone(),
+                    aliases: self.subagent_aliases_for(&id),
                     parent_id: string_at(update, &["parent_session_id"]),
                     label: label.clone(),
                     status: SubagentStatus::InProgress,
@@ -3442,12 +3779,53 @@ impl OutputDecoder {
                 let label = self.task_subjects.get(&id).cloned().unwrap_or_default();
                 decoded.kinds.push(ActivityKind::Subagent {
                     id: id.clone(),
+                    aliases: self.subagent_aliases_for(&id),
                     parent_id: string_at(update, &["parent_session_id"]),
                     label: label.clone(),
                     status: subagent_status,
                     model: string_at(update, &["model"]),
                     detail: detail.clone(),
                     tool_calls: update.get("tool_calls").and_then(Value::as_u64),
+                });
+                if subagent_status == SubagentStatus::Completed
+                    && let Some(text) = string_at(update, &["output"])
+                    && let Some(text) = self.remember_subagent_message(&id, text)
+                {
+                    decoded.kinds.push_scoped(
+                        AgentScope::Child { id },
+                        ActivityKind::AssistantText { text },
+                    );
+                }
+            }
+            "subagent_progress" => {
+                let Some(id) = string_at(update, &["subagent_id", "child_session_id"])
+                    .filter(|id| !id.is_empty())
+                else {
+                    return decoded;
+                };
+                decoded.recognized = true;
+                let label = self.task_subjects.get(&id).cloned().unwrap_or_default();
+                let tool_calls = update.get("tool_call_count").and_then(Value::as_u64);
+                let detail = string_list_at(update, &["tools_used"])
+                    .last()
+                    .map(|tool| format!("Using {}", activity_tool_name(tool)))
+                    .or_else(|| {
+                        update
+                            .get("turn_count")
+                            .and_then(Value::as_u64)
+                            .map(|turns| {
+                                format!("{turns} turn{}", if turns == 1 { "" } else { "s" })
+                            })
+                    });
+                decoded.kinds.push(ActivityKind::Subagent {
+                    id: id.clone(),
+                    aliases: self.subagent_aliases_for(&id),
+                    parent_id: string_at(update, &["parent_session_id"]),
+                    label,
+                    status: SubagentStatus::InProgress,
+                    model: string_at(update, &["model"]),
+                    detail,
+                    tool_calls,
                 });
             }
             "tool_call" => {
@@ -3638,6 +4016,11 @@ impl OutputDecoder {
                 self.decode_claude_tool_progress(value, &mut decoded);
             }
             Some("stream_event") => {
+                let Some(scope) = self.claude_envelope_scope(value) else {
+                    decoded.recognized = true;
+                    return decoded;
+                };
+                let child_id = scope.child_id().map(str::to_owned);
                 let delta = value.pointer("/event/delta");
                 match delta
                     .and_then(|delta| delta.get("type"))
@@ -3650,9 +4033,18 @@ impl OutputDecoder {
                             .and_then(|delta| delta.get("text"))
                             .and_then(Value::as_str)
                         {
-                            decoded.kinds.push(ActivityKind::AssistantText {
-                                text: text.to_owned(),
-                            });
+                            let text = if let Some(child_id) = child_id.as_deref() {
+                                let _ = self.remember_claude_child_text_delta(child_id, text);
+                                None
+                            } else {
+                                Some(text.to_owned())
+                            };
+                            if let Some(text) = text {
+                                decoded.kinds.push_scoped(
+                                    scope.clone(),
+                                    ActivityKind::AssistantText { text },
+                                );
+                            }
                         }
                     }
                     Some("thinking_delta") => {
@@ -3662,9 +4054,16 @@ impl OutputDecoder {
                             .and_then(|delta| delta.get("thinking").or_else(|| delta.get("text")))
                             .and_then(Value::as_str)
                         {
-                            decoded
-                                .kinds
-                                .push(ActivityKind::Thinking { text: text.into() });
+                            let text = if let Some(child_id) = child_id.as_deref() {
+                                self.remember_claude_child_thinking_delta(child_id, text)
+                            } else {
+                                Some(text.to_owned())
+                            };
+                            if let Some(text) = text {
+                                decoded
+                                    .kinds
+                                    .push_scoped(scope, ActivityKind::Thinking { text });
+                            }
                         }
                     }
                     _ => {}
@@ -3672,27 +4071,90 @@ impl OutputDecoder {
             }
             Some("assistant") => {
                 decoded.recognized = true;
-                for block in content_blocks(value) {
+                let Some(scope) = self.claude_envelope_scope(value) else {
+                    return decoded;
+                };
+                let child_id = scope.child_id().map(str::to_owned);
+                let blocks = content_blocks(value).collect::<Vec<_>>();
+                let child_text = child_id.as_ref().map(|_| {
+                    blocks
+                        .iter()
+                        .filter_map(|block| {
+                            (block.get("type").and_then(Value::as_str) == Some("text"))
+                                .then(|| block.get("text").and_then(Value::as_str))
+                                .flatten()
+                        })
+                        .collect::<String>()
+                });
+                let child_thinking = child_id.as_ref().map(|_| {
+                    blocks
+                        .iter()
+                        .filter_map(|block| {
+                            (block.get("type").and_then(Value::as_str) == Some("thinking"))
+                                .then(|| {
+                                    block
+                                        .get("thinking")
+                                        .or_else(|| block.get("text"))
+                                        .and_then(Value::as_str)
+                                })
+                                .flatten()
+                        })
+                        .collect::<String>()
+                });
+                let mut emitted_child_text = false;
+                let mut emitted_child_thinking = false;
+                for block in blocks {
                     match block.get("type").and_then(Value::as_str) {
-                        Some("text") if !self.saw_text_delta => {
-                            if let Some(text) = block.get("text").and_then(Value::as_str)
-                                && !text.is_empty()
-                            {
-                                decoded.kinds.push(ActivityKind::AssistantText {
-                                    text: text.to_owned(),
-                                });
+                        Some("text") => {
+                            let text = if let Some(child_id) = child_id.as_deref() {
+                                if emitted_child_text {
+                                    None
+                                } else {
+                                    emitted_child_text = true;
+                                    child_text.as_deref().and_then(|text| {
+                                        self.complete_claude_child_text(child_id, text.to_owned())
+                                    })
+                                }
+                            } else if !self.saw_text_delta {
+                                block
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .filter(|text| !text.is_empty())
+                                    .map(str::to_owned)
+                            } else {
+                                None
+                            };
+                            if let Some(text) = text {
+                                decoded.kinds.push_scoped(
+                                    scope.clone(),
+                                    ActivityKind::AssistantText { text },
+                                );
                             }
                         }
-                        Some("thinking") if !self.saw_thinking_delta => {
-                            if let Some(text) = block
-                                .get("thinking")
-                                .or_else(|| block.get("text"))
-                                .and_then(Value::as_str)
-                                && !text.is_empty()
-                            {
+                        Some("thinking") => {
+                            let text = if let Some(child_id) = child_id.as_deref() {
+                                if emitted_child_thinking {
+                                    None
+                                } else {
+                                    emitted_child_thinking = true;
+                                    child_thinking.as_deref().and_then(|text| {
+                                        self.complete_claude_child_thinking(child_id, text)
+                                    })
+                                }
+                            } else if !self.saw_thinking_delta {
+                                block
+                                    .get("thinking")
+                                    .or_else(|| block.get("text"))
+                                    .and_then(Value::as_str)
+                                    .filter(|text| !text.is_empty())
+                                    .map(str::to_owned)
+                            } else {
+                                None
+                            };
+                            if let Some(text) = text {
                                 decoded
                                     .kinds
-                                    .push(ActivityKind::Thinking { text: text.into() });
+                                    .push_scoped(scope.clone(), ActivityKind::Thinking { text });
                             }
                         }
                         Some("tool_use") => {
@@ -3703,26 +4165,56 @@ impl OutputDecoder {
                                 self.decode_tool_use(block)
                             };
                             if let Some(kind) = kind {
-                                decoded.kinds.push(kind);
+                                decoded.kinds.push_scoped(scope.clone(), kind);
                             }
                         }
                         _ => {}
                     }
                 }
+                if let Some(child_id) = child_id {
+                    self.claude_child_streamed_thinking_bytes.remove(&child_id);
+                }
             }
             Some("user") => {
                 decoded.recognized = true;
+                let Some(scope) = self.claude_envelope_scope(value) else {
+                    return decoded;
+                };
+                if value.pointer("/origin/kind").and_then(Value::as_str)
+                    == Some("task-notification")
+                    && let Some(content) = value.pointer("/message/content").and_then(Value::as_str)
+                {
+                    self.decode_claude_task_notification_text(content, value, &mut decoded);
+                }
                 for block in content_blocks(value) {
                     if block.get("type").and_then(Value::as_str) == Some("tool_result")
                         && let Some(kind) = self.decode_tool_result(block, Some(value))
                     {
+                        let child_message = match &kind {
+                            ActivityKind::Subagent {
+                                id,
+                                status: SubagentStatus::Completed | SubagentStatus::Failed,
+                                ..
+                            } => claude_subagent_result_text(block, Some(value))
+                                .map(|text| (id.clone(), text)),
+                            _ => None,
+                        };
                         if let ActivityKind::Subagent { id, .. } = &kind
                             && let Some(duration_ms) =
                                 claude_subagent_duration_ms(block, Some(value))
                         {
                             decoded.subagent_duration_ms.insert(id.clone(), duration_ms);
                         }
-                        decoded.kinds.push(kind);
+                        decoded.kinds.push_scoped(scope.clone(), kind);
+                        if let Some((child_id, text)) = child_message {
+                            let text = self.complete_or_dedupe_claude_child_result(&child_id, text);
+                            if let Some(text) = text {
+                                decoded.kinds.push_scoped(
+                                    AgentScope::Child { id: child_id },
+                                    ActivityKind::AssistantText { text },
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -3763,6 +4255,82 @@ impl OutputDecoder {
         decoded
     }
 
+    fn decode_claude_task_notification_text(
+        &mut self,
+        content: &str,
+        envelope: &Value,
+        decoded: &mut JsonDecodeResult,
+    ) {
+        let content = content.trim();
+        if !content.starts_with("<task-notification>") || !content.ends_with("</task-notification>")
+        {
+            return;
+        }
+        let task_id = tagged_text(content, "task-id").unwrap_or_default();
+        let tool_use_id = tagged_text(content, "tool-use-id").unwrap_or_default();
+        let seed_id = if !tool_use_id.is_empty() && self.is_known_subagent(&tool_use_id) {
+            tool_use_id.as_str()
+        } else if !task_id.is_empty() && self.is_known_subagent(&task_id) {
+            task_id.as_str()
+        } else {
+            return;
+        };
+        let canonical_id = self.canonical_subagent_id(seed_id);
+        if !tool_use_id.is_empty() {
+            self.bind_subagent_alias(tool_use_id, canonical_id.clone());
+        }
+        if !task_id.is_empty() {
+            self.bind_subagent_alias(task_id, canonical_id.clone());
+        }
+
+        let status = claude_subagent_status(tagged_text(content, "status").as_deref());
+        let parent_id = self
+            .subagents
+            .get(&canonical_id)
+            .and_then(|metadata| metadata.parent_id.clone())
+            .or_else(|| string_at(envelope, &["session_id", "sessionId"]))
+            .or_else(|| self.session_id.clone());
+        let metadata = self.remember_subagent(
+            &canonical_id,
+            KnownSubagent {
+                parent_id,
+                label: String::new(),
+                model: None,
+                detail: tagged_text(content, "summary"),
+                status: None,
+            },
+            status,
+        );
+        decoded.kinds.push(ActivityKind::Subagent {
+            id: canonical_id.clone(),
+            aliases: self.subagent_aliases_for(&canonical_id),
+            parent_id: metadata.parent_id,
+            label: metadata.label,
+            status,
+            model: metadata.model,
+            detail: metadata.detail,
+            tool_calls: tagged_text(content, "tool_uses")
+                .and_then(|value| value.parse::<u64>().ok()),
+        });
+        if let Some(duration_ms) =
+            tagged_text(content, "duration_ms").and_then(|value| value.parse::<i64>().ok())
+        {
+            decoded
+                .subagent_duration_ms
+                .insert(canonical_id.clone(), duration_ms.max(0));
+        }
+        if status.is_terminal()
+            && let Some(text) = tagged_text(content, "result")
+                .map(|text| unescape_claude_notification_entities(&text))
+            && let Some(text) = self.complete_or_dedupe_claude_child_result(&canonical_id, text)
+        {
+            decoded.kinds.push_scoped(
+                AgentScope::Child { id: canonical_id },
+                ActivityKind::AssistantText { text },
+            );
+        }
+    }
+
     fn decode_claude_system(&mut self, value: &Value, decoded: &mut JsonDecodeResult) {
         let subtype = string_at(value, &["subtype"]).unwrap_or_default();
         match normalized_token(&subtype).as_str() {
@@ -3785,7 +4353,10 @@ impl OutputDecoder {
     ) {
         let task_id = string_at(value, &["task_id", "taskId"]).unwrap_or_default();
         let tool_use_id = string_at(value, &["tool_use_id", "toolUseId"]);
-        let subagent_type = string_at(value, &["subagent_type", "subagentType"]);
+        let subagent_type = string_at(value, &["subagent_type", "subagentType"]).or_else(|| {
+            string_at(value, &["task_type", "taskType"])
+                .filter(|task_type| normalized_token(task_type).contains("agent"))
+        });
         let known = self.is_known_subagent(&task_id)
             || tool_use_id
                 .as_deref()
@@ -3863,7 +4434,9 @@ impl OutputDecoder {
                 label,
                 model: string_at(value, &["resolved_model", "resolvedModel", "model"]),
                 detail,
+                status: None,
             },
+            status,
         );
         let usage = value.get("usage");
         let tool_calls = usage
@@ -3891,6 +4464,7 @@ impl OutputDecoder {
             });
         decoded.kinds.push(ActivityKind::Subagent {
             id: canonical_id.clone(),
+            aliases: self.subagent_aliases_for(&canonical_id),
             parent_id: metadata.parent_id,
             label: metadata.label,
             status,
@@ -3970,10 +4544,13 @@ impl OutputDecoder {
                         ],
                     )
                 }),
+                status: None,
             },
+            SubagentStatus::InProgress,
         );
         decoded.kinds.push(ActivityKind::Subagent {
             id: canonical_id.clone(),
+            aliases: self.subagent_aliases_for(&canonical_id),
             parent_id: metadata.parent_id,
             label: metadata.label,
             status: SubagentStatus::InProgress,
@@ -4047,9 +4624,12 @@ impl OutputDecoder {
                 .unwrap_or_else(|| "Subagent".into()),
                 model: string_at(&input, &["model"]),
                 detail,
+                status: None,
             },
+            SubagentStatus::InProgress,
         );
         Some(ActivityKind::Subagent {
+            aliases: self.subagent_aliases_for(&canonical_id),
             id: canonical_id,
             parent_id: metadata.parent_id,
             label: metadata.label,
@@ -4489,10 +5069,9 @@ impl OutputDecoder {
             .and_then(|payload| string_at(payload, &["agent_id", "agentId", "task_id", "taskId"]));
         let canonical_id = if self.is_known_subagent(&tool_use_id) {
             self.canonical_subagent_id(&tool_use_id)
-        } else if let Some(provider_agent_id) = provider_agent_id.as_deref() {
-            self.canonical_subagent_id(provider_agent_id)
         } else {
-            return None;
+            let provider_agent_id = provider_agent_id.as_deref()?;
+            self.canonical_subagent_id(provider_agent_id)
         };
         self.bind_subagent_alias(tool_use_id, canonical_id.clone());
         if let Some(provider_agent_id) = provider_agent_id {
@@ -4535,6 +5114,11 @@ impl OutputDecoder {
                 envelope.and_then(|envelope| string_at(envelope, &["session_id", "sessionId"]))
             })
             .or_else(|| self.session_id.clone());
+        let lifecycle_detail = if status == SubagentStatus::Completed {
+            None
+        } else {
+            payload_detail.or(fallback_output)
+        };
         let metadata = self.remember_subagent(
             &canonical_id,
             KnownSubagent {
@@ -4550,10 +5134,13 @@ impl OutputDecoder {
                 model: payload.and_then(|payload| {
                     string_at(payload, &["resolved_model", "resolvedModel", "model"])
                 }),
-                detail: payload_detail.or(fallback_output),
+                detail: lifecycle_detail,
+                status: None,
             },
+            status,
         );
         Some(ActivityKind::Subagent {
+            aliases: self.subagent_aliases_for(&canonical_id),
             id: canonical_id,
             parent_id: metadata.parent_id,
             label: metadata.label,
@@ -4971,7 +5558,13 @@ fn is_grok_session_activity_update(value: &Value) -> bool {
         grok_session_update(value)
             .get("sessionUpdate")
             .and_then(Value::as_str),
-        Some("subagent_spawned" | "subagent_finished" | "tool_call" | "tool_call_update")
+        Some(
+            "subagent_spawned"
+                | "subagent_progress"
+                | "subagent_finished"
+                | "tool_call"
+                | "tool_call_update"
+        )
     )
 }
 
@@ -4982,10 +5575,10 @@ fn decode_grok_session_activity_events(
     let result = decoder.decode_grok_session_update(update);
     let timestamp = grok_session_timestamp_ms(update);
     let mut events = Vec::with_capacity(result.kinds.len());
-    for kind in result.kinds {
+    for activity in result.kinds {
         decoder.recognized_events = decoder.recognized_events.saturating_add(1);
-        let is_subagent = matches!(kind, ActivityKind::Subagent { .. });
-        let mut event = activity_event(kind);
+        let is_subagent = matches!(&activity.kind, ActivityKind::Subagent { .. });
+        let mut event = scoped_activity_event(activity.scope, activity.kind);
         if let Some(timestamp) = timestamp {
             event.at = UnixMillis(timestamp);
         }
@@ -5200,6 +5793,7 @@ fn harvest_grok_subagent_metadata(
         };
         let mut event = activity_event(ActivityKind::Subagent {
             id: id.clone(),
+            aliases: decoder.subagent_aliases_for(&id),
             parent_id: Some(parent_session_id.into()),
             label: label.clone(),
             status,
@@ -5589,6 +6183,14 @@ fn compact_subagent_label(value: &str) -> Option<String> {
     }
 }
 
+fn compact_subagent_detail(value: String) -> String {
+    if value.len() <= MAX_SUBAGENT_DETAIL_BYTES {
+        return value;
+    }
+    let maximum = MAX_SUBAGENT_DETAIL_BYTES.saturating_sub("…".len());
+    format!("{}…", truncate_utf8(&value, maximum))
+}
+
 fn codex_subagent_status(
     agent_status: Option<&str>,
     call_status: Option<&str>,
@@ -5706,6 +6308,96 @@ fn claude_tool_result_payload<'a>(
         }
     }
     value_at(block, &["tool_use_result", "toolUseResult"]).filter(|payload| !payload.is_null())
+}
+
+fn claude_subagent_result_text(block: &Value, envelope: Option<&Value>) -> Option<String> {
+    claude_tool_result_payload(block, envelope)
+        .and_then(|payload| {
+            flattened_content(payload.get("content"))
+                .or_else(|| string_at(payload, &["summary", "description"]))
+        })
+        .or_else(|| flattened_content(block.get("content")))
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn claude_terminal_result_repeats(existing: &str, candidate: &str) -> bool {
+    let existing = existing.trim();
+    let candidate = candidate.trim();
+    if existing.is_empty() || candidate.is_empty() {
+        return false;
+    }
+    if candidate.len() > MAX_SUBAGENT_MESSAGE_BYTES
+        && truncate_utf8(candidate, MAX_SUBAGENT_MESSAGE_BYTES).trim() == existing
+    {
+        return true;
+    }
+    if candidate == existing
+        || candidate
+            .strip_suffix(existing)
+            .is_some_and(|prefix| prefix.chars().last().is_some_and(char::is_whitespace))
+    {
+        return true;
+    }
+    if candidate
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .eq(existing
+            .chars()
+            .filter(|character| !character.is_whitespace()))
+    {
+        return true;
+    }
+    if !candidate.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let mut candidate = candidate
+        .chars()
+        .rev()
+        .filter(|character| !character.is_whitespace());
+    existing
+        .chars()
+        .rev()
+        .filter(|character| !character.is_whitespace())
+        .all(|character| candidate.next() == Some(character))
+}
+
+fn tagged_text(value: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = value.find(&start_tag)?.saturating_add(start_tag.len());
+    let relative_end = value.get(start..)?.find(&end_tag)?;
+    let end = start.saturating_add(relative_end);
+    let text = value.get(start..end)?.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn unescape_claude_notification_entities(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let remaining = &value[cursor..];
+        let (replacement, consumed) = if remaining.starts_with("&amp;") {
+            (Some('&'), 5)
+        } else if remaining.starts_with("&lt;") {
+            (Some('<'), 4)
+        } else if remaining.starts_with("&gt;") {
+            (Some('>'), 4)
+        } else {
+            (None, 0)
+        };
+        if let Some(replacement) = replacement {
+            output.push(replacement);
+            cursor += consumed;
+        } else {
+            let character = remaining
+                .chars()
+                .next()
+                .expect("cursor remains on a character boundary");
+            output.push(character);
+            cursor += character.len_utf8();
+        }
+    }
+    output
 }
 
 fn is_claude_agent_output(payload: &Value) -> bool {
@@ -9347,8 +10039,12 @@ send({
     fn kimi_and_codex_shapes_normalize_to_text_and_activity() {
         let kimi = json!({"role":"assistant","content":"Kimi answer"});
         let mut kimi_decoder = OutputDecoder::new("kimi_cli".into(), OutputMode::JsonLines);
+        let kimi_kinds = kimi_decoder
+            .decode_provider_event(&kimi)
+            .kinds
+            .into_main_kinds();
         assert!(matches!(
-            kimi_decoder.decode_provider_event(&kimi).kinds.as_slice(),
+            kimi_kinds.as_slice(),
             [ActivityKind::AssistantText { text }] if text == "Kimi answer"
         ));
 
@@ -9357,8 +10053,12 @@ send({
             "item":{"id":"answer-1","type":"agent_message","text":"Codex answer"}
         });
         let mut codex_decoder = OutputDecoder::new("codex_cli".into(), OutputMode::JsonLines);
+        let codex_kinds = codex_decoder
+            .decode_provider_event(&codex)
+            .kinds
+            .into_main_kinds();
         assert!(matches!(
-            codex_decoder.decode_provider_event(&codex).kinds.as_slice(),
+            codex_kinds.as_slice(),
             [ActivityKind::AssistantText { text }] if text == "Codex answer"
         ));
 
@@ -9372,8 +10072,12 @@ send({
             }]}
         });
         let mut claude_decoder = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
+        let claude_kinds = claude_decoder
+            .decode_provider_event(&tool)
+            .kinds
+            .into_main_kinds();
         assert!(matches!(
-            claude_decoder.decode_provider_event(&tool).kinds.as_slice(),
+            claude_kinds.as_slice(),
             [ActivityKind::ToolCall { name, .. }] if name == "Read"
         ));
     }
@@ -9382,12 +10086,18 @@ send({
     fn codex_native_collab_items_project_one_stable_subagent_with_aliases() {
         let stream = concat!(
             "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"root-thread\"}}}\n",
-            "{\"method\":\"item/started\",\"params\":{\"item\":{\"id\":\"collab-1\",\"type\":\"collabAgentToolCall\",\"tool\":\"spawnAgent\",\"status\":\"inProgress\",\"senderThreadId\":\"root-thread\",\"receiverThreadIds\":[\"child-thread\"],\"prompt\":\"Audit authentication flows\\nReturn concise findings\",\"model\":\"gpt-5.6\",\"reasoningEffort\":\"high\",\"agentsStates\":{\"child-thread\":{\"status\":\"running\",\"message\":\"Reading auth files\"}}}}}\n",
+            "{\"type\":\"item.started\",\"item\":{\"id\":\"collab-1\",\"type\":\"collab_tool_call\",\"tool\":\"spawn_agent\",\"status\":\"in_progress\",\"sender_thread_id\":\"root-thread\",\"receiver_thread_ids\":[\"child-thread\"],\"prompt\":\"Audit authentication flows\\nReturn concise findings\",\"model\":\"gpt-5.6\",\"reasoning_effort\":\"high\",\"agents_states\":{\"child-thread\":{\"status\":\"running\",\"message\":\"Reading auth files\"}}}}\n",
             "{\"type\":\"item.completed\",\"item\":{\"id\":\"activity-1\",\"type\":\"sub_agent_activity\",\"kind\":\"interacted\",\"agent_thread_id\":\"child-thread\",\"agent_path\":\"root/child-thread\"}}\n",
-            "{\"method\":\"item/completed\",\"params\":{\"item\":{\"id\":\"collab-1\",\"type\":\"collabAgentToolCall\",\"tool\":\"wait\",\"status\":\"completed\",\"senderThreadId\":\"root-thread\",\"receiverThreadIds\":[\"child-thread\"],\"durationMs\":3125,\"agentsStates\":{\"child-thread\":{\"status\":\"completed\",\"message\":\"Audit complete\"}}}}}\n"
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"collab-1\",\"type\":\"collab_tool_call\",\"tool\":\"wait\",\"status\":\"completed\",\"sender_thread_id\":\"root-thread\",\"receiver_thread_ids\":[\"child-thread\"],\"duration_ms\":3125,\"agents_states\":{\"child-thread\":{\"status\":\"completed\",\"message\":\"Audit complete\"}}}}\n"
         );
         let (decoder, decoded) = decode_in_chunks("codex_cli", stream, 9);
         assert_eq!(decoder.session_id.as_deref(), Some("root-thread"));
+        assert!(decoder.output.is_empty());
+        assert!(
+            !decoded
+                .iter()
+                .any(|event| matches!(event, Decoded::Delta(_)))
+        );
         let accumulator = accumulated(&decoded);
         let subagents = crate::chat_core::project_subagents(&accumulator.events);
         assert_eq!(subagents.len(), 1);
@@ -9396,8 +10106,11 @@ send({
         assert_eq!(subagents[0].label, "Audit authentication flows");
         assert_eq!(subagents[0].status, SubagentStatus::Completed);
         assert_eq!(subagents[0].model.as_deref(), Some("gpt-5.6"));
-        assert_eq!(subagents[0].detail.as_deref(), Some("Audit complete"));
+        assert!(subagents[0].detail.is_none());
         assert_eq!(subagents[0].duration_ms, Some(3_125));
+        assert_eq!(subagents[0].prose_cells.len(), 1);
+        assert_eq!(subagents[0].prose_cells[0].text, "Audit complete");
+        assert!(crate::chat_core::assistant_flat_text(&accumulator.events).is_empty());
         assert!(!accumulator.events.iter().any(|event| matches!(
             event.kind,
             ActivityKind::TaskMutation { .. } | ActivityKind::PlanUpdate { .. }
@@ -9418,6 +10131,12 @@ send({
         );
         let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 13);
         assert_eq!(decoder.session_id.as_deref(), Some("claude-root"));
+        assert!(decoder.output.is_empty());
+        assert!(
+            !decoded
+                .iter()
+                .any(|event| matches!(event, Decoded::Delta(_)))
+        );
         let accumulator = accumulated(&decoded);
         let subagents = crate::chat_core::project_subagents(&accumulator.events);
         assert_eq!(subagents.len(), 1);
@@ -9429,6 +10148,16 @@ send({
         assert_eq!(subagents[0].detail.as_deref(), Some("Auth audit delivered"));
         assert_eq!(subagents[0].tool_calls, Some(8));
         assert_eq!(subagents[0].duration_ms, Some(5_000));
+        assert_eq!(
+            subagents[0].aliases,
+            vec!["background-agent-7", "claude-agent-real"]
+        );
+        assert_eq!(subagents[0].prose_cells.len(), 1);
+        assert_eq!(
+            subagents[0].prose_cells[0].text,
+            "Found two validation gaps"
+        );
+        assert!(crate::chat_core::assistant_flat_text(&accumulator.events).is_empty());
         assert!(!accumulator.events.iter().any(|event| matches!(
             event.kind,
             ActivityKind::TaskMutation { .. } | ActivityKind::PlanUpdate { .. }
@@ -9601,6 +10330,490 @@ send({
                 );
             }
         }
+    }
+
+    #[test]
+    fn version_pinned_child_fixtures_keep_parent_and_child_prose_separate() {
+        for (provider, stream) in [
+            (
+                "codex_cli",
+                include_str!("../tests/fixtures/ai/codex/0.144.1/subagent.jsonl"),
+            ),
+            (
+                "claude_cli",
+                include_str!("../tests/fixtures/ai/claude/2.1.128/subagent.jsonl"),
+            ),
+        ] {
+            assert_jsonl_fixture(stream);
+            for chunk_size in [1, 11, stream.len()] {
+                let (decoder, decoded) = decode_in_chunks(provider, stream, chunk_size);
+                assert_eq!(decoder.output, "PARENT_FIXTURE_OK");
+                let streamed = decoded
+                    .iter()
+                    .filter_map(|event| match event {
+                        Decoded::Delta(text) => Some(text.as_str()),
+                        Decoded::Activity(_) | Decoded::StreamReset => None,
+                    })
+                    .collect::<String>();
+                assert_eq!(streamed, "PARENT_FIXTURE_OK");
+
+                let accumulator = accumulated(&decoded);
+                assert_eq!(
+                    crate::chat_core::assistant_flat_text(&accumulator.events),
+                    "PARENT_FIXTURE_OK"
+                );
+                let children = crate::chat_core::project_subagents(&accumulator.events);
+                assert_eq!(children.len(), 1);
+                assert_eq!(children[0].status, SubagentStatus::Completed);
+                assert_eq!(children[0].prose_cells.len(), 1);
+                let expected_child = if provider == "claude_cli" {
+                    "CHILD_FIXTURE_OK & A < B > C"
+                } else {
+                    "CHILD_FIXTURE_OK"
+                };
+                assert_eq!(children[0].prose_cells[0].text, expected_child);
+                assert!(children[0].checklist.is_none());
+                if provider == "claude_cli" {
+                    assert_eq!(children[0].id, "claude-agent-call");
+                    assert_eq!(children[0].aliases, vec!["claude-durable-agent"]);
+                    assert_eq!(children[0].tool_calls, Some(1));
+                    assert_eq!(children[0].duration_ms, Some(1_000));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn claude_foreground_child_never_leaks_prose_or_tools_into_main() {
+        let stream = include_str!("../tests/fixtures/ai/claude/2.1.128/foreground-subagent.jsonl");
+        assert_jsonl_fixture(stream);
+        for chunk_size in [1, 11, stream.len()] {
+            let (decoder, decoded) = decode_in_chunks("claude_cli", stream, chunk_size);
+            assert_eq!(
+                decoder.output, "PARENT_FOREGROUND_OK",
+                "parent capture changed at chunk size {chunk_size}"
+            );
+            let deltas = decoded
+                .iter()
+                .filter_map(|event| match event {
+                    Decoded::Delta(text) => Some(text.as_str()),
+                    Decoded::Activity(_) | Decoded::StreamReset => None,
+                })
+                .collect::<String>();
+            assert_eq!(deltas, "PARENT_FOREGROUND_OK");
+
+            let accumulator = accumulated(&decoded);
+            assert_eq!(
+                crate::chat_core::assistant_flat_text(&accumulator.events),
+                "PARENT_FOREGROUND_OK"
+            );
+            let children = crate::chat_core::project_subagents(&accumulator.events);
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0].id, "claude-foreground-agent");
+            assert_eq!(children[0].status, SubagentStatus::Completed);
+            assert_eq!(children[0].aliases, vec!["claude-foreground-task"]);
+            assert_eq!(children[0].prose_cells.len(), 1);
+            assert_eq!(children[0].prose_cells[0].text, "CHILD_FOREGROUND_OK");
+
+            let child_scope = AgentScope::Child {
+                id: "claude-foreground-agent".into(),
+            };
+            assert!(accumulator.events.iter().all(|event| {
+                let text = match &event.kind {
+                    ActivityKind::AssistantText { text } | ActivityKind::Thinking { text } => text,
+                    _ => return true,
+                };
+                if event.scope.is_main() {
+                    !text.contains("CHILD_")
+                } else {
+                    event.scope == child_scope && !text.contains("PARENT_")
+                }
+            }));
+            assert!(accumulator.events.iter().any(|event| {
+                event.scope == child_scope
+                    && matches!(
+                        &event.kind,
+                        ActivityKind::Thinking { text } if text == "CHILD_THINKING"
+                    )
+            }));
+            assert!(accumulator.events.iter().any(|event| {
+                event.scope.is_main()
+                    && matches!(
+                        &event.kind,
+                        ActivityKind::Thinking { text } if text == "PARENT_THINKING"
+                    )
+            }));
+
+            let command_scope = |id: &str| {
+                accumulator
+                    .events
+                    .iter()
+                    .filter_map(|event| match &event.kind {
+                        ActivityKind::Command {
+                            id: command_id,
+                            status,
+                            ..
+                        } if command_id == id => Some((&event.scope, *status)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                command_scope("child-command"),
+                vec![(&child_scope, ActivityStatus::Completed)]
+            );
+            assert_eq!(
+                command_scope("parent-command"),
+                vec![(&AgentScope::Main, ActivityStatus::Completed)]
+            );
+        }
+    }
+
+    #[test]
+    fn claude_explicit_child_identity_never_falls_back_to_main() {
+        let stream = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"root\"}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"orphan\",\"session_id\":\"root\",\"parent_tool_use_id\":\"orphan-child\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ORPHAN_CHILD\"}}}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":7,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"MALFORMED_CHILD\"}]}}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":\"\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"EMPTY_CHILD\"}]}}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"MAIN_ONLY\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 7);
+        assert_eq!(decoder.output, "MAIN_ONLY");
+        let accumulator = accumulated(&decoded);
+        assert_eq!(
+            crate::chat_core::assistant_flat_text(&accumulator.events),
+            "MAIN_ONLY"
+        );
+        assert!(accumulator.events.iter().any(|event| {
+            event.scope.child_id() == Some("orphan-child")
+                && matches!(
+                    &event.kind,
+                    ActivityKind::AssistantText { text } if text == "ORPHAN_CHILD"
+                )
+        }));
+        assert!(!accumulator.events.iter().any(|event| match &event.kind {
+            ActivityKind::AssistantText { text } => {
+                text.contains("MALFORMED_CHILD") || text.contains("EMPTY_CHILD")
+            }
+            _ => false,
+        }));
+        assert!(
+            crate::chat_core::project_subagents(&accumulator.events).is_empty(),
+            "an orphan scope must not invent a lifecycle row"
+        );
+    }
+
+    #[test]
+    fn claude_foreground_children_keep_independent_snapshot_state() {
+        let stream = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"root\"}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"child-a\",\"name\":\"Agent\",\"input\":{\"description\":\"Child A\",\"prompt\":\"A\",\"subagent_type\":\"Explore\"}},{\"type\":\"tool_use\",\"id\":\"child-b\",\"name\":\"Agent\",\"input\":{\"description\":\"Child B\",\"prompt\":\"B\",\"subagent_type\":\"Explore\"}}]}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"a-delta\",\"session_id\":\"root\",\"parent_tool_use_id\":\"child-a\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"A_\"}}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"b-delta\",\"session_id\":\"root\",\"parent_tool_use_id\":\"child-b\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"B_OK\"}}}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":\"child-a\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"A_OK\"}]}}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":\"child-b\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"B_OK\"}]}}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PARENT_OK\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 5);
+        assert_eq!(decoder.output, "PARENT_OK");
+        let accumulator = accumulated(&decoded);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 2);
+        for (id, expected) in [("child-a", "A_OK"), ("child-b", "B_OK")] {
+            let child = children.iter().find(|child| child.id == id).unwrap();
+            assert_eq!(child.prose_cells.len(), 1);
+            assert_eq!(child.prose_cells[0].text, expected);
+        }
+        assert_eq!(
+            crate::chat_core::assistant_flat_text(&accumulator.events),
+            "PARENT_OK"
+        );
+    }
+
+    #[test]
+    fn claude_child_multiblock_snapshot_and_terminal_echo_stay_single() {
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"parent-call\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"child-1\",\"name\":\"Agent\",\"input\":{\"description\":\"Child\",\"prompt\":\"Work\",\"subagent_type\":\"Explore\"}}]}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"alpha-delta\",\"parent_tool_use_id\":\"child-1\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Alpha\"}}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"beta-delta\",\"parent_tool_use_id\":\"child-1\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Beta\"}}}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"child-snapshot\",\"parent_tool_use_id\":\"child-1\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Alpha\"},{\"type\":\"text\",\"text\":\"Beta\"}]}}\n",
+            "{\"type\":\"user\",\"uuid\":\"parent-result\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"child-1\",\"content\":\"\",\"is_error\":false}]},\"tool_use_result\":{\"agentId\":\"child-1\",\"status\":\"completed\",\"content\":[{\"type\":\"text\",\"text\":\"Agent preamble\"},{\"type\":\"text\",\"text\":\"Alpha\"},{\"type\":\"text\",\"text\":\"Beta\"}]}}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"parent-final\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PARENT_OK\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 3);
+        assert_eq!(decoder.output, "PARENT_OK");
+        let accumulator = accumulated(&decoded);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].prose_cells.len(), 1);
+        assert_eq!(children[0].prose_cells[0].text, "AlphaBeta");
+        assert_eq!(
+            crate::chat_core::assistant_flat_text(&accumulator.events),
+            "PARENT_OK"
+        );
+    }
+
+    #[test]
+    fn claude_unfinished_child_stream_flushes_one_bounded_partial_cell() {
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"parent-call\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"child-1\",\"name\":\"Agent\",\"input\":{\"description\":\"Child\",\"prompt\":\"Work\",\"subagent_type\":\"Explore\"}}]}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"partial\",\"parent_tool_use_id\":\"child-1\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PARTIAL_CHILD\"}}}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"parent-final\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PARENT_OK\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 2);
+        assert_eq!(decoder.output, "PARENT_OK");
+        let accumulator = accumulated(&decoded);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].prose_cells.len(), 1);
+        assert_eq!(children[0].prose_cells[0].text, "PARTIAL_CHILD");
+    }
+
+    #[test]
+    fn claude_terminal_result_completes_an_unfinished_child_stream_once() {
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"parent-call\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"child-1\",\"name\":\"Agent\",\"input\":{\"description\":\"Child\",\"prompt\":\"Work\",\"subagent_type\":\"Explore\"}}]}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"partial\",\"parent_tool_use_id\":\"child-1\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PARTIAL\"}}}\n",
+            "{\"type\":\"user\",\"uuid\":\"parent-result\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"child-1\",\"content\":\"\",\"is_error\":false}]},\"tool_use_result\":{\"agentId\":\"child-1\",\"status\":\"completed\",\"content\":[{\"type\":\"text\",\"text\":\"COMPLETE_CHILD\"}]}}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"parent-final\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PARENT_OK\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 5);
+        assert_eq!(decoder.output, "PARENT_OK");
+        let accumulator = accumulated(&decoded);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].prose_cells.len(), 1);
+        assert_eq!(children[0].prose_cells[0].text, "COMPLETE_CHILD");
+    }
+
+    #[test]
+    fn claude_task_notification_completes_an_unfinished_child_stream_once() {
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"parent-call\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"child-1\",\"name\":\"Agent\",\"input\":{\"description\":\"Child\",\"prompt\":\"Work\",\"subagent_type\":\"Explore\"}}]}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"partial\",\"parent_tool_use_id\":\"child-1\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PARTIAL\"}}}\n",
+            "{\"type\":\"user\",\"uuid\":\"task-result\",\"parent_tool_use_id\":null,\"origin\":{\"kind\":\"task-notification\"},\"message\":{\"content\":\"<task-notification>\\n<task-id>child-task</task-id>\\n<tool-use-id>child-1</tool-use-id>\\n<status>completed</status>\\n<result>COMPLETE_CHILD</result>\\n</task-notification>\"}}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"parent-final\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PARENT_OK\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 5);
+        assert_eq!(decoder.output, "PARENT_OK");
+        let accumulator = accumulated(&decoded);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].prose_cells.len(), 1);
+        assert_eq!(children[0].prose_cells[0].text, "COMPLETE_CHILD");
+    }
+
+    #[test]
+    fn claude_resumed_child_preserves_its_pre_resume_partial_response() {
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"parent-call\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"child-1\",\"name\":\"Agent\",\"input\":{\"description\":\"Child\",\"prompt\":\"Work\",\"subagent_type\":\"Explore\"}}]}}\n",
+            "{\"type\":\"system\",\"subtype\":\"task_started\",\"uuid\":\"start-1\",\"task_id\":\"child-task\",\"tool_use_id\":\"child-1\",\"task_type\":\"local_agent\"}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"before-resume\",\"parent_tool_use_id\":\"child-1\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"BEFORE_RESUME\"}}}\n",
+            "{\"type\":\"system\",\"subtype\":\"task_notification\",\"uuid\":\"cancel-1\",\"task_id\":\"child-task\",\"tool_use_id\":\"child-1\",\"task_type\":\"local_agent\",\"status\":\"cancelled\"}\n",
+            "{\"type\":\"system\",\"subtype\":\"task_started\",\"uuid\":\"start-2\",\"task_id\":\"child-task\",\"tool_use_id\":\"child-1\",\"task_type\":\"local_agent\"}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"after-resume\",\"parent_tool_use_id\":\"child-1\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"AFTER_RESUME\"}]}}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"parent-final\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PARENT_OK\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 3);
+        assert_eq!(decoder.output, "PARENT_OK");
+        let accumulator = accumulated(&decoded);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].prose_cells.len(), 2);
+        assert_eq!(children[0].prose_cells[0].text, "BEFORE_RESUME");
+        assert_eq!(children[0].prose_cells[1].text, "AFTER_RESUME");
+    }
+
+    #[test]
+    fn scoped_child_output_and_lifecycle_detail_are_strictly_bounded() {
+        let mut decoder = OutputDecoder::new("codex_cli".into(), OutputMode::JsonLines);
+        let oversized = "é".repeat(MAX_SUBAGENT_MESSAGE_BYTES);
+        let first = decoder
+            .remember_subagent_message("child-0", oversized)
+            .expect("first child output");
+        assert!(first.len() <= MAX_SUBAGENT_MESSAGE_BYTES);
+        assert!(first.is_char_boundary(first.len()));
+
+        for index in 1..32 {
+            let text = format!("{index}-{}", "x".repeat(MAX_SUBAGENT_MESSAGE_BYTES));
+            let _ = decoder.remember_subagent_message(&format!("child-{index}"), text);
+        }
+        assert!(decoder.subagent_output_bytes <= MAX_SUBAGENT_OUTPUT_BYTES);
+        assert!(
+            decoder
+                .remember_subagent_message("overflow", "must not persist".into())
+                .is_none()
+        );
+
+        let detail = compact_subagent_detail("é".repeat(MAX_SUBAGENT_DETAIL_BYTES));
+        assert!(detail.len() <= MAX_SUBAGENT_DETAIL_BYTES);
+        assert!(detail.ends_with('…'));
+
+        let mut foreground = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
+        let oversized_delta = "x".repeat(MAX_SUBAGENT_MESSAGE_BYTES + 1);
+        let first = foreground
+            .remember_claude_child_text_delta("foreground-child", &oversized_delta)
+            .expect("bounded foreground delta");
+        assert_eq!(first.len(), MAX_SUBAGENT_MESSAGE_BYTES);
+        assert!(
+            foreground
+                .remember_claude_child_text_delta("foreground-child", "overflow")
+                .is_none(),
+            "one foreground message cannot exceed its per-message cap"
+        );
+        assert!(foreground.subagent_output_bytes <= MAX_SUBAGENT_OUTPUT_BYTES);
+
+        foreground.subagent_output_bytes = MAX_SUBAGENT_OUTPUT_BYTES;
+        for index in 0..32 {
+            let child_id = format!("post-cap-child-{index}");
+            assert!(
+                foreground
+                    .remember_claude_child_text_delta(&child_id, "dropped")
+                    .is_none()
+            );
+            assert!(
+                foreground
+                    .complete_claude_child_text(&child_id, "x".repeat(MAX_SUBAGENT_MESSAGE_BYTES))
+                    .is_none()
+            );
+        }
+        assert!(
+            foreground
+                .claude_child_streamed_text
+                .keys()
+                .all(|child_id| !child_id.starts_with("post-cap-child-"))
+        );
+        let retained_message_bytes = foreground
+            .subagent_messages
+            .values()
+            .map(String::len)
+            .sum::<usize>();
+        assert!(
+            retained_message_bytes <= MAX_SUBAGENT_OUTPUT_BYTES,
+            "post-cap snapshots must not create unaccounted retained output"
+        );
+
+        let mut terminal_echo = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
+        assert_eq!(
+            terminal_echo.complete_claude_child_text("child-echo", "SAME".into()),
+            Some("SAME".into())
+        );
+        terminal_echo.subagent_output_bytes = MAX_SUBAGENT_OUTPUT_BYTES - 2;
+        let before_echo = terminal_echo.subagent_output_bytes;
+        assert!(
+            terminal_echo
+                .complete_or_dedupe_claude_child_result("child-echo", "SAME".into())
+                .is_none(),
+            "remaining capacity must not turn an exact terminal echo into a partial duplicate"
+        );
+        assert_eq!(terminal_echo.subagent_output_bytes, before_echo);
+
+        let oversized_echo = "x".repeat(MAX_SUBAGENT_MESSAGE_BYTES + 64);
+        let mut truncated_echo = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
+        assert_eq!(
+            truncated_echo
+                .complete_claude_child_text("child-echo", oversized_echo.clone())
+                .map(|text| text.len()),
+            Some(MAX_SUBAGENT_MESSAGE_BYTES)
+        );
+        truncated_echo.subagent_output_bytes = MAX_SUBAGENT_OUTPUT_BYTES - 2;
+        let before_echo = truncated_echo.subagent_output_bytes;
+        assert!(
+            truncated_echo
+                .complete_or_dedupe_claude_child_result("child-echo", oversized_echo)
+                .is_none(),
+            "a capped authoritative response must suppress its full terminal echo"
+        );
+        assert_eq!(truncated_echo.subagent_output_bytes, before_echo);
+    }
+
+    #[test]
+    fn claude_child_thinking_obeys_output_bounds_and_lifecycle_cleanup() {
+        let mut decoder = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
+        let oversized = "é".repeat(MAX_SUBAGENT_MESSAGE_BYTES);
+        let first = decoder
+            .remember_claude_child_thinking_delta("child-1", &oversized)
+            .expect("bounded child thinking");
+        assert!(first.len() <= MAX_SUBAGENT_MESSAGE_BYTES);
+        assert!(first.is_char_boundary(first.len()));
+        assert!(
+            decoder
+                .remember_claude_child_thinking_delta("child-1", "overflow")
+                .is_none(),
+            "one child reasoning message cannot exceed its per-message cap"
+        );
+        assert!(
+            decoder
+                .complete_claude_child_thinking("child-1", &oversized)
+                .is_none(),
+            "the terminal thinking snapshot must not repeat streamed reasoning"
+        );
+        assert!(decoder.claude_child_streamed_thinking_bytes.is_empty());
+
+        let child = KnownSubagent {
+            label: "Reasoning child".into(),
+            ..KnownSubagent::default()
+        };
+        assert_eq!(
+            decoder.remember_claude_child_thinking_delta("child-1", "fresh"),
+            Some("fresh".into())
+        );
+        decoder.remember_subagent("child-1", child.clone(), SubagentStatus::Cancelled);
+        assert!(
+            decoder.claude_child_streamed_thinking_bytes.is_empty(),
+            "terminal lifecycle must clear unterminated reasoning state"
+        );
+        decoder.remember_subagent("child-1", child, SubagentStatus::InProgress);
+        assert_eq!(
+            decoder.remember_claude_child_thinking_delta("child-1", "resumed"),
+            Some("resumed".into())
+        );
+
+        decoder.claude_child_streamed_thinking_bytes.clear();
+        decoder.subagent_output_bytes = MAX_SUBAGENT_OUTPUT_BYTES;
+        for index in 0..32 {
+            assert!(
+                decoder
+                    .remember_claude_child_thinking_delta(
+                        &format!("post-cap-thinking-{index}"),
+                        "dropped"
+                    )
+                    .is_none()
+            );
+        }
+        assert!(
+            decoder.claude_child_streamed_thinking_bytes.is_empty(),
+            "post-cap reasoning must not retain child ids"
+        );
+    }
+
+    #[test]
+    fn resumed_child_can_repeat_a_legitimate_terminal_message() {
+        let mut decoder = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
+        let child = KnownSubagent {
+            label: "Research child".into(),
+            ..KnownSubagent::default()
+        };
+        decoder.remember_subagent("child-1", child.clone(), SubagentStatus::Completed);
+        assert_eq!(
+            decoder.remember_subagent_message("child-1", "No findings".into()),
+            Some("No findings".into())
+        );
+        assert!(
+            decoder
+                .remember_subagent_message("child-1", "No findings".into())
+                .is_none(),
+            "duplicate output in one lifecycle stays coalesced"
+        );
+
+        decoder.remember_subagent("child-1", child.clone(), SubagentStatus::InProgress);
+        decoder.remember_subagent("child-1", child, SubagentStatus::Completed);
+        assert_eq!(
+            decoder.remember_subagent_message("child-1", "No findings".into()),
+            Some("No findings".into()),
+            "a resumed lifecycle may legitimately produce the same final prose"
+        );
     }
 
     #[test]
@@ -10100,6 +11313,54 @@ send({
         assert_eq!(
             decoder.protocol_error.as_deref(),
             Some("Web access approval could not be answered in this non-interactive Grok run.")
+        );
+    }
+
+    #[test]
+    fn grok_session_child_output_is_scoped_but_does_not_enable_the_runtime_gate() {
+        let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
+        let updates = [
+            json!({"params":{"update":{
+                "sessionUpdate":"subagent_spawned",
+                "subagent_id":"child-1",
+                "child_session_id":"child-1",
+                "parent_session_id":"root-1",
+                "description":"Research sources"
+            }}}),
+            json!({"params":{"update":{
+                "sessionUpdate":"subagent_progress",
+                "subagent_id":"child-1",
+                "child_session_id":"child-1",
+                "parent_session_id":"root-1",
+                "turn_count":2,
+                "tool_call_count":3,
+                "tools_used":["WebSearch"]
+            }}}),
+            json!({"params":{"update":{
+                "sessionUpdate":"subagent_finished",
+                "subagent_id":"child-1",
+                "child_session_id":"child-1",
+                "status":"completed",
+                "tool_calls":3,
+                "duration_ms":1200,
+                "output":"CHILD_ONLY"
+            }}}),
+        ];
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for update in updates {
+            accumulator.ingest_many(decode_grok_session_activity_events(&mut decoder, &update));
+        }
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, SubagentStatus::Completed);
+        assert_eq!(children[0].tool_calls, Some(3));
+        assert_eq!(children[0].prose_cells[0].text, "CHILD_ONLY");
+        assert!(crate::chat_core::assistant_flat_text(&accumulator.events).is_empty());
+
+        let version = CliVersion::parse("grok 0.2.117 (f1c06093089f)").unwrap();
+        assert!(
+            !runtime_tuning_profile(ProviderKind::Grok, Some(&version), "grok-4.5")
+                .supports_scoped_child_text()
         );
     }
 

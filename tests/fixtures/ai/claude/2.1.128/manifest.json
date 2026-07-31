@@ -8,5 +8,5 @@
     "session and event ids replaced",
     "cwd, tools, commands, plugins, and memory paths omitted"
   ],
-  "note": "The local CLI was signed out, so this fixture intentionally pins its structured authentication-failure terminal shape."
+  "note": "auth-error.jsonl is the local signed-out capture. subagent.jsonl is a redacted contract derived from the exact 2.1.128 async Agent renderer, embedded task schemas, and local task-notification transcripts. foreground-subagent.jsonl is a minimal redacted contract fixture: its assistant/user parent_tool_use_id routing matches exact 2.1.128 foreground child envelopes, while its child stream_event rows are schema-derived defensive coverage."
 }

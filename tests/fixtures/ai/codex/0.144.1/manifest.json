@@ -7,5 +7,6 @@
   "redactions": [
     "thread id replaced",
     "prompt and response reduced to fixture sentinels"
-  ]
+  ],
+  "note": "basic.jsonl is a captured turn. subagent.jsonl pins the captured 0.144.1 exec event spelling (collab_tool_call) and the child-id/message fields defined by the linked official exec schema; its values are fixture sentinels."
 }
