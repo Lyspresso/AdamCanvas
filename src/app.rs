@@ -4,8 +4,9 @@ use crate::{
         agent_rows, preflight_notice,
     },
     ai::{
-        AiEngine, AiEvent, AiFailureKind, AiRunRequest, clamp_provider_preferences,
-        installed_runtime_tuning, provider_exposes_app_task_tools, resolve_effective_provider_id,
+        AiEngine, AiEngineError, AiEvent, AiFailureKind, AiRunRequest, clamp_provider_preferences,
+        installed_kimi_uses_acp, installed_runtime_tuning, provider_exposes_app_task_tools,
+        resolve_effective_provider_id,
     },
     ai_prompt::{
         BuiltPrompt, HistoricalTurn, HistoryRole, PromptAttachment, PromptBudget, PromptContinuity,
@@ -16,22 +17,24 @@ use crate::{
     assets::AssetStore,
     automation::{ReconcileRequest, canvas_objects_from_workspace, reconcile_workspace},
     chat_core::{
-        ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, AgentScope,
-        PlanItem, PlanItemStatus, ProgressSource, RetryHint, RuntimeTuningProfile, StreamDialect,
-        SubagentStatus, SystemPromptChannel, TurnStatus, assistant_flat_text, capability_profile,
+        ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, AgentGroupKind,
+        AgentGroupProjection, AgentGroupVisibility, AgentScope, PlanItem, PlanItemStatus,
+        ProgressSource, RetryHint, RuntimeTuningProfile, StreamDialect, SubagentStatus,
+        SystemPromptChannel, TurnStatus, assistant_flat_text, capability_profile,
         current_work_label, latest_turn_status, newest_plan, newest_plan_for_scope,
-        project_artifacts, project_context, project_progress, project_subagents, project_usage,
+        project_agent_groups, project_artifacts, project_context, project_progress,
+        project_subagents, project_usage,
     },
     clipboard::{self, PasteContent},
     domain::{
-        AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_THINKING,
-        AI_FEATURE_WEB_SEARCH, AiActionKind, AiActionOutcome, AiActionRecord, AiActionRequest,
-        AiAttachmentRef, AiCheckpoint, AiConversation, AiConversationKind, AiConversationSettings,
-        AiProviderPreferences, AiQueuedTurn, AiWorkspaceMode, ApplyMode, ApprovalEvidence,
-        AuthorizationDecision, AutoTagRule, AutoTagSettings, ContainmentMode, DomainActor,
-        EarnedTagRemovalPolicy, ExistingTilesPolicy, InitialMembership, MessageRole, PaletteColor,
-        PermissionMode, Pile, PileHistoryKind, RuleEditProgressPolicy, RuleState, TagClaim,
-        TagName, TagSource, TimeUnit, TimingMode, TrashActor, TrashItem, UnixMillis,
+        AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_SWARM,
+        AI_FEATURE_THINKING, AI_FEATURE_WEB_SEARCH, AiActionKind, AiActionOutcome, AiActionRecord,
+        AiActionRequest, AiAttachmentRef, AiCheckpoint, AiConversation, AiConversationKind,
+        AiConversationSettings, AiProviderPreferences, AiQueuedTurn, AiWorkspaceMode, ApplyMode,
+        ApprovalEvidence, AuthorizationDecision, AutoTagRule, AutoTagSettings, ContainmentMode,
+        DomainActor, EarnedTagRemovalPolicy, ExistingTilesPolicy, InitialMembership, MessageRole,
+        PaletteColor, PermissionMode, Pile, PileHistoryKind, RuleEditProgressPolicy, RuleState,
+        TagClaim, TagName, TagSource, TimeUnit, TimingMode, TrashActor, TrashItem, UnixMillis,
         apply_rule_edit, authorize_ai_action, auto_tag_rule_sentence, resolve_pile_memberships,
     },
     dots::{self, ChromeRects},
@@ -402,6 +405,30 @@ struct AiTurnLaunch {
     model_override: Option<String>,
     provider_profile_override: Option<AiProviderPreferences>,
     user_message_already_committed: bool,
+    force_replay: bool,
+}
+
+#[derive(Default)]
+struct TemporaryApiKeys(HashMap<String, String>);
+
+impl std::fmt::Debug for TemporaryApiKeys {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TemporaryApiKeys([REDACTED])")
+    }
+}
+
+impl TemporaryApiKeys {
+    fn trimmed(&self, provider_id: &str) -> Option<String> {
+        self.0
+            .get(provider_id)
+            .map(|key| key.trim())
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+    }
+
+    fn value_mut(&mut self, provider_id: &str) -> &mut String {
+        self.0.entry(provider_id.to_owned()).or_default()
+    }
 }
 
 #[derive(Debug)]
@@ -426,7 +453,10 @@ struct AiChatRuntime {
     prompt_budget: Option<PromptBudget>,
     error: Option<String>,
     inspector_notice: Option<String>,
-    api_key: String,
+    /// Memory-only credentials keyed by the exact provider that may receive
+    /// them. A temporary xAI key must never follow a provider switch into an
+    /// OpenAI-compatible endpoint (or vice versa).
+    api_keys: TemporaryApiKeys,
     show_inspector: bool,
     workspace_files: Vec<AiWorkspaceFile>,
     file_preview: Option<AiFilePreview>,
@@ -457,13 +487,23 @@ impl Default for AiChatRuntime {
             prompt_budget: None,
             error: None,
             inspector_notice: None,
-            api_key: String::new(),
+            api_keys: TemporaryApiKeys::default(),
             show_inspector: true,
             workspace_files: Vec::new(),
             file_preview: None,
             show_subagents_detail: false,
             show_all_outputs: false,
         }
+    }
+}
+
+impl AiChatRuntime {
+    fn temporary_api_key(&self, provider_id: &str) -> Option<String> {
+        self.api_keys.trimmed(provider_id)
+    }
+
+    fn temporary_api_key_mut(&mut self, provider_id: &str) -> &mut String {
+        self.api_keys.value_mut(provider_id)
     }
 }
 
@@ -6706,6 +6746,7 @@ impl AdamApp {
                 model_override: Some(provider_profile.model.clone()),
                 provider_profile_override: Some(provider_profile),
                 user_message_already_committed: true,
+                force_replay: false,
             },
             context,
         ) {
@@ -6721,6 +6762,14 @@ impl AdamApp {
         conversation: &AiConversation,
         provider_id: &str,
     ) -> Option<ResumeGate> {
+        let configured_working_directory = conversation
+            .settings
+            .working_directory
+            .as_deref()
+            .map(Path::new);
+        if provider_id == "kimi_cli" && !installed_kimi_uses_acp(configured_working_directory) {
+            return None;
+        }
         let (executable, arguments) = ai_provider_profile_inputs(
             provider_id,
             &conversation.settings.custom_command,
@@ -6817,6 +6866,8 @@ impl AdamApp {
         launch: AiTurnLaunch,
         context: &Context,
     ) -> bool {
+        let force_replay = launch.force_replay;
+        let user_message_already_committed = launch.user_message_already_committed;
         let Some(conversation) = self
             .workspace
             .domain
@@ -6888,8 +6939,18 @@ impl AdamApp {
             self.changed(false);
         }
         let model = provider_profile.model.clone();
-        let resume_gate = self.ai_resume_gate(&conversation, &provider_id);
-        let mut invalidated_resume = false;
+        let resume_gate = if force_replay {
+            None
+        } else {
+            self.ai_resume_gate(&conversation, &provider_id)
+        };
+        let mut invalidated_resume = should_forget_unavailable_kimi_resume(
+            &provider_id,
+            resume_gate.is_some(),
+            self.resume_store
+                .record(conversation_id)
+                .map(|record| record.provider_key.as_str()),
+        );
         let resume_session_id = resume_gate.as_ref().and_then(|gate| {
             match self.resume_store.eligible_record(conversation_id, gate) {
                 Ok(Some(record)) => Some(record.session_id.clone()),
@@ -6908,8 +6969,7 @@ impl AdamApp {
             self.save_ai_resume_store();
         }
         let runtime = self.chat_runtimes.entry(conversation_id).or_default();
-        let api_key =
-            (!runtime.api_key.trim().is_empty()).then(|| runtime.api_key.trim().to_owned());
+        let api_key = runtime.temporary_api_key(&provider_id);
         let task_seed =
             newest_plan(&persisted_ai_activity(&conversation)).map(|progress| progress.items);
         let built_prompt = self.compose_ai_prompt(
@@ -6932,7 +6992,7 @@ impl AdamApp {
             } else {
                 PromptContinuity::Replay
             },
-            launch.user_message_already_committed,
+            user_message_already_committed,
         );
         let prompt_budget = built_prompt.budget;
         let turn_id = Uuid::new_v4();
@@ -6963,7 +7023,7 @@ impl AdamApp {
 
         match self.ai_engine.start(request) {
             Ok(()) => {
-                if !launch.user_message_already_committed
+                if !user_message_already_committed
                     && let Some(stored) = self
                         .workspace
                         .domain
@@ -7012,6 +7072,33 @@ impl AdamApp {
                 context.request_repaint_after(Duration::from_millis(40));
                 true
             }
+            Err(AiEngineError::NativeResumeUnavailable(message))
+                if resume_session_id.is_some() && !force_replay =>
+            {
+                log::info!(
+                    "native Kimi session for {conversation_id} changed before launch; replaying safely: {message}"
+                );
+                self.resume_store.forget(conversation_id);
+                self.save_ai_resume_store();
+                self.chat_runtimes
+                    .entry(conversation_id)
+                    .or_default()
+                    .inspector_notice =
+                    Some("Kimi changed before launch; replaying the conversation safely…".into());
+                self.launch_ai_turn(
+                    conversation_id,
+                    user_text,
+                    attachments,
+                    AiTurnLaunch {
+                        provider_override: Some(provider_id),
+                        model_override: Some(model),
+                        provider_profile_override: Some(provider_profile),
+                        user_message_already_committed,
+                        force_replay: true,
+                    },
+                    context,
+                )
+            }
             Err(error) => {
                 let runtime = self.chat_runtimes.entry(conversation_id).or_default();
                 runtime.error = Some(error.to_string());
@@ -7044,6 +7131,7 @@ impl AdamApp {
                 model_override: queued.model.clone(),
                 provider_profile_override: queued.provider_profile.clone(),
                 user_message_already_committed: false,
+                force_replay: false,
             },
             context,
         ) {
@@ -7132,6 +7220,7 @@ impl AdamApp {
                     model_override: Some(replay.model),
                     provider_profile_override: Some(replay.provider_profile),
                     user_message_already_committed: true,
+                    force_replay: true,
                 },
                 context,
             ) {
@@ -7322,7 +7411,11 @@ impl AdamApp {
                         runtime.active_used_resume = false;
                         runtime.active_had_productive_activity = false;
                         runtime.streamed_text.clear();
-                        if let Some(session_id) = session_id.clone() {
+                        let persist_session_activity = runtime
+                            .active_provider_id
+                            .as_deref()
+                            .is_some_and(provider_session_is_portable_activity);
+                        if persist_session_activity && let Some(session_id) = session_id.clone() {
                             runtime.activity_trace.ingest(HarnessActivityEvent::new(
                                 Uuid::new_v4(),
                                 unix_now(),
@@ -7381,7 +7474,12 @@ impl AdamApp {
                     refresh_folders.insert(conversation_id);
                     drain_queues.insert(conversation_id);
                 }
-                AiEvent::Failed { kind, message, .. } => {
+                AiEvent::Failed {
+                    kind,
+                    message,
+                    resume_rejected,
+                    ..
+                } => {
                     let retry_message = self
                         .workspace
                         .domain
@@ -7393,7 +7491,8 @@ impl AdamApp {
                         .map(|last| (last.text.clone(), last.attachments.clone()));
                     let scheduled_resume_replay = {
                         let runtime = self.chat_runtimes.entry(conversation_id).or_default();
-                        let unproductive_resume = should_replay_failed_native_session(runtime);
+                        let unproductive_resume =
+                            should_replay_failed_native_session(runtime, resume_rejected);
                         if unproductive_resume {
                             retry_message.map(|(text, attachments)| {
                                 let replay = AiResumeReplay {
@@ -7715,11 +7814,10 @@ impl AdamApp {
             &conversation.settings.api_endpoint,
         );
         let profile = capability_profile(provider_id, &executable, &arguments);
-        let system_delivery = if matches!(profile.system_prompt, SystemPromptChannel::InPrompt) {
-            SystemDelivery::InlineFenced
-        } else {
-            SystemDelivery::Separate
-        };
+        // A previous_response_id carries conversation continuity, but not
+        // request-level instructions. CLI-owned sessions keep their existing
+        // one-time native system-prompt behavior.
+        let system_delivery = ai_system_delivery(&profile);
 
         build_prompt(&HarnessPromptInput {
             continuity,
@@ -12190,6 +12288,7 @@ const AI_PROVIDER_OPTIONS: &[(&str, &str)] = &[
     ("claude_cli", "Claude CLI"),
     ("codex_cli", "Codex CLI"),
     ("grok_cli", "Grok CLI"),
+    ("xai_api", "Grok Heavy API"),
     ("kimi_cli", "Kimi CLI"),
     ("lm_studio", "LM Studio"),
     ("ollama", "Ollama"),
@@ -12288,6 +12387,48 @@ fn ai_activity_summary(kind: &ActivityKind) -> String {
                 }
             )
         }
+        ActivityKind::AgentGroup {
+            label,
+            kind,
+            status,
+            expected_count,
+            visibility,
+            ..
+        } => {
+            let count = expected_count
+                .map(|count| {
+                    format!(
+                        " · {count} {}",
+                        if *kind == AgentGroupKind::MultiAgentInference {
+                            "agents"
+                        } else {
+                            "jobs"
+                        }
+                    )
+                })
+                .unwrap_or_default();
+            let state = match status {
+                SubagentStatus::Pending => "delegated",
+                SubagentStatus::InProgress => "running",
+                SubagentStatus::Completed => "done",
+                SubagentStatus::Failed => "failed",
+                SubagentStatus::Cancelled => "cancelled",
+                SubagentStatus::PermissionBlocked => "permission needed",
+            };
+            let visibility = if *visibility == AgentGroupVisibility::AggregateOnly {
+                " · aggregate"
+            } else {
+                ""
+            };
+            format!(
+                "{}{count} · {state}{visibility}",
+                if label.trim().is_empty() {
+                    "Agent group".into()
+                } else {
+                    truncate(label, 64)
+                }
+            )
+        }
         ActivityKind::Usage { .. } => "Usage updated".into(),
         ActivityKind::TurnError { message } => format!("Error: {}", truncate(message, 72)),
         ActivityKind::TurnStatus {
@@ -12311,6 +12452,10 @@ fn ai_trace_has_productive_activity(events: &[HarnessActivityEvent]) -> bool {
         }
         ActivityKind::Usage { .. }
         | ActivityKind::SessionInfo { .. }
+        | ActivityKind::AgentGroup {
+            kind: AgentGroupKind::MultiAgentInference,
+            ..
+        }
         | ActivityKind::TurnError { .. }
         | ActivityKind::TurnStatus { .. } => false,
         ActivityKind::ToolCall { .. }
@@ -12323,8 +12468,31 @@ fn ai_trace_has_productive_activity(events: &[HarnessActivityEvent]) -> bool {
         | ActivityKind::HostMutation { .. }
         | ActivityKind::HostRead { .. }
         | ActivityKind::PermissionPrompt { .. }
-        | ActivityKind::Subagent { .. } => true,
+        | ActivityKind::Subagent { .. }
+        | ActivityKind::AgentGroup { .. } => true,
     })
+}
+
+fn provider_session_is_portable_activity(provider_id: &str) -> bool {
+    !matches!(provider_id, "kimi_cli" | "xai_api")
+}
+
+fn kimi_uses_legacy_print_transport(provider_id: &str, tuning: &RuntimeTuningProfile) -> bool {
+    provider_id == "kimi_cli"
+        && tuning
+            .version
+            .as_ref()
+            .is_some_and(|version| version.major == 1)
+}
+
+fn ai_system_delivery(profile: &crate::chat_core::CapabilityProfile) -> SystemDelivery {
+    if matches!(profile.system_prompt, SystemPromptChannel::InPrompt) {
+        SystemDelivery::InlineFenced
+    } else if profile.resume == crate::chat_core::ResumeStrategy::PreviousResponseId {
+        SystemDelivery::SeparateEveryTurn
+    } else {
+        SystemDelivery::Separate
+    }
 }
 
 fn ensure_terminal_status(
@@ -12524,8 +12692,19 @@ fn turn_status_for_failure(kind: AiFailureKind) -> TurnStatus {
     }
 }
 
-fn should_replay_failed_native_session(runtime: &AiChatRuntime) -> bool {
-    runtime.active_used_resume && !runtime.active_had_productive_activity
+fn should_replay_failed_native_session(runtime: &AiChatRuntime, resume_rejected: bool) -> bool {
+    let requires_typed_rejection = runtime.active_provider_id.as_deref() == Some("xai_api");
+    runtime.active_used_resume
+        && !runtime.active_had_productive_activity
+        && (!requires_typed_rejection || resume_rejected)
+}
+
+fn should_forget_unavailable_kimi_resume(
+    provider_id: &str,
+    resume_available: bool,
+    recorded_provider_id: Option<&str>,
+) -> bool {
+    provider_id == "kimi_cli" && !resume_available && recorded_provider_id == Some("kimi_cli")
 }
 
 fn ai_activity_tool_markers(events: &[HarnessActivityEvent]) -> Vec<String> {
@@ -12801,7 +12980,9 @@ fn render_ai_inspector(
     let projected_events = projected_ai_activity(conversation, runtime);
     let progress = project_progress(&persisted_events, live_events);
     let live_progress = project_progress(&[], live_events);
-    let subagents = project_subagents(&projected_ai_subagent_activity(conversation, runtime));
+    let projected_agent_events = projected_ai_subagent_activity(conversation, runtime);
+    let subagents = project_subagents(&projected_agent_events);
+    let agent_groups = project_agent_groups(&projected_agent_events);
     let terminal = if runtime.active_turn.is_some() {
         latest_turn_status(live_events)
     } else {
@@ -12810,6 +12991,12 @@ fn render_ai_inspector(
     let outputs = project_artifacts(&projected_events);
     let context_items = project_context(&projected_events);
     let usage = project_usage(&projected_events);
+    let xai_cost_unreported = conversation
+        .messages()
+        .iter()
+        .any(|message| ai_events_have_unreported_xai_cost(&message.activities))
+        || (runtime.active_turn.is_some()
+            && ai_events_have_unreported_xai_cost(&runtime.activity_trace.events));
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -12960,6 +13147,11 @@ fn render_ai_inspector(
                     }
                 }
             });
+
+            if !agent_groups.is_empty() {
+                ui.add_space(4.0);
+                render_ai_agent_groups_panel(ui, conversation_id, &agent_groups, colors);
+            }
 
             if !subagents.is_empty() {
                 ui.add_space(4.0);
@@ -13198,10 +13390,7 @@ fn render_ai_inspector(
                             usage.cached_input,
                             usage.reasoning,
                             usage.output,
-                            usage
-                                .cost_usd
-                                .map(|cost| format!(" · ${cost:.4}"))
-                                .unwrap_or_default()
+                            ai_usage_cost_suffix(usage.cost_usd, xai_cost_unreported)
                         ))
                         .size(10.0)
                         .monospace()
@@ -13376,6 +13565,133 @@ fn render_ai_workspace_entry(
             ui.close();
         }
     });
+}
+
+fn render_ai_agent_groups_panel(
+    ui: &mut Ui,
+    conversation_id: Uuid,
+    groups: &[AgentGroupProjection],
+    colors: Theme,
+) {
+    egui::CollapsingHeader::new(format!("Agent groups · {}", groups.len()))
+        .id_salt(("ai-inspector-agent-groups", conversation_id))
+        .default_open(true)
+        .show(ui, |ui| {
+            for group in groups {
+                let (glyph, state, color) = match group.status {
+                    SubagentStatus::Pending => ("○", "Delegated", colors.tertiary_text),
+                    SubagentStatus::InProgress => ("●", "Running", colors.accent),
+                    SubagentStatus::Completed => ("✓", "Completed", colors.accent),
+                    SubagentStatus::Failed => ("!", "Failed", colors.danger),
+                    SubagentStatus::Cancelled => ("×", "Cancelled", colors.tertiary_text),
+                    SubagentStatus::PermissionBlocked => ("!", "Permission needed", colors.danger),
+                };
+                Frame::NONE
+                    .fill(colors.panel_inset)
+                    .corner_radius(8)
+                    .inner_margin(Margin::symmetric(9, 7))
+                    .stroke(Stroke::new(1.0, colors.tile_border))
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            ui.label(RichText::new(glyph).size(11.0).color(color));
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(if group.label.trim().is_empty() {
+                                        match group.kind {
+                                            AgentGroupKind::Swarm => "Agent swarm",
+                                            AgentGroupKind::Delegation => "Agent delegation",
+                                            AgentGroupKind::Workflow => "Agent workflow",
+                                            AgentGroupKind::MultiAgentInference => {
+                                                "Multi-agent inference"
+                                            }
+                                        }
+                                    } else {
+                                        &group.label
+                                    })
+                                    .size(11.5)
+                                    .strong()
+                                    .color(colors.secondary_text),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(state).size(9.5).color(color));
+                                    if let Some(count) = group.expected_count {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{count} {}",
+                                                if group.kind == AgentGroupKind::MultiAgentInference
+                                                {
+                                                    "agents"
+                                                } else {
+                                                    "jobs"
+                                                }
+                                            ))
+                                            .size(9.5)
+                                            .color(colors.tertiary_text),
+                                        );
+                                    }
+                                    if group.visibility == AgentGroupVisibility::AggregateOnly {
+                                        ui.label(
+                                            RichText::new("provider-managed · aggregate only")
+                                                .size(9.5)
+                                                .color(colors.tertiary_text),
+                                        );
+                                    } else if !group.members.is_empty() {
+                                        let completed = group
+                                            .members
+                                            .iter()
+                                            .filter(|member| {
+                                                member.status == SubagentStatus::Completed
+                                            })
+                                            .count();
+                                        let stopped = group
+                                            .members
+                                            .iter()
+                                            .filter(|member| {
+                                                matches!(
+                                                    member.status,
+                                                    SubagentStatus::Failed
+                                                        | SubagentStatus::Cancelled
+                                                        | SubagentStatus::PermissionBlocked
+                                                )
+                                            })
+                                            .count();
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{completed} done{}",
+                                                if stopped > 0 {
+                                                    format!(" · {stopped} stopped")
+                                                } else {
+                                                    String::new()
+                                                }
+                                            ))
+                                            .size(9.5)
+                                            .color(
+                                                if stopped > 0 {
+                                                    colors.danger
+                                                } else {
+                                                    colors.tertiary_text
+                                                },
+                                            ),
+                                        );
+                                    }
+                                });
+                                if let Some(detail) = group
+                                    .detail
+                                    .as_deref()
+                                    .filter(|detail| !detail.trim().is_empty())
+                                {
+                                    ui.label(
+                                        RichText::new(truncate(detail, 100))
+                                            .size(10.0)
+                                            .color(colors.tertiary_text),
+                                    );
+                                }
+                            });
+                        });
+                    });
+                ui.add_space(4.0);
+            }
+        });
 }
 
 fn render_ai_subagents_panel(
@@ -13932,6 +14248,7 @@ fn render_ai_inspector_activity(
                     | ActivityKind::PlanUpdate { .. }
                     | ActivityKind::TaskMutation { .. }
                     | ActivityKind::Subagent { .. }
+                    | ActivityKind::AgentGroup { .. }
                     | ActivityKind::Usage { .. }
                     | ActivityKind::TurnStatus { .. }
                     | ActivityKind::SessionInfo { .. }
@@ -14147,11 +14464,17 @@ fn render_ai_chat_page(
     } else {
         64.0 + conversation.queued_turns().len().min(3) as f32 * 28.0
     };
+    let provider_notice_height = if settings.provider_id == "xai_api" {
+        36.0
+    } else {
+        0.0
+    };
     let composer_height = if runtime.pending_attachments.is_empty() {
         174.0
     } else {
         218.0
-    } + queue_height;
+    } + queue_height
+        + provider_notice_height;
     let transcript_height = (ui.available_height() - composer_height).max(180.0);
     egui::ScrollArea::vertical()
         .id_salt(("adam-ai-transcript", conversation.id))
@@ -14465,8 +14788,10 @@ fn render_ai_empty_state(
             .color(colors.text),
         );
         ui.label(
-            RichText::new("Pick any installed provider above. Your conversation stays in Adam.")
-                .color(colors.secondary_text),
+            RichText::new(
+                "Your conversation is saved in Adam; connected providers receive the turns you send.",
+            )
+            .color(colors.secondary_text),
         );
         ui.add_space(18.0);
         for suggestion in match mode {
@@ -14746,6 +15071,60 @@ fn render_ai_activity_trace(ui: &mut Ui, events: &[HarnessActivityEvent], colors
         return;
     }
 
+    let agent_groups = project_agent_groups(events);
+    if !agent_groups.is_empty() {
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            for group in agent_groups.iter().take(3) {
+                let (glyph, color) = match group.status {
+                    SubagentStatus::Pending => ("○", colors.tertiary_text),
+                    SubagentStatus::InProgress => ("●", colors.accent),
+                    SubagentStatus::Completed => ("✓", colors.accent),
+                    SubagentStatus::Failed | SubagentStatus::PermissionBlocked => {
+                        ("!", colors.danger)
+                    }
+                    SubagentStatus::Cancelled => ("×", colors.tertiary_text),
+                };
+                Frame::NONE
+                    .fill(colors.panel_inset)
+                    .corner_radius(12)
+                    .inner_margin(Margin::symmetric(8, 4))
+                    .stroke(Stroke::new(1.0, colors.tile_border))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(glyph).size(9.5).color(color));
+                            ui.label(
+                                RichText::new(truncate(
+                                    if group.label.trim().is_empty() {
+                                        "Agent group"
+                                    } else {
+                                        &group.label
+                                    },
+                                    34,
+                                ))
+                                .size(10.5)
+                                .color(colors.secondary_text),
+                            );
+                            if let Some(count) = group.expected_count {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{count} {}",
+                                        if group.kind == AgentGroupKind::MultiAgentInference {
+                                            "agents"
+                                        } else {
+                                            "jobs"
+                                        }
+                                    ))
+                                    .size(9.5)
+                                    .color(colors.tertiary_text),
+                                );
+                            }
+                        });
+                    });
+            }
+        });
+    }
+
     let subagents = project_subagents(events);
     if !subagents.is_empty() {
         ui.add_space(8.0);
@@ -14808,6 +15187,7 @@ fn render_ai_activity_trace(ui: &mut Ui, events: &[HarnessActivityEvent], colors
                 ActivityKind::AssistantText { .. }
                     | ActivityKind::PlanUpdate { .. }
                     | ActivityKind::Subagent { .. }
+                    | ActivityKind::AgentGroup { .. }
                     | ActivityKind::Usage { .. }
                     | ActivityKind::SessionInfo { .. }
                     | ActivityKind::TurnError { .. }
@@ -15156,11 +15536,7 @@ fn render_ai_composer(
                     action.send |= ui
                         .add_enabled(
                             !runtime.draft.trim().is_empty(),
-                            Button::new(if running {
-                                "Queue  ↵"
-                            } else {
-                                "Send  ↵"
-                            }),
+                            Button::new(if running { "Queue  ↵" } else { "Send  ↵" }),
                         )
                         .clicked();
                 });
@@ -15193,6 +15569,7 @@ fn render_ai_composer(
                         render_ai_reasoning_selector(
                             ui,
                             conversation_id,
+                            &provider_id,
                             &mut provider_profile,
                             &tuning,
                         );
@@ -15206,16 +15583,23 @@ fn render_ai_composer(
                     );
                 }
             });
-            if provider_id == "kimi_cli"
+            if kimi_uses_legacy_print_transport(&provider_id, &tuning)
                 && (settings.workspace_mode == AiWorkspaceMode::Chat
                     || !matches!(*permission, PermissionMode::Auto | PermissionMode::Bypass))
             {
                 ui.label(
                     RichText::new(
-                        "Kimi CLI needs Cowork or Code with Automatic access because its print mode auto-approves tools.",
+                        "Legacy Kimi print mode needs Cowork or Code with Automatic access because it auto-approves tools. Kimi Code 0.31 ACP supports Adam's normal permission controls.",
                     )
                     .size(9.5)
                     .color(colors.danger),
+                );
+            }
+            if provider_id == "xai_api" {
+                ui.label(
+                    RichText::new(XAI_SERVER_STORAGE_DISCLOSURE)
+                        .size(9.5)
+                        .color(colors.tertiary_text),
                 );
             }
             let send_with_return = response.has_focus()
@@ -15264,13 +15648,56 @@ const CLAUDE_MODEL_OPTIONS: &[(&str, &str)] = &[
     ("haiku", "Haiku"),
 ];
 const GROK_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Provider default"), ("grok-4.5", "Grok 4.5")];
+const XAI_MULTI_AGENT_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Grok 4.20 · Multi-agent")];
 const DEFAULT_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Provider default")];
+const XAI_SERVER_STORAGE_DISCLOSURE: &str = "Privacy · xAI stores your messages and Grok Heavy responses for follow-up turns (30 days by default).";
+const XAI_COST_NOT_REPORTED: &str = "Cost not reported by xAI";
+
+fn ai_usage_cost_suffix(cost_usd: Option<f64>, xai_cost_unreported: bool) -> String {
+    let reported = match cost_usd {
+        Some(cost) => {
+            let precision = if cost != 0.0 && cost.abs() < 0.0001 {
+                8
+            } else if cost.abs() < 0.01 {
+                6
+            } else {
+                4
+            };
+            format!(" · ${cost:.precision$}")
+        }
+        None => String::new(),
+    };
+    if xai_cost_unreported {
+        format!("{reported} · {XAI_COST_NOT_REPORTED}")
+    } else {
+        reported
+    }
+}
+
+fn ai_events_have_unreported_xai_cost(events: &[HarnessActivityEvent]) -> bool {
+    let is_xai_turn = events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            ActivityKind::AgentGroup {
+                id,
+                kind: AgentGroupKind::MultiAgentInference,
+                ..
+            } if id.starts_with("xai-heavy-")
+        )
+    });
+    if !is_xai_turn {
+        return false;
+    }
+    let usage = project_usage(events);
+    usage.has_data && usage.cost_usd.is_none()
+}
 
 fn ai_model_options(provider_id: &str) -> &'static [(&'static str, &'static str)] {
     match provider_id {
         "codex_cli" => CODEX_MODEL_OPTIONS,
         "claude_cli" => CLAUDE_MODEL_OPTIONS,
         "grok_cli" => GROK_MODEL_OPTIONS,
+        "xai_api" => XAI_MULTI_AGENT_MODEL_OPTIONS,
         _ => DEFAULT_MODEL_OPTIONS,
     }
 }
@@ -15303,16 +15730,18 @@ fn render_ai_model_selector(
             for (model, label) in ai_model_options(provider_id) {
                 ui.selectable_value(&mut profile.model, (*model).to_owned(), *label);
             }
-            ui.separator();
-            ui.label(RichText::new("Custom model ID").size(10.0));
-            ui.add(
-                TextEdit::singleline(&mut profile.model)
-                    .hint_text(match provider_id {
-                        "lm_studio" | "ollama" | "openai_compatible" => "Required model ID",
-                        _ => "Optional model ID",
-                    })
-                    .desired_width(220.0),
-            );
+            if provider_id != "xai_api" {
+                ui.separator();
+                ui.label(RichText::new("Custom model ID").size(10.0));
+                ui.add(
+                    TextEdit::singleline(&mut profile.model)
+                        .hint_text(match provider_id {
+                            "lm_studio" | "ollama" | "openai_compatible" => "Required model ID",
+                            _ => "Optional model ID",
+                        })
+                        .desired_width(220.0),
+                );
+            }
         });
 }
 
@@ -15333,6 +15762,7 @@ fn reasoning_effort_label(value: &str) -> String {
 fn render_ai_reasoning_selector(
     ui: &mut Ui,
     conversation_id: Uuid,
+    provider_id: &str,
     profile: &mut AiProviderPreferences,
     tuning: &RuntimeTuningProfile,
 ) {
@@ -15341,22 +15771,44 @@ fn render_ai_reasoning_selector(
         return;
     }
     egui::ComboBox::from_id_salt(("ai-composer-reasoning", conversation_id))
-        .selected_text(format!(
-            "Reasoning · {}",
-            reasoning_effort_label(&profile.reasoning_effort)
-        ))
+        .selected_text(if provider_id == "xai_api" {
+            match profile.reasoning_effort.as_str() {
+                "high" | "xhigh" => "Heavy · 16 agents".to_owned(),
+                "low" | "medium" => "Multi-agent · 4 agents".to_owned(),
+                _ => "Multi-agent · 4 agents".to_owned(),
+            }
+        } else {
+            format!(
+                "Reasoning · {}",
+                reasoning_effort_label(&profile.reasoning_effort)
+            )
+        })
         .width(150.0)
         .show_ui(ui, |ui| {
             ui.selectable_value(
                 &mut profile.reasoning_effort,
                 String::new(),
-                reasoning_effort_label(""),
+                if provider_id == "xai_api" {
+                    "Default · 4 agents".into()
+                } else {
+                    reasoning_effort_label("")
+                },
             );
             for effort in tuning.reasoning_efforts {
                 ui.selectable_value(
                     &mut profile.reasoning_effort,
                     (*effort).to_owned(),
-                    reasoning_effort_label(effort),
+                    if provider_id == "xai_api" {
+                        match *effort {
+                            "low" => "Low · 4 agents".into(),
+                            "medium" => "Medium · 4 agents".into(),
+                            "high" => "High · 16 agents (Heavy)".into(),
+                            "xhigh" => "Extra high · 16 agents (Heavy)".into(),
+                            _ => reasoning_effort_label(effort),
+                        }
+                    } else {
+                        reasoning_effort_label(effort)
+                    },
                 );
             }
         });
@@ -15365,14 +15817,14 @@ fn render_ai_reasoning_selector(
 fn ai_provider_has_abilities(provider_id: &str) -> bool {
     matches!(
         provider_id,
-        "claude_cli" | "codex_cli" | "grok_cli" | "kimi_cli" | "ollama"
+        "claude_cli" | "codex_cli" | "grok_cli" | "xai_api" | "kimi_cli" | "ollama"
     )
 }
 
 fn ai_provider_has_configuration(provider_id: &str) -> bool {
     matches!(
         provider_id,
-        "claude_cli" | "grok_cli" | "lm_studio" | "openai_compatible" | "custom_cli"
+        "claude_cli" | "grok_cli" | "xai_api" | "lm_studio" | "openai_compatible" | "custom_cli"
     )
 }
 
@@ -15462,7 +15914,53 @@ fn render_ai_provider_abilities(
             }
             render_ai_feature_choice(ui, profile, AI_FEATURE_MEMORY, "Memory", true, true);
         }
-        "kimi_cli" | "ollama" => {
+        "xai_api" => {
+            render_ai_feature_choice(
+                ui,
+                profile,
+                AI_FEATURE_WEB_SEARCH,
+                "Web research",
+                true,
+                true,
+            );
+            ui.label(
+                RichText::new(
+                    "This is xAI’s server-managed multi-agent model. Low/medium uses 4 agents; high/extra-high uses 16.",
+                )
+                .size(9.0)
+                .color(colors.tertiary_text),
+            );
+        }
+        "kimi_cli" => {
+            if tuning.verified_runtime {
+                render_ai_feature_choice(ui, profile, AI_FEATURE_THINKING, "Thinking", true, true);
+            } else {
+                ui.label(
+                    RichText::new("Thinking · available after a compatible Kimi CLI is detected")
+                        .size(10.5)
+                        .color(colors.secondary_text),
+                );
+            }
+            if tuning.agent_group_channel
+                == crate::chat_core::AgentGroupChannel::KimiAcpToolAggregateV1
+            {
+                render_ai_feature_choice(ui, profile, AI_FEATURE_SWARM, "AgentSwarm", true, true);
+                ui.label(
+                    RichText::new(
+                        "AgentSwarm delegates real foreground Kimi child jobs. Kimi ACP reports final member results, not live child prose.",
+                    )
+                    .size(9.0)
+                    .color(colors.tertiary_text),
+                );
+            } else {
+                ui.label(
+                    RichText::new("AgentSwarm · requires verified Kimi Code 0.31.0")
+                        .size(10.5)
+                        .color(colors.secondary_text),
+                );
+            }
+        }
+        "ollama" => {
             render_ai_feature_choice(ui, profile, AI_FEATURE_THINKING, "Thinking", true, true);
         }
         _ => {}
@@ -15500,6 +15998,45 @@ fn render_ai_provider_configuration(
                 );
             }
         }
+        "xai_api" => {
+            ui.label(RichText::new("Authentication").size(10.5).strong());
+            ui.label(
+                RichText::new("Uses XAI_API_KEY, or the temporary key below.")
+                    .size(9.5)
+                    .color(colors.tertiary_text),
+            );
+            ui.add(
+                TextEdit::singleline(runtime.temporary_api_key_mut(provider_id))
+                    .password(true)
+                    .hint_text("Temporary xAI API key; never saved")
+                    .desired_width(280.0),
+            );
+            ui.label(
+                RichText::new(
+                    "Heavy is a separate xAI API service and does not reuse Grok CLI sign-in.",
+                )
+                .size(9.0)
+                .color(colors.tertiary_text),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Server storage and billing")
+                    .size(10.5)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(XAI_SERVER_STORAGE_DISCLOSURE)
+                    .size(9.0)
+                    .color(colors.tertiary_text),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "Request cost appears in Usage when xAI reports it; otherwise Adam shows “{XAI_COST_NOT_REPORTED}”."
+                ))
+                .size(9.0)
+                .color(colors.tertiary_text),
+            );
+        }
         "lm_studio" | "openai_compatible" => {
             ui.label(RichText::new("Server endpoint").size(10.5).strong());
             ui.add(
@@ -15517,7 +16054,7 @@ fn render_ai_provider_configuration(
             }
             ui.label(RichText::new("Temporary API key").size(10.5));
             ui.add(
-                TextEdit::singleline(&mut runtime.api_key)
+                TextEdit::singleline(runtime.temporary_api_key_mut(provider_id))
                     .password(true)
                     .hint_text("Optional; never saved")
                     .desired_width(280.0),
@@ -15811,6 +16348,8 @@ fn ai_stream_dialect_key(dialect: StreamDialect) -> &'static str {
         StreamDialect::ClaudeStreamJson => "claude-stream-json:v1",
         StreamDialect::GrokStreamingJson => "grok-streaming-json:v1",
         StreamDialect::KimiStreamJson => "kimi-stream-json:v1",
+        StreamDialect::KimiAcp => "kimi-acp:v1",
+        StreamDialect::XaiResponsesSse => "xai-responses-sse:v1",
         StreamDialect::OpenAiCompatibleJson => "openai-compatible-json:v1",
     }
 }
@@ -15831,10 +16370,8 @@ fn ai_provider_profile_inputs(
             "grok".into(),
             vec!["--output-format".into(), "streaming-json".into()],
         ),
-        "kimi_cli" => (
-            "kimi".into(),
-            vec!["--output-format".into(), "stream-json".into()],
-        ),
+        "kimi_cli" => ("kimi".into(), vec!["acp".into()]),
+        "xai_api" => ("xai".into(), vec!["responses".into()]),
         // A configured endpoint uses LM Studio's OpenAI-compatible server;
         // clearing it intentionally selects the `lms` command-line client.
         "lm_studio" if !endpoint.trim().is_empty() => (String::new(), Vec::new()),
@@ -17390,12 +17927,23 @@ mod tests {
     }
 
     #[test]
-    fn failed_native_resume_replays_only_before_any_productive_activity() {
+    fn xai_resume_replays_only_for_typed_stale_session_failure() {
         let mut runtime = AiChatRuntime {
             active_used_resume: true,
+            active_provider_id: Some("xai_api".into()),
             ..AiChatRuntime::default()
         };
-        assert!(should_replay_failed_native_session(&runtime));
+        assert!(
+            !should_replay_failed_native_session(&runtime, false),
+            "a generic provider or transport failure must not issue a second request"
+        );
+        assert!(should_replay_failed_native_session(&runtime, true));
+        runtime.active_provider_id = Some("codex_cli".into());
+        assert!(
+            should_replay_failed_native_session(&runtime, false),
+            "existing CLI adapters retain their bounded unproductive-resume fallback"
+        );
+        runtime.active_provider_id = Some("xai_api".into());
 
         let session_only = HarnessActivityEvent::new(
             Uuid::new_v4(),
@@ -17407,11 +17955,55 @@ mod tests {
         );
         assert!(!ai_trace_has_productive_activity(&[session_only]));
 
+        let opaque_group_start = HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(1),
+            ActivityKind::AgentGroup {
+                id: "xai-turn".into(),
+                aliases: Vec::new(),
+                label: "Grok Heavy".into(),
+                kind: AgentGroupKind::MultiAgentInference,
+                status: SubagentStatus::InProgress,
+                expected_count: Some(16),
+                members: Vec::new(),
+                visibility: AgentGroupVisibility::AggregateOnly,
+                detail: None,
+            },
+        );
+        assert!(
+            !ai_trace_has_productive_activity(&[opaque_group_start]),
+            "adapter-owned aggregate startup must not suppress stale-id replay"
+        );
+
         let text =
             HarnessActivityEvent::assistant_text(Uuid::new_v4(), UnixMillis(2), "provider output");
         assert!(ai_trace_has_productive_activity(&[text]));
         runtime.active_had_productive_activity = true;
-        assert!(!should_replay_failed_native_session(&runtime));
+        assert!(!should_replay_failed_native_session(&runtime, true));
+    }
+
+    #[test]
+    fn unavailable_kimi_acp_runtime_forgets_only_its_stale_sidecar() {
+        assert!(should_forget_unavailable_kimi_resume(
+            "kimi_cli",
+            false,
+            Some("kimi_cli")
+        ));
+        assert!(!should_forget_unavailable_kimi_resume(
+            "kimi_cli",
+            true,
+            Some("kimi_cli")
+        ));
+        assert!(!should_forget_unavailable_kimi_resume(
+            "kimi_cli",
+            false,
+            Some("codex_cli")
+        ));
+        assert!(!should_forget_unavailable_kimi_resume(
+            "codex_cli",
+            false,
+            Some("kimi_cli")
+        ));
     }
 
     #[test]
@@ -17943,6 +18535,39 @@ mod tests {
     }
 
     #[test]
+    fn kimi_legacy_warning_tracks_the_actual_runtime_contract() {
+        let acp_version = crate::chat_core::CliVersion::parse("0.31.0").unwrap();
+        let unsupported_version = crate::chat_core::CliVersion::parse("0.31.1").unwrap();
+        let legacy_version = crate::chat_core::CliVersion::parse("1.49.0").unwrap();
+        let acp = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            Some(&acp_version),
+            "",
+        );
+        let legacy = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            Some(&legacy_version),
+            "",
+        );
+        let unsupported = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            Some(&unsupported_version),
+            "",
+        );
+        let unknown = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            None,
+            "",
+        );
+
+        assert!(!kimi_uses_legacy_print_transport("kimi_cli", &acp));
+        assert!(!kimi_uses_legacy_print_transport("kimi_cli", &unsupported));
+        assert!(!kimi_uses_legacy_print_transport("kimi_cli", &unknown));
+        assert!(kimi_uses_legacy_print_transport("kimi_cli", &legacy));
+        assert!(!kimi_uses_legacy_print_transport("codex_cli", &legacy));
+    }
+
+    #[test]
     fn provider_switch_materializes_legacy_model_and_restores_each_profile() {
         let mut settings = AiConversationSettings {
             provider_id: "codex_cli".into(),
@@ -17965,6 +18590,129 @@ mod tests {
         assert_eq!(settings.model, "gpt-5.6-sol");
         select_ai_provider(&mut settings, "claude_cli");
         assert_eq!(settings.model, "sonnet");
+    }
+
+    #[test]
+    fn response_id_resume_repeats_system_delivery_without_changing_cli_resume() {
+        let xai = capability_profile("xai_api", "", &[]);
+        let codex = capability_profile("codex_cli", "codex", &[]);
+
+        assert_eq!(ai_system_delivery(&xai), SystemDelivery::SeparateEveryTurn);
+        assert_eq!(ai_system_delivery(&codex), SystemDelivery::Separate);
+    }
+
+    #[test]
+    fn temporary_api_keys_are_scoped_to_their_exact_provider() {
+        let mut runtime = AiChatRuntime::default();
+        *runtime.temporary_api_key_mut("xai_api") = "  xai-secret  ".into();
+        *runtime.temporary_api_key_mut("openai_compatible") = "openai-secret".into();
+
+        assert_eq!(
+            runtime.temporary_api_key("xai_api").as_deref(),
+            Some("xai-secret")
+        );
+        assert_eq!(
+            runtime.temporary_api_key("openai_compatible").as_deref(),
+            Some("openai-secret")
+        );
+        assert_eq!(runtime.temporary_api_key("lm_studio"), None);
+        assert!(!provider_session_is_portable_activity("xai_api"));
+        assert!(!provider_session_is_portable_activity("kimi_cli"));
+        assert!(provider_session_is_portable_activity("codex_cli"));
+    }
+
+    #[test]
+    fn temporary_api_key_debug_is_redacted_at_the_runtime_boundary() {
+        let mut runtime = AiChatRuntime::default();
+        *runtime.temporary_api_key_mut("xai_api") = "  xai-canary-secret  ".into();
+        *runtime.temporary_api_key_mut("openai_compatible") = "openai-canary-secret".into();
+
+        for debug in [format!("{:?}", runtime.api_keys), format!("{runtime:?}")] {
+            assert!(!debug.contains("xai-canary-secret"));
+            assert!(!debug.contains("openai-canary-secret"));
+            assert!(!debug.contains("xai_api"));
+            assert!(!debug.contains("openai_compatible"));
+            assert!(debug.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn xai_usage_and_storage_disclosures_are_explicit() {
+        assert!(XAI_SERVER_STORAGE_DISCLOSURE.contains("your messages"));
+        assert!(XAI_SERVER_STORAGE_DISCLOSURE.contains("Grok Heavy responses"));
+        assert!(XAI_SERVER_STORAGE_DISCLOSURE.contains("follow-up turns"));
+        assert!(XAI_SERVER_STORAGE_DISCLOSURE.contains("30 days by default"));
+        assert_eq!(
+            ai_usage_cost_suffix(None, true),
+            format!(" · {XAI_COST_NOT_REPORTED}")
+        );
+        assert_eq!(ai_usage_cost_suffix(None, false), "");
+        assert_eq!(ai_usage_cost_suffix(Some(0.125), false), " · $0.1250");
+        assert_eq!(
+            ai_usage_cost_suffix(Some(0.00001585), false),
+            " · $0.00001585"
+        );
+        assert_eq!(
+            ai_usage_cost_suffix(Some(0.125), true),
+            format!(" · $0.1250 · {XAI_COST_NOT_REPORTED}")
+        );
+    }
+
+    #[test]
+    fn xai_cost_fallback_is_derived_per_turn_across_mixed_provider_history() {
+        let codex_events = vec![HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(1),
+            ActivityKind::Usage {
+                input: Some(100),
+                output: Some(20),
+                cached_input: None,
+                reasoning: None,
+                cost_usd: Some(0.10),
+            },
+        )];
+        let xai_events = vec![
+            HarnessActivityEvent::new(
+                Uuid::new_v4(),
+                UnixMillis(2),
+                ActivityKind::AgentGroup {
+                    id: "xai-heavy-persisted-turn".into(),
+                    aliases: Vec::new(),
+                    label: "Grok Heavy".into(),
+                    kind: AgentGroupKind::MultiAgentInference,
+                    status: SubagentStatus::Completed,
+                    expected_count: Some(16),
+                    members: Vec::new(),
+                    visibility: AgentGroupVisibility::AggregateOnly,
+                    detail: None,
+                },
+            ),
+            HarnessActivityEvent::new(
+                Uuid::new_v4(),
+                UnixMillis(3),
+                ActivityKind::Usage {
+                    input: Some(200),
+                    output: Some(40),
+                    cached_input: None,
+                    reasoning: Some(10),
+                    cost_usd: None,
+                },
+            ),
+        ];
+
+        assert!(!ai_events_have_unreported_xai_cost(&codex_events));
+        assert!(ai_events_have_unreported_xai_cost(&xai_events));
+        let combined = codex_events
+            .iter()
+            .chain(xai_events.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let usage = project_usage(&combined);
+        assert_eq!(usage.cost_usd, Some(0.10));
+        assert_eq!(
+            ai_usage_cost_suffix(usage.cost_usd, true),
+            format!(" · $0.1000 · {XAI_COST_NOT_REPORTED}")
+        );
     }
 
     #[test]

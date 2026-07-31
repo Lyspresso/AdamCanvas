@@ -1,0 +1,26 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"<RESPONSE_4>","object":"response","model":"grok-4.20-multi-agent","status":"in_progress"}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"<RESPONSE_4>","object":"response","model":"grok-4.20-multi-agent","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"id":"<WEB_SEARCH_1>","type":"web_search_call","status":"in_progress","action":{"type":"search","query":"primary sources for the research question"}}}
+
+event: response.web_search_call.searching
+data: {"type":"response.web_search_call.searching","item_id":"<WEB_SEARCH_1>","output_index":0}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"<WEB_SEARCH_1>","type":"web_search_call","status":"completed","action":{"type":"search","query":"primary sources for the research question"}}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"<MESSAGE_4>","output_index":1,"content_index":0,"delta":"Four-agent research synthesis."}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","item_id":"<MESSAGE_4>","output_index":1,"content_index":0,"text":"Four-agent research synthesis."}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":1,"item":{"id":"<MESSAGE_4>","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Four-agent research synthesis.","annotations":[]}]}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"<RESPONSE_4>","object":"response","model":"grok-4.20-multi-agent","status":"completed","output":[{"id":"<WEB_SEARCH_1>","type":"web_search_call","status":"completed","action":{"type":"search","query":"primary sources for the research question"}},{"id":"<MESSAGE_4>","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Four-agent research synthesis.","annotations":[]}]}],"reasoning":{"effort":"low","summary":null},"previous_response_id":null,"usage":{"input_tokens":400,"input_tokens_details":{"cached_tokens":0},"output_tokens":120,"output_tokens_details":{"reasoning_tokens":80},"total_tokens":520,"cost_in_usd_ticks":12500000,"num_sources_used":3,"num_server_side_tools_used":1},"store":true}}

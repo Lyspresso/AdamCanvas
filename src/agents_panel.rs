@@ -52,15 +52,18 @@ const TESTED_VERSIONS: &[(&str, &str)] = &[
     ("claude_cli", "2.1.128"),
     ("codex_cli", "0.144.1"),
     ("grok_cli", "0.2.117"),
+    ("kimi_cli", "0.31.0"),
     ("kimi_cli", "1.49.0"),
     ("ollama", "0.32.1"),
 ];
 
-fn tested_version_for(provider_id: &str) -> Option<CliVersion> {
+fn tested_version_for_series(provider_id: &str, installed: &CliVersion) -> Option<CliVersion> {
     TESTED_VERSIONS
         .iter()
-        .find(|(id, _)| *id == provider_id)
-        .and_then(|(_, version)| CliVersion::parse(version))
+        .filter(|(id, _)| *id == provider_id)
+        .filter_map(|(_, version)| CliVersion::parse(version))
+        .filter(|tested| tested.major == installed.major && tested.minor == installed.minor)
+        .max_by_key(|tested| tested.patch)
 }
 
 /// Sign-in axis, filled only for providers whose CLI has a vendor status
@@ -187,6 +190,20 @@ pub const AGENT_PROVIDERS: &[AgentProviderMeta] = &[
         docs_url: Some("https://ollama.com/download"),
         hover_note: Some("The binary being present does not mean the Ollama daemon is running."),
         info_note: None,
+        auth_probe: None,
+        sign_in_command: None,
+    },
+    AgentProviderMeta {
+        provider_id: "xai_api",
+        label: "Grok Heavy API",
+        binary: None,
+        install_command: None,
+        install_hint: "Set XAI_API_KEY or enter a temporary key in the chat composer.",
+        docs_url: Some("https://docs.x.ai/developers/model-capabilities/text/multi-agent"),
+        hover_note: Some(
+            "Runs xAI’s server-managed 4- or 16-agent model through the Responses API; it is separate from Grok Build.",
+        ),
+        info_note: Some("API provider · requires an xAI API key"),
         auth_probe: None,
         sign_in_command: None,
     },
@@ -817,7 +834,7 @@ pub fn classify_probe(provider_id: &str, probe: &ProviderProbe) -> AgentAvailabi
     // Same major.minor as a tested version with only a newer patch: the
     // usual self-update drift. Softer badge; older-than-tested or a
     // different series stays plain Detected (never grant on downgrade).
-    if let Some(tested) = tested_version_for(provider_id)
+    if let Some(tested) = tested_version_for_series(provider_id, &version)
         && version.major == tested.major
         && version.minor == tested.minor
         && version.patch > tested.patch
@@ -1230,8 +1247,10 @@ fn probed_row_ui(
         hover.push(program.to_string_lossy().into_owned());
     }
     match availability {
-        AgentAvailability::Detected { version: Some(_) } => {
-            hover.push(match tested_version_for(row.meta.provider_id) {
+        AgentAvailability::Detected {
+            version: Some(version),
+        } => {
+            hover.push(match tested_version_for_series(row.meta.provider_id, version) {
                 Some(tested) => format!(
                     "Tested version is v{}.{}.{}; this build differs — provider defaults apply until it's re-tested.",
                     tested.major, tested.minor, tested.patch
@@ -1481,6 +1500,8 @@ mod tests {
             ("claude_cli", "2.1.128"),
             ("codex_cli", "0.144.1"),
             ("grok_cli", "0.2.111"),
+            ("kimi_cli", "0.31.0"),
+            ("kimi_cli", "1.49.0"),
             ("ollama", "0.32.1"),
         ] {
             assert!(
@@ -1501,10 +1522,12 @@ mod tests {
 
     #[test]
     fn kimi_contract_row_is_verified_despite_empty_reasoning_list() {
-        assert!(matches!(
-            classify_probe("kimi_cli", &probe(Some("/bin/kimi"), Some("1.49.0"))),
-            AgentAvailability::DetectedVerified { .. }
-        ));
+        for version in ["0.31.0", "1.49.0"] {
+            assert!(matches!(
+                classify_probe("kimi_cli", &probe(Some("/bin/kimi"), Some(version))),
+                AgentAvailability::DetectedVerified { .. }
+            ));
+        }
     }
 
     #[test]
@@ -1858,9 +1881,10 @@ mod tests {
                     .any(|meta| meta.provider_id == *provider_id && meta.binary.is_some()),
                 "{provider_id} must be a probed provider id, not an alias"
             );
+            let installed = CliVersion::parse(version).expect("tested version parses");
             assert!(
-                tested_version_for(provider_id).is_some(),
-                "{provider_id} entry must parse and resolve through tested_version_for"
+                tested_version_for_series(provider_id, &installed).is_some(),
+                "{provider_id} entry must resolve through its tested major/minor series"
             );
         }
     }
@@ -1875,6 +1899,20 @@ mod tests {
                 assert_eq!((tested.major, tested.minor, tested.patch), (0, 2, 117));
             }
             other => panic!("expected series-tested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kimi_patch_drift_uses_the_matching_verified_contract_family() {
+        for (installed, expected) in [("0.31.1", (0, 31, 0)), ("1.49.1", (1, 49, 0))] {
+            match classify_probe("kimi_cli", &probe(Some("/bin/kimi"), Some(installed))) {
+                AgentAvailability::DetectedSeriesTested { tested, .. } => {
+                    assert_eq!((tested.major, tested.minor, tested.patch), expected);
+                }
+                other => {
+                    panic!("expected Kimi {installed} to match its tested series, got {other:?}")
+                }
+            }
         }
     }
 

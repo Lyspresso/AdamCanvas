@@ -2246,6 +2246,7 @@ fn default_ai_tools_enabled() -> bool {
 pub const AI_FEATURE_MEMORY: &str = "memory";
 pub const AI_FEATURE_PLANNING: &str = "planning";
 pub const AI_FEATURE_SUBAGENTS: &str = "subagents";
+pub const AI_FEATURE_SWARM: &str = "swarm";
 pub const AI_FEATURE_THINKING: &str = "thinking";
 pub const AI_FEATURE_WEB_SEARCH: &str = "web_search";
 

@@ -49,8 +49,9 @@ Together, the profiles identify:
 | --- | --- | --- | --- | --- |
 | Claude CLI | Local agent CLI | Structured stream | Native session when an ID is returned; replay otherwise | Chat, Cowork, Code |
 | Codex CLI | Local agent CLI | JSON lines | Native `exec resume`; replay otherwise | Chat, Cowork, Code |
-| Grok CLI | Local agent CLI | Structured JSON | Native resume when an ID is returned; replay otherwise | Chat, Cowork, Code |
-| Kimi CLI | Local agent CLI | Structured stream when supported | Bounded replay | Cowork/Code in the CLI’s supported automatic tool posture |
+| Grok Build CLI | Local agent CLI | Structured ACP events | Native ACP session load when an ID is returned; replay otherwise | Chat, Cowork, Code with scoped CLI subagents and workflows |
+| Kimi Code CLI 0.31.0 | Local agent CLI | Structured ACP events | Native ACP session load | Chat, Cowork, Code with root plans plus Agent/AgentSwarm delegation |
+| xAI Grok Heavy | Remote xAI Responses API | Leader-visible Responses events plus one aggregate group | `previous_response_id` | Multi-agent research with 4 or 16 opaque server agents |
 | LM Studio | Local OpenAI-compatible HTTP endpoint | Streaming compatible events | Bounded replay | Private local chat and analysis |
 | Ollama | Local model CLI | Plain text | Bounded replay | Private local chat and analysis |
 | OpenAI-compatible | HTTP endpoint | Streaming compatible events | Bounded replay | Hosted or self-hosted chat models |
@@ -96,6 +97,21 @@ that session emits its own prose. Lifecycle and prose carry independent
 event IDs; the capture also retains Grok's idless, status-only
 `model_changed` child update.
 
+Kimi 0.31.0 and xAI Grok Heavy fixtures make a stricter provenance
+distinction. Kimi’s `initialize` exchange was captured locally without a
+model prompt. Its config, root-plan, `Agent`, and `AgentSwarm` fixtures are
+source-derived from the exact
+[`@moonshot-ai/kimi-code@0.31.0` tag](https://github.com/MoonshotAI/kimi-code/tree/bc28e9d802fbec29395a7aed85e880679a050145),
+because the local account was signed out and no authenticated run was made.
+The xAI request, response, and SSE fixtures are likewise marked
+official-schema-derived, not live captures. They follow xAI’s
+[`grok-4.20-multi-agent` contract](https://docs.x.ai/developers/model-capabilities/text/multi-agent)
+and the official [Responses API schema](https://docs.x.ai/developers/rest-api-reference/inference/chat).
+Its billing fixture follows xAI’s documented
+[`usage.cost_in_usd_ticks` contract](https://docs.x.ai/developers/cost-tracking).
+The manifests retain that distinction so a synthetic fixture can never be
+mistaken for observed provider behavior.
+
 Detection reuses the launch path's own resolver and version cache through the
 additive accessor `ai::probe_installed_provider` — what the panel shows and
 what a turn runs cannot drift. Scans run on a background worker
@@ -138,6 +154,10 @@ effort, and abilities instead of sharing one global model field.
 
 An empty model or effort means **use the provider or model default**. Adam does
 not silently translate that into Medium or another guessed default.
+The dedicated xAI multi-agent adapter is the one explicit exception: its
+composer labels the empty choice “Default · 4 agents” and sends Medium, because
+the selected effort is the public REST control that determines whether xAI
+allocates 4 or 16 agents.
 
 The rows below name the captured runtime contracts. Other installed versions
 keep the provider-default reasoning setting until a fixture verifies their
@@ -148,8 +168,10 @@ accepted values.
 | Codex 0.144.1 | Known GPT-5.6 Sol, Terra, and Luna choices plus custom model ID | Sol/Terra: Low through Ultra; Luna: Low through Max; other models: Low through XHigh | Explicit web-search enable |
 | Claude Code 2.1.128 | Provider default, Opus, Sonnet, Haiku, or custom model ID | Low, Medium, High, XHigh, Max | Web tools on/off and optional fallback model |
 | Grok 0.2.111 / 0.2.114 | Provider default, Grok 4.5, or custom model ID | Low, Medium, High | Web search, planning, memory, and a 1–100 turn limit; subagents forced off |
-| Grok 0.2.117 | Provider default, Grok 4.5, or custom model ID | Low, Medium, High | The same controls plus scoped ACP subagents |
-| Kimi 1.49.0 | Provider default or custom model ID | Provider default | Thinking on/off |
+| Grok Build 0.2.117 | Provider default, Grok 4.5, or custom model ID | Low, Medium, High | The same controls plus scoped ACP subagents and provider workflow grouping |
+| Kimi Code 0.31.0 | Optional model ID, accepted only when the live ACP session advertises it | On/off preference resolved to a value advertised by the selected model | ACP mode plus explicit foreground AgentSwarm preference |
+| Kimi CLI 1.49.0 (legacy capture) | Provider default or custom model ID | Provider default | Thinking on/off on the legacy stream contract |
+| xAI `grok-4.20-multi-agent` | Fixed multi-agent model | Low/Medium: 4 agents; High/XHigh: 16 agents | Optional hosted web search and `previous_response_id` continuity |
 | Ollama 0.32.1 | Required local model ID | Low, Medium, High, or thinking on/off | Local model execution |
 | LM Studio | Required loaded model ID | Provider default | Local server endpoint and memory-only key |
 | OpenAI-compatible | Required endpoint model ID | Provider default | Endpoint, key environment variable, and memory-only key |
@@ -209,7 +231,62 @@ The visible choices map to real provider controls:
   Unless web is explicitly switched off, read-only Chat research grants only
   `WebSearch` and `WebFetch`; it never turns that into blanket
   filesystem-mutation approval.
-- Kimi receives `--thinking` or `--no-thinking`.
+  Grok Build workflows remain part of this CLI contract: a provider
+  `workflow_run_id` groups the real scoped child sessions that belong to the
+  workflow. It does not turn the workflow into “Grok Heavy,” and it does not
+  infer an agent count from reasoning effort.
+- Verified Kimi 0.31.0 launches as `kimi acp`. Adam reads the session’s
+  advertised `model`, `thinking`, and `mode` config options and sets only
+  values the live session offered. “Thinking on” is a semantic preference:
+  boolean-thinking models receive their advertised On value, while an
+  effort-based model receives a supported non-Off choice rather than a
+  hard-coded spelling. Its root `TodoList` display becomes the native
+  whole-list plan. The AgentSwarm ability asks the root model to use its real
+  foreground `AgentSwarm` tool when the work can be decomposed; Adam does not
+  treat that preference as proof that a swarm launched. The root tool’s
+  `rawInput` is the first genuine delegation signal and its final `rawOutput`
+  supplies stable child IDs and outcomes. Adam sends `mcpServers: []`: Kimi
+  children inherit session MCP clients while the ACP adapter filters child
+  caller identity, so attaching Adam task tools would break the
+  native-XOR-tools safety boundary. Kimi’s root ACP permission requests still
+  pass through Adam’s normal stance mapping and fail closed when the request
+  cannot be answered safely. Kimi 0.31 also bridges `AskUserQuestion` through
+  that same ACP method with a distinct `q0_opt_*` / `q0_skip` option contract.
+  Until Adam has an interactive question surface, it recognizes only that exact
+  shape and selects Kimi’s explicit Skip response in every permission stance;
+  it never fabricates the first answer in Bypass or marks the turn permission-
+  blocked solely for dismissing the unsupported question. Background `Agent`
+  jobs are refused: Adam’s
+  per-turn ACP host cannot truthfully keep such a job alive or receive its
+  later notification after the root turn exits. Adam freshly re-probes Kimi
+  both at the resume gate and again at process preparation. If the executable
+  changes between those checks, preparation rejects the saved ACP session,
+  deletes its sidecar, and makes one explicitly session-free replay with the
+  full conversation context. The ACP ID is never passed into legacy print
+  mode. Only a detected legacy 1.x runtime receives the visible Cowork/Code
+  plus Automatic-access warning; unknown and unverified 0.x builds do not.
+- xAI Grok Heavy is a dedicated Responses API adapter, not the generic
+  OpenAI-compatible path and not a Grok Build mode. It fixes the model to
+  `grok-4.20-multi-agent`, sets `reasoning.effort`, and maps Low or Medium to
+  4 server agents and High or XHigh to 16. Adam sends the hosted
+  `web_search` tool only when explicitly enabled, sends no client function
+  tools, and reads its key from the temporary setting or `XAI_API_KEY`.
+  Requests set `store: true` so `previous_response_id` can continue follow-up
+  turns. That setting stores the messages sent to xAI and Grok Heavy’s
+  responses. Adam discloses the server storage beside the composer and in the
+  provider configuration; xAI documents 30-day retention by default.
+  If xAI nevertheless reports an unrequested or unknown server-side hosted
+  call, Adam quarantines that item without executing or projecting it as a
+  local tool, preserves the leader response, and attaches one bounded provider
+  notice to the completed group. An unsolicited client `function_call` or
+  `custom_tool_call` still fails closed because Adam exposed no such executor.
+  The API exposes leader tool calls and the leader’s answer, so the only
+  honest lifecycle is one aggregate 4- or 16-agent group. Stop wins a
+  serialized terminal race, cancels Adam’s HTTP transport, closes the live
+  connection, and joins the bounded worker before releasing the run slot.
+  xAI documents no synchronous Responses cancellation endpoint, so Adam does
+  not claim a server-side cancel: connection teardown is the truthful client
+  boundary. Late provider output cannot outlive that joined worker.
 - The captured Ollama runtime receives its supported `--think` level or
   boolean.
 - Custom CLI may use `{prompt}`, `{model}`, `{reasoning_effort}`, and
@@ -226,7 +303,10 @@ being forwarded optimistically.
 Generic OpenAI-compatible HTTP bodies intentionally remain limited to
 `model`, `messages`, `stream`, and ordinary OpenAI function descriptors when
 Adam's task tools are available. Adam does not assume that every compatible
-server accepts OpenAI-, Anthropic-, or xAI-specific reasoning extensions.
+server accepts OpenAI-, Anthropic-, or xAI-specific reasoning extensions. The
+xAI Grok Heavy adapter is a separate, fixed-host Responses transport; its
+`reasoning.effort` mapping never leaks into LM Studio or another compatible
+endpoint.
 
 ## Structured activity
 
@@ -243,6 +323,9 @@ Provider output is normalized into one ordered, typed activity vocabulary:
 - permission prompts;
 - child-agent lifecycle updates, including parent identity, status, model,
   tool count, detail, and elapsed time;
+- provider-declared agent-group lifecycle, including stable group identity,
+  group kind, expected count, visibility, aggregate state, and any members
+  the provider actually revealed;
 - explicit terminal outcomes: completed, user-cancelled, permission-blocked,
   timed out, maximum turns reached, or provider error;
 - usage;
@@ -320,14 +403,18 @@ in full and remains listable, but task-tool mutations fail closed until a
 native snapshot reduces it to the supported mutation limit.
 
 Tool exposure is checked both when a provider lists tools and when it calls
-one. Dead runs fail closed. Claude and Codex keep their native task channel and
-never receive Adam’s task tools. Fresh verified Grok 0.2.114 ACP, compatible
-HTTP function calling, and the explicit Custom CLI bridge contract receive
-Adam’s tools and do not project a second main plan channel. Grok 0.2.117 and
-resumed Grok ACP runs receive no Adam task server and use their native root
-plan instead. This is deliberate mutual exclusion: Grok children inherit
-connected MCP clients without a trustworthy root/child caller identity. The
-tools are independent of canvas access: a model can maintain Progress without
+one. Dead runs fail closed. Claude, Codex, and Kimi 0.31.0 keep their native
+root task channel and never receive Adam’s task tools. Fresh verified Grok
+0.2.114 ACP, compatible HTTP function calling, and the explicit Custom CLI
+bridge contract receive Adam’s tools and do not project a second main plan
+channel. Grok 0.2.117 and resumed Grok ACP runs receive no Adam task server
+and use their native root plan instead. This is deliberate mutual exclusion:
+Grok and Kimi children inherit connected MCP clients without a trustworthy
+root/child caller identity at the external bridge. xAI Grok Heavy receives
+neither channel: its server-side group publishes no structured main plan, and
+Adam does not send task functions into an opaque multi-agent run. Its group
+status belongs under Agents, never as invented Progress rows. The task tools
+are independent of canvas access: a model can maintain Progress without
 gaining permission to read or mutate canvas data.
 
 HTTP providers receive ordinary function-tool descriptors and may perform up
@@ -402,32 +489,80 @@ and relaunch restores the same order, labels, origins, and statuses. A turn
 that did not publish or mutate a task list does not manufacture an empty
 snapshot that would erase earlier progress.
 
-## Subagents are a separate lifecycle projection
+## Subagents and agent groups are a separate lifecycle projection
 
-Subagents are not checklist rows and are not inferred from prose such as “I’ll
-launch five agents.” Adam creates them only from genuine provider child-agent
-events. Each stable child ID is projected through pending, working, completed,
-failed, cancelled, or permission-blocked states. Parent IDs preserve a nested
-tree when a provider launches children from another child.
+Agents are not checklist rows and are never inferred from prose such as “I’ll
+launch five agents.” Adam creates an individual child row only from a genuine
+provider child identity. It creates an agent-group row only from a genuine
+provider workflow, delegation tool, or multi-agent request. A group’s
+`visibility` says whether its members are provider-visible or aggregate-only;
+the requested count is never expanded into synthetic child IDs.
 
-The chat shows compact live chips beside the relevant activity update, with
-working, done, and stopped totals. The right rail expands the same events into
-individual rows with status, model, tool-call count, duration, detail, and
-parent/child indentation. **View all** opens a wider Active/Done subagent
-panel without leaving the conversation. Repeated status updates replace the
-earlier state for that child rather than creating duplicate “agent” rows.
+Where a provider streams child lifecycle, each stable child ID is projected
+through pending, working, completed, failed, cancelled, or permission-blocked
+states. Parent IDs preserve a nested tree. The chat shows compact group/child
+chips beside the relevant activity update, and the right rail expands the same
+state into group summaries and individual rows. **View all** opens the wider
+Active/Done panel. Repeated updates replace the earlier state for the same
+group or child rather than creating duplicate “agent” rows.
 
-Grok 0.2.117 joins this projection through its verified ACP parent/child
-sessions. The child session ID is the canonical Adam ID; a distinct provider
-subagent ID is retained as an alias. Child prose is collected into one
-response cell and never enters the main transcript or main completion text.
-Duplicate event IDs and resume replay do not create duplicate cells. Earlier
-captured Grok versions remain forced off because their available streams do
-not provide end-to-end child scope. Codex collaboration calls and
-subagent-activity items join thread aliases into the same lifecycle. Claude
-Agent/legacy Task calls, task lifecycle notifications, and tool-progress
-events join tool-use, task, and provider-agent IDs. Unsupported providers
-simply show no Subagents section instead of an invented one.
+The four multi-agent contracts remain deliberately distinct:
+
+- **Grok Build scoped subagents:** verified Grok 0.2.117 ACP parent/child
+  sessions provide stable child scope. The child session ID is Adam’s
+  canonical ID; a distinct provider subagent ID is retained as an alias.
+  Child prose is collected into one response cell and never enters the main
+  transcript or root completion. Duplicate event IDs and resume replay do not
+  create duplicate cells. Earlier captured Grok Build versions remain forced
+  off because their streams do not provide end-to-end child scope.
+- **Grok Build workflows:** a real provider `workflow_run_id` becomes a group
+  around the real Grok Build child sessions that report that workflow. The
+  group folds child state without replacing the individual scoped rows. This
+  is a CLI workflow, not the xAI Grok Heavy model.
+- **Kimi Agent and AgentSwarm:** Kimi 0.31.0’s ACP adapter intentionally
+  forwards only main-agent SDK events. A root `Agent` or `AgentSwarm`
+  `rawInput` therefore creates an honest **delegated** group with its requested
+  work, not fake working children. The terminal `rawOutput` supplies the real
+  `agent_id`, outcome, item, resume marker, and final result for each revealed
+  member; only then can Adam create/update stable child rows and their final
+  prose cells. Kimi does not expose live per-child prose or live child
+  lifecycle through this ACP version, so Adam does not claim it does.
+  Duplicate stable IDs or ambiguous result markup keep the delegation
+  aggregate-only. Background Agent output is never rendered as a permanently
+  working child.
+- **xAI Grok Heavy:** `grok-4.20-multi-agent` runs either 4 or 16 agents on
+  xAI’s servers. xAI returns only leader-visible tool calls and the leader’s
+  final answer by default; intermediate child state is hidden. Adam therefore
+  shows one aggregate group with the expected count and terminal state, with
+  no child tree, no per-child prose, and no made-up completed count. Adam keeps
+  a bounded registry of visible leader web searches; after it fills, further
+  searches continue at xAI but fine-grained Activity projection degrades
+  instead of aborting the root response. Every projected open tool row is
+  failed on cancellation, limits, malformed streams, or transport errors.
+
+Codex collaboration calls and subagent-activity items join thread aliases into
+the same child lifecycle. Claude Agent/legacy Task calls, task lifecycle
+notifications, and tool-progress events join tool-use, task, and
+provider-agent IDs. Providers without a genuine child or group signal simply
+show no Agents section instead of an invented one.
+
+High-volume ACP activity uses a degradation budget, not a kill switch.
+Grok’s budget is scoped per provider session so one noisy child cannot consume
+every sibling’s detail allowance. Kimi applies the same principle to its root
+stream. When presentation detail reaches the budget, Adam stops forwarding
+fine-grained thought and intermediate update chatter, coalesces the latest
+tool/progress/plan state, and continues reading the provider. Session identity,
+permission decisions, final plans and tools, root completion, real child
+spawn/finish state, final child prose, and terminal outcomes remain observable.
+If either ACP transport then fails, it first flushes already-accepted partial
+root text plus the latest root tool and plan snapshots, returns the original
+error, and does not invent a successful terminal. Line, protocol-byte, text,
+and identity bounds remain hard failures because those protect memory and
+protocol integrity rather than presentation density. Grok's cumulative child
+projection registry is different: after 256 tracked children it stops
+projecting newly discovered children, keeps the root turn alive, and denies
+permissions whose ownership can no longer be proven. Kimi's bounded root-tool
+registry remains a hard identity and permission boundary.
 
 ## Inspector, artifacts, files, and context
 
@@ -435,7 +570,8 @@ The right side is a task workspace with six independent, collapsible
 sections:
 
 - **Progress** — the authoritative task projection described above;
-- **Agents** — real child-agent lifecycle, counts, and parent/child tree;
+- **Agents** — real child lifecycle plus honest provider groups, including
+  aggregate-only groups that intentionally have no child tree;
 - **Artifacts** — files and host artifacts actually created by the conversation;
 - **Activity** — tools, commands, searches, and other execution diagnostics;
 - **Working folder** — an expandable file tree for the scoped folder; and
@@ -464,24 +600,30 @@ turn so the running agent’s scope cannot drift.
 Context deduplicates supplied files by path and shows provider-reported tool,
 command, web-search, and host-read use counts. Usage comes from the same typed
 event stream and keeps input, cached-input, reasoning, output, and cost fields
-separate. If older conversation turns are omitted from bounded replay, the
-replay meter says exactly how many.
+separate. For xAI, the exact integer `usage.cost_in_usd_ticks` value is retained
+and converted with 10,000,000,000 ticks per USD for the shared cost field. Adam
+does not estimate or silently display zero when xAI omits that field; the
+inspector says that cost was not reported. If older conversation turns are
+omitted from bounded replay, the replay meter says exactly how many.
 
 ## Prompt continuity
 
-Adam has two continuity paths.
+Adam has provider-native continuity where the provider supplies a safe token,
+and bounded replay everywhere else.
 
 ### Safe native resume
 
-Claude, Codex, and Grok can resume a provider-owned session only when every
-gate still matches:
+Claude, Codex, Grok Build, and Kimi 0.31.0 can resume a provider-owned session
+only when every gate still matches. Kimi uses ACP `session/load`; its replayed
+history notifications are transport recovery, not new child or group events.
+The gates are:
 
 - conversation;
 - provider;
 - executable basename;
 - canonical working folder;
 - parser dialect;
-- native sandbox identity; and
+- native sandbox or permission-mode identity; and
 - last committed conversation sequence.
 
 The provider session ID is machine-local state, not portable workspace data.
@@ -490,11 +632,29 @@ cancelled, or ID-less turn forgets the record, and a settings or permission
 change invalidates it. Adam never falls back to a provider’s vague “continue
 most recent” behavior.
 
-If a native resume fails before producing any text, thinking, tool, command,
-file, plan, or other substantive activity, Adam forgets the stale ID and makes
-one bounded-replay attempt without duplicating the committed user message.
-Once any substantive activity has appeared—even before a poisoned stream reset—
-Adam will not replay automatically, avoiding duplicated side effects.
+The existing CLI-native adapters can make one bounded fresh replay when a
+resumed process fails before any text, thinking, tool, command, file, plan, or
+other substantive activity begins. Grok Heavy is stricter because a generic
+network or provider failure is not proof that its paid server-side inference
+did no work: xAI fresh replay additionally requires the structured error code
+`previous_response_not_found` with `param` exactly `previous_response_id`.
+Lookalike free text, a timeout, a transport error, or any other provider error
+cannot launch a second xAI request. Adam then forgets the stale ID and replays
+without duplicating the committed user message. Once substantive activity has
+appeared, no provider replays automatically, avoiding duplicated side effects.
+
+xAI Grok Heavy uses the Responses API’s `previous_response_id` rather than a
+CLI session. Adam stores the last committed response ID only after a completed
+turn and sends it on the next compatible turn. A changed provider, model,
+conversation generation, or failed response clears the chain. Adam never
+combines `previous_response_id` with a guessed transcript replay, and it does
+not interpret the opaque prior response as recoverable child-agent history.
+Unlike CLI-native sessions, a response ID does not carry request-level
+instructions forward. Adam therefore resends its complete standing safety and
+untrusted-data instructions on every Grok Heavy request, including resumed
+turns, without replaying transcript history.
+An xAI incomplete response is a provider error unless its exact reason is the
+known `max_output_tokens` terminal, which maps to Adam’s turn-limit outcome.
 
 ### Bounded replay
 
@@ -544,7 +704,7 @@ retry. The web action retries the last request with a narrow one-run grant.
 Background completions mark the conversation unread.
 
 The transcript follows a compact work chronology: a Working/Worked/Blocked
-header with elapsed time, coalesced activity rows, live subagent chips,
+header with elapsed time, coalesced activity rows, live agent/group chips,
 provider commentary, the final response, and the genuine checklist step
 indicator near the composer. Consecutive reasoning updates collapse to the
 latest useful line instead of rendering dozens of identical “Thinking…”
@@ -571,6 +731,21 @@ Native CLI filesystem posture and Adam host-data permission are separate:
 - Adam host permission is re-evaluated for every host call, so changing the
   stance mid-run takes effect immediately.
 
+Grok Build and Kimi ACP permission requests are typed provider events. Adam
+answers only the root call whose identity it can prove and preserves the
+provider’s cancellation as a permission-blocked terminal outcome. Kimi’s ACP
+adapter does not expose child caller identity, which is why Adam launches it
+with an empty MCP server list instead of delegating task or canvas authority
+to unknown children. For Kimi delegation requests, only an explicit
+`subagent_type: explore` is treated as read-only. The provider’s default
+`coder` profile—and any missing or unfamiliar profile—is mutation-capable, so
+Ask and Sandbox do not silently grant it; background Agent jobs are refused
+for every Adam stance because the per-turn ACP host cannot own their later
+lifecycle. xAI Grok Heavy receives no local filesystem or Adam function tools
+at all. Its optional `web_search` runs on xAI’s servers and is present only
+when the user enabled that ability for the turn; an Adam access stance does
+not pretend to govern hidden server-agent internals.
+
 The provider-neutral host gate already supplies canonical call fingerprints,
 deduplicated five-minute prompts, Allow Once, memory-only Always for this
 conversation, Deny, destructive-Always refusal, stance re-evaluation,
@@ -592,9 +767,14 @@ cannot revive a completed run.
 
 - The workspace stores conversations, messages, attachments, typed activity,
   queue state, settings, and checkpoints.
-- Provider session IDs and future compaction summaries live in versioned
-  machine-local sidecars.
-- Temporary API keys remain in memory.
+- Provider session IDs, xAI response IDs, and future compaction summaries live
+  in versioned machine-local sidecars. Kimi projects model metadata without
+  copying its opaque ACP session ID into portable conversation activity.
+- Temporary API keys remain in memory and are scoped to the selected provider,
+  so an xAI key cannot follow a later provider switch into a compatible HTTP
+  endpoint. Grok Heavy may alternatively read `XAI_API_KEY`; the key is never
+  stored in the conversation or activity log, and its runtime container’s
+  debug representation redacts the entire temporary-key map.
 - CLI providers reuse their existing local login.
 - Commands are spawned directly; Custom CLI input is not evaluated by a shell.
 - The working directory is explicit for Cowork and Code.
@@ -614,8 +794,17 @@ The current harness does not claim:
 - a completed model-callable Adam host-tool server;
 - scoped child prose for Grok versions whose streams do not identify the
   emitting child session;
-- native Adam task-tool attachment for Kimi or Ollama CLI builds that expose
-  no verified external-tool transport;
+- live Kimi 0.31.0 child prose or child lifecycle—the ACP root tool reveals
+  requested work first and stable member results only when it finishes;
+- persistent Kimi background Agent jobs—foreground Agent and AgentSwarm
+  delegation are the supported truthful lifecycle;
+- child identities, child transcripts, or per-child completion counts for
+  xAI Grok Heavy, whose default response keeps server-agent state opaque;
+- Adam task-tool attachment for Kimi 0.31.0 or xAI Grok Heavy: Kimi uses its
+  native root plan with no MCP servers, while Grok Heavy exposes neither a
+  safe native plan nor client task functions;
+- native Adam task-tool attachment for Ollama CLI builds that expose no
+  verified external-tool transport;
 - an interactive approval sheet for every provider permission request—safe
   read-only web requests can be granted narrowly, while a request Adam cannot
   safely answer terminates with a typed permission-blocked outcome;

@@ -4,26 +4,40 @@
 //! No provider command is routed through a shell, and dangerous bypass flags
 //! are never synthesized by this module.
 
+#[cfg(not(test))]
+use crate::xai_responses::run_xai_responses_cancellable;
 use crate::{
     ai_task_bridge::TaskToolBridge,
     ai_task_tools::{TaskToolOutcome, TaskToolRegistry},
     chat_core::{
-        ActivityEvent, ActivityKind, ActivityStatus, AgentScope, CliVersion, FileChange,
-        FileChangeKind, PermissionResolution, PlanChannel, PlanItem, PlanItemOrigin,
-        PlanItemStatus, ProviderKind, ResumeStrategy, RetryHint, RuntimeTuningProfile,
-        SubagentStatus, SystemPromptChannel, TaskMutationKind, TurnStatus, capability_profile,
-        capability_profile_for_runtime, runtime_tuning_profile,
+        ActivityEvent, ActivityKind, ActivityStatus, AgentGroupKind, AgentGroupMember,
+        AgentGroupVisibility, AgentScope, CliVersion, FileChange, FileChangeKind,
+        PermissionResolution, PlanChannel, PlanItem, PlanItemOrigin, PlanItemStatus, ProviderKind,
+        ResumeStrategy, RetryHint, RuntimeTuningProfile, SubagentStatus, SystemPromptChannel,
+        TaskMutationKind, TurnStatus, capability_profile, capability_profile_for_runtime,
+        runtime_tuning_profile,
     },
     domain::{
-        AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_THINKING,
-        AI_FEATURE_WEB_SEARCH, AiPermissionClass, AiPermissionVerdict, AiProviderPreferences,
-        AiWorkspaceMode, PermissionMode, UnixMillis, ai_permission_verdict,
+        AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_SWARM,
+        AI_FEATURE_THINKING, AI_FEATURE_WEB_SEARCH, AiPermissionClass, AiPermissionVerdict,
+        AiProviderPreferences, AiWorkspaceMode, PermissionMode, UnixMillis, ai_permission_verdict,
     },
     grok_acp::{
         GrokAcpError, GrokAcpEvent, GrokAcpHttpMcpServer, GrokAcpLimits, GrokAcpPermissionDecision,
         GrokAcpPermissionRequest, GrokAcpPermissionResolution, GrokAcpPlanStatus,
         GrokAcpProgressRoute, GrokAcpRequest, GrokAcpSessionScope, GrokAcpStopReason,
         GrokAcpSubagentStatus, GrokAcpToolCall, GrokAcpToolKind, GrokAcpToolStatus, run_grok_acp,
+    },
+    kimi_acp::{
+        KIMI_ACP_RUNTIME_VERSION, KimiAcpError, KimiAcpEvent, KimiAcpLimits, KimiAcpOutcome,
+        KimiAcpPermissionDecision, KimiAcpPermissionRequest, KimiAcpPermissionResolution,
+        KimiAcpPlanStatus, KimiAcpRequest, KimiAcpStopReason, KimiAcpToolCall, KimiAcpToolKind,
+        KimiAcpToolStatus, run_kimi_acp,
+    },
+    xai_responses::{
+        XAI_API_KEY_ENV, XAI_MULTI_AGENT_MODEL, XaiGroupStatus, XaiReasoningEffort,
+        XaiResponsesError, XaiResponsesEvent, XaiResponsesLimits, XaiResponsesRequest,
+        XaiTransportAbort,
     },
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
@@ -40,7 +54,7 @@ use std::{
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -64,6 +78,9 @@ const MAX_GROK_SESSION_POLL_BYTES: usize = 512 * 1024;
 const MAX_GROK_SESSION_SCAN_BYTES: u64 = 32 * 1024 * 1024;
 const GROK_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_GROK_SUBAGENTS: usize = 256;
+const MAX_KIMI_SWARM_MEMBERS: usize = 128;
+const MAX_KIMI_SWARM_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_KIMI_SWARM_MEMBER_DETAIL_BYTES: usize = 1024 * 1024;
 const MAX_HTTP_TOOL_ROUNDS: usize = 16;
 const MAX_HTTP_TOOL_CALLS_PER_ROUND: usize = 32;
 const MAX_HTTP_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
@@ -76,8 +93,10 @@ const CHAT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const TASK_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(1);
 pub const MAX_CONCURRENT_AI_RUNS: usize = 4;
+const MAX_XAI_HTTP_WORKERS: usize = MAX_CONCURRENT_AI_RUNS * 2;
 
 static CLI_VERSION_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<CliVersion>>>> = OnceLock::new();
+static XAI_HTTP_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// One provider turn. The API key value is deliberately memory-only and its
 /// custom `Debug` implementation never prints it.
@@ -186,6 +205,9 @@ pub enum AiEvent {
         conversation_id: Uuid,
         kind: AiFailureKind,
         message: String,
+        /// The provider rejected the saved native session before doing work.
+        /// Consumers may use this typed signal for one fresh replay.
+        resume_rejected: bool,
     },
     Cancelled {
         turn_id: Uuid,
@@ -253,6 +275,8 @@ pub enum AiEngineError {
     ExecutableNotFound(String),
     #[error("invalid AI provider configuration: {0}")]
     InvalidConfiguration(String),
+    #[error("native AI session is unavailable: {0}")]
+    NativeResumeUnavailable(String),
     #[error("could not start the AI worker: {0}")]
     WorkerStart(#[source] io::Error),
 }
@@ -350,6 +374,12 @@ impl AiEngine {
                             &events,
                             &task_tools,
                         ),
+                        PreparedRun::KimiAcp(specification) => {
+                            run_kimi_acp_transport(&request, specification, &control, &events)
+                        }
+                        PreparedRun::XaiResponses(specification) => {
+                            run_xai_responses_transport(&request, specification, &control, &events)
+                        }
                         PreparedRun::Http { provider_id, url } => {
                             run_http(&request, &provider_id, url, &control, &events, &task_tools)
                         }
@@ -378,6 +408,14 @@ impl AiEngine {
                         conversation_id,
                         kind,
                         message,
+                        resume_rejected: false,
+                    }),
+                    RunOutcome::ResumeRejected { message } => Some(AiEvent::Failed {
+                        turn_id,
+                        conversation_id,
+                        kind: AiFailureKind::ProviderError,
+                        message,
+                        resume_rejected: true,
                     }),
                     RunOutcome::Cancelled => Some(AiEvent::Cancelled {
                         turn_id,
@@ -403,12 +441,7 @@ impl AiEngine {
         let control = lock_unpoison(&self.active)
             .get(&turn_id)
             .map(|run| Arc::clone(&run.control));
-        if let Some(control) = control {
-            control.cancel();
-            true
-        } else {
-            false
-        }
+        control.is_some_and(|control| control.cancel())
     }
 
     pub fn try_recv(&self) -> Option<AiEvent> {
@@ -498,7 +531,7 @@ impl AiEngine {
             .map(|run| Arc::clone(&run.control))
             .collect();
         for control in controls {
-            control.cancel();
+            let _ = control.cancel();
         }
     }
 
@@ -526,11 +559,13 @@ impl Drop for AiEngine {
 #[derive(Default)]
 struct RunControl {
     cancelled: AtomicBool,
+    terminal_claimed: AtomicBool,
     child: Mutex<Option<Child>>,
     /// Serializes the transition to a terminal HTTP state against every model
     /// event and task-tool dispatch. Once `cancelled` is set while this gate is
     /// held, no later HTTP event or task mutation may begin.
     http_event_gate: Mutex<()>,
+    xai_transport_abort: Mutex<Option<XaiTransportAbort>>,
     #[cfg(test)]
     http_read_in_progress: AtomicBool,
 }
@@ -541,22 +576,58 @@ struct ActiveRun {
 }
 
 impl RunControl {
-    fn request_stop(&self) {
+    fn request_stop(&self) -> bool {
         let _gate = lock_unpoison(&self.http_event_gate);
+        if self.terminal_claimed.load(Ordering::Acquire) {
+            return false;
+        }
         self.cancelled.store(true, Ordering::Release);
+        self.abort_xai_transport();
+        true
     }
 
-    fn cancel(&self) {
-        self.request_stop();
+    fn cancel(&self) -> bool {
+        if !self.request_stop() {
+            return false;
+        }
         if let Some(child) = lock_unpoison(&self.child).as_mut() {
             terminate_child_tree(child);
         }
+        true
+    }
+
+    fn claim_terminal_result(&self) -> bool {
+        let _gate = lock_unpoison(&self.http_event_gate);
+        if self.cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        self.terminal_claimed.store(true, Ordering::Release);
+        true
+    }
+
+    fn install_xai_transport_abort(&self, abort: XaiTransportAbort) {
+        if self.cancelled.load(Ordering::Acquire) {
+            abort.cancel();
+        }
+        *lock_unpoison(&self.xai_transport_abort) = Some(abort);
+    }
+
+    fn abort_xai_transport(&self) {
+        if let Some(abort) = lock_unpoison(&self.xai_transport_abort).as_ref() {
+            abort.cancel();
+        }
+    }
+
+    fn clear_xai_transport_abort(&self) {
+        lock_unpoison(&self.xai_transport_abort).take();
     }
 }
 
 enum PreparedRun {
     Process(ProcessSpec),
     GrokAcp(GrokAcpSpec),
+    KimiAcp(KimiAcpSpec),
+    XaiResponses(XaiResponsesSpec),
     Http { provider_id: String, url: Url },
 }
 
@@ -565,6 +636,8 @@ impl PreparedRun {
         match self {
             Self::Process(specification) => &specification.provider_id,
             Self::GrokAcp(_) => "grok_cli",
+            Self::KimiAcp(_) => "kimi_cli",
+            Self::XaiResponses(_) => "xai_api",
             Self::Http { provider_id, .. } => provider_id,
         }
     }
@@ -591,6 +664,8 @@ impl PreparedRun {
                 .plan_channel
             }
             Self::GrokAcp(specification) => specification.plan_channel,
+            Self::KimiAcp(_) => PlanChannel::NativeStream,
+            Self::XaiResponses(_) => PlanChannel::None,
             Self::Http { .. } => PlanChannel::AppTaskTools,
         }
     }
@@ -629,6 +704,20 @@ struct GrokAcpSpec {
     subagents_enabled: bool,
 }
 
+#[derive(Debug)]
+struct KimiAcpSpec {
+    program: PathBuf,
+    cwd: PathBuf,
+    runtime_version: CliVersion,
+}
+
+#[derive(Debug)]
+struct XaiResponsesSpec {
+    url: Url,
+    #[cfg(test)]
+    disconnect_worker: bool,
+}
+
 fn built_in_cli_executable(provider_id: &str) -> Option<&'static str> {
     match provider_id.trim().to_ascii_lowercase().as_str() {
         "claude_cli" => Some("claude"),
@@ -648,6 +737,9 @@ pub fn installed_runtime_tuning(
     model: &str,
     cwd: Option<&Path>,
 ) -> RuntimeTuningProfile {
+    if provider_id.trim().eq_ignore_ascii_case("xai_api") {
+        return runtime_tuning_profile(ProviderKind::Xai, None, XAI_MULTI_AGENT_MODEL);
+    }
     let Some(executable) = built_in_cli_executable(provider_id) else {
         return runtime_tuning_profile(ProviderKind::Custom, None, model);
     };
@@ -656,6 +748,16 @@ pub fn installed_runtime_tuning(
         return runtime_tuning_profile(profile.runtime_family, None, model);
     };
     runtime_tuning_for_program(provider_id, &program, model)
+}
+
+/// Whether the installed `kimi` executable selects Adam's fixture-verified
+/// ACP transport. Resume eligibility calls this at the launch boundary so a
+/// same-path upgrade or downgrade cannot reuse an ACP sidecar with the legacy
+/// print-mode adapter.
+pub fn installed_kimi_uses_acp(cwd: Option<&Path>) -> bool {
+    resolve_executable("kimi", cwd)
+        .map(|program| fresh_runtime_tuning_for_program("kimi_cli", &program, ""))
+        .is_some_and(|tuning| supports_kimi_acp_transport(tuning.version.as_ref()))
 }
 
 /// Clamp saved controls to the verified runtime table. Returns true when the
@@ -676,6 +778,14 @@ pub fn clamp_provider_preferences(
     }
     if provider_id == "grok_cli" && !tuning.supports_scoped_child_text() {
         preferences.set_feature(AI_FEATURE_SUBAGENTS, Some(false));
+    }
+    if provider_id == "kimi_cli"
+        && tuning.agent_group_channel != crate::chat_core::AgentGroupChannel::KimiAcpToolAggregateV1
+    {
+        preferences.set_feature(AI_FEATURE_SWARM, Some(false));
+    }
+    if provider_id.eq_ignore_ascii_case("xai_api") {
+        preferences.model.clear();
     }
     *preferences != original
 }
@@ -797,6 +907,12 @@ fn probe_cli_version(program: &Path) -> Option<CliVersion> {
 fn prepare_run(request: &AiRunRequest) -> Result<PreparedRun, AiEngineError> {
     let provider = request.provider_id.trim().to_ascii_lowercase();
     match provider.as_str() {
+        "xai_api" => Ok(PreparedRun::XaiResponses(XaiResponsesSpec {
+            url: Url::parse("https://api.x.ai/v1/responses")
+                .expect("the compiled-in xAI Responses endpoint is valid"),
+            #[cfg(test)]
+            disconnect_worker: false,
+        })),
         "openai_compatible" => prepare_http(&provider, request),
         "lm_studio" if !request.endpoint.trim().is_empty() => prepare_http(&provider, request),
         "auto" => {
@@ -961,6 +1077,44 @@ fn prepare_resolved_cli(
             }));
         }
     }
+    if provider_id == "kimi_cli" {
+        // Kimi Code replaced the unrelated legacy kimi-cli while retaining
+        // the same executable name. Re-probe every launch and select ACP only
+        // for the exact fixture-backed runtime.
+        let tuning =
+            fresh_runtime_tuning_for_program(provider_id, &program, effective_model(request));
+        if supports_kimi_acp_transport(tuning.version.as_ref()) {
+            let cwd = match canonical_working_directory(request.cwd.as_deref())? {
+                Some(cwd) => cwd,
+                None => env::current_dir()
+                    .and_then(fs::canonicalize)
+                    .map_err(|error| {
+                        AiEngineError::InvalidConfiguration(format!(
+                            "could not resolve the Kimi working directory: {error}"
+                        ))
+                    })?,
+            };
+            return Ok(PreparedRun::KimiAcp(KimiAcpSpec {
+                program,
+                cwd,
+                runtime_version: tuning
+                    .version
+                    .expect("verified Kimi ACP runtime has a parsed version"),
+            }));
+        }
+        if request.resume_session_id.is_some() {
+            return Err(AiEngineError::NativeResumeUnavailable(
+                "the installed Kimi runtime no longer matches the 0.31.0 ACP session contract"
+                    .into(),
+            ));
+        }
+        return Ok(PreparedRun::Process(preset_process_spec_with_tuning(
+            provider_id,
+            program,
+            request,
+            &tuning,
+        )?));
+    }
     Ok(PreparedRun::Process(preset_process_spec(
         provider_id,
         program,
@@ -987,6 +1141,10 @@ fn supports_grok_acp_task_bridge(version: Option<&CliVersion>) -> bool {
             (0, 2, 114) | (0, 2, 117)
         )
     })
+}
+
+fn supports_kimi_acp_transport(version: Option<&CliVersion>) -> bool {
+    version.is_some_and(|version| (version.major, version.minor, version.patch) == (0, 31, 0))
 }
 
 fn effective_model(request: &AiRunRequest) -> &str {
@@ -1179,21 +1337,17 @@ fn preset_process_spec_with_tuning(
             (PromptInput::SecureFile, OutputMode::JsonLines)
         }
         "kimi_cli" => {
-            // Kimi Code CLI (0.x) supersedes the legacy kimi-cli (1.x) and is
-            // what the vendor installer now delivers, but it is a different
-            // interface: the prompt moves to `-p <text>` (no stdin form —
-            // Commander has no dash convention, so `-p -` would send a literal
-            // dash), `--thinking` is gone, and its stream-json shape is
-            // uncaptured. The arguments below drive the legacy CLI only.
-            // Refuse clearly instead of launching a command we cannot drive.
-            // Port target: its `kimi acp` subcommand, alongside the Grok ACP work.
+            // Exact Kimi Code 0.31.0 is selected above and driven through ACP.
+            // Other 0.x releases must be fixture-verified before Adam launches
+            // them; the arguments below are only for the unrelated legacy 1.x
+            // CLI that used the same executable name.
             if tuning
                 .version
                 .as_ref()
                 .is_some_and(|version| version.major == 0)
             {
                 return Err(AiEngineError::InvalidConfiguration(
-                    "This is Kimi Code CLI, which replaced the legacy kimi-cli and uses a different command interface. Adam cannot drive it yet — pick another provider, or connect Kimi as an OpenAI-compatible endpoint."
+                    "Adam supports the fixture-verified Kimi Code CLI 0.31.0 ACP contract; this installed 0.x version has a different, unverified interface. Install 0.31.0, or connect Kimi through an OpenAI-compatible endpoint."
                         .into(),
                 ));
             }
@@ -1418,6 +1572,11 @@ fn apply_resume_arguments(
             arguments.insert(0, session_id.into());
             arguments.insert(0, "--resume".into());
         }
+        ResumeStrategy::AcpSessionLoad | ResumeStrategy::PreviousResponseId => {
+            return Err(AiEngineError::InvalidConfiguration(format!(
+                "{provider_id} resume is owned by its structured transport"
+            )));
+        }
         ResumeStrategy::None => {
             return Err(AiEngineError::InvalidConfiguration(format!(
                 "{provider_id} does not support native session resume"
@@ -1622,6 +1781,9 @@ enum RunOutcome {
         tool: Option<String>,
         retry: Option<RetryHint>,
     },
+    ResumeRejected {
+        message: String,
+    },
     Cancelled,
     /// The runner sent its user-facing terminal event before its underlying
     /// worker exited, then retained the engine slot until cleanup completed.
@@ -1678,6 +1840,14 @@ fn run_outcome_status(outcome: &RunOutcome) -> Option<ActivityKind> {
                 message: Some(message.clone()),
                 tool: tool.clone(),
                 retry,
+            });
+        }
+        RunOutcome::ResumeRejected { message } => {
+            return Some(ActivityKind::TurnStatus {
+                status: TurnStatus::ProviderError,
+                message: Some(message.clone()),
+                tool: None,
+                retry: Some(RetryHint::Retry),
             });
         }
         RunOutcome::Cancelled => (TurnStatus::UserCancelled, None, None),
@@ -1762,6 +1932,8 @@ struct GrokAcpProjectionState {
     emitted_tool_calls: HashSet<(String, String)>,
     permission_tools: HashMap<(String, String), String>,
     child_permission_blocks: HashMap<String, GrokPermissionBlock>,
+    workflow_members: HashMap<String, Vec<AgentGroupMember>>,
+    workflow_by_child_session: HashMap<String, String>,
 }
 
 impl GrokAcpProjectionState {
@@ -1810,6 +1982,48 @@ impl GrokAcpProjectionState {
                 id: session_id.to_owned(),
             }),
         }
+    }
+
+    fn upsert_workflow_member(
+        &mut self,
+        workflow_id: &str,
+        child_session_id: &str,
+        label: Option<&str>,
+        status: SubagentStatus,
+        detail: Option<String>,
+    ) -> Vec<AgentGroupMember> {
+        let members = self
+            .workflow_members
+            .entry(workflow_id.to_owned())
+            .or_default();
+        if let Some(member) = members
+            .iter_mut()
+            .find(|member| member.id == child_session_id)
+        {
+            if label.is_some_and(|label| !label.trim().is_empty()) {
+                member.label = label.unwrap_or_default().to_owned();
+            }
+            member.status = status;
+            if detail.is_some() || status.is_terminal() {
+                member.detail = detail;
+            }
+        } else {
+            members.push(AgentGroupMember {
+                id: child_session_id.to_owned(),
+                label: label.unwrap_or_default().to_owned(),
+                status,
+                detail,
+            });
+        }
+        self.workflow_by_child_session
+            .insert(child_session_id.to_owned(), workflow_id.to_owned());
+        members.clone()
+    }
+
+    fn workflow_for_child(&self, child_session_id: &str) -> Option<String> {
+        self.workflow_by_child_session
+            .get(child_session_id)
+            .cloned()
     }
 }
 
@@ -2381,6 +2595,12 @@ fn emit_grok_acp_event(
             );
         }
         GrokAcpEvent::SubagentSpawned { subagent } => {
+            let workflow_id = subagent.workflow_run_id.clone();
+            let child_label = if subagent.description.trim().is_empty() {
+                subagent.subagent_type.clone()
+            } else {
+                subagent.description.clone()
+            };
             let child_scope = GrokAcpSessionScope::Child {
                 subagent_id: subagent.subagent_id.clone(),
                 parent_session_id: subagent.parent_session_id.clone(),
@@ -2388,6 +2608,24 @@ fn emit_grok_acp_event(
             projection
                 .borrow_mut()
                 .remember_child(&subagent.child_session_id, child_scope);
+            if let Some(workflow_id) = workflow_id.as_deref() {
+                let members = projection.borrow_mut().upsert_workflow_member(
+                    workflow_id,
+                    &subagent.child_session_id,
+                    Some(&child_label),
+                    SubagentStatus::InProgress,
+                    None,
+                );
+                send_grok_workflow_group(
+                    request,
+                    event_sender,
+                    workflow_id,
+                    SubagentStatus::InProgress,
+                    None,
+                    members,
+                    None,
+                );
+            }
             send_grok_acp_activity(
                 request,
                 event_sender,
@@ -2399,11 +2637,7 @@ fn emit_grok_acp_event(
                         &subagent.subagent_id,
                     ),
                     parent_id: Some(subagent.parent_session_id),
-                    label: if subagent.description.trim().is_empty() {
-                        subagent.subagent_type
-                    } else {
-                        subagent.description
-                    },
+                    label: child_label,
                     status: SubagentStatus::InProgress,
                     model: subagent.model,
                     detail: subagent.capability_mode.or(subagent.role),
@@ -2431,6 +2665,27 @@ fn emit_grok_acp_event(
                         )
                     })
                 });
+            if let Some(workflow_id) = projection
+                .borrow()
+                .workflow_for_child(&progress.child_session_id)
+            {
+                let members = projection.borrow_mut().upsert_workflow_member(
+                    &workflow_id,
+                    &progress.child_session_id,
+                    None,
+                    SubagentStatus::InProgress,
+                    detail.clone(),
+                );
+                send_grok_workflow_group(
+                    request,
+                    event_sender,
+                    &workflow_id,
+                    SubagentStatus::InProgress,
+                    None,
+                    members,
+                    None,
+                );
+            }
             send_grok_acp_activity(
                 request,
                 event_sender,
@@ -2463,6 +2718,46 @@ fn emit_grok_acp_event(
             let detail = result.error.or_else(|| {
                 permission_block.map(|block| format!("Permission unavailable for {}", block.tool))
             });
+            if let Some(workflow_id) = projection
+                .borrow()
+                .workflow_for_child(&result.child_session_id)
+            {
+                let members = projection.borrow_mut().upsert_workflow_member(
+                    &workflow_id,
+                    &result.child_session_id,
+                    None,
+                    status,
+                    detail.clone(),
+                );
+                let group_status = if members.iter().all(|member| member.status.is_terminal()) {
+                    if members.iter().any(|member| {
+                        matches!(
+                            member.status,
+                            SubagentStatus::Failed | SubagentStatus::PermissionBlocked
+                        )
+                    }) {
+                        SubagentStatus::Failed
+                    } else if members
+                        .iter()
+                        .any(|member| member.status == SubagentStatus::Cancelled)
+                    {
+                        SubagentStatus::Cancelled
+                    } else {
+                        SubagentStatus::Completed
+                    }
+                } else {
+                    SubagentStatus::InProgress
+                };
+                send_grok_workflow_group(
+                    request,
+                    event_sender,
+                    &workflow_id,
+                    group_status,
+                    None,
+                    members,
+                    None,
+                );
+            }
             send_grok_acp_activity(
                 request,
                 event_sender,
@@ -2480,8 +2775,69 @@ fn emit_grok_acp_event(
                 Some(grok_duration_ms(result.duration_ms)),
             );
         }
-        GrokAcpEvent::Terminal { .. } => {}
+        GrokAcpEvent::Terminal { .. } => {
+            let groups = projection
+                .borrow()
+                .workflow_members
+                .iter()
+                .map(|(id, members)| (id.clone(), members.clone()))
+                .collect::<Vec<_>>();
+            for (workflow_id, members) in groups {
+                let status = if members.iter().any(|member| {
+                    matches!(
+                        member.status,
+                        SubagentStatus::Failed | SubagentStatus::PermissionBlocked
+                    )
+                }) {
+                    SubagentStatus::Failed
+                } else if members
+                    .iter()
+                    .any(|member| member.status == SubagentStatus::Cancelled)
+                {
+                    SubagentStatus::Cancelled
+                } else {
+                    SubagentStatus::Completed
+                };
+                send_grok_workflow_group(
+                    request,
+                    event_sender,
+                    &workflow_id,
+                    status,
+                    u32::try_from(members.len()).ok(),
+                    members,
+                    Some("Grok Build workflow finished.".into()),
+                );
+            }
+        }
     }
+}
+
+fn send_grok_workflow_group(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    workflow_id: &str,
+    status: SubagentStatus,
+    expected_count: Option<u32>,
+    members: Vec<AgentGroupMember>,
+    detail: Option<String>,
+) {
+    send_grok_acp_activity(
+        request,
+        event_sender,
+        AgentScope::Main,
+        ActivityKind::AgentGroup {
+            id: workflow_id.to_owned(),
+            aliases: Vec::new(),
+            label: "Grok Build workflow".into(),
+            kind: AgentGroupKind::Workflow,
+            status,
+            expected_count,
+            members,
+            visibility: AgentGroupVisibility::DelegatedMembers,
+            detail,
+        },
+        None,
+    );
 }
 
 fn send_grok_acp_activity(
@@ -2626,6 +2982,1567 @@ fn grok_acp_tool_label(tool_call: &GrokAcpToolCall) -> String {
 fn grok_acp_tool_output(tool_call: &GrokAcpToolCall) -> Option<String> {
     let content = serde_json::to_string(&tool_call.content).ok()?;
     tail_text(Some(&content))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KimiDelegationKind {
+    Agent,
+    Swarm,
+}
+
+#[derive(Clone, Debug)]
+struct KimiDelegationState {
+    kind: KimiDelegationKind,
+    label: String,
+    expected_count: Option<u32>,
+    members: Vec<AgentGroupMember>,
+    terminal: bool,
+}
+
+#[derive(Debug, Default)]
+struct KimiAcpProjectionState {
+    emitted_tool_calls: HashSet<String>,
+    emitted_tool_results: HashSet<String>,
+    permission_tools: HashMap<String, String>,
+    delegations: HashMap<String, KimiDelegationState>,
+}
+
+#[derive(Clone, Debug)]
+struct KimiDelegatedResult {
+    agent_id: Option<String>,
+    label: String,
+    status: SubagentStatus,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct KimiPermissionBlockState {
+    pending: Option<GrokPermissionBlock>,
+}
+
+fn run_kimi_acp_transport(
+    request: &AiRunRequest,
+    specification: KimiAcpSpec,
+    control: &Arc<RunControl>,
+    event_sender: &Sender<AiEvent>,
+) -> RunOutcome {
+    let tuning = fresh_runtime_tuning_for_program(
+        "kimi_cli",
+        &specification.program,
+        effective_model(request),
+    );
+    if tuning.version.as_ref() != Some(&specification.runtime_version)
+        || !tuning.verified_runtime
+        || tuning.agent_group_channel != crate::chat_core::AgentGroupChannel::KimiAcpToolAggregateV1
+    {
+        return RunOutcome::provider_error(
+            "the installed Kimi runtime changed after this turn was prepared; retry the turn so Adam can apply the current capability contract",
+        );
+    }
+
+    let model = (!effective_model(request).is_empty()).then(|| effective_model(request).to_owned());
+    let thinking = match request.provider_preferences.feature(AI_FEATURE_THINKING) {
+        Some(true) => Some("on".into()),
+        Some(false) => Some("off".into()),
+        None => None,
+    };
+    let mode = match (request.workspace_mode, request.permission_mode) {
+        (AiWorkspaceMode::Chat, _) | (_, PermissionMode::Plan) => Some("plan".into()),
+        (
+            AiWorkspaceMode::Cowork | AiWorkspaceMode::Code,
+            PermissionMode::Sandbox
+            | PermissionMode::Ask
+            | PermissionMode::Auto
+            | PermissionMode::Bypass,
+        ) => Some("default".into()),
+    };
+    let acp_request = KimiAcpRequest {
+        executable: specification.program,
+        cwd: specification.cwd,
+        prompt: kimi_acp_prompt(request),
+        verified_runtime_version: KIMI_ACP_RUNTIME_VERSION.into(),
+        model,
+        thinking,
+        mode,
+        resume_session_id: request.resume_session_id.clone(),
+        limits: KimiAcpLimits {
+            wall_timeout: run_timeout(request.workspace_mode),
+            ..KimiAcpLimits::default()
+        },
+    };
+
+    let permission_block = RefCell::new(KimiPermissionBlockState::default());
+    let projection = RefCell::new(KimiAcpProjectionState::default());
+    let swarm_enabled = request.provider_preferences.feature(AI_FEATURE_SWARM) != Some(false);
+    let result = run_kimi_acp(
+        &acp_request,
+        &control.cancelled,
+        |permission| {
+            kimi_acp_permission_decision(
+                permission,
+                request.permission_mode,
+                request.workspace_mode,
+                swarm_enabled,
+                &permission_block,
+            )
+        },
+        |event| {
+            observe_kimi_permission_progress(&event, &permission_block);
+            emit_kimi_acp_event(request, event_sender, event, &projection);
+        },
+    );
+
+    let cancellation_requested = control.cancelled.load(Ordering::Acquire);
+    finalize_kimi_delegations_after_adapter_return(
+        request,
+        event_sender,
+        &result,
+        cancellation_requested,
+        &projection,
+    );
+    if cancellation_requested {
+        return RunOutcome::Cancelled;
+    }
+    let permission_block = permission_block.into_inner().pending;
+    match result {
+        Err(error) => kimi_acp_error_outcome(error, permission_block),
+        Ok(outcome) => match outcome.stop_reason {
+            KimiAcpStopReason::EndTurn => RunOutcome::Completed {
+                text: outcome.response_text,
+                session_id: Some(outcome.session_id),
+            },
+            KimiAcpStopReason::Cancelled | KimiAcpStopReason::Refusal
+                if permission_block.is_some() =>
+            {
+                let block = permission_block.expect("guarded by is_some");
+                kimi_permission_blocked_outcome(block.tool)
+            }
+            KimiAcpStopReason::Cancelled => RunOutcome::Cancelled,
+            KimiAcpStopReason::MaxTokens | KimiAcpStopReason::MaxTurnRequests => {
+                RunOutcome::Failed {
+                    kind: AiFailureKind::MaxTurnsReached,
+                    message: "Kimi reached its turn or token limit before completing.".into(),
+                    tool: None,
+                    retry: Some(RetryHint::Retry),
+                }
+            }
+            KimiAcpStopReason::Refusal => {
+                RunOutcome::provider_error("Kimi refused the requested turn")
+            }
+            KimiAcpStopReason::Other(reason) => RunOutcome::provider_error(format!(
+                "Kimi stopped with an unsupported terminal reason: {reason}"
+            )),
+        },
+    }
+}
+
+fn finalize_kimi_delegations_after_adapter_return(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    result: &Result<KimiAcpOutcome, KimiAcpError>,
+    cancellation_requested: bool,
+    projection: &RefCell<KimiAcpProjectionState>,
+) {
+    let stop_reason = if cancellation_requested {
+        KimiAcpStopReason::Cancelled
+    } else {
+        match result {
+            Ok(outcome) => outcome.stop_reason.clone(),
+            Err(KimiAcpError::ProviderCancelled) => KimiAcpStopReason::Cancelled,
+            Err(_) => KimiAcpStopReason::Other("adapter_error".into()),
+        }
+    };
+    // A normal ACP terminal event already closes these groups. Repeating the
+    // operation here is intentional and idempotent: protocol/IO/timeout/EOF
+    // failures can return without a terminal event, and must not strand an
+    // in-progress Agent or AgentSwarm in persisted conversation state.
+    finalize_open_kimi_delegations(request, event_sender, stop_reason, projection);
+}
+
+fn kimi_acp_prompt(request: &AiRunRequest) -> String {
+    let mut sections = Vec::new();
+    if let Some(system_prompt) = request
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+    {
+        sections.push(format!("System instructions:\n{system_prompt}"));
+    }
+    match request.provider_preferences.feature(AI_FEATURE_SWARM) {
+        Some(true) => sections.push(
+            "Delegation preference: when the request contains independent work that benefits from parallelism, use Kimi's native foreground AgentSwarm tool. For read-only research, set subagent_type to explore explicitly. Agent and AgentSwarm otherwise default to coder and may edit files or run commands; coder/default/unknown delegations require an Auto or Bypass run and are not silently granted in Ask or Sandbox. Do not launch Agent with run_in_background=true: Adam's per-turn ACP host cannot receive its later notification. Report only the real agent IDs and outcomes returned by Kimi; do not claim live child telemetry that the ACP session does not expose."
+                .into(),
+        ),
+        Some(false) => sections.push(
+            "Delegation restriction: do not use Kimi's Agent or AgentSwarm tools in this run."
+                .into(),
+        ),
+        None => {}
+    }
+    sections.push(format!("User request:\n{}", request.prompt));
+    sections.join("\n\n")
+}
+
+fn kimi_acp_error_outcome(
+    error: KimiAcpError,
+    permission_block: Option<GrokPermissionBlock>,
+) -> RunOutcome {
+    match error {
+        KimiAcpError::TimedOut { seconds } => {
+            RunOutcome::timed_out(format!("Kimi timed out after {seconds} seconds"))
+        }
+        KimiAcpError::ProviderCancelled if permission_block.is_some() => {
+            kimi_permission_blocked_outcome(permission_block.expect("guarded by is_some").tool)
+        }
+        error => RunOutcome::provider_error(format!("Kimi ACP failed: {error}")),
+    }
+}
+
+fn kimi_permission_blocked_outcome(tool: String) -> RunOutcome {
+    let retry = if is_explicit_web_tool(Some(&tool)) {
+        RetryHint::AllowWebAndRetry
+    } else {
+        RetryHint::Retry
+    };
+    RunOutcome::Failed {
+        kind: AiFailureKind::PermissionBlocked,
+        message: format!("Kimi could not continue after permission to use {tool} was unavailable."),
+        tool: Some(tool),
+        retry: Some(retry),
+    }
+}
+
+fn kimi_acp_permission_decision(
+    permission: &KimiAcpPermissionRequest,
+    mode: PermissionMode,
+    workspace_mode: AiWorkspaceMode,
+    swarm_enabled: bool,
+    blocked: &RefCell<KimiPermissionBlockState>,
+) -> KimiAcpPermissionDecision {
+    // Kimi 0.31 reuses session/request_permission for AskUserQuestion because
+    // ACP has no question RPC. Adam does not yet have an interactive question
+    // surface, so choose Kimi's explicit Skip option in every stance. In
+    // particular, Bypass must never turn the first allow_once choice into an
+    // answer the user did not provide. This is a graceful tool dismissal, not
+    // a blocked capability, so do not set the permission terminal cause.
+    if let Some(skip) = permission.ask_user_question_skip_option() {
+        return KimiAcpPermissionDecision::Reject {
+            option_id: skip.id.clone(),
+        };
+    }
+
+    let tool = kimi_acp_tool_label(&permission.tool_call);
+    let tool_call_id = permission.tool_call.id.clone();
+    let delegation = kimi_delegation_kind(&permission.tool_call);
+    let background_agent = delegation == Some(KimiDelegationKind::Agent)
+        && permission
+            .tool_call
+            .raw_input
+            .as_ref()
+            .and_then(|input| input.get("run_in_background"))
+            .and_then(Value::as_bool)
+            == Some(true);
+    let class = if delegation.is_some() {
+        kimi_delegation_permission_class(&permission.tool_call)
+    } else {
+        match permission.tool_call.kind {
+            Some(
+                KimiAcpToolKind::Read
+                | KimiAcpToolKind::Search
+                | KimiAcpToolKind::Fetch
+                | KimiAcpToolKind::Think,
+            ) => AiPermissionClass::Read,
+            Some(
+                KimiAcpToolKind::Delete | KimiAcpToolKind::SwitchMode | KimiAcpToolKind::Other(_),
+            )
+            | None => AiPermissionClass::Destructive,
+            Some(KimiAcpToolKind::Edit | KimiAcpToolKind::Move | KimiAcpToolKind::Execute) => {
+                AiPermissionClass::Mutate
+            }
+        }
+    };
+    let verdict = if background_agent
+        || (delegation.is_some() && !swarm_enabled)
+        || (workspace_mode == AiWorkspaceMode::Chat && class != AiPermissionClass::Read)
+    {
+        AiPermissionVerdict::Deny
+    } else {
+        ai_permission_verdict(mode, class)
+    };
+
+    match verdict {
+        AiPermissionVerdict::Allow => {
+            if let Some(option) = permission.first_allow_once_option() {
+                blocked.borrow_mut().pending = None;
+                KimiAcpPermissionDecision::Allow {
+                    option_id: option.id.clone(),
+                }
+            } else {
+                blocked.borrow_mut().pending = Some(GrokPermissionBlock { tool, tool_call_id });
+                KimiAcpPermissionDecision::Cancel
+            }
+        }
+        AiPermissionVerdict::Prompt | AiPermissionVerdict::Deny => {
+            blocked.borrow_mut().pending = Some(GrokPermissionBlock { tool, tool_call_id });
+            permission
+                .first_reject_once_option()
+                .map(|option| KimiAcpPermissionDecision::Reject {
+                    option_id: option.id.clone(),
+                })
+                .unwrap_or(KimiAcpPermissionDecision::Cancel)
+        }
+    }
+}
+
+fn kimi_delegation_permission_class(tool_call: &KimiAcpToolCall) -> AiPermissionClass {
+    let subagent_type = tool_call
+        .raw_input
+        .as_ref()
+        .and_then(|input| input.get("subagent_type"))
+        .and_then(Value::as_str)
+        .map(normalized_token);
+    if subagent_type.as_deref() == Some("explore") {
+        AiPermissionClass::Read
+    } else {
+        // Kimi 0.31 defaults Agent/AgentSwarm to `coder`. That profile can
+        // Edit, Write, and Bash, and Kimi may internally approve writes in
+        // the git cwd. Missing or unfamiliar subagent types therefore cannot
+        // inherit Adam's read-only delegation shortcut.
+        AiPermissionClass::Mutate
+    }
+}
+
+fn observe_kimi_permission_progress(
+    event: &KimiAcpEvent,
+    blocked: &RefCell<KimiPermissionBlockState>,
+) {
+    let should_clear = match event {
+        KimiAcpEvent::ToolCall { tool_call, .. }
+        | KimiAcpEvent::ToolCallUpdate { tool_call, .. } => {
+            blocked.borrow().pending.as_ref().is_some_and(|pending| {
+                pending.tool_call_id != tool_call.id
+                    || tool_call.status == Some(KimiAcpToolStatus::Completed)
+            })
+        }
+        KimiAcpEvent::PlanSnapshot { .. } => true,
+        KimiAcpEvent::PermissionResolved { resolution, .. } => {
+            matches!(resolution, KimiAcpPermissionResolution::Allowed { .. })
+        }
+        _ => false,
+    };
+    if should_clear {
+        blocked.borrow_mut().pending = None;
+    }
+}
+
+fn emit_kimi_acp_event(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    event: KimiAcpEvent,
+    projection: &RefCell<KimiAcpProjectionState>,
+) {
+    match event {
+        KimiAcpEvent::SessionStarted { .. } => send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::SessionInfo {
+                model: (!effective_model(request).is_empty())
+                    .then(|| effective_model(request).to_owned()),
+                // Provider session IDs are machine-local sidecar data. The
+                // completed outcome still carries the ID to ResumeStore, but
+                // portable conversation activity keeps only display metadata.
+                session_id: None,
+            },
+        ),
+        KimiAcpEvent::SessionInfo { .. } => {}
+        KimiAcpEvent::AgentMessageChunk { text, .. } => {
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::AssistantText { text: text.clone() },
+            );
+            let _ = event_sender.send(AiEvent::Delta {
+                turn_id: request.turn_id,
+                conversation_id: request.conversation_id,
+                text,
+            });
+        }
+        KimiAcpEvent::AgentThoughtChunk { text, .. } => {
+            send_provider_activity(request, event_sender, ActivityKind::Thinking { text })
+        }
+        KimiAcpEvent::ToolCall { tool_call, .. }
+        | KimiAcpEvent::ToolCallUpdate { tool_call, .. } => {
+            emit_kimi_acp_tool_call(request, event_sender, &tool_call, projection);
+        }
+        KimiAcpEvent::PlanSnapshot { entries, .. } => {
+            let tasks = entries
+                .into_iter()
+                .map(|entry| PlanItem {
+                    content: entry.content,
+                    active_form: None,
+                    status: kimi_acp_plan_status(entry.status),
+                    task_id: (!entry.id.trim().is_empty()).then_some(entry.id),
+                    origin: PlanItemOrigin::Native,
+                })
+                .collect();
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::PlanUpdate {
+                    tasks,
+                    authoritative: false,
+                    compacted: false,
+                    replaces_native: true,
+                },
+            );
+        }
+        KimiAcpEvent::PermissionRequested {
+            request: permission,
+        } => {
+            let tool = kimi_acp_tool_label(&permission.tool_call);
+            projection
+                .borrow_mut()
+                .permission_tools
+                .insert(permission.tool_call.id.clone(), tool.clone());
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::PermissionPrompt {
+                    id: permission.tool_call.id,
+                    tool: tool.clone(),
+                    summary: format!("Kimi requested permission to use {tool}."),
+                    resolution: None,
+                },
+            );
+        }
+        KimiAcpEvent::PermissionResolved {
+            tool_call_id,
+            resolution,
+            ..
+        } => {
+            let tool = projection
+                .borrow_mut()
+                .permission_tools
+                .remove(&tool_call_id)
+                .unwrap_or_else(|| "Kimi tool".into());
+            let resolution = match resolution {
+                KimiAcpPermissionResolution::Allowed { .. } => PermissionResolution::Allowed,
+                KimiAcpPermissionResolution::Rejected { .. }
+                | KimiAcpPermissionResolution::Cancelled => PermissionResolution::Denied,
+            };
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::PermissionPrompt {
+                    id: tool_call_id,
+                    tool: tool.clone(),
+                    summary: format!("Kimi permission request for {tool} resolved."),
+                    resolution: Some(resolution),
+                },
+            );
+        }
+        KimiAcpEvent::Terminal { stop_reason, .. } => {
+            finalize_open_kimi_delegations(request, event_sender, stop_reason, projection);
+        }
+    }
+}
+
+fn emit_kimi_acp_tool_call(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    tool_call: &KimiAcpToolCall,
+    projection: &RefCell<KimiAcpProjectionState>,
+) {
+    let first = projection
+        .borrow_mut()
+        .emitted_tool_calls
+        .insert(tool_call.id.clone());
+    if first {
+        send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::ToolCall {
+                id: tool_call.id.clone(),
+                name: kimi_acp_tool_label(tool_call),
+                server: Some("kimi".into()),
+                input_summary: tool_call
+                    .raw_input
+                    .as_ref()
+                    .and_then(compact_input_summary)
+                    .or_else(|| {
+                        tool_call
+                            .locations
+                            .first()
+                            .map(|location| location.path.clone())
+                    }),
+            },
+        );
+    }
+
+    if let Some(kind) = kimi_delegation_kind(tool_call) {
+        emit_kimi_delegation(request, event_sender, tool_call, kind, projection);
+    }
+
+    let terminal = matches!(
+        tool_call.status,
+        Some(KimiAcpToolStatus::Completed | KimiAcpToolStatus::Failed)
+    );
+    let first_terminal = terminal
+        && projection
+            .borrow_mut()
+            .emitted_tool_results
+            .insert(tool_call.id.clone());
+    if first_terminal {
+        send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::ToolResult {
+                id: tool_call.id.clone(),
+                output: kimi_acp_tool_output(tool_call),
+                is_error: tool_call.status == Some(KimiAcpToolStatus::Failed),
+            },
+        );
+    }
+}
+
+fn emit_kimi_delegation(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    tool_call: &KimiAcpToolCall,
+    kind: KimiDelegationKind,
+    projection: &RefCell<KimiAcpProjectionState>,
+) {
+    let mut state = {
+        let mut projection = projection.borrow_mut();
+        projection
+            .delegations
+            .entry(tool_call.id.clone())
+            .or_insert_with(|| kimi_delegation_state(tool_call, kind))
+            .clone()
+    };
+    if state.terminal {
+        return;
+    }
+
+    let terminal = matches!(
+        tool_call.status,
+        Some(KimiAcpToolStatus::Completed | KimiAcpToolStatus::Failed)
+    );
+    if !terminal {
+        send_kimi_group(
+            request,
+            event_sender,
+            &tool_call.id,
+            &state,
+            SubagentStatus::InProgress,
+            Some(kimi_delegation_progress_detail(&state)),
+        );
+        return;
+    }
+
+    let parsed = tool_call
+        .raw_output
+        .as_ref()
+        .and_then(Value::as_str)
+        .and_then(|output| match kind {
+            KimiDelegationKind::Agent => parse_kimi_agent_result(output).map(|member| vec![member]),
+            KimiDelegationKind::Swarm => {
+                parse_kimi_agent_swarm_result(output, state.expected_count)
+            }
+        });
+    let background_result = kind == KimiDelegationKind::Agent
+        && parsed.as_ref().is_some_and(|results| {
+            results
+                .iter()
+                .any(|result| result.status == SubagentStatus::InProgress)
+        });
+    let parsed = (!background_result).then_some(parsed).flatten();
+    if let Some(results) = parsed.as_ref() {
+        for result in results {
+            let Some(agent_id) = result.agent_id.as_deref() else {
+                continue;
+            };
+            let label = if kind == KimiDelegationKind::Agent
+                && result.label == "Kimi agent"
+                && !state.label.trim().is_empty()
+            {
+                state.label.clone()
+            } else {
+                result.label.clone()
+            };
+            state.members.push(AgentGroupMember {
+                id: agent_id.into(),
+                label: label.clone(),
+                status: result.status,
+                detail: result.detail.as_deref().and_then(kimi_member_detail),
+            });
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::Subagent {
+                    id: agent_id.into(),
+                    aliases: Vec::new(),
+                    parent_id: Some(tool_call.id.clone()),
+                    label,
+                    status: result.status,
+                    model: None,
+                    detail: result.detail.as_deref().and_then(kimi_member_detail),
+                    tool_calls: None,
+                },
+            );
+            if let Some(text) = result
+                .detail
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                let text = truncate_owned_utf8(text, MAX_SUBAGENT_MESSAGE_BYTES);
+                let _ = event_sender.send(AiEvent::Activity {
+                    turn_id: request.turn_id,
+                    conversation_id: request.conversation_id,
+                    event: scoped_activity_event(
+                        AgentScope::Child {
+                            id: agent_id.into(),
+                        },
+                        ActivityKind::AssistantText { text },
+                    ),
+                });
+            }
+        }
+        state.members.sort_by(|left, right| left.id.cmp(&right.id));
+        state.members.dedup_by(|left, right| left.id == right.id);
+    }
+
+    let result_statuses = parsed
+        .as_ref()
+        .map(|results| {
+            results
+                .iter()
+                .map(|result| result.status)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let group_status = if background_result
+        || tool_call.status == Some(KimiAcpToolStatus::Failed)
+        || result_statuses.contains(&SubagentStatus::Failed)
+    {
+        SubagentStatus::Failed
+    } else if result_statuses.contains(&SubagentStatus::Cancelled) {
+        SubagentStatus::Cancelled
+    } else if result_statuses.contains(&SubagentStatus::InProgress) {
+        SubagentStatus::InProgress
+    } else {
+        SubagentStatus::Completed
+    };
+    state.terminal = true;
+    let detail = if background_result {
+        "Kimi returned a background Agent job, which Adam cannot keep alive after this turn. Run the delegation in the foreground instead."
+            .into()
+    } else if let Some(results) = parsed.as_ref() {
+        kimi_delegation_terminal_detail(&state, results)
+    } else {
+        "Kimi finished the delegation, but its individual result list was unavailable or ambiguous."
+            .into()
+    };
+    send_kimi_group(
+        request,
+        event_sender,
+        &tool_call.id,
+        &state,
+        group_status,
+        Some(detail),
+    );
+    projection
+        .borrow_mut()
+        .delegations
+        .insert(tool_call.id.clone(), state);
+}
+
+fn finalize_open_kimi_delegations(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    stop_reason: KimiAcpStopReason,
+    projection: &RefCell<KimiAcpProjectionState>,
+) {
+    let open = projection
+        .borrow()
+        .delegations
+        .iter()
+        .filter(|(_, state)| !state.terminal)
+        .map(|(id, state)| (id.clone(), state.clone()))
+        .collect::<Vec<_>>();
+    for (id, mut state) in open {
+        let status = match stop_reason {
+            KimiAcpStopReason::Cancelled => SubagentStatus::Cancelled,
+            _ => SubagentStatus::Failed,
+        };
+        state.terminal = true;
+        send_kimi_group(
+            request,
+            event_sender,
+            &id,
+            &state,
+            status,
+            Some("Kimi ended the turn without a terminal delegation result.".into()),
+        );
+        projection.borrow_mut().delegations.insert(id, state);
+    }
+}
+
+fn send_kimi_group(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    id: &str,
+    state: &KimiDelegationState,
+    status: SubagentStatus,
+    detail: Option<String>,
+) {
+    send_provider_activity(
+        request,
+        event_sender,
+        ActivityKind::AgentGroup {
+            id: id.into(),
+            aliases: Vec::new(),
+            label: state.label.clone(),
+            kind: match state.kind {
+                KimiDelegationKind::Agent => AgentGroupKind::Delegation,
+                KimiDelegationKind::Swarm => AgentGroupKind::Swarm,
+            },
+            status,
+            expected_count: state.expected_count,
+            members: state.members.clone(),
+            visibility: if state.terminal && state.members.is_empty() {
+                AgentGroupVisibility::AggregateOnly
+            } else {
+                AgentGroupVisibility::DelegatedMembers
+            },
+            detail,
+        },
+    );
+}
+
+fn kimi_delegation_state(
+    tool_call: &KimiAcpToolCall,
+    kind: KimiDelegationKind,
+) -> KimiDelegationState {
+    let input = tool_call.raw_input.as_ref();
+    let label = input
+        .and_then(|value| value.get("description"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| match kind {
+            KimiDelegationKind::Agent => "Kimi delegated agent".into(),
+            KimiDelegationKind::Swarm => "Kimi AgentSwarm".into(),
+        });
+    let expected_count = match kind {
+        KimiDelegationKind::Agent => Some(1),
+        KimiDelegationKind::Swarm => input.and_then(kimi_swarm_expected_count),
+    };
+    KimiDelegationState {
+        kind,
+        label,
+        expected_count,
+        members: Vec::new(),
+        terminal: false,
+    }
+}
+
+fn kimi_swarm_expected_count(input: &Value) -> Option<u32> {
+    let items = input
+        .get("items")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let resumed = input
+        .get("resume_agent_ids")
+        .and_then(Value::as_object)
+        .map_or(0, Map::len);
+    let total = items.saturating_add(resumed);
+    (total > 0 && total <= MAX_KIMI_SWARM_MEMBERS)
+        .then(|| u32::try_from(total).expect("Kimi swarm limit fits u32"))
+}
+
+fn kimi_delegation_progress_detail(state: &KimiDelegationState) -> String {
+    match (state.kind, state.expected_count) {
+        (KimiDelegationKind::Swarm, Some(count)) => format!(
+            "Kimi delegated {count} job{}; member results appear when AgentSwarm returns.",
+            if count == 1 { "" } else { "s" }
+        ),
+        (KimiDelegationKind::Swarm, None) => {
+            "Kimi delegated a swarm; member results appear when AgentSwarm returns.".into()
+        }
+        (KimiDelegationKind::Agent, _) => {
+            "Kimi delegated one agent; its result appears when the Agent tool returns.".into()
+        }
+    }
+}
+
+fn kimi_delegation_terminal_detail(
+    state: &KimiDelegationState,
+    results: &[KimiDelegatedResult],
+) -> String {
+    let completed = results
+        .iter()
+        .filter(|result| result.status == SubagentStatus::Completed)
+        .count();
+    let failed = results
+        .iter()
+        .filter(|result| result.status == SubagentStatus::Failed)
+        .count();
+    let cancelled = results
+        .iter()
+        .filter(|result| result.status == SubagentStatus::Cancelled)
+        .count();
+    let running = results
+        .iter()
+        .filter(|result| result.status == SubagentStatus::InProgress)
+        .count();
+    format!(
+        "Kimi returned {} result{} ({}/{} with stable agent IDs): {completed} completed, {failed} failed, {cancelled} aborted, {running} running.",
+        results.len(),
+        if results.len() == 1 { "" } else { "s" },
+        state.members.len(),
+        results.len(),
+    )
+}
+
+fn kimi_delegation_kind(tool_call: &KimiAcpToolCall) -> Option<KimiDelegationKind> {
+    match tool_call.kind.as_ref() {
+        Some(KimiAcpToolKind::Other(name)) => {
+            if let Some(kind) = kimi_exact_delegation_identity(name) {
+                return Some(kind);
+            }
+        }
+        None => {}
+        // A structured ACP kind is authoritative. Filenames such as
+        // AGENTS.md and search queries containing "agent" must retain their
+        // native Read/Search/Edit permission class.
+        Some(_) => return None,
+    }
+    tool_call
+        .title
+        .as_deref()
+        .and_then(kimi_exact_delegation_identity)
+}
+
+fn kimi_exact_delegation_identity(value: &str) -> Option<KimiDelegationKind> {
+    let value = value.trim().to_ascii_lowercase();
+    match normalized_token(&value).as_str() {
+        "agent" => return Some(KimiDelegationKind::Agent),
+        "agentswarm" => return Some(KimiDelegationKind::Swarm),
+        _ => {}
+    }
+    if value == "launching agent swarm" || value.starts_with("launching agent swarm:") {
+        return Some(KimiDelegationKind::Swarm);
+    }
+    let identity = value
+        .split_once(':')
+        .map_or(value.as_str(), |(identity, _)| identity.trim());
+    (identity.starts_with("launching ") && identity.ends_with(" agent"))
+        .then_some(KimiDelegationKind::Agent)
+}
+
+fn kimi_acp_tool_label(tool_call: &KimiAcpToolCall) -> String {
+    tool_call
+        .title
+        .clone()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| match &tool_call.kind {
+            Some(KimiAcpToolKind::Other(name)) if !name.trim().is_empty() => name.clone(),
+            Some(kind) => format!("{kind:?}"),
+            None => "Kimi tool".into(),
+        })
+}
+
+fn kimi_acp_tool_output(tool_call: &KimiAcpToolCall) -> Option<String> {
+    if let Some(output) = tool_call.raw_output.as_ref() {
+        if let Some(text) = output.as_str() {
+            return tail_text(Some(text));
+        }
+        if let Ok(serialized) = serde_json::to_string(output) {
+            return tail_text(Some(&serialized));
+        }
+    }
+    let content = serde_json::to_string(&tool_call.content).ok()?;
+    tail_text(Some(&content))
+}
+
+fn kimi_acp_plan_status(status: KimiAcpPlanStatus) -> PlanItemStatus {
+    match status {
+        KimiAcpPlanStatus::Pending => PlanItemStatus::Pending,
+        KimiAcpPlanStatus::InProgress => PlanItemStatus::InProgress,
+        KimiAcpPlanStatus::Completed => PlanItemStatus::Completed,
+        KimiAcpPlanStatus::Other(status)
+            if matches!(normalized_token(&status).as_str(), "cancelled" | "canceled") =>
+        {
+            PlanItemStatus::Cancelled
+        }
+        KimiAcpPlanStatus::Other(_) => PlanItemStatus::Pending,
+    }
+}
+
+fn parse_kimi_agent_result(output: &str) -> Option<KimiDelegatedResult> {
+    if output.len() > MAX_KIMI_SWARM_OUTPUT_BYTES {
+        return None;
+    }
+    let (header, body) = output.split_once("\n\n").unwrap_or((output, ""));
+    let mut agent_id = None;
+    let mut status = None;
+    for line in header.lines() {
+        let (key, value) = line.split_once(':')?;
+        match key.trim() {
+            "agent_id" => agent_id = kimi_valid_agent_id(value.trim()).map(str::to_owned),
+            "status" => status = kimi_result_status(value.trim()),
+            _ => {}
+        }
+    }
+    Some(KimiDelegatedResult {
+        agent_id,
+        label: "Kimi agent".into(),
+        status: status?,
+        detail: bounded_kimi_result_body(body),
+    })
+}
+
+fn parse_kimi_agent_swarm_result(
+    output: &str,
+    expected_count: Option<u32>,
+) -> Option<Vec<KimiDelegatedResult>> {
+    if output.len() > MAX_KIMI_SWARM_OUTPUT_BYTES
+        || !output.contains("<agent_swarm_result>")
+        || !output.contains("</agent_swarm_result>")
+    {
+        return None;
+    }
+    let start_count = output.match_indices("<subagent ").count();
+    if start_count == 0 || start_count > MAX_KIMI_SWARM_MEMBERS {
+        return None;
+    }
+    if expected_count.is_some_and(|expected| start_count != expected as usize) {
+        return None;
+    }
+
+    let mut cursor = output.find("<subagent ")?;
+    let mut results = Vec::with_capacity(start_count);
+    while results.len() < start_count {
+        let open_start = cursor;
+        let open_end = output[open_start..].find('>')? + open_start;
+        let attributes = &output[open_start + "<subagent ".len()..open_end];
+        let close_start = output[open_end + 1..].find("</subagent>")? + open_end + 1;
+        let body = &output[open_end + 1..close_start];
+        let close_end = close_start + "</subagent>".len();
+        let next_start = output[close_end..]
+            .find("<subagent ")
+            .map(|offset| close_end + offset);
+        let boundary = next_start.unwrap_or_else(|| {
+            output[close_end..]
+                .find("</agent_swarm_result>")
+                .map(|offset| close_end + offset)
+                .unwrap_or(output.len())
+        });
+        if !output[close_end..boundary].trim().is_empty() {
+            return None;
+        }
+
+        let outcome = kimi_xml_attribute(attributes, "outcome")?;
+        let status = kimi_result_status(&outcome)?;
+        let agent_id = kimi_xml_attribute(attributes, "agent_id")
+            .and_then(|value| kimi_valid_agent_id(&value).map(str::to_owned));
+        let label = kimi_xml_attribute(attributes, "item")
+            .map(|value| truncate_owned_utf8(value.trim(), MAX_SUBAGENT_DETAIL_BYTES))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "Kimi swarm member".into());
+        results.push(KimiDelegatedResult {
+            agent_id,
+            label,
+            status,
+            detail: bounded_kimi_result_body(body),
+        });
+        let Some(next_start) = next_start else {
+            break;
+        };
+        cursor = next_start;
+    }
+    let mut stable_ids = HashSet::new();
+    if results
+        .iter()
+        .filter_map(|result| result.agent_id.as_ref())
+        .any(|agent_id| !stable_ids.insert(agent_id.clone()))
+    {
+        return None;
+    }
+    (results.len() == start_count).then_some(results)
+}
+
+fn kimi_xml_attribute(attributes: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let mut search_start = 0;
+    let start = loop {
+        let relative = attributes[search_start..].find(&needle)?;
+        let candidate = search_start + relative;
+        if candidate == 0
+            || attributes.as_bytes()[candidate.saturating_sub(1)].is_ascii_whitespace()
+        {
+            break candidate + needle.len();
+        }
+        search_start = candidate.saturating_add(1);
+    };
+    let end = attributes[start..].find('"')? + start;
+    let value = &attributes[start..end];
+    Some(
+        value
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
+fn kimi_result_status(value: &str) -> Option<SubagentStatus> {
+    match value.trim() {
+        "completed" => Some(SubagentStatus::Completed),
+        "failed" => Some(SubagentStatus::Failed),
+        "aborted" | "cancelled" | "canceled" => Some(SubagentStatus::Cancelled),
+        "running" => Some(SubagentStatus::InProgress),
+        _ => None,
+    }
+}
+
+fn kimi_valid_agent_id(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')))
+    .then_some(value)
+}
+
+fn bounded_kimi_result_body(body: &str) -> Option<String> {
+    let body = body.trim();
+    (!body.is_empty()).then(|| truncate_owned_utf8(body, MAX_KIMI_SWARM_MEMBER_DETAIL_BYTES))
+}
+
+fn kimi_member_detail(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| truncate_owned_utf8(text, MAX_SUBAGENT_DETAIL_BYTES))
+}
+
+fn truncate_owned_utf8(value: &str, maximum_bytes: usize) -> String {
+    if value.len() <= maximum_bytes {
+        return value.to_owned();
+    }
+    let mut end = maximum_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}…", &value[..end])
+}
+
+struct XaiHttpWorkerPermit;
+
+impl XaiHttpWorkerPermit {
+    fn try_acquire() -> Option<Self> {
+        let mut current = XAI_HTTP_WORKERS.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_XAI_HTTP_WORKERS {
+                return None;
+            }
+            match XAI_HTTP_WORKERS.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for XaiHttpWorkerPermit {
+    fn drop(&mut self) {
+        XAI_HTTP_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn run_xai_responses_transport(
+    request: &AiRunRequest,
+    specification: XaiResponsesSpec,
+    control: &Arc<RunControl>,
+    event_sender: &Sender<AiEvent>,
+) -> RunOutcome {
+    #[cfg(test)]
+    let disconnect_worker = specification.disconnect_worker;
+    let Some(worker_permit) = XaiHttpWorkerPermit::try_acquire() else {
+        return RunOutcome::provider_error(
+            "Grok Heavy is still cleaning up too many stopped network requests; retry after one finishes",
+        );
+    };
+    let bearer_key = request
+        .api_key
+        .clone()
+        .or_else(|| env::var(XAI_API_KEY_ENV).ok())
+        .filter(|key| !key.trim().is_empty());
+    let Some(bearer_key) = bearer_key else {
+        return RunOutcome::provider_error(
+            "Grok Heavy needs XAI_API_KEY or a temporary xAI API key in Configure",
+        );
+    };
+    let effort = if request
+        .provider_preferences
+        .reasoning_effort
+        .trim()
+        .is_empty()
+    {
+        XaiReasoningEffort::Medium
+    } else {
+        match XaiReasoningEffort::parse(&request.provider_preferences.reasoning_effort) {
+            Ok(effort) => effort,
+            Err(error) => return RunOutcome::provider_error(error.to_string()),
+        }
+    };
+    let mut xai_request = XaiResponsesRequest::new(
+        bearer_key,
+        request.prompt.clone(),
+        XAI_MULTI_AGENT_MODEL,
+        effort,
+        format!("xai-heavy-{}", request.turn_id),
+    );
+    xai_request.endpoint = specification.url;
+    xai_request.instructions = request.system_prompt.clone();
+    xai_request.previous_response_id = request.resume_session_id.clone();
+    xai_request.web_search =
+        request.provider_preferences.feature(AI_FEATURE_WEB_SEARCH) == Some(true);
+    xai_request.limits = XaiResponsesLimits {
+        wall_timeout: run_timeout(request.workspace_mode),
+        ..XaiResponsesLimits::default()
+    };
+
+    let transport_abort = XaiTransportAbort::default();
+    control.install_xai_transport_abort(transport_abort.clone());
+    let (result_sender, result_receiver) = bounded(1);
+    let worker_request = request.clone();
+    let worker_xai_request = xai_request.clone();
+    let worker_control = Arc::clone(control);
+    let worker_transport_abort = transport_abort;
+    let worker_events = event_sender.clone();
+    let worker = match thread::Builder::new()
+        .name(format!("adam-ai-xai-{}", short_uuid(request.turn_id)))
+        .spawn(move || {
+            let _worker_permit = worker_permit;
+            #[cfg(test)]
+            if disconnect_worker {
+                return;
+            }
+            // The adapter produces GroupFinished immediately before returning,
+            // but completion must first win the same gate used by Stop and the
+            // wall-clock timeout. Buffer just that terminal group event until
+            // the provider result owns the terminal transition.
+            let terminal_group = RefCell::new(None::<XaiResponsesEvent>);
+            #[cfg(test)]
+            let result = crate::xai_responses::run_xai_responses_observed(
+                &worker_xai_request,
+                &worker_control.cancelled,
+                &worker_transport_abort,
+                &worker_control.http_read_in_progress,
+                |event| {
+                    if matches!(event, XaiResponsesEvent::GroupFinished { .. }) {
+                        *terminal_group.borrow_mut() = Some(event);
+                        return;
+                    }
+                    let _event_gate = lock_unpoison(&worker_control.http_event_gate);
+                    if !worker_control.cancelled.load(Ordering::Acquire)
+                        || xai_event_is_error_cleanup(&event)
+                    {
+                        emit_xai_responses_event(&worker_request, &worker_events, event);
+                    }
+                },
+            );
+            #[cfg(not(test))]
+            let result = run_xai_responses_cancellable(
+                &worker_xai_request,
+                &worker_control.cancelled,
+                &worker_transport_abort,
+                |event| {
+                    if matches!(event, XaiResponsesEvent::GroupFinished { .. }) {
+                        *terminal_group.borrow_mut() = Some(event);
+                        return;
+                    }
+                    let _event_gate = lock_unpoison(&worker_control.http_event_gate);
+                    if !worker_control.cancelled.load(Ordering::Acquire)
+                        || xai_event_is_error_cleanup(&event)
+                    {
+                        emit_xai_responses_event(&worker_request, &worker_events, event);
+                    }
+                },
+            );
+            let result_claimed = {
+                let _event_gate = lock_unpoison(&worker_control.http_event_gate);
+                if worker_control.cancelled.load(Ordering::Acquire)
+                    || worker_control.terminal_claimed.load(Ordering::Acquire)
+                {
+                    false
+                } else {
+                    worker_control
+                        .terminal_claimed
+                        .store(true, Ordering::Release);
+                    if let Some(event) = terminal_group.borrow_mut().take() {
+                        emit_xai_responses_event(&worker_request, &worker_events, event);
+                    }
+                    true
+                }
+            };
+            let _ = result_sender.send((result, result_claimed));
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            control.clear_xai_transport_abort();
+            return RunOutcome::provider_error(format!(
+                "could not start the Grok Heavy API worker: {error}"
+            ));
+        }
+    };
+
+    let timeout = run_timeout(request.workspace_mode);
+    let started_at = Instant::now();
+    let expected_count = effort.agent_count();
+    loop {
+        if control.cancelled.load(Ordering::Acquire) {
+            control.abort_xai_transport();
+            let _ = worker.join();
+            control.clear_xai_transport_abort();
+            emit_xai_cancel_terminal(request, control, event_sender, expected_count);
+            return RunOutcome::TerminalAlreadyEmitted;
+        }
+        if started_at.elapsed() >= timeout {
+            let message = timeout_failure_message(timeout);
+            let (timeout_won, completion_already_won) = {
+                let _event_gate = lock_unpoison(&control.http_event_gate);
+                if control.cancelled.load(Ordering::Acquire) {
+                    (false, false)
+                } else if control.terminal_claimed.load(Ordering::Acquire) {
+                    (false, true)
+                } else {
+                    control.terminal_claimed.store(true, Ordering::Release);
+                    control.cancelled.store(true, Ordering::Release);
+                    control.abort_xai_transport();
+                    (true, false)
+                }
+            };
+            if timeout_won {
+                let _ = worker.join();
+                control.clear_xai_transport_abort();
+                emit_xai_early_group_terminal(
+                    request,
+                    event_sender,
+                    expected_count,
+                    SubagentStatus::Failed,
+                    &message,
+                );
+                let _ = event_sender.send(AiEvent::Activity {
+                    turn_id: request.turn_id,
+                    conversation_id: request.conversation_id,
+                    event: activity_event(ActivityKind::TurnStatus {
+                        status: TurnStatus::TimedOut,
+                        message: Some(message.clone()),
+                        tool: None,
+                        retry: Some(RetryHint::Retry),
+                    }),
+                });
+                let _ = event_sender.send(AiEvent::Failed {
+                    turn_id: request.turn_id,
+                    conversation_id: request.conversation_id,
+                    kind: AiFailureKind::TimedOut,
+                    message,
+                    resume_rejected: false,
+                });
+                return RunOutcome::TerminalAlreadyEmitted;
+            }
+            if !completion_already_won {
+                control.abort_xai_transport();
+                let _ = worker.join();
+                control.clear_xai_transport_abort();
+                emit_xai_cancel_terminal(request, control, event_sender, expected_count);
+                return RunOutcome::TerminalAlreadyEmitted;
+            }
+            // The network worker completed before the timeout gate. It sends
+            // the claimed result immediately after releasing that gate, so let
+            // the receive path below publish the matching turn terminal.
+        }
+        match result_receiver.recv_timeout(Duration::from_millis(40)) {
+            Ok((result, result_claimed)) => {
+                let _ = worker.join();
+                control.clear_xai_transport_abort();
+                if result_claimed
+                    && control.terminal_claimed.load(Ordering::Acquire)
+                    && !control.cancelled.load(Ordering::Acquire)
+                {
+                    return xai_result_outcome(result);
+                }
+                emit_xai_cancel_terminal(request, control, event_sender, expected_count);
+                return RunOutcome::TerminalAlreadyEmitted;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = worker.join();
+                control.clear_xai_transport_abort();
+                if control.claim_terminal_result() {
+                    let message = "the Grok Heavy API worker stopped unexpectedly";
+                    emit_xai_early_group_terminal(
+                        request,
+                        event_sender,
+                        expected_count,
+                        SubagentStatus::Failed,
+                        message,
+                    );
+                    return RunOutcome::provider_error(message);
+                }
+                emit_xai_cancel_terminal(request, control, event_sender, expected_count);
+                return RunOutcome::TerminalAlreadyEmitted;
+            }
+        }
+    }
+}
+
+fn emit_xai_cancel_terminal(
+    request: &AiRunRequest,
+    control: &RunControl,
+    event_sender: &Sender<AiEvent>,
+    expected_count: u32,
+) {
+    let _event_gate = lock_unpoison(&control.http_event_gate);
+    if control.terminal_claimed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    emit_xai_early_group_terminal(
+        request,
+        event_sender,
+        expected_count,
+        SubagentStatus::Cancelled,
+        "Grok Heavy was stopped by the user.",
+    );
+    let _ = event_sender.send(AiEvent::Activity {
+        turn_id: request.turn_id,
+        conversation_id: request.conversation_id,
+        event: activity_event(ActivityKind::TurnStatus {
+            status: TurnStatus::UserCancelled,
+            message: None,
+            tool: None,
+            retry: None,
+        }),
+    });
+    let _ = event_sender.send(AiEvent::Cancelled {
+        turn_id: request.turn_id,
+        conversation_id: request.conversation_id,
+    });
+}
+
+fn xai_result_outcome(
+    result: Result<crate::xai_responses::XaiResponsesOutcome, XaiResponsesError>,
+) -> RunOutcome {
+    match result {
+        Ok(outcome) => RunOutcome::Completed {
+            text: outcome.text,
+            session_id: Some(outcome.response_id),
+        },
+        Err(XaiResponsesError::Cancelled) => RunOutcome::Cancelled,
+        Err(XaiResponsesError::TimedOut) => RunOutcome::timed_out("Grok Heavy timed out"),
+        Err(XaiResponsesError::PreviousResponseNotFound { message }) => {
+            RunOutcome::ResumeRejected {
+                message: format!("Grok Heavy could not resume its saved response: {message}"),
+            }
+        }
+        Err(XaiResponsesError::Incomplete { reason, .. })
+            if reason.trim() == "max_output_tokens" =>
+        {
+            RunOutcome::Failed {
+                kind: AiFailureKind::MaxTurnsReached,
+                message: "Grok Heavy reached its output-token limit before completing.".into(),
+                tool: None,
+                retry: Some(RetryHint::Retry),
+            }
+        }
+        Err(XaiResponsesError::Incomplete { reason, .. }) => RunOutcome::provider_error(format!(
+            "Grok Heavy returned an incomplete response: {reason}"
+        )),
+        Err(error) => RunOutcome::provider_error(format!("Grok Heavy failed: {error}")),
+    }
+}
+
+fn emit_xai_early_group_terminal(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    expected_count: u32,
+    status: SubagentStatus,
+    detail: &str,
+) {
+    send_provider_activity(
+        request,
+        event_sender,
+        ActivityKind::AgentGroup {
+            id: format!("xai-heavy-{}", request.turn_id),
+            aliases: Vec::new(),
+            label: "Grok Heavy".into(),
+            kind: AgentGroupKind::MultiAgentInference,
+            status,
+            expected_count: Some(expected_count),
+            members: Vec::new(),
+            visibility: AgentGroupVisibility::AggregateOnly,
+            detail: Some(detail.into()),
+        },
+    );
+}
+
+fn xai_event_is_error_cleanup(event: &XaiResponsesEvent) -> bool {
+    matches!(
+        event,
+        XaiResponsesEvent::LeaderToolFinished { is_error: true, .. }
+    )
+}
+
+fn emit_xai_responses_event(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    event: XaiResponsesEvent,
+) {
+    match event {
+        XaiResponsesEvent::GroupStarted {
+            group_id,
+            model,
+            effort,
+            expected_count,
+        } => send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::AgentGroup {
+                id: group_id,
+                aliases: Vec::new(),
+                label: format!("Grok Heavy · {expected_count} agents"),
+                kind: AgentGroupKind::MultiAgentInference,
+                status: SubagentStatus::InProgress,
+                expected_count: Some(expected_count),
+                members: Vec::new(),
+                visibility: AgentGroupVisibility::AggregateOnly,
+                detail: Some(format!(
+                    "xAI server-side multi-agent inference started with {model} at {} effort.",
+                    effort.as_str(),
+                )),
+            },
+        ),
+        XaiResponsesEvent::GroupUpdated { group_id, detail } => send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::AgentGroup {
+                id: group_id,
+                aliases: Vec::new(),
+                label: "Grok Heavy".into(),
+                kind: AgentGroupKind::MultiAgentInference,
+                status: SubagentStatus::InProgress,
+                expected_count: None,
+                members: Vec::new(),
+                visibility: AgentGroupVisibility::AggregateOnly,
+                detail: Some(detail),
+            },
+        ),
+        XaiResponsesEvent::GroupFinished {
+            group_id,
+            status,
+            detail,
+        } => {
+            let status = match status {
+                XaiGroupStatus::Completed => SubagentStatus::Completed,
+                XaiGroupStatus::Cancelled => SubagentStatus::Cancelled,
+                XaiGroupStatus::Incomplete | XaiGroupStatus::Failed => SubagentStatus::Failed,
+            };
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::AgentGroup {
+                    id: group_id,
+                    aliases: Vec::new(),
+                    label: "Grok Heavy".into(),
+                    kind: AgentGroupKind::MultiAgentInference,
+                    status,
+                    expected_count: None,
+                    members: Vec::new(),
+                    visibility: AgentGroupVisibility::AggregateOnly,
+                    detail,
+                },
+            );
+        }
+        // The response id is returned through RunOutcome and committed only to
+        // the machine-local resume sidecar. Do not mirror it into the portable
+        // conversation activity stream.
+        XaiResponsesEvent::Session { .. } => {}
+        XaiResponsesEvent::TextDelta { text } => {
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::AssistantText { text: text.clone() },
+            );
+            let _ = event_sender.send(AiEvent::Delta {
+                turn_id: request.turn_id,
+                conversation_id: request.conversation_id,
+                text,
+            });
+        }
+        XaiResponsesEvent::LeaderToolStarted {
+            id,
+            name,
+            input_summary,
+        } => send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::ToolCall {
+                id,
+                name,
+                server: Some("xai".into()),
+                input_summary,
+            },
+        ),
+        XaiResponsesEvent::LeaderToolUpdated { .. } => {}
+        XaiResponsesEvent::LeaderToolFinished {
+            id,
+            is_error,
+            detail,
+            ..
+        } => send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::ToolResult {
+                id,
+                output: detail,
+                is_error,
+            },
+        ),
+        XaiResponsesEvent::Usage(usage) => send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::Usage {
+                input: usage.input_tokens,
+                output: usage.output_tokens,
+                cached_input: usage.cached_input_tokens,
+                reasoning: usage.reasoning_tokens,
+                cost_usd: usage.cost_usd(),
+            },
+        ),
+    }
+}
+
+fn send_provider_activity(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    kind: ActivityKind,
+) {
+    let _ = event_sender.send(AiEvent::Activity {
+        turn_id: request.turn_id,
+        conversation_id: request.conversation_id,
+        event: activity_event(kind),
+    });
 }
 
 fn run_process(
@@ -3476,6 +5393,10 @@ impl OutputDecoder {
     }
 }
 
+// Activity events stay value-typed throughout this mature decoder pipeline.
+// Boxing only this edge would add churn to every provider parser and test for
+// no measurable benefit under the existing bounded event caps.
+#[allow(clippy::large_enum_variant)]
 enum Decoded {
     Delta(String),
     Activity(ActivityEvent),
@@ -7233,6 +9154,7 @@ fn run_http(
                     conversation_id: request.conversation_id,
                     kind: AiFailureKind::TimedOut,
                     message,
+                    resume_rejected: false,
                 });
             }
             wait_for_http_worker(result_receiver, worker);
@@ -8327,6 +10249,8 @@ fn lock_unpoison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    static XAI_TRANSPORT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     fn request(provider_id: &str) -> AiRunRequest {
         AiRunRequest {
             turn_id: Uuid::from_u128(1),
@@ -8393,6 +10317,74 @@ mod tests {
                     id: "reject-once".into(),
                     name: "Reject once".into(),
                     kind: crate::grok_acp::GrokAcpPermissionOptionKind::RejectOnce,
+                },
+            ],
+        }
+    }
+
+    fn kimi_permission(
+        title: &str,
+        kind: KimiAcpToolKind,
+        raw_input: Option<Value>,
+    ) -> KimiAcpPermissionRequest {
+        KimiAcpPermissionRequest {
+            session_id: "kimi-session".into(),
+            tool_call: KimiAcpToolCall {
+                id: format!("kimi-tool-{title}"),
+                title: Some(title.into()),
+                kind: Some(kind),
+                status: Some(KimiAcpToolStatus::Pending),
+                content: Vec::new(),
+                locations: Vec::new(),
+                raw_input,
+                raw_output: None,
+            },
+            options: vec![
+                crate::kimi_acp::KimiAcpPermissionOption {
+                    id: "allow-once".into(),
+                    name: "Allow once".into(),
+                    kind: crate::kimi_acp::KimiAcpPermissionOptionKind::AllowOnce,
+                },
+                crate::kimi_acp::KimiAcpPermissionOption {
+                    id: "reject-once".into(),
+                    name: "Reject once".into(),
+                    kind: crate::kimi_acp::KimiAcpPermissionOptionKind::RejectOnce,
+                },
+            ],
+        }
+    }
+
+    fn kimi_question_permission() -> KimiAcpPermissionRequest {
+        KimiAcpPermissionRequest {
+            session_id: "kimi-session".into(),
+            tool_call: KimiAcpToolCall {
+                id: "1:ask-user".into(),
+                title: Some("AskUserQuestion".into()),
+                kind: None,
+                status: None,
+                content: vec![json!({
+                    "type": "content",
+                    "content": {"type": "text", "text": "Which option?"}
+                })],
+                locations: Vec::new(),
+                raw_input: None,
+                raw_output: None,
+            },
+            options: vec![
+                crate::kimi_acp::KimiAcpPermissionOption {
+                    id: "q0_opt_0".into(),
+                    name: "First".into(),
+                    kind: crate::kimi_acp::KimiAcpPermissionOptionKind::AllowOnce,
+                },
+                crate::kimi_acp::KimiAcpPermissionOption {
+                    id: "q0_opt_1".into(),
+                    name: "Second".into(),
+                    kind: crate::kimi_acp::KimiAcpPermissionOptionKind::AllowOnce,
+                },
+                crate::kimi_acp::KimiAcpPermissionOption {
+                    id: "q0_skip".into(),
+                    name: "Skip".into(),
+                    kind: crate::kimi_acp::KimiAcpPermissionOptionKind::RejectOnce,
                 },
             ],
         }
@@ -10245,6 +12237,29 @@ send({
     }
 
     #[test]
+    fn saved_xai_model_overrides_self_heal_to_the_fixed_heavy_contract() {
+        let tuning = runtime_tuning_profile(ProviderKind::Xai, None, XAI_MULTI_AGENT_MODEL);
+        let mut preferences = AiProviderPreferences {
+            model: "grok-4.20-multi-agent-beta-stale".into(),
+            reasoning_effort: " XHIGH ".into(),
+            ..AiProviderPreferences::default()
+        };
+
+        assert!(clamp_provider_preferences(
+            "xai_api",
+            &mut preferences,
+            &tuning
+        ));
+        assert!(preferences.model.is_empty());
+        assert_eq!(preferences.reasoning_effort, "xhigh");
+        assert!(!clamp_provider_preferences(
+            "xai_api",
+            &mut preferences,
+            &tuning
+        ));
+    }
+
+    #[test]
     fn kimi_and_ollama_map_explicit_thinking_controls() {
         let mut kimi = request("kimi_cli");
         kimi.permission_mode = PermissionMode::Auto;
@@ -11476,6 +13491,124 @@ send({
                 ..
             } if message.contains("runtime changed")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kimi_0_31_selects_the_exact_acp_adapter_and_rejects_runtime_drift() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_version_stub(path: &Path, version: &str) {
+            fs::write(path, format!("#!/bin/sh\necho 'kimi {version}'\n")).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("kimi-version-stub");
+        let mut run = request("kimi_cli");
+        run.cwd = Some(temporary.path().to_path_buf());
+
+        write_version_stub(&executable, KIMI_ACP_RUNTIME_VERSION);
+        let PreparedRun::KimiAcp(specification) =
+            prepare_resolved_cli("kimi_cli", executable.clone(), &run).unwrap()
+        else {
+            panic!("verified Kimi 0.31.0 must use ACP");
+        };
+        assert_eq!(specification.program, executable);
+        assert_eq!(
+            (
+                specification.runtime_version.major,
+                specification.runtime_version.minor,
+                specification.runtime_version.patch,
+            ),
+            (0, 31, 0)
+        );
+
+        write_version_stub(&specification.program, "0.31.1");
+        let (sender, _receiver) = unbounded();
+        let outcome = run_kimi_acp_transport(
+            &run,
+            specification,
+            &Arc::new(RunControl::default()),
+            &sender,
+        );
+        assert!(matches!(
+            outcome,
+            RunOutcome::Failed {
+                kind: AiFailureKind::ProviderError,
+                message,
+                ..
+            } if message.contains("runtime changed")
+        ));
+        assert!(supports_kimi_acp_transport(
+            CliVersion::parse("0.31.0").as_ref()
+        ));
+        assert!(!supports_kimi_acp_transport(
+            CliVersion::parse("1.49.0").as_ref()
+        ));
+
+        let mut resumed = request("kimi_cli");
+        resumed.cwd = Some(temporary.path().to_path_buf());
+        resumed.resume_session_id = Some("saved-kimi-session".into());
+        write_version_stub(&executable, "1.49.0");
+        assert!(matches!(
+            prepare_resolved_cli("kimi_cli", executable.clone(), &resumed),
+            Err(AiEngineError::NativeResumeUnavailable(message))
+                if message.contains("no longer matches")
+        ));
+
+        write_version_stub(&executable, "0.31.1");
+        assert!(matches!(
+            prepare_resolved_cli("kimi_cli", executable, &resumed),
+            Err(AiEngineError::NativeResumeUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn kimi_session_activity_keeps_the_provider_id_sidecar_only() {
+        let mut run = request("kimi_cli");
+        run.model = "kimi-for-coding".into();
+        let (sender, receiver) = unbounded();
+        emit_kimi_acp_event(
+            &run,
+            &sender,
+            KimiAcpEvent::SessionStarted {
+                session_id: "private-kimi-session".into(),
+                resumed: false,
+            },
+            &RefCell::new(KimiAcpProjectionState::default()),
+        );
+
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AiEvent::Activity {
+                event: ActivityEvent {
+                    kind: ActivityKind::SessionInfo {
+                        model: Some(model),
+                        session_id: None,
+                    },
+                    ..
+                },
+                ..
+            } if model == "kimi-for-coding"
+        ));
+        assert!(!format!("{events:?}").contains("private-kimi-session"));
+    }
+
+    #[test]
+    fn xai_provider_selects_the_fixed_responses_transport() {
+        let prepared = prepare_run(&request("xai_api")).unwrap();
+        assert_eq!(prepared.provider_id(), "xai_api");
+        assert_eq!(prepared.plan_channel(), PlanChannel::None);
+        let PreparedRun::XaiResponses(specification) = prepared else {
+            panic!("Grok Heavy must not fall through to a CLI or generic HTTP adapter");
+        };
+        assert_eq!(
+            specification.url.as_str(),
+            crate::xai_responses::XAI_RESPONSES_ENDPOINT
+        );
     }
 
     #[test]
@@ -13947,6 +16080,939 @@ send({
             }
         }
         assert_eq!(terminal_count, 1, "a duplicate terminal event was emitted");
+    }
+
+    #[test]
+    fn xai_stop_closes_live_connection_and_joins_worker() {
+        use std::net::TcpListener;
+
+        let _xai_test = lock_unpoison(&XAI_TRANSPORT_TEST_LOCK);
+        let workers_before = XAI_HTTP_WORKERS.load(Ordering::Acquire);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (response_sender, response_receiver) = bounded(1);
+        let (closed_sender, closed_receiver) = bounded(1);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request_bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request_bytes.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "client closed before sending HTTP headers");
+                request_bytes.extend_from_slice(&buffer[..count]);
+            }
+            let header_end = request_bytes
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = std::str::from_utf8(&request_bytes[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while request_bytes.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "client closed before sending the HTTP body");
+                request_bytes.extend_from_slice(&buffer[..count]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Connection: close\r\n\
+                      \r\n\
+                      data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-open\"}}\n\n\
+                      data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"ws-open\",\"type\":\"web_search_call\",\"status\":\"in_progress\"}}\n\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            response_sender.send(()).unwrap();
+            let closed = match stream.read(&mut buffer) {
+                Ok(0) => true,
+                Err(error) => matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                ),
+                Ok(_) => false,
+            };
+            closed_sender.send(closed).unwrap();
+        });
+
+        let mut run = request("xai_api");
+        run.model.clear();
+        run.provider_preferences.reasoning_effort = "high".into();
+        set_feature(&mut run, AI_FEATURE_WEB_SEARCH, true);
+        let control = Arc::new(RunControl::default());
+        let worker_control = Arc::clone(&control);
+        let (sender, receiver) = unbounded();
+        let adapter = thread::spawn(move || {
+            run_xai_responses_transport(
+                &run,
+                XaiResponsesSpec {
+                    url: Url::parse(&format!("http://{address}/v1/responses")).unwrap(),
+                    disconnect_worker: false,
+                },
+                &worker_control,
+                &sender,
+            )
+        });
+
+        response_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let mut events = Vec::new();
+        let tool_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < tool_deadline {
+            if let Ok(event) = receiver.recv_timeout(Duration::from_millis(20)) {
+                let saw_tool = matches!(
+                    &event,
+                    AiEvent::Activity {
+                        event: ActivityEvent {
+                            kind: ActivityKind::ToolCall { id, .. },
+                            ..
+                        },
+                        ..
+                    } if id == "ws-open"
+                );
+                events.push(event);
+                if saw_tool {
+                    break;
+                }
+            }
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AiEvent::Activity {
+                event: ActivityEvent {
+                    kind: ActivityKind::ToolCall { id, .. },
+                    ..
+                },
+                ..
+            } if id == "ws-open"
+        )));
+        let read_deadline = Instant::now() + Duration::from_secs(2);
+        while !control.http_read_in_progress.load(Ordering::Acquire)
+            && Instant::now() < read_deadline
+        {
+            thread::yield_now();
+        }
+        assert!(
+            control.http_read_in_progress.load(Ordering::Acquire),
+            "Grok Heavy worker never entered its blocking response read"
+        );
+        let cancelled_at = Instant::now();
+        assert!(control.cancel());
+        let finish_deadline = Instant::now() + Duration::from_secs(2);
+        while !adapter.is_finished() && Instant::now() < finish_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            adapter.is_finished(),
+            "Grok Heavy did not cleanly join after closing its transport"
+        );
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        assert!(
+            closed_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            "the server did not observe prompt connection EOF after Stop"
+        );
+        assert!(matches!(
+            adapter.join().unwrap(),
+            RunOutcome::TerminalAlreadyEmitted
+        ));
+        assert_eq!(XAI_HTTP_WORKERS.load(Ordering::Acquire), workers_before);
+
+        events.extend(receiver.try_iter());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AiEvent::Cancelled { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AiEvent::Activity {
+                event: ActivityEvent {
+                    kind: ActivityKind::ToolResult {
+                        id,
+                        is_error: true,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            } if id == "ws-open"
+        )));
+        server.join().unwrap();
+        let late_events = receiver.try_iter().collect::<Vec<_>>();
+        assert!(
+            late_events.is_empty(),
+            "late Grok Heavy output escaped the cancellation gate: {late_events:?}"
+        );
+    }
+
+    #[test]
+    fn xai_completed_result_owns_terminal_before_group_completion_is_visible() {
+        use std::net::TcpListener;
+
+        let _xai_test = lock_unpoison(&XAI_TRANSPORT_TEST_LOCK);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request_bytes.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "client closed before sending HTTP headers");
+                request_bytes.extend_from_slice(&buffer[..count]);
+            }
+            let header_end = request_bytes
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = std::str::from_utf8(&request_bytes[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while request_bytes.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "client closed before sending the HTTP body");
+                request_bytes.extend_from_slice(&buffer[..count]);
+            }
+            let body = concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-complete\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-complete\",\"status\":\"completed\",\"output_text\":\"done\"}}\n\n",
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let mut run = request("xai_api");
+        run.model.clear();
+        run.provider_preferences.reasoning_effort = "high".into();
+        let control = Arc::new(RunControl::default());
+        let worker_control = Arc::clone(&control);
+        let (sender, receiver) = unbounded();
+        let adapter = thread::spawn(move || {
+            run_xai_responses_transport(
+                &run,
+                XaiResponsesSpec {
+                    url: Url::parse(&format!("http://{address}/v1/responses")).unwrap(),
+                    disconnect_worker: false,
+                },
+                &worker_control,
+                &sender,
+            )
+        });
+
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if let Ok(event) = receiver.recv_timeout(Duration::from_millis(20)) {
+                let completed_group = matches!(
+                    &event,
+                    AiEvent::Activity {
+                        event: ActivityEvent {
+                            kind: ActivityKind::AgentGroup {
+                                status: SubagentStatus::Completed,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    }
+                );
+                events.push(event);
+                if completed_group {
+                    break;
+                }
+            }
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AiEvent::Activity {
+                    event: ActivityEvent {
+                        kind: ActivityKind::AgentGroup {
+                            status: SubagentStatus::Completed,
+                            ..
+                        },
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "completed group was not emitted"
+        );
+        assert!(
+            !control.cancel(),
+            "Stop must lose once the completed group is observable"
+        );
+        assert!(matches!(
+            adapter.join().unwrap(),
+            RunOutcome::Completed { ref text, .. } if text == "done"
+        ));
+        server.join().unwrap();
+        events.extend(receiver.try_iter());
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AiEvent::Cancelled { .. }
+                | AiEvent::Activity {
+                    event: ActivityEvent {
+                        kind: ActivityKind::SessionInfo { .. },
+                        ..
+                    },
+                    ..
+                }
+        )));
+    }
+
+    #[test]
+    fn xai_worker_disconnect_claims_one_failed_terminal_not_cancellation() {
+        let _xai_test = lock_unpoison(&XAI_TRANSPORT_TEST_LOCK);
+        let mut run = request("xai_api");
+        run.model.clear();
+        let control = Arc::new(RunControl::default());
+        let (sender, receiver) = unbounded();
+        let outcome = run_xai_responses_transport(
+            &run,
+            XaiResponsesSpec {
+                url: Url::parse(crate::xai_responses::XAI_RESPONSES_ENDPOINT).unwrap(),
+                disconnect_worker: true,
+            },
+            &control,
+            &sender,
+        );
+
+        assert!(matches!(
+            outcome,
+            RunOutcome::Failed {
+                kind: AiFailureKind::ProviderError,
+                ..
+            }
+        ));
+        assert!(!control.cancel());
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AiEvent::Activity {
+                        event: ActivityEvent {
+                            kind: ActivityKind::AgentGroup {
+                                status: SubagentStatus::Failed,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AiEvent::Cancelled { .. }))
+        );
+    }
+
+    #[test]
+    fn kimi_agent_swarm_fixture_projects_only_real_returned_children() {
+        let fixture = include_str!("../tests/fixtures/ai/kimi/0.31.0/acp-agent-tools.jsonl");
+        let mut lines = fixture.lines();
+        let _agent_start: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let _agent_finish: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let swarm_start: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let swarm_finish: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let start = swarm_start.pointer("/params/update").unwrap();
+        let finish = swarm_finish.pointer("/params/update").unwrap();
+        let tool_call = KimiAcpToolCall {
+            id: start["toolCallId"].as_str().unwrap().into(),
+            title: start["title"].as_str().map(str::to_owned),
+            kind: Some(KimiAcpToolKind::Other("other".into())),
+            status: Some(KimiAcpToolStatus::Completed),
+            content: finish["content"].as_array().cloned().unwrap_or_default(),
+            locations: Vec::new(),
+            raw_input: start.get("rawInput").cloned(),
+            raw_output: finish.get("rawOutput").cloned(),
+        };
+        assert_eq!(
+            kimi_delegation_kind(&tool_call),
+            Some(KimiDelegationKind::Swarm)
+        );
+        assert_eq!(
+            kimi_swarm_expected_count(tool_call.raw_input.as_ref().unwrap()),
+            Some(3)
+        );
+        let parsed = parse_kimi_agent_swarm_result(
+            tool_call.raw_output.as_ref().unwrap().as_str().unwrap(),
+            Some(3),
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(parsed[1].label, "api");
+        assert_eq!(parsed[2].status, SubagentStatus::Failed);
+
+        let run = request("kimi_cli");
+        let (sender, receiver) = unbounded();
+        emit_kimi_acp_tool_call(
+            &run,
+            &sender,
+            &tool_call,
+            &RefCell::new(KimiAcpProjectionState::default()),
+        );
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for event in receiver.try_iter() {
+            if let AiEvent::Activity { event, .. } = event {
+                accumulator.ingest(event);
+            }
+        }
+        let groups = crate::chat_core::project_agent_groups(&accumulator.events);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].expected_count, Some(3));
+        assert_eq!(groups[0].status, SubagentStatus::Failed);
+        assert_eq!(groups[0].members.len(), 3);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 3);
+        assert!(
+            children.iter().any(|child| child.id == "agent-2"
+                && child.prose_cells[0].text == "API review complete.")
+        );
+        assert!(crate::chat_core::assistant_flat_text(&accumulator.events).is_empty());
+    }
+
+    #[test]
+    fn kimi_swarm_parser_keeps_unidentified_jobs_aggregate_only() {
+        let output = concat!(
+            "<agent_swarm_result>\n",
+            "<summary>completed: 1, aborted: 1</summary>\n",
+            "<subagent agent_id=\"agent-a\" item=\"Known\" state=\"started\" outcome=\"completed\">done</subagent>\n",
+            "<subagent item=\"Never started\" state=\"not_started\" outcome=\"aborted\">not scheduled</subagent>\n",
+            "</agent_swarm_result>"
+        );
+        let results = parse_kimi_agent_swarm_result(output, Some(2)).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].agent_id.as_deref(), Some("agent-a"));
+        assert_eq!(results[1].agent_id, None);
+        assert_eq!(results[1].status, SubagentStatus::Cancelled);
+
+        let ambiguous = output.replace(
+            "done</subagent>",
+            "unsafe <subagent outcome=\"failed\">text</subagent></subagent>",
+        );
+        assert!(
+            parse_kimi_agent_swarm_result(&ambiguous, Some(2)).is_none(),
+            "tag-like member prose must fail closed instead of inventing a child"
+        );
+
+        let duplicate_id = concat!(
+            "<agent_swarm_result>",
+            "<subagent agent_id=\"agent-a\" item=\"One\" outcome=\"completed\">one</subagent>",
+            "<subagent agent_id=\"agent-a\" item=\"Two\" outcome=\"failed\">two</subagent>",
+            "</agent_swarm_result>"
+        );
+        assert!(
+            parse_kimi_agent_swarm_result(duplicate_id, Some(2)).is_none(),
+            "conflicting rows with one stable ID must remain aggregate-only"
+        );
+    }
+
+    #[test]
+    fn kimi_permissions_keep_swarm_preference_and_workspace_safety_separate() {
+        let swarm = kimi_permission(
+            "Launching agent swarm",
+            KimiAcpToolKind::Other("other".into()),
+            Some(json!({
+                "description": "Research",
+                "prompt_template": "Research {{item}}",
+                "items": ["one", "two"]
+            })),
+        );
+        let blocked = RefCell::new(KimiPermissionBlockState::default());
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &swarm,
+                PermissionMode::Auto,
+                AiWorkspaceMode::Code,
+                false,
+                &blocked,
+            ),
+            KimiAcpPermissionDecision::Reject { .. }
+        ));
+
+        let explore = kimi_permission(
+            "Launching agent swarm: Read-only research",
+            KimiAcpToolKind::Other("other".into()),
+            Some(json!({
+                "description": "Read-only research",
+                "prompt_template": "Research {{item}}",
+                "items": ["one", "two"],
+                "subagent_type": "explore"
+            })),
+        );
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &explore,
+                PermissionMode::Sandbox,
+                AiWorkspaceMode::Code,
+                true,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Allow { .. }
+        ));
+
+        for raw_input in [
+            json!({
+                "description": "Coder swarm",
+                "prompt_template": "Implement {{item}}",
+                "items": ["one"],
+                "subagent_type": "coder"
+            }),
+            json!({
+                "description": "Default swarm",
+                "prompt_template": "Handle {{item}}",
+                "items": ["one"]
+            }),
+            json!({
+                "description": "Unknown swarm",
+                "prompt_template": "Handle {{item}}",
+                "items": ["one"],
+                "subagent_type": "future-profile"
+            }),
+        ] {
+            let mutating = kimi_permission(
+                "Launching agent swarm: Mutating work",
+                KimiAcpToolKind::Other("other".into()),
+                Some(raw_input),
+            );
+            assert!(matches!(
+                kimi_acp_permission_decision(
+                    &mutating,
+                    PermissionMode::Ask,
+                    AiWorkspaceMode::Code,
+                    true,
+                    &RefCell::new(KimiPermissionBlockState::default()),
+                ),
+                KimiAcpPermissionDecision::Reject { .. } | KimiAcpPermissionDecision::Cancel
+            ));
+        }
+
+        let coder = kimi_permission(
+            "Launching agent swarm: Coder work",
+            KimiAcpToolKind::Other("other".into()),
+            Some(json!({
+                "description": "Coder swarm",
+                "prompt_template": "Implement {{item}}",
+                "items": ["one"],
+                "subagent_type": "coder"
+            })),
+        );
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &coder,
+                PermissionMode::Auto,
+                AiWorkspaceMode::Code,
+                true,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Allow { .. }
+        ));
+
+        let fixture = include_str!("../tests/fixtures/ai/kimi/0.31.0/acp-permission.jsonl");
+        let mut fixture_lines = fixture.lines();
+        let tracked: Value = serde_json::from_str(fixture_lines.next().unwrap()).unwrap();
+        let sparse: Value = serde_json::from_str(fixture_lines.next().unwrap()).unwrap();
+        let background = kimi_permission(
+            sparse
+                .pointer("/params/toolCall/title")
+                .and_then(Value::as_str)
+                .unwrap(),
+            KimiAcpToolKind::Other("other".into()),
+            tracked.pointer("/params/update/rawInput").cloned(),
+        );
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &background,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Code,
+                true,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Reject { .. } | KimiAcpPermissionDecision::Cancel
+        ));
+
+        let delete = kimi_permission("Delete file", KimiAcpToolKind::Delete, None);
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &delete,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                true,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn kimi_questions_are_skipped_without_fabricating_answers_or_blocking_the_turn() {
+        let question = kimi_question_permission();
+        for permission_mode in [
+            PermissionMode::Sandbox,
+            PermissionMode::Ask,
+            PermissionMode::Plan,
+            PermissionMode::Auto,
+            PermissionMode::Bypass,
+        ] {
+            for workspace_mode in [
+                AiWorkspaceMode::Chat,
+                AiWorkspaceMode::Cowork,
+                AiWorkspaceMode::Code,
+            ] {
+                let blocked = RefCell::new(KimiPermissionBlockState::default());
+                assert_eq!(
+                    kimi_acp_permission_decision(
+                        &question,
+                        permission_mode,
+                        workspace_mode,
+                        true,
+                        &blocked,
+                    ),
+                    KimiAcpPermissionDecision::Reject {
+                        option_id: "q0_skip".into()
+                    }
+                );
+                assert!(
+                    blocked.borrow().pending.is_none(),
+                    "skipping a question is not a permission-block terminal cause"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_question_title_alone_cannot_change_permission_policy() {
+        let lookalike = kimi_permission(
+            "AskUserQuestion",
+            KimiAcpToolKind::Other("other".into()),
+            None,
+        );
+        assert!(lookalike.ask_user_question_skip_option().is_none());
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &lookalike,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Code,
+                true,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Allow { ref option_id } if option_id == "allow-once"
+        ));
+    }
+
+    #[test]
+    fn kimi_structured_tool_titles_do_not_alias_agent_delegations() {
+        for permission in [
+            kimi_permission("Read AGENTS.md", KimiAcpToolKind::Read, None),
+            kimi_permission("Search agent documentation", KimiAcpToolKind::Search, None),
+        ] {
+            assert_eq!(kimi_delegation_kind(&permission.tool_call), None);
+            assert!(matches!(
+                kimi_acp_permission_decision(
+                    &permission,
+                    PermissionMode::Sandbox,
+                    AiWorkspaceMode::Code,
+                    false,
+                    &RefCell::new(KimiPermissionBlockState::default()),
+                ),
+                KimiAcpPermissionDecision::Allow { .. }
+            ));
+        }
+
+        let edit = kimi_permission("Edit src/agent.rs", KimiAcpToolKind::Edit, None);
+        assert_eq!(kimi_delegation_kind(&edit.tool_call), None);
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &edit,
+                PermissionMode::Ask,
+                AiWorkspaceMode::Code,
+                false,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Reject { .. } | KimiAcpPermissionDecision::Cancel
+        ));
+
+        let agent = kimi_permission(
+            "Agent",
+            KimiAcpToolKind::Other("other".into()),
+            Some(json!({"subagent_type": "explore", "prompt": "Inspect"})),
+        );
+        assert_eq!(
+            kimi_delegation_kind(&agent.tool_call),
+            Some(KimiDelegationKind::Agent)
+        );
+
+        let mut swarm = kimi_permission(
+            "Unrelated display title",
+            KimiAcpToolKind::Other("AgentSwarm".into()),
+            Some(json!({"items": ["one"], "prompt_template": "Inspect {{item}}"})),
+        );
+        assert_eq!(
+            kimi_delegation_kind(&swarm.tool_call),
+            Some(KimiDelegationKind::Swarm)
+        );
+        swarm.tool_call.kind = None;
+        swarm.tool_call.title = Some("AgentSwarm".into());
+        assert_eq!(
+            kimi_delegation_kind(&swarm.tool_call),
+            Some(KimiDelegationKind::Swarm)
+        );
+    }
+
+    #[test]
+    fn kimi_background_agent_result_stays_aggregate_and_terminal() {
+        let tool_call = KimiAcpToolCall {
+            id: "background-agent".into(),
+            title: Some("Launching background agent".into()),
+            kind: Some(KimiAcpToolKind::Other("other".into())),
+            status: Some(KimiAcpToolStatus::Completed),
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: Some(json!({
+                "description": "Research later",
+                "prompt": "Research and notify the parent later",
+                "run_in_background": true
+            })),
+            raw_output: Some(Value::String(
+                "agent_id: agent-background\nstatus: running\n\nStill working.".into(),
+            )),
+        };
+        let run = request("kimi_cli");
+        let (sender, receiver) = unbounded();
+        emit_kimi_acp_tool_call(
+            &run,
+            &sender,
+            &tool_call,
+            &RefCell::new(KimiAcpProjectionState::default()),
+        );
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for event in receiver.try_iter() {
+            if let AiEvent::Activity { event, .. } = event {
+                accumulator.ingest(event);
+            }
+        }
+        assert!(crate::chat_core::project_subagents(&accumulator.events).is_empty());
+        let groups = crate::chat_core::project_agent_groups(&accumulator.events);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].status, SubagentStatus::Failed);
+        assert!(groups[0].members.is_empty());
+        assert_eq!(groups[0].visibility, AgentGroupVisibility::AggregateOnly);
+        assert!(
+            groups[0]
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("background"))
+        );
+    }
+
+    #[test]
+    fn kimi_adapter_return_finalizes_open_delegations_once_for_errors_and_cancellation() {
+        let tool_call = KimiAcpToolCall {
+            id: "pending-swarm".into(),
+            title: Some("Launching agent swarm: Research in parallel".into()),
+            kind: Some(KimiAcpToolKind::Other("other".into())),
+            status: Some(KimiAcpToolStatus::InProgress),
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: Some(json!({
+                "description": "Research in parallel",
+                "prompt_template": "Research {{item}}",
+                "items": ["one", "two"]
+            })),
+            raw_output: None,
+        };
+        let run = request("kimi_cli");
+
+        let (failed_sender, failed_receiver) = unbounded();
+        let failed_projection = RefCell::new(KimiAcpProjectionState::default());
+        emit_kimi_acp_tool_call(&run, &failed_sender, &tool_call, &failed_projection);
+        let adapter_error: Result<KimiAcpOutcome, KimiAcpError> = Err(KimiAcpError::UnexpectedEof);
+        finalize_kimi_delegations_after_adapter_return(
+            &run,
+            &failed_sender,
+            &adapter_error,
+            false,
+            &failed_projection,
+        );
+        finalize_kimi_delegations_after_adapter_return(
+            &run,
+            &failed_sender,
+            &adapter_error,
+            false,
+            &failed_projection,
+        );
+        let failed_events = failed_receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            failed_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AiEvent::Activity {
+                        event: ActivityEvent {
+                            kind: ActivityKind::AgentGroup {
+                                status: SubagentStatus::Failed,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "adapter error cleanup must be terminal and idempotent"
+        );
+
+        let (cancelled_sender, cancelled_receiver) = unbounded();
+        let cancelled_projection = RefCell::new(KimiAcpProjectionState::default());
+        emit_kimi_acp_tool_call(&run, &cancelled_sender, &tool_call, &cancelled_projection);
+        finalize_kimi_delegations_after_adapter_return(
+            &run,
+            &cancelled_sender,
+            &adapter_error,
+            true,
+            &cancelled_projection,
+        );
+        assert_eq!(
+            cancelled_receiver
+                .try_iter()
+                .filter(|event| matches!(
+                    event,
+                    AiEvent::Activity {
+                        event: ActivityEvent {
+                            kind: ActivityKind::AgentGroup {
+                                status: SubagentStatus::Cancelled,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "local cancellation must close open Kimi groups as cancelled"
+        );
+    }
+
+    #[test]
+    fn ambiguous_kimi_swarm_output_projects_an_aggregate_terminal_group() {
+        let tool_call = KimiAcpToolCall {
+            id: "ambiguous-swarm".into(),
+            title: Some("Launching agent swarm: Research".into()),
+            kind: Some(KimiAcpToolKind::Other("other".into())),
+            status: Some(KimiAcpToolStatus::Completed),
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: Some(json!({
+                "description": "Research",
+                "items": ["one", "two"]
+            })),
+            raw_output: Some(Value::String(concat!(
+                "<agent_swarm_result>",
+                "<subagent agent_id=\"duplicate\" item=\"One\" outcome=\"completed\">one</subagent>",
+                "<subagent agent_id=\"duplicate\" item=\"Two\" outcome=\"failed\">two</subagent>",
+                "</agent_swarm_result>"
+            ).into())),
+        };
+        let run = request("kimi_cli");
+        let (sender, receiver) = unbounded();
+        emit_kimi_acp_tool_call(
+            &run,
+            &sender,
+            &tool_call,
+            &RefCell::new(KimiAcpProjectionState::default()),
+        );
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for event in receiver.try_iter() {
+            if let AiEvent::Activity { event, .. } = event {
+                accumulator.ingest(event);
+            }
+        }
+
+        assert!(crate::chat_core::project_subagents(&accumulator.events).is_empty());
+        let groups = crate::chat_core::project_agent_groups(&accumulator.events);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].status, SubagentStatus::Completed);
+        assert_eq!(groups[0].visibility, AgentGroupVisibility::AggregateOnly);
+        assert!(groups[0].members.is_empty());
+    }
+
+    #[test]
+    fn xai_multi_agent_events_remain_one_opaque_group() {
+        let run = request("xai_api");
+        let (sender, receiver) = unbounded();
+        emit_xai_responses_event(
+            &run,
+            &sender,
+            XaiResponsesEvent::GroupStarted {
+                group_id: "heavy-turn".into(),
+                model: XAI_MULTI_AGENT_MODEL.into(),
+                effort: XaiReasoningEffort::High,
+                expected_count: 16,
+            },
+        );
+        emit_xai_responses_event(
+            &run,
+            &sender,
+            XaiResponsesEvent::GroupFinished {
+                group_id: "heavy-turn".into(),
+                status: XaiGroupStatus::Completed,
+                detail: None,
+            },
+        );
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for event in receiver.try_iter() {
+            if let AiEvent::Activity { event, .. } = event {
+                accumulator.ingest(event);
+            }
+        }
+        let groups = crate::chat_core::project_agent_groups(&accumulator.events);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].expected_count, Some(16));
+        assert_eq!(groups[0].status, SubagentStatus::Completed);
+        assert_eq!(groups[0].visibility, AgentGroupVisibility::AggregateOnly);
+        assert!(groups[0].members.is_empty());
+        assert!(crate::chat_core::project_subagents(&accumulator.events).is_empty());
     }
 
     #[test]

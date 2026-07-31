@@ -1,0 +1,54 @@
+{
+  "provider": "Kimi Code CLI",
+  "version": "0.31.0",
+  "build": "bc28e9d802fbec29395a7aed85e880679a050145",
+  "capturedAt": "2026-07-31",
+  "captures": [
+    {
+      "files": [
+        "acp-initialize.jsonl"
+      ],
+      "provenance": "locally-captured",
+      "transport": "ACP (Agent Client Protocol)",
+      "command": "printf <INITIALIZE_REQUEST> | kimi acp",
+      "note": "Captured from the installed 0.31.0 executable without sending a model prompt. The local account was signed out, so session/new was not claimed as a live capture."
+    },
+    {
+      "files": [
+        "acp-config-options.jsonl",
+        "acp-root-plan.jsonl"
+      ],
+      "provenance": "source-derived",
+      "source": [
+        "https://github.com/MoonshotAI/kimi-code/blob/bc28e9d802fbec29395a7aed85e880679a050145/packages/acp-adapter/src/config-options.ts",
+        "https://github.com/MoonshotAI/kimi-code/blob/bc28e9d802fbec29395a7aed85e880679a050145/packages/acp-adapter/src/modes.ts",
+        "https://github.com/MoonshotAI/kimi-code/blob/bc28e9d802fbec29395a7aed85e880679a050145/packages/acp-adapter/src/events-map.ts"
+      ],
+      "note": "Schema fixtures assembled from the exact tagged source. Model identifiers are redacted placeholders because session/new could not be captured without authenticating."
+    },
+    {
+      "files": [
+        "acp-agent-tools.jsonl",
+        "acp-permission.jsonl",
+        "acp-ask-user-question.jsonl"
+      ],
+      "provenance": "source-derived",
+      "source": [
+        "https://github.com/MoonshotAI/kimi-code/blob/bc28e9d802fbec29395a7aed85e880679a050145/packages/acp-adapter/src/events-map.ts",
+        "https://github.com/MoonshotAI/kimi-code/blob/bc28e9d802fbec29395a7aed85e880679a050145/packages/acp-adapter/src/approval.ts",
+        "https://github.com/MoonshotAI/kimi-code/blob/bc28e9d802fbec29395a7aed85e880679a050145/packages/acp-adapter/src/question.ts",
+        "https://github.com/MoonshotAI/kimi-code/blob/bc28e9d802fbec29395a7aed85e880679a050145/packages/acp-adapter/src/session.ts",
+        "https://github.com/MoonshotAI/kimi-code/blob/bc28e9d802fbec29395a7aed85e880679a050145/packages/agent-core/src/tools/builtin/collaboration/agent.ts",
+        "https://github.com/MoonshotAI/kimi-code/blob/bc28e9d802fbec29395a7aed85e880679a050145/packages/agent-core/src/tools/builtin/collaboration/agent-swarm.ts"
+      ],
+      "note": "The fixtures preserve the tagged rawInput/rawOutput contracts for Agent and AgentSwarm plus the AskUserQuestion bridge's exact q0 option namespace. Kimi's ACP adapter deliberately filters non-main-agent SDK events, so this is a root tool lifecycle, not a claimed live child stream."
+    }
+  ],
+  "redactions": [
+    "local executable path replaced with <KIMI_EXECUTABLE>",
+    "session, request, tool-call, task and agent ids replaced consistently",
+    "configured model id and display name replaced with placeholders",
+    "fixture prompts and results are synthetic and contain no account data or credentials"
+  ],
+  "note": "Only acp-initialize.jsonl is a local wire capture. Every other file is explicitly source-derived from the 0.31.0 tag; none is presented as a model-backed run."
+}
