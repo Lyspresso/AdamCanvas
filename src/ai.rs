@@ -53,7 +53,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, TryLockError,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -91,11 +91,16 @@ const HTTP_TASK_TOOLS_REJECTED_PREFIX: &str = "adam-http-task-tools-rejected:";
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const CHAT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const TASK_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-const CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(1);
+const CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+const CLI_VERSION_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const MAX_CLI_VERSION_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_CONCURRENT_AI_RUNS: usize = 4;
 const MAX_XAI_HTTP_WORKERS: usize = MAX_CONCURRENT_AI_RUNS * 2;
 
-static CLI_VERSION_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<CliVersion>>>> = OnceLock::new();
+static CLI_VERSION_CACHE: OnceLock<Mutex<HashMap<PathBuf, CliVersionCacheEntry>>> = OnceLock::new();
+static CLI_VERSION_PROBE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+static CLI_VERSION_PROBE_FAILURES: OnceLock<Mutex<HashMap<PathBuf, CliVersionProbeFailureEntry>>> =
+    OnceLock::new();
 static XAI_HTTP_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// One provider turn. The API key value is deliberately memory-only and its
@@ -208,10 +213,16 @@ pub enum AiEvent {
         /// The provider rejected the saved native session before doing work.
         /// Consumers may use this typed signal for one fresh replay.
         resume_rejected: bool,
+        /// A launch/runtime verification failed without proving the saved
+        /// native session stale. Consumers must retain that session.
+        preserve_resume: bool,
     },
     Cancelled {
         turn_id: Uuid,
         conversation_id: Uuid,
+        /// Cancellation happened before the provider/session was touched.
+        /// Consumers must retain an eligible native resume record.
+        preserve_resume: bool,
     },
 }
 
@@ -312,6 +323,7 @@ impl AiEngine {
         let prepared = prepare_run(&request)?;
         let effective_provider = prepared.provider_id().to_owned();
         let plan_channel = prepared.plan_channel();
+        let accepts_returned_session_id = prepared.accepts_returned_session_id();
         let control = Arc::new(RunControl::default());
 
         {
@@ -361,7 +373,7 @@ impl AiEngine {
                 });
 
                 let outcome = if control.cancelled.load(Ordering::Acquire) {
-                    RunOutcome::Cancelled
+                    RunOutcome::CancelledBeforeLaunch
                 } else {
                     match prepared {
                         PreparedRun::Process(specification) => {
@@ -396,33 +408,12 @@ impl AiEngine {
                         event: activity_event(status),
                     });
                 }
-                let terminal = match outcome {
-                    RunOutcome::Completed { text, session_id } => Some(AiEvent::Completed {
-                        turn_id,
-                        conversation_id,
-                        text,
-                        session_id,
-                    }),
-                    RunOutcome::Failed { kind, message, .. } => Some(AiEvent::Failed {
-                        turn_id,
-                        conversation_id,
-                        kind,
-                        message,
-                        resume_rejected: false,
-                    }),
-                    RunOutcome::ResumeRejected { message } => Some(AiEvent::Failed {
-                        turn_id,
-                        conversation_id,
-                        kind: AiFailureKind::ProviderError,
-                        message,
-                        resume_rejected: true,
-                    }),
-                    RunOutcome::Cancelled => Some(AiEvent::Cancelled {
-                        turn_id,
-                        conversation_id,
-                    }),
-                    RunOutcome::TerminalAlreadyEmitted => None,
-                };
+                let terminal = terminal_event_for_run_outcome(
+                    turn_id,
+                    conversation_id,
+                    accepts_returned_session_id,
+                    outcome,
+                );
                 if let Some(terminal) = terminal {
                     let _ = events.send(terminal);
                 }
@@ -556,6 +547,57 @@ impl Drop for AiEngine {
     }
 }
 
+fn terminal_event_for_run_outcome(
+    turn_id: Uuid,
+    conversation_id: Uuid,
+    accepts_returned_session_id: bool,
+    outcome: RunOutcome,
+) -> Option<AiEvent> {
+    match outcome {
+        RunOutcome::Completed { text, session_id } => Some(AiEvent::Completed {
+            turn_id,
+            conversation_id,
+            text,
+            session_id: accepts_returned_session_id.then_some(session_id).flatten(),
+        }),
+        RunOutcome::Failed { kind, message, .. } => Some(AiEvent::Failed {
+            turn_id,
+            conversation_id,
+            kind,
+            message,
+            resume_rejected: false,
+            preserve_resume: false,
+        }),
+        RunOutcome::ResumeRejected { message } => Some(AiEvent::Failed {
+            turn_id,
+            conversation_id,
+            kind: AiFailureKind::ProviderError,
+            message,
+            resume_rejected: true,
+            preserve_resume: false,
+        }),
+        RunOutcome::RuntimeProbeFailed { message } => Some(AiEvent::Failed {
+            turn_id,
+            conversation_id,
+            kind: AiFailureKind::ProviderError,
+            message,
+            resume_rejected: false,
+            preserve_resume: true,
+        }),
+        RunOutcome::Cancelled => Some(AiEvent::Cancelled {
+            turn_id,
+            conversation_id,
+            preserve_resume: false,
+        }),
+        RunOutcome::CancelledBeforeLaunch => Some(AiEvent::Cancelled {
+            turn_id,
+            conversation_id,
+            preserve_resume: true,
+        }),
+        RunOutcome::TerminalAlreadyEmitted => None,
+    }
+}
+
 #[derive(Default)]
 struct RunControl {
     cancelled: AtomicBool,
@@ -669,6 +711,13 @@ impl PreparedRun {
             Self::Http { .. } => PlanChannel::AppTaskTools,
         }
     }
+
+    fn accepts_returned_session_id(&self) -> bool {
+        !matches!(
+            self,
+            Self::Process(specification) if specification.provider_id == "kimi_cli"
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -693,6 +742,7 @@ struct ProcessSpec {
     prompt_input: PromptInput,
     output_mode: OutputMode,
     grok_session_id: Option<String>,
+    expected_runtime_version: Option<CliVersion>,
 }
 
 #[derive(Debug)]
@@ -747,17 +797,35 @@ pub fn installed_runtime_tuning(
         let profile = capability_profile(provider_id, executable, &[]);
         return runtime_tuning_profile(profile.runtime_family, None, model);
     };
-    runtime_tuning_for_program(provider_id, &program, model)
+    cached_runtime_tuning_for_program(provider_id, &program, model)
 }
 
-/// Whether the installed `kimi` executable selects Adam's fixture-verified
-/// ACP transport. Resume eligibility calls this at the launch boundary so a
-/// same-path upgrade or downgrade cannot reuse an ACP sidecar with the legacy
-/// print-mode adapter.
+/// Lossy compatibility predicate for callers that only need a display hint.
+/// `false` includes probe failures and unverified versions; launch and resume
+/// decisions must use the checked internal path below so failure can never be
+/// mistaken for permission to select the auto-approving legacy adapter.
 pub fn installed_kimi_uses_acp(cwd: Option<&Path>) -> bool {
     resolve_executable("kimi", cwd)
-        .map(|program| fresh_runtime_tuning_for_program("kimi_cli", &program, ""))
+        .and_then(|program| fresh_runtime_tuning_for_program("kimi_cli", &program, "").ok())
         .is_some_and(|tuning| supports_kimi_acp_transport(tuning.version.as_ref()))
+}
+
+pub(crate) fn checked_installed_kimi_uses_acp(cwd: Option<&Path>) -> Result<bool, String> {
+    let Some(program) = resolve_executable("kimi", cwd) else {
+        return Err(
+            "Adam could not find the installed Kimi Code executable. The saved Kimi session was preserved; restore the executable or choose another provider."
+                .into(),
+        );
+    };
+    let tuning = cached_verified_runtime_tuning_for_program("kimi_cli", &program, "")
+        .map_err(|failure| cli_version_probe_message("kimi_cli", &failure))?;
+    if let Some(uses_acp) = verified_kimi_resume_compatibility(tuning.version.as_ref()) {
+        return Ok(uses_acp);
+    }
+    Err(
+        "Adam found an unverified Kimi version, so the saved Kimi session was preserved. Install the fixture-verified Kimi Code 0.31.0 contract or refresh Agents after changing versions."
+            .into(),
+    )
 }
 
 /// Clamp saved controls to the verified runtime table. Returns true when the
@@ -767,6 +835,15 @@ pub fn clamp_provider_preferences(
     preferences: &mut AiProviderPreferences,
     tuning: &RuntimeTuningProfile,
 ) -> bool {
+    if built_in_cli_executable(provider_id).is_some() && !tuning.verified_runtime {
+        // Missing or transiently unverified is not evidence that a saved
+        // control became unsupported. That includes a missing probe result and
+        // a parseable version that has no fixture-verified contract. In
+        // particular, never persistently turn off Grok subagents or Kimi
+        // swarms because a busy machine delayed `--version` beyond the probe
+        // deadline or because the CLI was upgraded ahead of Adam's table.
+        return false;
+    }
     let original = preferences.clone();
     let requested = preferences.reasoning_effort.trim();
     if requested.is_empty() {
@@ -800,6 +877,34 @@ pub struct ProviderProbe {
     pub version: Option<CliVersion>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CliExecutableIdentity {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanoseconds: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CliVersionCacheEntry {
+    version: CliVersion,
+    identity: CliExecutableIdentity,
+    observed_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct CliVersionProbeFailureEntry {
+    failure: CliVersionProbeFailure,
+    identity: CliExecutableIdentity,
+    completed_at: Instant,
+}
+
 /// Resolve and version-probe a built-in provider CLI without launching a
 /// turn. `refresh` drops the resolved path's cached version first so an
 /// upgraded binary at the same path re-probes; plain calls stay cache-cheap.
@@ -829,14 +934,45 @@ fn invalidate_cached_cli_version(program: &Path) {
     let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
     let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     lock_unpoison(cache).remove(&key);
+    let failures = CLI_VERSION_PROBE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    lock_unpoison(failures).remove(&key);
 }
 
-fn runtime_tuning_for_program(
+fn cli_version_probe_lock(program: &Path) -> Arc<Mutex<()>> {
+    let locks = CLI_VERSION_PROBE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    Arc::clone(
+        lock_unpoison(locks)
+            .entry(program.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
+fn cached_runtime_tuning_for_program(
     provider_id: &str,
     program: &Path,
     model: &str,
 ) -> RuntimeTuningProfile {
-    let version = cached_cli_version(program);
+    let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let identity = cli_executable_identity(&key).ok();
+    let mut cache = lock_unpoison(cache);
+    let version = cache
+        .get(&key)
+        .filter(|entry| identity.as_ref() == Some(&entry.identity))
+        .map(|entry| entry.version.clone());
+    if version.is_none() {
+        cache.remove(&key);
+    }
+    runtime_tuning_for_version(provider_id, program, model, version)
+}
+
+fn runtime_tuning_for_version(
+    provider_id: &str,
+    program: &Path,
+    model: &str,
+    version: Option<CliVersion>,
+) -> RuntimeTuningProfile {
+    let version = version.filter(|version| version_banner_matches_provider(provider_id, version));
     let profile = capability_profile_for_runtime(
         provider_id,
         &program.to_string_lossy(),
@@ -855,53 +991,588 @@ fn fresh_runtime_tuning_for_program(
     provider_id: &str,
     program: &Path,
     model: &str,
-) -> RuntimeTuningProfile {
-    invalidate_cached_cli_version(program);
-    runtime_tuning_for_program(provider_id, program, model)
+) -> Result<RuntimeTuningProfile, CliVersionProbeFailure> {
+    fresh_runtime_tuning_for_program_cancellable(provider_id, program, model, None)
+}
+
+fn fresh_runtime_tuning_for_program_cancellable(
+    provider_id: &str,
+    program: &Path,
+    model: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<RuntimeTuningProfile, CliVersionProbeFailure> {
+    let requested_at = Instant::now();
+    let lock_deadline = requested_at + CLI_VERSION_TIMEOUT;
+    let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let probe_lock = cli_version_probe_lock(&key);
+    let _probe_guard = lock_cli_version_probe(&probe_lock, lock_deadline, cancelled)?;
+    let identity = cli_executable_identity(&key)?;
+    let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let cache = lock_unpoison(cache);
+        if let Some(entry) = cache.get(&key)
+            && entry.identity == identity
+            && entry.observed_at >= requested_at
+        {
+            return Ok(runtime_tuning_for_version(
+                provider_id,
+                program,
+                model,
+                Some(entry.version.clone()),
+            ));
+        }
+    }
+    let failures = CLI_VERSION_PROBE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let failures = lock_unpoison(failures);
+        if let Some(entry) = failures.get(&key)
+            && entry.identity == identity
+            && entry.completed_at >= requested_at
+        {
+            return Err(entry.failure.clone());
+        }
+    }
+    let Some(probe_timeout) = lock_deadline.checked_duration_since(Instant::now()) else {
+        return Err(CliVersionProbeFailure::TimedOut);
+    };
+    let entry = match probe_cli_version_entry_with_timeout(&key, probe_timeout, cancelled) {
+        Ok(entry) => entry,
+        Err(failure) => {
+            record_cli_version_probe_failure(&key, identity, &failure);
+            return Err(failure);
+        }
+    };
+    lock_unpoison(failures).remove(&key);
+    lock_unpoison(cache).insert(key, entry.clone());
+    Ok(runtime_tuning_for_version(
+        provider_id,
+        program,
+        model,
+        Some(entry.version),
+    ))
+}
+
+fn lock_cli_version_probe<'a>(
+    probe_lock: &'a Mutex<()>,
+    deadline: Instant,
+    cancelled: Option<&AtomicBool>,
+) -> Result<std::sync::MutexGuard<'a, ()>, CliVersionProbeFailure> {
+    loop {
+        match probe_lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    return Err(CliVersionProbeFailure::Cancelled);
+                }
+                if Instant::now() >= deadline {
+                    return Err(CliVersionProbeFailure::TimedOut);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// Read a successful identity-matched observation without starting a process.
+/// UI-side resume gating uses this path; the run worker owns fresh probes.
+fn cached_verified_runtime_tuning_for_program(
+    provider_id: &str,
+    program: &Path,
+    model: &str,
+) -> Result<RuntimeTuningProfile, CliVersionProbeFailure> {
+    let version = cached_verified_cli_version(program)?;
+    Ok(runtime_tuning_for_version(
+        provider_id,
+        program,
+        model,
+        Some(version),
+    ))
 }
 
 fn cached_cli_version(program: &Path) -> Option<CliVersion> {
-    let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
-    let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(version) = lock_unpoison(cache).get(&key).cloned() {
-        return version;
-    }
-    let version = probe_cli_version(&key);
-    lock_unpoison(cache).insert(key, version.clone());
-    version
+    verified_cli_version(program).ok()
 }
 
-fn probe_cli_version(program: &Path) -> Option<CliVersion> {
-    let mut child = Command::new(program)
+fn verified_cli_version(program: &Path) -> Result<CliVersion, CliVersionProbeFailure> {
+    let requested_at = Instant::now();
+    let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let probe_lock = cli_version_probe_lock(&key);
+    let _probe_guard = lock_unpoison(&probe_lock);
+    let identity = cli_executable_identity(&key)?;
+    let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let mut cache = lock_unpoison(cache);
+        if let Some(entry) = cache.get(&key) {
+            if entry.identity == identity {
+                return Ok(entry.version.clone());
+            }
+            cache.remove(&key);
+        }
+    }
+    let failures = CLI_VERSION_PROBE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let failures = lock_unpoison(failures);
+        if let Some(entry) = failures.get(&key)
+            && entry.identity == identity
+            && entry.completed_at >= requested_at
+        {
+            return Err(entry.failure.clone());
+        }
+    }
+    let entry = match probe_cli_version_entry(&key) {
+        Ok(entry) => entry,
+        Err(failure) => {
+            record_cli_version_probe_failure(&key, identity, &failure);
+            return Err(failure);
+        }
+    };
+    let version = entry.version.clone();
+    lock_unpoison(failures).remove(&key);
+    lock_unpoison(cache).insert(key, entry);
+    Ok(version)
+}
+
+fn record_cli_version_probe_failure(
+    key: &Path,
+    identity: CliExecutableIdentity,
+    failure: &CliVersionProbeFailure,
+) {
+    // Cancellation belongs only to the run whose Stop token fired. Sharing
+    // it with another overlapping caller would incorrectly cancel that run.
+    if matches!(failure, CliVersionProbeFailure::Cancelled) {
+        return;
+    }
+    let failures = CLI_VERSION_PROBE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    lock_unpoison(failures).insert(
+        key.to_path_buf(),
+        CliVersionProbeFailureEntry {
+            failure: failure.clone(),
+            identity,
+            completed_at: Instant::now(),
+        },
+    );
+}
+
+fn cached_verified_cli_version(program: &Path) -> Result<CliVersion, CliVersionProbeFailure> {
+    let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let identity = cli_executable_identity(&key)?;
+    let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = lock_unpoison(cache);
+    if let Some(entry) = cache.get(&key) {
+        if entry.identity == identity {
+            return Ok(entry.version.clone());
+        }
+        cache.remove(&key);
+    }
+    Err(CliVersionProbeFailure::NotObserved)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CliVersionProbeFailure {
+    NotObserved,
+    Cancelled,
+    Metadata(String),
+    Spawn(String),
+    TimedOut,
+    Wait(String),
+    NonZero(String),
+    Output(String),
+    Unparseable,
+    Ambiguous,
+    Changed,
+}
+
+impl fmt::Display for CliVersionProbeFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotObserved => formatter.write_str(
+                "no current version observation is available; detection runs in the Agents panel",
+            ),
+            Self::Cancelled => formatter.write_str("version detection was cancelled"),
+            Self::Metadata(error) => write!(formatter, "could not inspect the executable: {error}"),
+            Self::Spawn(error) => write!(formatter, "could not start `--version`: {error}"),
+            Self::TimedOut => write!(
+                formatter,
+                "`--version` did not finish within {} seconds",
+                CLI_VERSION_TIMEOUT.as_secs()
+            ),
+            Self::Wait(error) => write!(formatter, "could not wait for `--version`: {error}"),
+            Self::NonZero(status) => write!(formatter, "`--version` exited {status}"),
+            Self::Output(error) => write!(formatter, "could not read `--version` output: {error}"),
+            Self::Unparseable => {
+                formatter.write_str("`--version` returned no recognizable version")
+            }
+            Self::Ambiguous => formatter
+                .write_str("`--version` returned ambiguous, multiple, or prerelease version text"),
+            Self::Changed => formatter.write_str("the executable changed during version detection"),
+        }
+    }
+}
+
+fn cli_executable_identity(
+    program: &Path,
+) -> Result<CliExecutableIdentity, CliVersionProbeFailure> {
+    let metadata = fs::metadata(program)
+        .map_err(|error| CliVersionProbeFailure::Metadata(error.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(CliExecutableIdentity {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            change_seconds: metadata.ctime(),
+            change_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(CliExecutableIdentity {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+fn probe_cli_version_entry(program: &Path) -> Result<CliVersionCacheEntry, CliVersionProbeFailure> {
+    probe_cli_version_entry_with_timeout(program, CLI_VERSION_TIMEOUT, None)
+}
+
+fn probe_cli_version_entry_with_timeout(
+    program: &Path,
+    timeout: Duration,
+    cancelled: Option<&AtomicBool>,
+) -> Result<CliVersionCacheEntry, CliVersionProbeFailure> {
+    let before = cli_executable_identity(program)?;
+    let version = probe_cli_version_with_timeout(program, timeout, cancelled)?;
+    let after = cli_executable_identity(program)?;
+    if before != after {
+        return Err(CliVersionProbeFailure::Changed);
+    }
+    Ok(CliVersionCacheEntry {
+        version,
+        identity: after,
+        observed_at: Instant::now(),
+    })
+}
+
+fn cli_version_probe_message(provider_id: &str, failure: &CliVersionProbeFailure) -> String {
+    let provider = match provider_id {
+        "grok_cli" => "Grok CLI",
+        "kimi_cli" => "Kimi Code",
+        "claude_cli" => "Claude Code",
+        "codex_cli" => "Codex CLI",
+        _ => "AI provider CLI",
+    };
+    format!(
+        "Adam could not verify the installed {provider} version because {failure}. Open Agents and press Refresh, then retry the turn; Adam will not silently switch provider adapters without a verified version."
+    )
+}
+
+#[derive(Debug)]
+struct CliVersionOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn drain_cli_version_output<R: Read>(mut reader: R) -> Result<CliVersionOutput, String> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_CLI_VERSION_OUTPUT_BYTES.saturating_sub(bytes.len());
+        let retained = remaining.min(read);
+        bytes.extend_from_slice(&buffer[..retained]);
+        truncated |= retained < read;
+    }
+    Ok(CliVersionOutput { bytes, truncated })
+}
+
+fn collect_cli_version_output(
+    receiver: &Receiver<(&'static str, Result<CliVersionOutput, String>)>,
+) -> Result<(CliVersionOutput, CliVersionOutput), CliVersionProbeFailure> {
+    let deadline = Instant::now() + CLI_VERSION_DRAIN_GRACE;
+    let mut stdout = None;
+    let mut stderr = None;
+    while stdout.is_none() || stderr.is_none() {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(CliVersionProbeFailure::Output(
+                "the version process left an output pipe open after it exited".into(),
+            ));
+        };
+        let (name, output) = receiver.recv_timeout(remaining).map_err(|_| {
+            CliVersionProbeFailure::Output(
+                "the version process left an output pipe open after it exited".into(),
+            )
+        })?;
+        let output = output.map_err(CliVersionProbeFailure::Output)?;
+        if name == "stdout" {
+            stdout = Some(output);
+        } else {
+            stderr = Some(output);
+        }
+    }
+    Ok((
+        stdout.expect("stdout output is present"),
+        stderr.expect("stderr output is present"),
+    ))
+}
+
+fn parse_unambiguous_cli_version(output: &str) -> Result<CliVersion, CliVersionProbeFailure> {
+    fn component(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+        let start = *cursor;
+        while bytes.get(*cursor).is_some_and(u8::is_ascii_digit) {
+            *cursor += 1;
+        }
+        (start != *cursor)
+            .then(|| {
+                std::str::from_utf8(&bytes[start..*cursor])
+                    .ok()?
+                    .parse()
+                    .ok()
+            })
+            .flatten()
+    }
+
+    let bytes = output.as_bytes();
+    let mut versions = HashSet::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit()
+            || index
+                .checked_sub(1)
+                .and_then(|previous| bytes.get(previous))
+                .is_some_and(|previous| previous.is_ascii_digit() || *previous == b'.')
+        {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index;
+        let Some(major) = component(bytes, &mut cursor) else {
+            index += 1;
+            continue;
+        };
+        if bytes.get(cursor) != Some(&b'.') {
+            index = cursor.max(index + 1);
+            continue;
+        }
+        cursor += 1;
+        let Some(minor) = component(bytes, &mut cursor) else {
+            index += 1;
+            continue;
+        };
+        if bytes.get(cursor) != Some(&b'.') {
+            index = cursor.max(index + 1);
+            continue;
+        }
+        cursor += 1;
+        let Some(patch) = component(bytes, &mut cursor) else {
+            index += 1;
+            continue;
+        };
+        if bytes
+            .get(cursor)
+            .is_some_and(|next| next.is_ascii_digit() || matches!(*next, b'.'))
+        {
+            index = cursor.max(index + 1);
+            continue;
+        }
+        if bytes
+            .get(cursor)
+            .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(*next, b'_' | b'-' | b'+'))
+        {
+            return Err(CliVersionProbeFailure::Ambiguous);
+        }
+        versions.insert((major, minor, patch));
+        index = cursor.max(index + 1);
+    }
+    let mut versions = versions.into_iter();
+    let Some((major, minor, patch)) = versions.next() else {
+        return Err(CliVersionProbeFailure::Unparseable);
+    };
+    if versions.next().is_some() {
+        return Err(CliVersionProbeFailure::Ambiguous);
+    }
+    Ok(CliVersion {
+        major,
+        minor,
+        patch,
+        raw: output.trim().to_owned(),
+    })
+}
+
+fn same_cli_contract_version(left: &CliVersion, right: &CliVersion) -> bool {
+    (left.major, left.minor, left.patch) == (right.major, right.minor, right.patch)
+}
+
+/// Exact transport gates need evidence that the parsed number belongs to the
+/// provider, rather than an unrelated runtime mentioned in a warning. Kimi
+/// Code 0.31.0 has also shipped a captured bare-numeric banner, so that one
+/// provider accepts an otherwise-empty line containing only the version.
+pub(crate) fn version_banner_matches_provider(provider_id: &str, version: &CliVersion) -> bool {
+    if !matches!(provider_id, "grok_cli" | "kimi_cli") {
+        return true;
+    }
+    let numeric = format!("{}.{}.{}", version.major, version.minor, version.patch);
+    version.raw.lines().any(|line| {
+        let line = line.trim();
+        let lowercase = line.to_ascii_lowercase();
+        let tail = if provider_id == "grok_cli" {
+            lowercase.strip_prefix("grok ")
+        } else if (version.major, version.minor, version.patch) == (0, 31, 0) && line == numeric {
+            Some(line)
+        } else {
+            lowercase
+                .strip_prefix("kimi, version ")
+                .or_else(|| lowercase.strip_prefix("kimi "))
+        };
+        tail.is_some_and(|tail| {
+            if tail == numeric {
+                return true;
+            }
+            if provider_id != "grok_cli" {
+                return false;
+            }
+            let Some(build) = tail
+                .strip_prefix(&numeric)
+                .and_then(|suffix| suffix.strip_prefix(" ("))
+                .and_then(|suffix| suffix.strip_suffix(')'))
+            else {
+                return false;
+            };
+            !build.is_empty() && build.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    })
+}
+
+#[cfg(test)]
+fn probe_cli_version(program: &Path) -> Result<CliVersion, CliVersionProbeFailure> {
+    probe_cli_version_with_timeout(program, CLI_VERSION_TIMEOUT, None)
+}
+
+fn probe_cli_version_with_timeout(
+    program: &Path,
+    timeout: Duration,
+    cancelled: Option<&AtomicBool>,
+) -> Result<CliVersion, CliVersionProbeFailure> {
+    probe_cli_version_with_timeout_observer(program, timeout, cancelled, None)
+}
+
+fn probe_cli_version_with_timeout_observer(
+    program: &Path,
+    timeout: Duration,
+    cancelled: Option<&AtomicBool>,
+    spawned: Option<&Sender<u32>>,
+) -> Result<CliVersion, CliVersionProbeFailure> {
+    let mut command = Command::new(program);
+    command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
-        .ok()?;
-    let deadline = Instant::now() + CLI_VERSION_TIMEOUT;
-    loop {
+        .map_err(|error| CliVersionProbeFailure::Spawn(error.to_string()))?;
+    if let Some(spawned) = spawned {
+        let _ = spawned.send(child.id());
+    }
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_child_tree(&mut child);
+            let _ = child.wait();
+            return Err(CliVersionProbeFailure::Output(
+                "the version process had no stdout pipe".into(),
+            ));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_child_tree(&mut child);
+            let _ = child.wait();
+            return Err(CliVersionProbeFailure::Output(
+                "the version process had no stderr pipe".into(),
+            ));
+        }
+    };
+    let (output_sender, output_receiver) = bounded(2);
+    let stdout_sender = output_sender.clone();
+    thread::spawn(move || {
+        let _ = stdout_sender.send(("stdout", drain_cli_version_output(stdout)));
+    });
+    thread::spawn(move || {
+        let _ = output_sender.send(("stderr", drain_cli_version_output(stderr)));
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            terminate_child_tree(&mut child);
+            let _ = child.wait();
+            let _ = collect_cli_version_output(&output_receiver);
+            return Err(CliVersionProbeFailure::Cancelled);
+        }
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => {
+                // A version command is never allowed to leave helper
+                // processes behind, even when it returned a usable banner.
+                terminate_child_tree(&mut child);
+                break status;
+            }
             Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
+            Ok(None) => {
+                terminate_child_tree(&mut child);
                 let _ = child.wait();
-                return None;
+                let _ = collect_cli_version_output(&output_receiver);
+                return Err(CliVersionProbeFailure::TimedOut);
+            }
+            Err(error) => {
+                terminate_child_tree(&mut child);
+                let _ = child.wait();
+                let _ = collect_cli_version_output(&output_receiver);
+                return Err(CliVersionProbeFailure::Wait(error.to_string()));
             }
         }
+    };
+    let (stdout, stderr) = match collect_cli_version_output(&output_receiver) {
+        Ok(output) => output,
+        Err(error) => {
+            terminate_child_tree(&mut child);
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    if stdout.truncated || stderr.truncated {
+        return Err(CliVersionProbeFailure::Output(format!(
+            "output exceeded {MAX_CLI_VERSION_OUTPUT_BYTES} bytes"
+        )));
     }
-    let output = child.wait_with_output().ok()?;
-    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !output.stderr.is_empty() {
+    let mut combined = String::from_utf8_lossy(&stdout.bytes).into_owned();
+    if !stderr.bytes.is_empty() {
         if !combined.is_empty() {
             combined.push('\n');
         }
-        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        combined.push_str(&String::from_utf8_lossy(&stderr.bytes));
     }
-    CliVersion::parse(&combined)
+    if !status.success() {
+        return Err(CliVersionProbeFailure::NonZero(status.to_string()));
+    }
+    parse_unambiguous_cli_version(&combined)
 }
 
 fn prepare_run(request: &AiRunRequest) -> Result<PreparedRun, AiEngineError> {
@@ -1008,7 +1679,7 @@ pub fn provider_exposes_app_task_tools(
         "lm_studio" => !endpoint.trim().is_empty(),
         "custom_cli" => true,
         "grok_cli" => resolve_executable("grok", cwd)
-            .map(|program| fresh_runtime_tuning_for_program("grok_cli", &program, ""))
+            .map(|program| cached_runtime_tuning_for_program("grok_cli", &program, ""))
             .is_some_and(|tuning| {
                 supports_grok_acp_task_bridge(tuning.version.as_ref())
                     && grok_acp_plan_channel(&tuning, resuming) == PlanChannel::AppTaskTools
@@ -1045,10 +1716,17 @@ fn prepare_resolved_cli(
     request: &AiRunRequest,
 ) -> Result<PreparedRun, AiEngineError> {
     if provider_id == "grok_cli" {
-        // Re-probe every launch. A same-path provider upgrade or downgrade
-        // must not inherit a cached capability contract from an earlier turn.
-        let tuning =
-            fresh_runtime_tuning_for_program(provider_id, &program, effective_model(request));
+        // Preparation consumes the latest successful background observation
+        // without blocking the UI. The worker freshly re-probes at the
+        // process boundary before it exposes tools or starts the provider.
+        let tuning = cached_verified_runtime_tuning_for_program(
+            provider_id,
+            &program,
+            effective_model(request),
+        )
+        .map_err(|failure| {
+            AiEngineError::InvalidConfiguration(cli_version_probe_message(provider_id, &failure))
+        })?;
         if supports_grok_acp_task_bridge(tuning.version.as_ref()) {
             let runtime_version = tuning
                 .version
@@ -1076,13 +1754,32 @@ fn prepare_resolved_cli(
                 subagents_enabled,
             }));
         }
+        if !supports_grok_legacy_process(tuning.version.as_ref()) {
+            return Err(AiEngineError::InvalidConfiguration(
+                "Adam supports the fixture-verified Grok CLI 0.2.111 legacy contract and 0.2.114/0.2.117 ACP contracts. This installed version is unverified, so Adam will not guess a transport or permission contract."
+                    .into(),
+            ));
+        }
+        return Ok(PreparedRun::Process(preset_process_spec_with_tuning(
+            provider_id,
+            program,
+            request,
+            &tuning,
+        )?));
     }
     if provider_id == "kimi_cli" {
         // Kimi Code replaced the unrelated legacy kimi-cli while retaining
-        // the same executable name. Re-probe every launch and select ACP only
-        // for the exact fixture-backed runtime.
-        let tuning =
-            fresh_runtime_tuning_for_program(provider_id, &program, effective_model(request));
+        // the same executable name. Select from the current background
+        // observation here; the worker rechecks the exact fixture-backed
+        // runtime at the process boundary.
+        let tuning = cached_verified_runtime_tuning_for_program(
+            provider_id,
+            &program,
+            effective_model(request),
+        )
+        .map_err(|failure| {
+            AiEngineError::InvalidConfiguration(cli_version_probe_message(provider_id, &failure))
+        })?;
         if supports_kimi_acp_transport(tuning.version.as_ref()) {
             let cwd = match canonical_working_directory(request.cwd.as_deref())? {
                 Some(cwd) => cwd,
@@ -1101,6 +1798,12 @@ fn prepare_resolved_cli(
                     .version
                     .expect("verified Kimi ACP runtime has a parsed version"),
             }));
+        }
+        if !supports_kimi_legacy_process(tuning.version.as_ref()) {
+            return Err(AiEngineError::InvalidConfiguration(
+                "Adam supports the fixture-verified Kimi Code 0.31.0 ACP contract and legacy Kimi CLI 1.49.0 contract. This installed version is unverified, so Adam will not select the auto-approving legacy adapter."
+                    .into(),
+            ));
         }
         if request.resume_session_id.is_some() {
             return Err(AiEngineError::NativeResumeUnavailable(
@@ -1143,8 +1846,26 @@ fn supports_grok_acp_task_bridge(version: Option<&CliVersion>) -> bool {
     })
 }
 
+fn supports_grok_legacy_process(version: Option<&CliVersion>) -> bool {
+    version.is_some_and(|version| (version.major, version.minor, version.patch) == (0, 2, 111))
+}
+
 fn supports_kimi_acp_transport(version: Option<&CliVersion>) -> bool {
     version.is_some_and(|version| (version.major, version.minor, version.patch) == (0, 31, 0))
+}
+
+fn supports_kimi_legacy_process(version: Option<&CliVersion>) -> bool {
+    version.is_some_and(|version| (version.major, version.minor, version.patch) == (1, 49, 0))
+}
+
+fn verified_kimi_resume_compatibility(version: Option<&CliVersion>) -> Option<bool> {
+    if supports_kimi_acp_transport(version) {
+        Some(true)
+    } else if supports_kimi_legacy_process(version) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn effective_model(request: &AiRunRequest) -> &str {
@@ -1161,7 +1882,7 @@ fn preset_process_spec(
     program: PathBuf,
     request: &AiRunRequest,
 ) -> Result<ProcessSpec, AiEngineError> {
-    let tuning = runtime_tuning_for_program(provider_id, &program, effective_model(request));
+    let tuning = cached_runtime_tuning_for_program(provider_id, &program, effective_model(request));
     preset_process_spec_with_tuning(provider_id, program, request, &tuning)
 }
 
@@ -1438,6 +2159,15 @@ fn preset_process_spec_with_tuning(
         prompt_input,
         output_mode,
         grok_session_id,
+        expected_runtime_version: match provider_id {
+            "grok_cli" if supports_grok_legacy_process(tuning.version.as_ref()) => {
+                tuning.version.clone()
+            }
+            "kimi_cli" if supports_kimi_legacy_process(tuning.version.as_ref()) => {
+                tuning.version.clone()
+            }
+            _ => None,
+        },
     })
 }
 
@@ -1626,6 +2356,7 @@ fn custom_process_spec(
         },
         output_mode: OutputMode::PlainText,
         grok_session_id: None,
+        expected_runtime_version: None,
     })
 }
 
@@ -1784,7 +2515,11 @@ enum RunOutcome {
     ResumeRejected {
         message: String,
     },
+    RuntimeProbeFailed {
+        message: String,
+    },
     Cancelled,
+    CancelledBeforeLaunch,
     /// The runner sent its user-facing terminal event before its underlying
     /// worker exited, then retained the engine slot until cleanup completed.
     TerminalAlreadyEmitted,
@@ -1806,6 +2541,12 @@ impl RunOutcome {
             message: message.into(),
             tool: None,
             retry: Some(RetryHint::Retry),
+        }
+    }
+
+    fn runtime_probe_failed(message: impl Into<String>) -> Self {
+        Self::RuntimeProbeFailed {
+            message: message.into(),
         }
     }
 }
@@ -1842,7 +2583,7 @@ fn run_outcome_status(outcome: &RunOutcome) -> Option<ActivityKind> {
                 retry,
             });
         }
-        RunOutcome::ResumeRejected { message } => {
+        RunOutcome::ResumeRejected { message } | RunOutcome::RuntimeProbeFailed { message } => {
             return Some(ActivityKind::TurnStatus {
                 status: TurnStatus::ProviderError,
                 message: Some(message.clone()),
@@ -1851,6 +2592,9 @@ fn run_outcome_status(outcome: &RunOutcome) -> Option<ActivityKind> {
             });
         }
         RunOutcome::Cancelled => (TurnStatus::UserCancelled, None, None),
+        RunOutcome::CancelledBeforeLaunch => {
+            (TurnStatus::UserCancelled, None, Some(RetryHint::Retry))
+        }
         RunOutcome::TerminalAlreadyEmitted => return None,
     };
     Some(ActivityKind::TurnStatus {
@@ -2037,21 +2781,42 @@ fn run_grok_acp_transport(
     // Prepared runs can wait in Adam's queue while a CLI updates in place.
     // Re-probe at the process boundary and fail closed instead of launching a
     // binary under a different child/tool contract than the registered run.
-    let tuning = fresh_runtime_tuning_for_program(
+    if control.cancelled.load(Ordering::Acquire) {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
+    let tuning = match fresh_runtime_tuning_for_program_cancellable(
         "grok_cli",
         &specification.program,
         effective_model(request),
-    );
+        Some(&control.cancelled),
+    ) {
+        Ok(tuning) => tuning,
+        Err(CliVersionProbeFailure::Cancelled) => return RunOutcome::CancelledBeforeLaunch,
+        Err(failure) => {
+            if control.cancelled.load(Ordering::Acquire) {
+                return RunOutcome::CancelledBeforeLaunch;
+            }
+            return RunOutcome::runtime_probe_failed(cli_version_probe_message(
+                "grok_cli", &failure,
+            ));
+        }
+    };
+    if control.cancelled.load(Ordering::Acquire) {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
     let subagents_requested =
         request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) != Some(false);
     let current_plan_channel = grok_acp_plan_channel(&tuning, request.resume_session_id.is_some());
     let current_subagents_enabled = tuning.supports_scoped_child_text() && subagents_requested;
-    if tuning.version.as_ref() != Some(&specification.runtime_version)
+    if !tuning
+        .version
+        .as_ref()
+        .is_some_and(|version| same_cli_contract_version(version, &specification.runtime_version))
         || !supports_grok_acp_task_bridge(tuning.version.as_ref())
         || current_plan_channel != specification.plan_channel
         || current_subagents_enabled != specification.subagents_enabled
     {
-        return RunOutcome::provider_error(
+        return RunOutcome::runtime_probe_failed(
             "the installed Grok runtime changed after this turn was prepared; retry the turn so Adam can apply the current capability contract",
         );
     }
@@ -2119,6 +2884,12 @@ fn run_grok_acp_transport(
         executable: specification.program,
         cwd: specification.cwd,
         prompt: request.prompt.clone(),
+        verified_runtime_version: format!(
+            "{}.{}.{}",
+            specification.runtime_version.major,
+            specification.runtime_version.minor,
+            specification.runtime_version.patch
+        ),
         rules,
         sandbox: if matches!(
             request.permission_mode,
@@ -2180,8 +2951,12 @@ fn run_grok_acp_transport(
             emit_grok_acp_event(request, event_sender, event, &projection);
         },
     );
+    let cancelled_before_launch = matches!(result, Err(GrokAcpError::CancelledBeforeLaunch));
     let bridge_stop = bridge.as_mut().map(TaskToolBridge::stop).transpose();
 
+    if cancelled_before_launch {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
     if control.cancelled.load(Ordering::Acquire) {
         return RunOutcome::Cancelled;
     }
@@ -2229,6 +3004,13 @@ fn grok_acp_error_outcome(
     permission_block: Option<GrokPermissionBlock>,
 ) -> RunOutcome {
     match error {
+        GrokAcpError::CancelledBeforeLaunch => RunOutcome::CancelledBeforeLaunch,
+        GrokAcpError::RuntimeVersionMismatch {
+            verified,
+            advertised,
+        } => RunOutcome::runtime_probe_failed(format!(
+            "Grok changed from runtime {verified} to {advertised} after Adam's executable probe; retry the turn so Adam can verify the current contract"
+        )),
         GrokAcpError::TimedOut { seconds } => {
             RunOutcome::timed_out(format!("Grok timed out after {seconds} seconds"))
         }
@@ -3026,16 +3808,37 @@ fn run_kimi_acp_transport(
     control: &Arc<RunControl>,
     event_sender: &Sender<AiEvent>,
 ) -> RunOutcome {
-    let tuning = fresh_runtime_tuning_for_program(
+    if control.cancelled.load(Ordering::Acquire) {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
+    let tuning = match fresh_runtime_tuning_for_program_cancellable(
         "kimi_cli",
         &specification.program,
         effective_model(request),
-    );
-    if tuning.version.as_ref() != Some(&specification.runtime_version)
+        Some(&control.cancelled),
+    ) {
+        Ok(tuning) => tuning,
+        Err(CliVersionProbeFailure::Cancelled) => return RunOutcome::CancelledBeforeLaunch,
+        Err(failure) => {
+            if control.cancelled.load(Ordering::Acquire) {
+                return RunOutcome::CancelledBeforeLaunch;
+            }
+            return RunOutcome::runtime_probe_failed(cli_version_probe_message(
+                "kimi_cli", &failure,
+            ));
+        }
+    };
+    if control.cancelled.load(Ordering::Acquire) {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
+    if !tuning
+        .version
+        .as_ref()
+        .is_some_and(|version| same_cli_contract_version(version, &specification.runtime_version))
         || !tuning.verified_runtime
         || tuning.agent_group_channel != crate::chat_core::AgentGroupChannel::KimiAcpToolAggregateV1
     {
-        return RunOutcome::provider_error(
+        return RunOutcome::runtime_probe_failed(
             "the installed Kimi runtime changed after this turn was prepared; retry the turn so Adam can apply the current capability contract",
         );
     }
@@ -3092,6 +3895,7 @@ fn run_kimi_acp_transport(
         },
     );
 
+    let cancelled_before_launch = matches!(result, Err(KimiAcpError::CancelledBeforeLaunch));
     let cancellation_requested = control.cancelled.load(Ordering::Acquire);
     finalize_kimi_delegations_after_adapter_return(
         request,
@@ -3100,6 +3904,9 @@ fn run_kimi_acp_transport(
         cancellation_requested,
         &projection,
     );
+    if cancelled_before_launch {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
     if cancellation_requested {
         return RunOutcome::Cancelled;
     }
@@ -3189,6 +3996,10 @@ fn kimi_acp_error_outcome(
     permission_block: Option<GrokPermissionBlock>,
 ) -> RunOutcome {
     match error {
+        KimiAcpError::CancelledBeforeLaunch => RunOutcome::CancelledBeforeLaunch,
+        KimiAcpError::UnsupportedRuntime { found } => RunOutcome::runtime_probe_failed(format!(
+            "Kimi changed to runtime {found} after Adam's executable probe; retry the turn so Adam can verify the current contract"
+        )),
         KimiAcpError::TimedOut { seconds } => {
             RunOutcome::timed_out(format!("Kimi timed out after {seconds} seconds"))
         }
@@ -4259,6 +5070,7 @@ fn run_xai_responses_transport(
                     kind: AiFailureKind::TimedOut,
                     message,
                     resume_rejected: false,
+                    preserve_resume: false,
                 });
                 return RunOutcome::TerminalAlreadyEmitted;
             }
@@ -4338,6 +5150,7 @@ fn emit_xai_cancel_terminal(
     let _ = event_sender.send(AiEvent::Cancelled {
         turn_id: request.turn_id,
         conversation_id: request.conversation_id,
+        preserve_resume: false,
     });
 }
 
@@ -4547,11 +5360,100 @@ fn send_provider_activity(
 
 fn run_process(
     request: &AiRunRequest,
-    specification: ProcessSpec,
+    mut specification: ProcessSpec,
     control: &Arc<RunControl>,
     event_sender: &Sender<AiEvent>,
     task_tools: &Arc<Mutex<TaskToolRegistry>>,
 ) -> RunOutcome {
+    if version_sensitive_process_controls_requested(&specification.provider_id, request) {
+        if control.cancelled.load(Ordering::Acquire) {
+            return RunOutcome::CancelledBeforeLaunch;
+        }
+        let tuning = match fresh_runtime_tuning_for_program_cancellable(
+            &specification.provider_id,
+            &specification.program,
+            effective_model(request),
+            Some(&control.cancelled),
+        ) {
+            Ok(tuning) => tuning,
+            Err(CliVersionProbeFailure::Cancelled) => {
+                return RunOutcome::CancelledBeforeLaunch;
+            }
+            Err(failure) => {
+                if control.cancelled.load(Ordering::Acquire) {
+                    return RunOutcome::CancelledBeforeLaunch;
+                }
+                return RunOutcome::runtime_probe_failed(cli_version_probe_message(
+                    &specification.provider_id,
+                    &failure,
+                ));
+            }
+        };
+        if !tuning.verified_runtime {
+            return RunOutcome::runtime_probe_failed(format!(
+                "Adam found an unverified {} runtime and did not launch it without the saved reasoning control. Refresh Agents after installing a fixture-verified version, then retry the turn.",
+                specification.provider_id
+            ));
+        }
+        let program = specification.program.clone();
+        specification = match preset_process_spec_with_tuning(
+            &specification.provider_id,
+            program,
+            request,
+            &tuning,
+        ) {
+            Ok(specification) => specification,
+            Err(error) => {
+                return RunOutcome::runtime_probe_failed(format!(
+                    "Adam could not apply the verified {} capability contract: {error}",
+                    specification.provider_id
+                ));
+            }
+        };
+    }
+    if let Some(expected) = specification.expected_runtime_version.as_ref() {
+        if control.cancelled.load(Ordering::Acquire) {
+            return RunOutcome::CancelledBeforeLaunch;
+        }
+        let tuning = match fresh_runtime_tuning_for_program_cancellable(
+            &specification.provider_id,
+            &specification.program,
+            effective_model(request),
+            Some(&control.cancelled),
+        ) {
+            Ok(tuning) => tuning,
+            Err(CliVersionProbeFailure::Cancelled) => {
+                return RunOutcome::CancelledBeforeLaunch;
+            }
+            Err(failure) => {
+                if control.cancelled.load(Ordering::Acquire) {
+                    return RunOutcome::CancelledBeforeLaunch;
+                }
+                return RunOutcome::runtime_probe_failed(cli_version_probe_message(
+                    &specification.provider_id,
+                    &failure,
+                ));
+            }
+        };
+        if control.cancelled.load(Ordering::Acquire) {
+            return RunOutcome::CancelledBeforeLaunch;
+        }
+        let exact_contract_still_matches = tuning
+            .version
+            .as_ref()
+            .is_some_and(|version| same_cli_contract_version(version, expected))
+            && match specification.provider_id.as_str() {
+                "grok_cli" => supports_grok_legacy_process(tuning.version.as_ref()),
+                "kimi_cli" => supports_kimi_legacy_process(tuning.version.as_ref()),
+                _ => false,
+            };
+        if !exact_contract_still_matches {
+            return RunOutcome::runtime_probe_failed(format!(
+                "the installed {} runtime changed after this turn was prepared; retry the turn so Adam can apply the current transport and permission contract",
+                specification.provider_id
+            ));
+        }
+    }
     let mut task_bridge = if specification.provider_id == "custom_cli" {
         let bridge_events = event_sender.clone();
         let turn_id = request.turn_id;
@@ -4597,6 +5499,15 @@ fn run_process(
     outcome
 }
 
+fn version_sensitive_process_controls_requested(provider_id: &str, request: &AiRunRequest) -> bool {
+    matches!(provider_id, "claude_cli" | "codex_cli" | "ollama")
+        && !request
+            .provider_preferences
+            .reasoning_effort
+            .trim()
+            .is_empty()
+}
+
 fn run_process_with_timeout(
     request: &AiRunRequest,
     mut specification: ProcessSpec,
@@ -4605,6 +5516,9 @@ fn run_process_with_timeout(
     task_bridge: Option<&TaskToolBridge>,
     timeout: Duration,
 ) -> RunOutcome {
+    if control.cancelled.load(Ordering::Acquire) {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
     let temporary_prompt = if specification.prompt_input == PromptInput::SecureFile {
         match SecurePromptFile::create(request.turn_id, &request.prompt) {
             Ok(file) => {
@@ -4665,6 +5579,12 @@ fn run_process_with_timeout(
         command.current_dir(cwd);
     }
 
+    // Stop can arrive while Adam is preparing a prompt file, follower, or
+    // command. Preserve that as a locally-unsent retry instead of briefly
+    // launching the provider and reporting an ordinary cancellation.
+    if control.cancelled.load(Ordering::Acquire) {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -9125,6 +10045,7 @@ fn run_http(
                 let _ = event_sender.send(AiEvent::Cancelled {
                     turn_id: request.turn_id,
                     conversation_id: request.conversation_id,
+                    preserve_resume: false,
                 });
             }
             wait_for_http_worker(result_receiver, worker);
@@ -9155,6 +10076,7 @@ fn run_http(
                     kind: AiFailureKind::TimedOut,
                     message,
                     resume_rejected: false,
+                    preserve_resume: false,
                 });
             }
             wait_for_http_worker(result_receiver, worker);
@@ -11342,7 +12264,7 @@ mod tests {
             .or_else(|| resolve_executable("grok", Some(temporary.path())))
             .expect("installed Grok CLI");
         assert!(
-            probe_cli_version(&executable).is_some_and(|version| {
+            probe_cli_version(&executable).is_ok_and(|version| {
                 (version.major, version.minor, version.patch) == (0, 2, 117)
             }),
             "this evidence test is pinned to installed Grok 0.2.117"
@@ -11366,6 +12288,7 @@ mod tests {
                 "then reply only PARENT_PERMISSION_TEST_DONE."
             )
             .into(),
+            verified_runtime_version: "0.2.117".into(),
             rules: concat!(
                 "This is a permission-boundary test. Adam has attached no MCP servers. ",
                 "The child must attempt the requested built-in write or edit tool. ",
@@ -11509,7 +12432,7 @@ import json
 import sys
 
 if "--version" in sys.argv:
-    print("grok 0.2.117 (fixture)")
+    print("grok 0.2.117 (f1c06093089f)")
     raise SystemExit(0)
 
 def receive():
@@ -11582,6 +12505,10 @@ send({
         let mut permissions = fs::metadata(&executable).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&executable, permissions).unwrap();
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("grok 0.2.117 (f1c06093089f)")
+        );
 
         for (subagents_enabled, resume_session_id, expected_session_id) in [
             (true, None, "fake-native-session"),
@@ -11664,11 +12591,12 @@ send({
             r#"#!/usr/bin/env python3
 import json
 import sys
-import urllib.request
 
 if "--version" in sys.argv:
-    print("grok 0.2.114 (fixture)")
+    print("grok 0.2.114 (0c785038798)")
     raise SystemExit(0)
+
+import urllib.request
 
 def receive():
     line = sys.stdin.readline()
@@ -11772,6 +12700,10 @@ send({
         let mut permissions = fs::metadata(&executable).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&executable, permissions).unwrap();
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("grok 0.2.114 (0c785038798)")
+        );
 
         let mut run = request("grok_cli");
         run.cwd = Some(temporary.path().to_path_buf());
@@ -12234,6 +13166,55 @@ send({
             &mut preferences,
             &tuning
         ));
+    }
+
+    #[test]
+    fn unverified_cli_version_never_persists_a_capability_downgrade() {
+        let mut grok = AiProviderPreferences {
+            reasoning_effort: "high".into(),
+            ..AiProviderPreferences::default()
+        };
+        grok.set_feature(AI_FEATURE_SUBAGENTS, Some(true));
+        let original_grok = grok.clone();
+        let unknown_grok = runtime_tuning_profile(ProviderKind::Grok, None, "grok-4.5");
+        assert!(!clamp_provider_preferences(
+            "grok_cli",
+            &mut grok,
+            &unknown_grok
+        ));
+        assert_eq!(grok, original_grok);
+
+        let unlisted_grok = CliVersion::parse("grok 0.2.118 (94172f2aa4e5)").unwrap();
+        let unlisted_grok =
+            runtime_tuning_profile(ProviderKind::Grok, Some(&unlisted_grok), "grok-4.5");
+        assert!(!unlisted_grok.verified_runtime);
+        assert!(!clamp_provider_preferences(
+            "grok_cli",
+            &mut grok,
+            &unlisted_grok
+        ));
+        assert_eq!(grok, original_grok);
+
+        let mut kimi = AiProviderPreferences::default();
+        kimi.set_feature(AI_FEATURE_SWARM, Some(true));
+        let original_kimi = kimi.clone();
+        let unknown_kimi = runtime_tuning_profile(ProviderKind::Kimi, None, "");
+        assert!(!clamp_provider_preferences(
+            "kimi_cli",
+            &mut kimi,
+            &unknown_kimi
+        ));
+        assert_eq!(kimi, original_kimi);
+
+        let unlisted_kimi = CliVersion::parse("kimi 0.31.1").unwrap();
+        let unlisted_kimi = runtime_tuning_profile(ProviderKind::Kimi, Some(&unlisted_kimi), "");
+        assert!(!unlisted_kimi.verified_runtime);
+        assert!(!clamp_provider_preferences(
+            "kimi_cli",
+            &mut kimi,
+            &unlisted_kimi
+        ));
+        assert_eq!(kimi, original_kimi);
     }
 
     #[test]
@@ -13388,7 +14369,7 @@ send({
 
     #[cfg(unix)]
     #[test]
-    fn stub_executable_probe_reports_path_and_version_and_refresh_reprobes() {
+    fn stub_executable_probe_rechecks_changed_identity_and_refresh_reprobes() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().expect("temp dir");
@@ -13404,20 +14385,530 @@ send({
             "first probe reads the stub version"
         );
 
-        fs::write(&stub, "#!/bin/sh\necho 9.9.10\n").expect("rewrite stub");
+        fs::write(&stub, "#!/bin/sh\necho 8.8.8\n").expect("rewrite stub in place");
         fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
         assert_eq!(
             cached_cli_version(&program),
-            CliVersion::parse("9.9.9"),
-            "without invalidation the cached version is returned"
+            CliVersion::parse("8.8.8"),
+            "same-size in-place changes invalidate the cached identity"
         );
 
-        invalidate_cached_cli_version(&program);
+        let replacement = directory.path().join("adam-probe-stub-replacement");
+        fs::write(&replacement, "#!/bin/sh\necho 9.9.10\n").expect("write replacement");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755))
+            .expect("chmod replacement");
+        fs::rename(&replacement, &stub).expect("replace stub identity");
         assert_eq!(
             cached_cli_version(&program),
             CliVersion::parse("9.9.10"),
+            "a same-path executable replacement invalidates the cached contract"
+        );
+
+        fs::write(&stub, "#!/bin/sh\necho 9.9.11\n").expect("rewrite stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+        invalidate_cached_cli_version(&program);
+        assert_eq!(
+            cached_cli_version(&program),
+            CliVersion::parse("9.9.11"),
             "refresh drops the cache entry so the new version is probed"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_version_probe_survives_the_old_one_second_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(CLI_VERSION_TIMEOUT >= Duration::from_secs(5));
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("slow-version-stub");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nsleep 2\necho 'grok 0.2.114 (0c785038798)'\n",
+        )
+        .expect("write slow stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod slow stub");
+
+        let started = Instant::now();
+        let version = probe_cli_version(&stub).expect("slow probe remains within the new budget");
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!((version.major, version.minor, version.patch), (0, 2, 114));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_worker_probe_applies_saved_codex_effort_instead_of_downgrading() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let executable = directory.path().join("slow-codex-version-stub");
+        let invoked = directory.path().join("provider-arguments");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  sleep 2\n  echo 'codex-cli 0.144.1'\n  exit 0\nfi\nprintf '%s\\n' \"$@\" > '{}'\n",
+                invoked.display()
+            ),
+        )
+        .expect("write slow Codex stub");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("chmod Codex stub");
+
+        let mut run = request("codex_cli");
+        run.cwd = Some(directory.path().to_path_buf());
+        run.provider_preferences.reasoning_effort = "high".into();
+        let unobserved = preset_process_spec("codex_cli", executable.clone(), &run).unwrap();
+        assert!(
+            !argument_strings(&unobserved)
+                .iter()
+                .any(|argument| argument.contains("model_reasoning_effort")),
+            "cache-only preparation must not guess before the worker probe"
+        );
+
+        let (sender, _receiver) = unbounded();
+        let outcome = run_process(
+            &run,
+            unobserved,
+            &Arc::new(RunControl::default()),
+            &sender,
+            &Arc::new(Mutex::new(TaskToolRegistry::new())),
+        );
+        assert!(matches!(outcome, RunOutcome::Completed { .. }));
+        let arguments = fs::read_to_string(&invoked).expect("provider invocation arguments");
+        assert!(
+            arguments.contains("model_reasoning_effort=\"high\""),
+            "saved effort was silently omitted after a slow probe: {arguments}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_worker_probe_refuses_to_launch_without_a_saved_control() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let executable = directory.path().join("failed-codex-version-stub");
+        let invoked = directory.path().join("provider-invoked");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo unavailable >&2\n  exit 7\nfi\necho invoked > '{}'\n",
+                invoked.display()
+            ),
+        )
+        .expect("write failed Codex stub");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("chmod Codex stub");
+
+        let mut run = request("codex_cli");
+        run.cwd = Some(directory.path().to_path_buf());
+        run.provider_preferences.reasoning_effort = "high".into();
+        let specification = preset_process_spec("codex_cli", executable, &run).unwrap();
+        let (sender, _receiver) = unbounded();
+        let outcome = run_process(
+            &run,
+            specification,
+            &Arc::new(RunControl::default()),
+            &sender,
+            &Arc::new(Mutex::new(TaskToolRegistry::new())),
+        );
+        assert!(matches!(outcome, RunOutcome::RuntimeProbeFailed { .. }));
+        assert!(
+            !invoked.exists(),
+            "provider launched without the saved effort"
+        );
+    }
+
+    #[test]
+    fn strict_version_parser_rejects_ambiguous_and_prerelease_text() {
+        let duplicate =
+            parse_unambiguous_cli_version("grok 0.2.117 (build-a)\ngrok 0.2.117 (build-b)")
+                .expect("duplicate mentions of one release are unambiguous");
+        assert_eq!(
+            (duplicate.major, duplicate.minor, duplicate.patch),
+            (0, 2, 117)
+        );
+
+        for output in [
+            "grok 0.2.117rc1",
+            "grok 0.2.117_beta",
+            "grok 0.2.117-beta.1",
+            "grok 0.2.117+local",
+            "node 20.0.0\ngrok 0.2.117",
+        ] {
+            assert_eq!(
+                parse_unambiguous_cli_version(output),
+                Err(CliVersionProbeFailure::Ambiguous),
+                "{output:?} must not grant an exact provider contract"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_provider_banners_match_only_captured_shapes() {
+        for (provider_id, banner) in [
+            ("grok_cli", "grok 0.2.117 (f1c06093089f)"),
+            ("kimi_cli", "0.31.0"),
+            ("kimi_cli", "kimi 0.31.0"),
+            ("kimi_cli", "kimi, version 1.49.0"),
+        ] {
+            let version = parse_unambiguous_cli_version(banner).expect("captured banner parses");
+            assert!(
+                version_banner_matches_provider(provider_id, &version),
+                "{provider_id} rejected captured banner {banner:?}"
+            );
+        }
+
+        for (provider_id, banner) in [
+            ("grok_cli", "node 0.2.117"),
+            ("grok_cli", "warning: grok requires node 0.2.117"),
+            ("grok_cli", "kimi 0.2.117"),
+            ("grok_cli", "grok 0.2.117 beta"),
+            ("grok_cli", "grok 0.2.117 (prerelease)"),
+            ("kimi_cli", "python 0.31.0"),
+            ("kimi_cli", "1.49.0"),
+            ("kimi_cli", "kimi, version 1.49.0 rc1"),
+            ("kimi_cli", "warning: kimi helper 0.31.0 failed"),
+            ("kimi_cli", "grok 0.31.0"),
+        ] {
+            let version = parse_unambiguous_cli_version(banner).expect("warning tuple parses");
+            assert!(
+                !version_banner_matches_provider(provider_id, &version),
+                "{provider_id} trusted unrelated banner {banner:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_version_probe_kills_its_process_group_and_can_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("timeout-version-stub");
+        let allow = directory.path().join("allow-success");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nif [ -f '{}' ]; then\n  echo 'grok 0.2.114'\nelse\n  sleep 10\nfi\n",
+                allow.display()
+            ),
+        )
+        .expect("write timeout stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let (pid_sender, pid_receiver) = bounded(1);
+        let worker_stub = stub.clone();
+        let worker = thread::spawn(move || {
+            probe_cli_version_with_timeout_observer(
+                &worker_stub,
+                Duration::from_millis(100),
+                None,
+                Some(&pid_sender),
+            )
+        });
+        let pid = pid_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("probe child pid") as i32;
+        let started = Instant::now();
+        assert_eq!(
+            worker.join().expect("probe worker"),
+            Err(CliVersionProbeFailure::TimedOut)
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+
+        fs::write(&allow, "ready").expect("enable retry");
+        let version = probe_cli_version(&stub).expect("same executable retries after timeout");
+        assert_eq!((version.major, version.minor, version.patch), (0, 2, 114));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_version_probe_is_not_cached_and_cannot_select_a_legacy_adapter() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let state = directory.path().join("probe-state");
+        let recovering = directory.path().join("recovering-version-stub");
+        fs::write(
+            &recovering,
+            format!(
+                "#!/bin/sh\nif [ ! -f '{}' ]; then\n  : > '{}'\n  echo 'version unavailable'\nelse\n  echo 'grok 0.2.114'\nfi\n",
+                state.display(),
+                state.display()
+            ),
+        )
+        .expect("write recovering stub");
+        fs::set_permissions(&recovering, fs::Permissions::from_mode(0o755))
+            .expect("chmod recovering stub");
+        assert_eq!(cached_cli_version(&recovering), None);
+        assert_eq!(
+            cached_cli_version(&recovering),
+            CliVersion::parse("grok 0.2.114"),
+            "an unchanged executable must run again after a transient probe failure"
+        );
+
+        let stub = directory.path().join("unknown-version-stub");
+        fs::write(&stub, "#!/bin/sh\necho 'version unavailable'\n").expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+        for provider_id in ["grok_cli", "kimi_cli"] {
+            let mut run = request(provider_id);
+            if provider_id == "kimi_cli" {
+                run.workspace_mode = AiWorkspaceMode::Cowork;
+                run.permission_mode = PermissionMode::Auto;
+            }
+            let result = prepare_resolved_cli(provider_id, stub.clone(), &run);
+            assert!(
+                matches!(
+                    result,
+                    Err(AiEngineError::InvalidConfiguration(message))
+                        if message.contains("will not silently switch provider adapters")
+                ),
+                "{provider_id} must fail visibly when its runtime contract is unknown"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_version_probe_cannot_grant_capabilities_from_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("failed-version-stub");
+        fs::write(&stub, "#!/bin/sh\necho 'grok 0.2.114' >&2\nexit 7\n").expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        assert!(matches!(
+            probe_cli_version(&stub),
+            Err(CliVersionProbeFailure::NonZero(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_fresh_probes_share_one_in_flight_observation() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Barrier;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let counter = directory.path().join("probe-count");
+        let stub = directory.path().join("single-flight-version-stub");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho probe >> '{}'\nsleep 1\necho 'grok 0.2.114'\n",
+                counter.display()
+            ),
+        )
+        .expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let stub = stub.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                fresh_runtime_tuning_for_program("grok_cli", &stub, "grok-4.5")
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            let tuning = worker.join().expect("probe worker").expect("probe result");
+            assert!(supports_grok_acp_task_bridge(tuning.version.as_ref()));
+        }
+        assert_eq!(
+            fs::read_to_string(&counter)
+                .expect("counter")
+                .lines()
+                .count(),
+            1,
+            "overlapping callers must share the completed observation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_failing_probes_share_the_failure_but_a_later_call_retries() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Barrier;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let counter = directory.path().join("failed-probe-count");
+        let stub = directory.path().join("failed-single-flight-version-stub");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho probe >> '{}'\nsleep 1\necho 'version unavailable'\n",
+                counter.display()
+            ),
+        )
+        .expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let stub = stub.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                fresh_runtime_tuning_for_program("grok_cli", &stub, "grok-4.5")
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            assert_eq!(
+                worker.join().expect("probe worker"),
+                Err(CliVersionProbeFailure::Unparseable)
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&counter)
+                .expect("counter")
+                .lines()
+                .count(),
+            1,
+            "overlapping callers must share the failed observation"
+        );
+
+        assert_eq!(
+            fresh_runtime_tuning_for_program("grok_cli", &stub, "grok-4.5"),
+            Err(CliVersionProbeFailure::Unparseable),
+            "a later caller retries rather than caching the failure"
+        );
+        assert_eq!(
+            fs::read_to_string(&counter)
+                .expect("counter")
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparing_a_turn_never_runs_a_slow_version_probe_on_the_caller() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let marker = directory.path().join("probe-ran");
+        let stub = directory.path().join("slow-unobserved-version-stub");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho ran > '{}'\nsleep 10\necho 'grok 0.2.117'\n",
+                marker.display()
+            ),
+        )
+        .expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let started = Instant::now();
+        let result = prepare_resolved_cli("grok_cli", stub, &request("grok_cli"));
+        assert!(
+            matches!(
+                result,
+                Err(AiEngineError::InvalidConfiguration(message))
+                    if message.contains("no current version observation")
+            ),
+            "unobserved Grok must fail preparation without probing"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!marker.exists(), "composer preparation ran `--version`");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_terminates_descendants_that_hold_output_pipes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("inherited-pipe-version-stub");
+        let child_pid = directory.path().join("child.pid");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n(sleep 10) &\necho $! > '{}'\necho 'grok 0.2.114'\nexit 0\n",
+                child_pid.display()
+            ),
+        )
+        .expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let version = probe_cli_version(&stub).expect("the direct version result remains usable");
+        assert_eq!((version.major, version.minor, version.patch), (0, 2, 114));
+        let pid: i32 = fs::read_to_string(&child_pid)
+            .expect("child pid")
+            .trim()
+            .parse()
+            .expect("numeric child pid");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the successful probe left its helper process alive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_drains_large_output_without_deadlocking() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("large-version-stub");
+        let output = "x".repeat(MAX_CLI_VERSION_OUTPUT_BYTES + 1);
+        fs::write(
+            &stub,
+            format!("#!/bin/sh\nprintf '%s\\n' '{output}'\necho 'grok 0.2.114'\n"),
+        )
+        .expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let result = probe_cli_version(&stub);
+        assert!(
+            matches!(
+                &result,
+                Err(CliVersionProbeFailure::Output(message))
+                    if message.contains("output exceeded")
+            ),
+            "unexpected probe result: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlisted_grok_and_kimi_versions_never_select_legacy_adapters() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let grok = directory.path().join("unlisted-grok-stub");
+        fs::write(&grok, "#!/bin/sh\necho 'grok 0.2.118'\n").expect("write Grok stub");
+        fs::set_permissions(&grok, fs::Permissions::from_mode(0o755)).expect("chmod Grok stub");
+        assert_eq!(cached_cli_version(&grok), CliVersion::parse("grok 0.2.118"));
+        assert!(matches!(
+            prepare_resolved_cli("grok_cli", grok, &request("grok_cli")),
+            Err(AiEngineError::InvalidConfiguration(message))
+                if message.contains("unverified")
+        ));
+
+        let kimi = directory.path().join("unlisted-kimi-stub");
+        fs::write(&kimi, "#!/bin/sh\necho 'kimi 1.50.0'\n").expect("write Kimi stub");
+        fs::set_permissions(&kimi, fs::Permissions::from_mode(0o755)).expect("chmod Kimi stub");
+        assert_eq!(cached_cli_version(&kimi), CliVersion::parse("kimi 1.50.0"));
+        assert!(matches!(
+            prepare_resolved_cli("kimi_cli", kimi, &request("kimi_cli")),
+            Err(AiEngineError::InvalidConfiguration(message))
+                if message.contains("unverified")
+                    && message.contains("auto-approving legacy adapter")
+        ));
     }
 
     #[cfg(unix)]
@@ -13437,6 +14928,10 @@ send({
         run.model = "grok-4.5".into();
 
         write_version_stub(&executable, "0.2.114");
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("grok 0.2.114")
+        );
         let PreparedRun::GrokAcp(old_specification) =
             prepare_resolved_cli("grok_cli", executable.clone(), &run).unwrap()
         else {
@@ -13454,6 +14949,10 @@ send({
         assert!(!old_specification.subagents_enabled);
 
         write_version_stub(&executable, "0.2.117");
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("grok 0.2.117")
+        );
         let PreparedRun::GrokAcp(new_specification) =
             prepare_resolved_cli("grok_cli", executable.clone(), &run).unwrap()
         else {
@@ -13485,11 +14984,8 @@ send({
         );
         assert!(matches!(
             outcome,
-            RunOutcome::Failed {
-                kind: AiFailureKind::ProviderError,
-                message,
-                ..
-            } if message.contains("runtime changed")
+            RunOutcome::RuntimeProbeFailed { message }
+                if message.contains("runtime changed")
         ));
     }
 
@@ -13509,6 +15005,10 @@ send({
         run.cwd = Some(temporary.path().to_path_buf());
 
         write_version_stub(&executable, KIMI_ACP_RUNTIME_VERSION);
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse(&format!("kimi {KIMI_ACP_RUNTIME_VERSION}"))
+        );
         let PreparedRun::KimiAcp(specification) =
             prepare_resolved_cli("kimi_cli", executable.clone(), &run).unwrap()
         else {
@@ -13534,11 +15034,8 @@ send({
         );
         assert!(matches!(
             outcome,
-            RunOutcome::Failed {
-                kind: AiFailureKind::ProviderError,
-                message,
-                ..
-            } if message.contains("runtime changed")
+            RunOutcome::RuntimeProbeFailed { message }
+                if message.contains("runtime changed")
         ));
         assert!(supports_kimi_acp_transport(
             CliVersion::parse("0.31.0").as_ref()
@@ -13551,6 +15048,10 @@ send({
         resumed.cwd = Some(temporary.path().to_path_buf());
         resumed.resume_session_id = Some("saved-kimi-session".into());
         write_version_stub(&executable, "1.49.0");
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("kimi 1.49.0")
+        );
         assert!(matches!(
             prepare_resolved_cli("kimi_cli", executable.clone(), &resumed),
             Err(AiEngineError::NativeResumeUnavailable(message))
@@ -13558,10 +15059,144 @@ send({
         ));
 
         write_version_stub(&executable, "0.31.1");
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("kimi 0.31.1")
+        );
         assert!(matches!(
             prepare_resolved_cli("kimi_cli", executable, &resumed),
-            Err(AiEngineError::NativeResumeUnavailable(_))
+            Err(AiEngineError::InvalidConfiguration(message))
+                if message.contains("unverified")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_exact_contracts_reprobe_before_spawn_and_refuse_runtime_drift() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_stub(path: &Path, banner: &str, marker: &Path) {
+            fs::write(
+                path,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo '{banner}'\n  exit 0\nfi\necho invoked > '{}'\n",
+                    marker.display()
+                ),
+            )
+            .expect("write provider stub");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+                .expect("chmod provider stub");
+        }
+
+        for (provider_id, initial_banner, changed_banner) in [
+            ("grok_cli", "grok 0.2.111", "grok 0.2.114"),
+            ("kimi_cli", "kimi, version 1.49.0", "kimi 1.50.0"),
+        ] {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let executable = directory.path().join(format!("{provider_id}-stub"));
+            let marker = directory.path().join("provider-invoked");
+            write_stub(&executable, initial_banner, &marker);
+            assert!(cached_cli_version(&executable).is_some());
+            let mut run = request(provider_id);
+            if provider_id == "kimi_cli" {
+                run.workspace_mode = AiWorkspaceMode::Cowork;
+                run.permission_mode = PermissionMode::Auto;
+            }
+            let PreparedRun::Process(specification) =
+                prepare_resolved_cli(provider_id, executable.clone(), &run)
+                    .expect("fixture-verified legacy contract prepares")
+            else {
+                panic!("{provider_id} legacy contract did not select Process");
+            };
+            assert!(specification.expected_runtime_version.is_some());
+
+            write_stub(&executable, changed_banner, &marker);
+            let (sender, _receiver) = unbounded();
+            let outcome = run_process(
+                &run,
+                specification,
+                &Arc::new(RunControl::default()),
+                &sender,
+                &Arc::new(Mutex::new(TaskToolRegistry::new())),
+            );
+            assert!(matches!(
+                outcome,
+                RunOutcome::RuntimeProbeFailed { message }
+                    if message.contains("runtime changed")
+            ));
+            assert!(
+                !marker.exists(),
+                "{provider_id} started the provider after exact-contract drift"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_slow_boundary_probe_cancels_before_provider_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let executable = directory.path().join("grok-slow-boundary-stub");
+        let ready = directory.path().join("probe-ready");
+        let invoked = directory.path().join("provider-invoked");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'grok 0.2.111'\n  exit 0\nfi\n",
+        )
+        .expect("write initial stub");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("chmod initial stub");
+        assert!(cached_cli_version(&executable).is_some());
+        let run = request("grok_cli");
+        let PreparedRun::Process(specification) =
+            prepare_resolved_cli("grok_cli", executable.clone(), &run)
+                .expect("legacy contract prepares")
+        else {
+            panic!("legacy Grok did not select Process");
+        };
+
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo ready > '{}'\n  sleep 10\n  echo 'grok 0.2.111'\n  exit 0\nfi\necho invoked > '{}'\n",
+                ready.display(),
+                invoked.display()
+            ),
+        )
+        .expect("write slow stub");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("chmod slow stub");
+
+        let control = Arc::new(RunControl::default());
+        let worker_control = Arc::clone(&control);
+        let (sender, _receiver) = unbounded();
+        let registry = Arc::new(Mutex::new(TaskToolRegistry::new()));
+        let worker = thread::spawn(move || {
+            run_process(&run, specification, &worker_control, &sender, &registry)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "boundary probe never reached its ready point"
+        );
+        control.cancelled.store(true, Ordering::Release);
+        assert!(matches!(
+            worker.join().expect("probe worker"),
+            RunOutcome::CancelledBeforeLaunch
+        ));
+        assert!(!invoked.exists(), "provider command ran after Stop");
+    }
+
+    #[test]
+    fn exact_contract_comparison_ignores_banner_formatting() {
+        let prepared = CliVersion::parse("grok 0.2.117 (build-a)").unwrap();
+        let observed = CliVersion::parse("warning text\ngrok 0.2.117 (build-b)").unwrap();
+        assert_ne!(prepared, observed, "raw banners remain diagnostic data");
+        assert!(same_cli_contract_version(&prepared, &observed));
     }
 
     #[test]
@@ -14813,8 +16448,113 @@ send({
             run_outcome_status(&RunOutcome::Cancelled),
             Some(ActivityKind::TurnStatus {
                 status: TurnStatus::UserCancelled,
+                retry: None,
                 ..
             })
+        ));
+        assert!(matches!(
+            run_outcome_status(&RunOutcome::CancelledBeforeLaunch),
+            Some(ActivityKind::TurnStatus {
+                status: TurnStatus::UserCancelled,
+                retry: Some(RetryHint::Retry),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn run_outcome_mapping_has_one_unambiguous_resume_disposition() {
+        let turn_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        for (outcome, expected_rejected, expected_preserved) in [
+            (RunOutcome::provider_error("ordinary failure"), false, false),
+            (
+                RunOutcome::ResumeRejected {
+                    message: "stale session".into(),
+                },
+                true,
+                false,
+            ),
+            (
+                RunOutcome::runtime_probe_failed("version unavailable"),
+                false,
+                true,
+            ),
+        ] {
+            let Some(AiEvent::Failed {
+                resume_rejected,
+                preserve_resume,
+                ..
+            }) = terminal_event_for_run_outcome(turn_id, conversation_id, true, outcome)
+            else {
+                panic!("failure outcome did not map to Failed");
+            };
+            assert_eq!(resume_rejected, expected_rejected);
+            assert_eq!(preserve_resume, expected_preserved);
+            assert!(!(resume_rejected && preserve_resume));
+        }
+
+        for (outcome, expected_preserved) in [
+            (RunOutcome::Cancelled, false),
+            (RunOutcome::CancelledBeforeLaunch, true),
+        ] {
+            assert!(matches!(
+                terminal_event_for_run_outcome(turn_id, conversation_id, true, outcome),
+                Some(AiEvent::Cancelled { preserve_resume, .. })
+                    if preserve_resume == expected_preserved
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_mapping_filters_legacy_kimi_session_ids_only() {
+        let process = |provider_id: &str| {
+            PreparedRun::Process(ProcessSpec {
+                provider_id: provider_id.into(),
+                program: PathBuf::from(provider_id),
+                arguments: Vec::new(),
+                cwd: None,
+                prompt_input: PromptInput::Stdin,
+                output_mode: OutputMode::PlainText,
+                grok_session_id: None,
+                expected_runtime_version: None,
+            })
+        };
+        let legacy_kimi = process("kimi_cli");
+        let other_cli = process("claude_cli");
+        let kimi_acp = PreparedRun::KimiAcp(KimiAcpSpec {
+            program: PathBuf::from("kimi"),
+            cwd: PathBuf::from("/tmp"),
+            runtime_version: CliVersion::parse("0.31.0").unwrap(),
+        });
+        assert!(!legacy_kimi.accepts_returned_session_id());
+        assert!(other_cli.accepts_returned_session_id());
+        assert!(kimi_acp.accepts_returned_session_id());
+
+        let terminal = |accepts_returned_session_id| {
+            terminal_event_for_run_outcome(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                accepts_returned_session_id,
+                RunOutcome::Completed {
+                    text: "done".into(),
+                    session_id: Some("provider-session".into()),
+                },
+            )
+        };
+        assert!(matches!(
+            terminal(false),
+            Some(AiEvent::Completed {
+                session_id: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            terminal(true),
+            Some(AiEvent::Completed {
+                session_id: Some(session_id),
+                ..
+            }) if session_id == "provider-session"
         ));
     }
 
@@ -15912,6 +17652,7 @@ send({
             prompt_input: PromptInput::Argument,
             output_mode: OutputMode::PlainText,
             grok_session_id: None,
+            expected_runtime_version: None,
         };
         let control = Arc::new(RunControl::default());
         let (sender, _receiver) = unbounded();
@@ -16014,6 +17755,7 @@ send({
                 Some(AiEvent::Cancelled {
                     turn_id: event_turn,
                     conversation_id: event_conversation,
+                    ..
                 }) => {
                     assert_eq!(event_turn, turn_id);
                     assert_eq!(event_conversation, conversation_id);

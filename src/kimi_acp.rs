@@ -366,6 +366,8 @@ pub enum KimiAcpError {
     InvalidConfiguration(&'static str),
     #[error("unsupported Kimi Code runtime {found}; this adapter requires 0.31.0")]
     UnsupportedRuntime { found: String },
+    #[error("Kimi ACP launch was cancelled before the provider process started")]
+    CancelledBeforeLaunch,
     #[error("could not start the Kimi ACP process")]
     Spawn(#[source] io::Error),
     #[error("the Kimi ACP process did not expose its {0} pipe")]
@@ -443,6 +445,9 @@ where
         command.process_group(0);
     }
 
+    if cancelled.load(Ordering::Acquire) {
+        return Err(KimiAcpError::CancelledBeforeLaunch);
+    }
     let mut child = ManagedChild::new(command.spawn().map_err(KimiAcpError::Spawn)?);
     let stdin = child
         .child
@@ -2566,6 +2571,25 @@ mod tests {
             resume_session_id: None,
             limits: KimiAcpLimits::default(),
         }
+    }
+
+    #[test]
+    fn prelaunch_cancellation_never_spawns_kimi() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut request = request();
+        request.executable = temporary.path().join("provider-must-not-start");
+        request.cwd = temporary.path().to_path_buf();
+        let cancelled = AtomicBool::new(true);
+
+        assert!(matches!(
+            run_kimi_acp(
+                &request,
+                &cancelled,
+                |_| KimiAcpPermissionDecision::Cancel,
+                |_| {}
+            ),
+            Err(KimiAcpError::CancelledBeforeLaunch)
+        ));
     }
 
     fn config_options() -> Value {

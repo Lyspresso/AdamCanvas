@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::ai::{ProviderProbe, probe_installed_provider};
+use crate::ai::{ProviderProbe, probe_installed_provider, version_banner_matches_provider};
 use crate::chat_core::{CliVersion, capability_profile, runtime_tuning_profile};
 
 /// Availability axis. Sign-in is the deliberately separate second axis
@@ -51,6 +51,8 @@ pub enum AgentAvailability {
 const TESTED_VERSIONS: &[(&str, &str)] = &[
     ("claude_cli", "2.1.128"),
     ("codex_cli", "0.144.1"),
+    ("grok_cli", "0.2.111"),
+    ("grok_cli", "0.2.114"),
     ("grok_cli", "0.2.117"),
     ("kimi_cli", "0.31.0"),
     ("kimi_cli", "1.49.0"),
@@ -64,6 +66,10 @@ fn tested_version_for_series(provider_id: &str, installed: &CliVersion) -> Optio
         .filter_map(|(_, version)| CliVersion::parse(version))
         .filter(|tested| tested.major == installed.major && tested.minor == installed.minor)
         .max_by_key(|tested| tested.patch)
+}
+
+fn transport_requires_exact_contract(provider_id: &str) -> bool {
+    matches!(provider_id, "grok_cli" | "kimi_cli")
 }
 
 /// Sign-in axis, filled only for providers whose CLI has a vendor status
@@ -613,7 +619,7 @@ fn install_outcome(
     }
 }
 
-/// Serial worker so version probes (1s timeout each) and installs never
+/// Serial worker so bounded version probes and installs never
 /// block the UI thread; matches the `start_image_paste_worker` pattern in
 /// app.rs. Installs are followed by a cache-bypassing rescan so rows flip
 /// without a manual Refresh.
@@ -828,13 +834,14 @@ pub fn classify_probe(provider_id: &str, probe: &ProviderProbe) -> AgentAvailabi
     let executable = probe.executable.unwrap_or_default();
     let family = capability_profile(provider_id, executable, &[]).runtime_family;
     let tuned = runtime_tuning_profile(family, Some(&version), "");
-    if tuned.verified_runtime {
+    if tuned.verified_runtime && version_banner_matches_provider(provider_id, &version) {
         return AgentAvailability::DetectedVerified { version };
     }
     // Same major.minor as a tested version with only a newer patch: the
     // usual self-update drift. Softer badge; older-than-tested or a
     // different series stays plain Detected (never grant on downgrade).
-    if let Some(tested) = tested_version_for_series(provider_id, &version)
+    if !transport_requires_exact_contract(provider_id)
+        && let Some(tested) = tested_version_for_series(provider_id, &version)
         && version.major == tested.major
         && version.minor == tested.minor
         && version.patch > tested.patch
@@ -1250,13 +1257,22 @@ fn probed_row_ui(
         AgentAvailability::Detected {
             version: Some(version),
         } => {
-            hover.push(match tested_version_for_series(row.meta.provider_id, version) {
-                Some(tested) => format!(
+            hover.push(
+                if transport_requires_exact_contract(row.meta.provider_id) {
+                    "Adam will not launch this version until its transport and permission contract is captured and verified."
+                        .into()
+                } else {
+                    match tested_version_for_series(row.meta.provider_id, version) {
+                        Some(tested) => format!(
                     "Tested version is v{}.{}.{}; this build differs — provider defaults apply until it's re-tested.",
                     tested.major, tested.minor, tested.patch
                 ),
-                None => "No captured contract for this version; provider defaults apply.".into(),
-            });
+                        None => {
+                            "No captured contract for this version; provider defaults apply.".into()
+                        }
+                    }
+                },
+            );
         }
         AgentAvailability::DetectedSeriesTested { tested, .. } => {
             hover.push(format!(
@@ -1499,9 +1515,11 @@ mod tests {
         for (provider_id, version) in [
             ("claude_cli", "2.1.128"),
             ("codex_cli", "0.144.1"),
-            ("grok_cli", "0.2.111"),
+            ("grok_cli", "grok 0.2.111"),
+            ("grok_cli", "grok 0.2.114"),
+            ("grok_cli", "grok 0.2.117"),
             ("kimi_cli", "0.31.0"),
-            ("kimi_cli", "1.49.0"),
+            ("kimi_cli", "kimi, version 1.49.0"),
             ("ollama", "0.32.1"),
         ] {
             assert!(
@@ -1522,7 +1540,7 @@ mod tests {
 
     #[test]
     fn kimi_contract_row_is_verified_despite_empty_reasoning_list() {
-        for version in ["0.31.0", "1.49.0"] {
+        for version in ["0.31.0", "kimi, version 1.49.0"] {
             assert!(matches!(
                 classify_probe("kimi_cli", &probe(Some("/bin/kimi"), Some(version))),
                 AgentAvailability::DetectedVerified { .. }
@@ -1866,9 +1884,14 @@ mod tests {
     #[test]
     fn tested_versions_mirror_the_verified_contract_rows() {
         for (provider_id, version) in TESTED_VERSIONS {
+            let banner = match *provider_id {
+                "grok_cli" => format!("grok {version}"),
+                "kimi_cli" => format!("kimi, version {version}"),
+                _ => (*version).into(),
+            };
             assert!(
                 matches!(
-                    classify_probe(provider_id, &probe(Some("/bin/stub"), Some(version))),
+                    classify_probe(provider_id, &probe(Some("/bin/stub"), Some(&banner))),
                     AgentAvailability::DetectedVerified { .. }
                 ),
                 "{provider_id} {version} must classify as verified — the display mirror has drifted from runtime_tuning_profile"
@@ -1891,28 +1914,26 @@ mod tests {
 
     #[test]
     fn newer_patch_in_a_tested_series_classifies_as_series_tested() {
-        // 0.2.117 itself is a contract row, so the series badge is
-        // demonstrated with the next patch above the tested version.
-        match classify_probe("grok_cli", &probe(Some("/bin/grok"), Some("0.2.118"))) {
+        match classify_probe("codex_cli", &probe(Some("/bin/codex"), Some("0.144.2"))) {
             AgentAvailability::DetectedSeriesTested { version, tested } => {
-                assert_eq!((version.major, version.minor, version.patch), (0, 2, 118));
-                assert_eq!((tested.major, tested.minor, tested.patch), (0, 2, 117));
+                assert_eq!((version.major, version.minor, version.patch), (0, 144, 2));
+                assert_eq!((tested.major, tested.minor, tested.patch), (0, 144, 1));
             }
             other => panic!("expected series-tested, got {other:?}"),
         }
     }
 
     #[test]
-    fn kimi_patch_drift_uses_the_matching_verified_contract_family() {
-        for (installed, expected) in [("0.31.1", (0, 31, 0)), ("1.49.1", (1, 49, 0))] {
-            match classify_probe("kimi_cli", &probe(Some("/bin/kimi"), Some(installed))) {
-                AgentAvailability::DetectedSeriesTested { tested, .. } => {
-                    assert_eq!((tested.major, tested.minor, tested.patch), expected);
-                }
-                other => {
-                    panic!("expected Kimi {installed} to match its tested series, got {other:?}")
-                }
-            }
+    fn grok_and_kimi_patch_drift_never_claims_a_runnable_series_contract() {
+        for (provider_id, binary, installed) in [
+            ("grok_cli", "/bin/grok", "0.2.118"),
+            ("kimi_cli", "/bin/kimi", "0.31.1"),
+            ("kimi_cli", "/bin/kimi", "1.49.1"),
+        ] {
+            assert!(matches!(
+                classify_probe(provider_id, &probe(Some(binary), Some(installed))),
+                AgentAvailability::Detected { version: Some(_) }
+            ));
         }
     }
 
