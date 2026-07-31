@@ -12,6 +12,7 @@ pub mod chat_core;
 pub mod clipboard;
 pub mod domain;
 pub mod dots;
+pub mod grid_view;
 pub(crate) mod grok_acp;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_image_io;

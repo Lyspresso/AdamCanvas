@@ -35,6 +35,7 @@ use crate::{
         apply_rule_edit, authorize_ai_action, auto_tag_rule_sentence, resolve_pile_memberships,
     },
     dots::{self, ChromeRects},
+    grid_view::{self, GridMetrics, GridViewState, Lightbox},
     model::{
         CanvasPage, CanvasTileStyle, DEFAULT_TILE_SIZE, FileKind, PageViewState, Tile, TileContent,
         TileKind, Workspace, WorldRect,
@@ -552,6 +553,7 @@ enum CanvasMenuAction {
     FitPage,
     FitContent,
     ToggleGrid,
+    ToggleGridView,
     ToggleSnap,
 }
 
@@ -901,6 +903,9 @@ pub struct AdamApp {
     automation_initialized: bool,
     semantic_reconcile_needed: bool,
     show_grid: bool,
+    /// Contact-sheet lens over the active page. `None` is the ordinary spatial
+    /// canvas; the grid never writes tile geometry, so toggling is free.
+    grid_view: Option<GridViewState>,
     snap_to_grid: bool,
     preferences: AppPreferences,
     dots_available: bool,
@@ -1185,6 +1190,7 @@ impl AdamApp {
             automation_initialized: false,
             semantic_reconcile_needed: true,
             show_grid: false,
+            grid_view: None,
             snap_to_grid: false,
             preferences,
             dots_available,
@@ -2054,6 +2060,17 @@ impl AdamApp {
         }
 
         let command = context.input(|input| input.modifiers.command);
+
+        // The grid view is a modal lens: it owns the keyboard while it is up,
+        // so canvas shortcuts cannot delete or move tiles you cannot see.
+        if !command && context.input(|input| input.key_pressed(Key::G)) {
+            self.toggle_grid_view();
+        }
+        if self.grid_view.is_some() {
+            self.handle_grid_view_shortcuts(context);
+            return;
+        }
+
         let import_pressed =
             context.input(|input| input.key_pressed(Key::I) || input.key_pressed(Key::O));
         if command && import_pressed {
@@ -2895,6 +2912,10 @@ impl AdamApp {
     }
 
     fn show_canvas(&mut self, root: &mut Ui) {
+        if self.grid_view.is_some() {
+            self.show_grid_view(root);
+            return;
+        }
         let context = root.ctx().clone();
         let colors = self.theme(&context);
         egui::CentralPanel::default()
@@ -3179,6 +3200,10 @@ impl AdamApp {
                         canvas_action = Some(CanvasMenuAction::FitContent);
                         ui.close();
                     }
+                    if ui.button("Grid View").clicked() {
+                        canvas_action = Some(CanvasMenuAction::ToggleGridView);
+                        ui.close();
+                    }
                     ui.separator();
                     if ui
                         .button(if self.show_grid {
@@ -3227,10 +3252,263 @@ impl AdamApp {
                     Some(CanvasMenuAction::FitPage) => self.fit_page(),
                     Some(CanvasMenuAction::FitContent) => self.fit_content(&context),
                     Some(CanvasMenuAction::ToggleGrid) => self.show_grid = !self.show_grid,
+                    Some(CanvasMenuAction::ToggleGridView) => self.toggle_grid_view(),
                     Some(CanvasMenuAction::ToggleSnap) => self.snap_to_grid = !self.snap_to_grid,
                     None => {}
                 }
             });
+    }
+
+    /// Renders the contact-sheet lens over the active page.
+    ///
+    /// This is a read-only view of tile geometry: nothing here writes
+    /// `tile.rect`, so leaving the grid restores the spatial arrangement
+    /// untouched.
+    fn show_grid_view(&mut self, root: &mut Ui) {
+        let context = root.ctx().clone();
+        let colors = self.theme(&context);
+        let reduce_motion = self.reduce_motion;
+        egui::CentralPanel::default()
+            .frame(Frame::NONE.fill(colors.desk))
+            .show(root, |ui| {
+                let available = ui.available_size().max(Vec2::splat(1.0));
+                let (response, base_painter) =
+                    ui.allocate_painter(available, Sense::click_and_drag());
+                let view = response.rect;
+                let painter = base_painter.with_clip_rect(view);
+                self.last_canvas_rect = Some(view);
+
+                let Some(mut state) = self.grid_view else {
+                    return;
+                };
+                let count = self.workspace.active_page().tiles.len();
+                let metrics = GridMetrics::compute(
+                    view.width(),
+                    count,
+                    grid_view::TARGET_CELL,
+                    grid_view::GAP,
+                    grid_view::PADDING,
+                );
+
+                // Tiles can be deleted or the page switched while the grid is
+                // open. Re-anchor the lightbox rather than indexing past the
+                // end of the new page.
+                if let Some(lightbox) = &mut state.lightbox {
+                    if count == 0 {
+                        state.lightbox = None;
+                    } else if lightbox.index >= count {
+                        lightbox.index = count - 1;
+                    }
+                }
+
+                if let Some(lightbox) = &mut state.lightbox {
+                    let delta = context.input(|input| input.stable_dt);
+                    if !lightbox.advance(delta, reduce_motion) {
+                        state.lightbox = None;
+                    } else if lightbox.is_animating() {
+                        context.request_repaint();
+                    }
+                }
+
+                // The grid scrolls; an open lightbox owns the wheel instead so
+                // the photo does not slide out from under itself.
+                if state.lightbox.is_none() && response.contains_pointer() {
+                    state.scroll -= context.input(|input| input.smooth_scroll_delta.y);
+                }
+                state.scroll = metrics.clamp_scroll(state.scroll, view.height());
+
+                let hovered = if state.lightbox.is_some() {
+                    None
+                } else {
+                    context
+                        .input(|input| input.pointer.hover_pos())
+                        .filter(|pointer| view.contains(*pointer))
+                        .and_then(|pointer| metrics.index_at(view, state.scroll, pointer))
+                };
+                if hovered.is_some() {
+                    context.set_cursor_icon(CursorIcon::PointingHand);
+                }
+
+                let pixels_per_point = context.pixels_per_point().max(1.0);
+                let focused = state.lightbox.map(|lightbox| lightbox.index);
+                let visible = metrics.visible_range(view.height(), state.scroll);
+
+                {
+                    let page = self.workspace.active_page();
+                    let selection = &self.selection;
+                    let previews = &mut self.previews;
+                    for index in visible {
+                        let Some(tile) = page.tiles.get(index) else {
+                            continue;
+                        };
+                        let rect = metrics.cell_rect(index, view, state.scroll);
+                        if !rect.intersects(view) {
+                            continue;
+                        }
+                        if focused == Some(index) {
+                            // The lightbox paints this tile itself. Leave the
+                            // slot showing so the wall keeps its shape.
+                            painter.rect_filled(
+                                rect,
+                                CornerRadius::same(4),
+                                color_with_alpha(colors.tile, 90),
+                            );
+                            continue;
+                        }
+                        draw_grid_cell(
+                            &painter,
+                            rect,
+                            tile,
+                            previews,
+                            pixels_per_point,
+                            hovered == Some(index),
+                            selection.contains(&tile.id),
+                            colors,
+                        );
+                    }
+                }
+
+                if count == 0 {
+                    painter.text(
+                        view.center(),
+                        Align2::CENTER_CENTER,
+                        "This page has no tiles yet.",
+                        FontId::proportional(15.0),
+                        colors.tertiary_text,
+                    );
+                }
+
+                let mut expanded_photo = None;
+                if let Some(lightbox) = state.lightbox {
+                    let page = self.workspace.active_page();
+                    if let Some(tile) = page.tiles.get(lightbox.index) {
+                        let cell = metrics.cell_rect(lightbox.index, view, state.scroll);
+                        let photo = draw_grid_lightbox(
+                            &painter,
+                            view,
+                            cell,
+                            tile,
+                            lightbox,
+                            &mut self.previews,
+                            pixels_per_point,
+                            colors,
+                        );
+                        draw_grid_lightbox_caption(&painter, photo, tile, lightbox, colors);
+                        expanded_photo = Some(photo);
+                    }
+                }
+
+                draw_grid_view_hint(&painter, view, count, state.lightbox.is_some(), colors);
+
+                if response.clicked() {
+                    if state.lightbox.is_some() {
+                        // Only the backdrop dismisses. Clicking the photo you
+                        // just opened should not close it again.
+                        let on_photo = context
+                            .input(|input| input.pointer.interact_pos())
+                            .zip(expanded_photo)
+                            .is_some_and(|(pointer, photo)| photo.contains(pointer));
+                        if !on_photo && let Some(lightbox) = &mut state.lightbox {
+                            lightbox.begin_close();
+                        }
+                    } else if let Some(index) = context
+                        .input(|input| input.pointer.interact_pos())
+                        .and_then(|pointer| metrics.index_at(view, state.scroll, pointer))
+                    {
+                        state.lightbox = Some(Lightbox::opening(index));
+                        context.request_repaint();
+                    }
+                }
+
+                self.grid_view = Some(state);
+            });
+    }
+
+    /// Enters or leaves the grid view. Opening always starts at the top of the
+    /// page with no photo expanded.
+    fn toggle_grid_view(&mut self) {
+        self.grid_view = match self.grid_view {
+            Some(_) => None,
+            None => Some(GridViewState::default()),
+        };
+    }
+
+    /// Grid-view key handling. Returns `true` when the grid consumed the
+    /// frame's keys, so the ordinary canvas shortcuts stay out of the way.
+    fn handle_grid_view_shortcuts(&mut self, context: &Context) -> bool {
+        let Some(mut state) = self.grid_view else {
+            return false;
+        };
+        let count = self.workspace.active_page().tiles.len();
+        let view_height = self
+            .last_canvas_rect
+            .map(|rect| rect.height())
+            .unwrap_or(1.0);
+        let metrics = GridMetrics::compute(
+            self.last_canvas_rect
+                .map(|rect| rect.width())
+                .unwrap_or(1.0),
+            count,
+            grid_view::TARGET_CELL,
+            grid_view::GAP,
+            grid_view::PADDING,
+        );
+
+        let (escape, left, right, up, down, enter) = context.input(|input| {
+            (
+                input.key_pressed(Key::Escape),
+                input.key_pressed(Key::ArrowLeft),
+                input.key_pressed(Key::ArrowRight),
+                input.key_pressed(Key::ArrowUp),
+                input.key_pressed(Key::ArrowDown),
+                input.key_pressed(Key::Enter),
+            )
+        });
+
+        if escape {
+            // First Escape closes the photo, a second leaves the grid.
+            match &mut state.lightbox {
+                Some(lightbox) if !lightbox.closing => lightbox.begin_close(),
+                _ => {
+                    self.grid_view = None;
+                    return true;
+                }
+            }
+        }
+
+        let step = match (left, right, up, down) {
+            (true, false, _, _) => Some(-1),
+            (false, true, _, _) => Some(1),
+            (_, _, true, false) => Some(-(metrics.columns as isize)),
+            (_, _, false, true) => Some(metrics.columns as isize),
+            _ => None,
+        };
+        if let Some(step) = step
+            && count > 0
+        {
+            match &mut state.lightbox {
+                Some(lightbox) => {
+                    lightbox.step(step, count);
+                    state.scroll =
+                        metrics.scroll_to_reveal(lightbox.index, view_height, state.scroll);
+                }
+                None => {
+                    // Without a photo open the arrows scroll the wall.
+                    state.scroll = metrics.clamp_scroll(
+                        state.scroll + step.signum() as f32 * metrics.cell,
+                        view_height,
+                    );
+                }
+            }
+            context.request_repaint();
+        }
+
+        if enter && state.lightbox.is_none() && count > 0 {
+            state.lightbox = Some(Lightbox::opening(0));
+        }
+
+        self.grid_view = Some(state);
+        true
     }
 
     fn show_canvas_quick_bar(&mut self, context: &Context, view: Rect, colors: Theme) -> Rect {
@@ -10819,6 +11097,295 @@ fn draw_pile_header(
         FontId::proportional(font_size),
         colors.text,
     );
+}
+
+/// Caption strip height inside a grid cell.
+const GRID_CAPTION_HEIGHT: f32 = 26.0;
+
+/// Documents read better cropped from the top — that is where the title and
+/// first lines are. Photos crop from the centre, matching the default
+/// `PhotoRecord::crop_anchor`.
+fn grid_crop_anchor(kind: FileKind) -> [f32; 2] {
+    if kind == FileKind::Image {
+        [0.5, 0.5]
+    } else {
+        [0.5, 0.0]
+    }
+}
+
+fn texture_aspect(size: Vec2) -> f32 {
+    if size.x > 0.0 && size.y > 0.0 {
+        size.x / size.y
+    } else {
+        1.0
+    }
+}
+
+/// Aspect a tile expands to in the lightbox. Photos use their source aspect so
+/// the expansion un-crops back to the real image; everything else keeps its
+/// canvas proportions so a note still looks like that note.
+fn grid_expanded_aspect(tile: &Tile, texture: Option<f32>) -> f32 {
+    texture
+        .or_else(|| tile.intrinsic_image_aspect())
+        .unwrap_or_else(|| {
+            let rect = tile.rect.normalized();
+            if rect.w > 0.0 && rect.h > 0.0 {
+                rect.w / rect.h
+            } else {
+                1.0
+            }
+        })
+}
+
+/// Paints one square cell of the contact sheet.
+#[allow(clippy::too_many_arguments)]
+fn draw_grid_cell(
+    painter: &Painter,
+    rect: Rect,
+    tile: &Tile,
+    previews: &mut PreviewCache,
+    pixels_per_point: f32,
+    hovered: bool,
+    selected: bool,
+    colors: Theme,
+) {
+    let radius = CornerRadius::same(4);
+    painter.rect_filled(rect, radius, colors.tile);
+
+    let mut painted_texture = false;
+    if let TileContent::File { path, kind } = &tile.content {
+        let projected = [
+            rect.width() * pixels_per_point,
+            rect.height() * pixels_per_point,
+        ];
+        let texture = if *kind == FileKind::Image {
+            previews.image_texture(tile.id, path, projected)
+        } else {
+            previews.quick_look_texture(tile.id, path)
+        };
+        if let Some(texture) = texture {
+            let uv = grid_view::cover_uv(
+                texture_aspect(texture.size_vec2()),
+                1.0,
+                grid_crop_anchor(*kind),
+            );
+            painter.image(texture.id(), rect, uv, Color32::WHITE);
+            painted_texture = true;
+        } else {
+            draw_file_placeholder(
+                painter,
+                rect.shrink(12.0),
+                *kind,
+                path,
+                colors.accent,
+                colors,
+                1.0,
+            );
+        }
+    } else {
+        let body = Rect::from_min_max(
+            rect.min + Vec2::splat(10.0),
+            pos2(rect.right() - 10.0, rect.bottom() - GRID_CAPTION_HEIGHT),
+        );
+        let (glyph, detail) = match &tile.content {
+            TileContent::Note { text } => ("¶", truncate(&text.replace(['\n', '\r'], " "), 64)),
+            TileContent::Website { url } => ("◍", truncate(url, 48)),
+            TileContent::Pile { .. } => ("▤", String::from("Pile")),
+            TileContent::Tag { .. } => ("◆", String::from("Tag")),
+            TileContent::AiChat { .. } => ("◎", String::from("AI chat")),
+            TileContent::File { .. } => ("", String::new()),
+        };
+        if body.height() > 30.0 {
+            painter.text(
+                pos2(body.left(), body.top()),
+                Align2::LEFT_TOP,
+                glyph,
+                FontId::proportional(20.0),
+                colors.accent,
+            );
+            painter.text(
+                pos2(body.left(), body.top() + 28.0),
+                Align2::LEFT_TOP,
+                detail,
+                FontId::proportional(11.5),
+                colors.secondary_text,
+            );
+        }
+    }
+
+    // Caption sits inside the cell so every cell stays exactly square.
+    let caption = Rect::from_min_max(
+        pos2(rect.left(), rect.bottom() - GRID_CAPTION_HEIGHT),
+        rect.max,
+    );
+    if painted_texture {
+        painter.rect_filled(
+            caption,
+            CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: radius.sw,
+                se: radius.se,
+            },
+            Color32::from_black_alpha(150),
+        );
+    }
+    let title_color = if painted_texture {
+        Color32::from_white_alpha(232)
+    } else {
+        colors.text
+    };
+    let characters = ((rect.width() - 16.0) / 6.0).max(4.0) as usize;
+    painter.text(
+        pos2(caption.left() + 8.0, caption.center().y),
+        Align2::LEFT_CENTER,
+        truncate(&tile.title, characters),
+        FontId::proportional(11.5),
+        title_color,
+    );
+
+    if selected {
+        painter.rect_stroke(
+            rect,
+            radius,
+            Stroke::new(2.0, colors.accent),
+            StrokeKind::Inside,
+        );
+    } else if hovered {
+        painter.rect_stroke(
+            rect,
+            radius,
+            Stroke::new(1.5, color_with_alpha(colors.text, 120)),
+            StrokeKind::Inside,
+        );
+    }
+}
+
+/// Expands the focused cell toward its natural aspect while walking the crop
+/// back out to the whole texture. Returns the rect the tile landed in.
+#[allow(clippy::too_many_arguments)]
+fn draw_grid_lightbox(
+    painter: &Painter,
+    view: Rect,
+    cell: Rect,
+    tile: &Tile,
+    lightbox: Lightbox,
+    previews: &mut PreviewCache,
+    pixels_per_point: f32,
+    colors: Theme,
+) -> Rect {
+    let factor = lightbox.factor();
+    painter.rect_filled(
+        view,
+        CornerRadius::ZERO,
+        Color32::from_black_alpha((216.0 * factor) as u8),
+    );
+
+    if let TileContent::File { path, kind } = &tile.content {
+        // Size the decode for the expanded photo, not the cell it grew from,
+        // or the un-crop would land on a thumbnail.
+        let target = grid_view::expanded_rect(
+            grid_expanded_aspect(tile, None),
+            view,
+            grid_view::LIGHTBOX_MARGIN,
+        );
+        let projected = [
+            target.width() * pixels_per_point,
+            target.height() * pixels_per_point,
+        ];
+        let texture = if *kind == FileKind::Image {
+            previews.image_texture(tile.id, path, projected)
+        } else {
+            previews.quick_look_texture(tile.id, path)
+        };
+        if let Some(texture) = texture {
+            let aspect = texture_aspect(texture.size_vec2());
+            let expanded = grid_view::expanded_rect(aspect, view, grid_view::LIGHTBOX_MARGIN);
+            let rect = grid_view::lerp_rect(cell, expanded, factor);
+            let cropped = grid_view::cover_uv(aspect, 1.0, grid_crop_anchor(*kind));
+            let uv = grid_view::lerp_rect(cropped, grid_view::full_uv(), factor);
+            painter.image(texture.id(), rect, uv, Color32::WHITE);
+            return rect;
+        }
+    }
+
+    // Non-photo tiles have nothing to un-crop; they simply grow to their
+    // canvas proportions.
+    let expanded = grid_view::expanded_rect(
+        grid_expanded_aspect(tile, None),
+        view,
+        grid_view::LIGHTBOX_MARGIN,
+    );
+    let rect = grid_view::lerp_rect(cell, expanded, factor);
+    painter.rect_filled(rect, CornerRadius::same(6), colors.tile);
+    if let TileContent::Note { text } = &tile.content
+        && rect.height() > 60.0
+    {
+        painter.text(
+            rect.min + Vec2::splat(18.0),
+            Align2::LEFT_TOP,
+            truncate(text, 900),
+            FontId::proportional(14.0),
+            color_with_alpha(colors.text, (255.0 * factor) as u8),
+        );
+    }
+    rect
+}
+
+fn draw_grid_lightbox_caption(
+    painter: &Painter,
+    photo: Rect,
+    tile: &Tile,
+    lightbox: Lightbox,
+    colors: Theme,
+) {
+    let factor = lightbox.factor();
+    if factor < 0.35 {
+        return;
+    }
+    let alpha = (((factor - 0.35) / 0.65).clamp(0.0, 1.0) * 235.0) as u8;
+    painter.text(
+        pos2(photo.center().x, photo.bottom() + 18.0),
+        Align2::CENTER_CENTER,
+        truncate(&tile.title, 90),
+        FontId::proportional(13.0),
+        color_with_alpha(colors.chrome_text, alpha),
+    );
+}
+
+fn draw_grid_view_hint(
+    painter: &Painter,
+    view: Rect,
+    count: usize,
+    lightbox_open: bool,
+    colors: Theme,
+) {
+    let hint = if lightbox_open {
+        "← → browse · Esc back to grid".to_string()
+    } else {
+        format!(
+            "Grid view · {count} tile{} · click to open · Esc or G to exit",
+            if count == 1 { "" } else { "s" }
+        )
+    };
+    // Lay the text out first so the pill can be sized to it, rather than
+    // painting the text twice and letting the first copy bleed through.
+    let galley = painter.layout_no_wrap(
+        hint,
+        FontId::proportional(11.5),
+        colors.chrome_secondary_text,
+    );
+    let text_min = pos2(
+        view.left() + 26.0,
+        view.bottom() - 25.0 - galley.size().y * 0.5,
+    );
+    let pill = Rect::from_min_size(text_min, galley.size()).expand2(vec2(10.0, 6.0));
+    painter.rect_filled(
+        pill,
+        CornerRadius::same(6),
+        color_with_alpha(colors.chrome, 224),
+    );
+    painter.galley(text_min, galley, colors.chrome_secondary_text);
 }
 
 fn draw_file_placeholder(
