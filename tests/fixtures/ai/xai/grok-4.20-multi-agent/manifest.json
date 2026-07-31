@@ -6,6 +6,7 @@
   "sources": [
     "https://docs.x.ai/developers/model-capabilities/text/multi-agent",
     "https://docs.x.ai/developers/rest-api-reference/inference/chat",
+    "https://docs.x.ai/developers/cost-tracking",
     "https://docs.x.ai/developers/tools/overview"
   ],
   "captures": [
@@ -41,7 +42,7 @@
   "redactions": [
     "response, message and hosted-tool ids replaced consistently",
     "prompts, source URLs and answer text are synthetic",
-    "token counts are inert schema examples; no key, account, billing or encrypted content was captured"
+    "token and cost counts are inert official-schema examples; no key, account, billing record or encrypted content was captured"
   ],
   "note": "These are not live API captures. They are deliberately marked official-schema-derived. xAI documents that only leader tool calls and the leader's final response are returned by default; Adam must not manufacture child rows from the requested 4/16 count."
 }

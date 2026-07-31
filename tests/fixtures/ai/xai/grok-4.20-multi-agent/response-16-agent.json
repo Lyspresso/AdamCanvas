@@ -33,6 +33,7 @@
       "reasoning_tokens": 320
     },
     "total_tokens": 2080,
+    "cost_in_usd_ticks": 50000000,
     "num_sources_used": 0,
     "num_server_side_tools_used": 0
   },

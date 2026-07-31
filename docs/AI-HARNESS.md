@@ -107,6 +107,8 @@ The xAI request, response, and SSE fixtures are likewise marked
 official-schema-derived, not live captures. They follow xAI’s
 [`grok-4.20-multi-agent` contract](https://docs.x.ai/developers/model-capabilities/text/multi-agent)
 and the official [Responses API schema](https://docs.x.ai/developers/rest-api-reference/inference/chat).
+Its billing fixture follows xAI’s documented
+[`usage.cost_in_usd_ticks` contract](https://docs.x.ai/developers/cost-tracking).
 The manifests retain that distinction so a synthetic fixture can never be
 mistaken for observed provider behavior.
 
@@ -269,6 +271,10 @@ The visible choices map to real provider controls:
   4 server agents and High or XHigh to 16. Adam sends the hosted
   `web_search` tool only when explicitly enabled, sends no client function
   tools, and reads its key from the temporary setting or `XAI_API_KEY`.
+  Requests set `store: true` so `previous_response_id` can continue follow-up
+  turns. That setting stores the messages sent to xAI and Grok Heavy’s
+  responses. Adam discloses the server storage beside the composer and in the
+  provider configuration; xAI documents 30-day retention by default.
   If xAI nevertheless reports an unrequested or unknown server-side hosted
   call, Adam quarantines that item without executing or projecting it as a
   local tool, preserves the leader response, and attaches one bounded provider
@@ -595,9 +601,10 @@ Context deduplicates supplied files by path and shows provider-reported tool,
 command, web-search, and host-read use counts. Usage comes from the same typed
 event stream and keeps input, cached-input, reasoning, output, and cost fields
 separate. For xAI, the exact integer `usage.cost_in_usd_ticks` value is retained
-and converted with 10,000,000,000 ticks per USD for the shared cost field. If
-older conversation turns are omitted from bounded replay, the replay meter
-says exactly how many.
+and converted with 10,000,000,000 ticks per USD for the shared cost field. Adam
+does not estimate or silently display zero when xAI omits that field; the
+inspector says that cost was not reported. If older conversation turns are
+omitted from bounded replay, the replay meter says exactly how many.
 
 ## Prompt continuity
 
@@ -642,6 +649,10 @@ turn and sends it on the next compatible turn. A changed provider, model,
 conversation generation, or failed response clears the chain. Adam never
 combines `previous_response_id` with a guessed transcript replay, and it does
 not interpret the opaque prior response as recoverable child-agent history.
+Unlike CLI-native sessions, a response ID does not carry request-level
+instructions forward. Adam therefore resends its complete standing safety and
+untrusted-data instructions on every Grok Heavy request, including resumed
+turns, without replaying transcript history.
 An xAI incomplete response is a provider error unless its exact reason is the
 known `max_output_tokens` terminal, which maps to Adam’s turn-limit outcome.
 
@@ -762,7 +773,8 @@ cannot revive a completed run.
 - Temporary API keys remain in memory and are scoped to the selected provider,
   so an xAI key cannot follow a later provider switch into a compatible HTTP
   endpoint. Grok Heavy may alternatively read `XAI_API_KEY`; the key is never
-  stored in the conversation or activity log.
+  stored in the conversation or activity log, and its runtime container’s
+  debug representation redacts the entire temporary-key map.
 - CLI providers reuse their existing local login.
 - Commands are spawned directly; Custom CLI input is not evaluated by a shell.
 - The working directory is explicit for Cowork and Code.

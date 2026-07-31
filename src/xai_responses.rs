@@ -925,6 +925,10 @@ where
     }
     let payload = data.join("\n");
     data.clear();
+    if payload.trim().is_empty() {
+        *event_name = None;
+        return Ok(());
+    }
     let decoded = decode_xai_responses_event(event_name.as_deref(), &payload)?;
     *event_name = None;
     state.apply(decoded, request, emit)
@@ -1860,6 +1864,10 @@ mod tests {
             .get("previous_response_id")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        request.instructions = expected
+            .get("instructions")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         request.web_search = expected.get("tools").is_some();
         assert_eq!(build_xai_responses_body(&request).unwrap(), expected);
     }
@@ -1915,6 +1923,28 @@ mod tests {
     }
 
     #[test]
+    fn resumed_request_fixtures_keep_standing_instructions() {
+        for fixture in [
+            include_str!("../tests/fixtures/ai/xai/grok-4.20-multi-agent/request-medium-4.json"),
+            include_str!("../tests/fixtures/ai/xai/grok-4.20-multi-agent/request-xhigh-16.json"),
+        ] {
+            let value: Value = serde_json::from_str(fixture).unwrap();
+            assert!(
+                value
+                    .get("previous_response_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| !id.trim().is_empty())
+            );
+            assert!(
+                value
+                    .get("instructions")
+                    .and_then(Value::as_str)
+                    .is_some_and(|instructions| !instructions.trim().is_empty())
+            );
+        }
+    }
+
+    #[test]
     fn checked_in_stream_and_json_fixtures_replay_through_the_decoder() {
         let (four, four_events) = replay_sse_fixture(
             include_str!("../tests/fixtures/ai/xai/grok-4.20-multi-agent/responses-4-agent.sse"),
@@ -1923,6 +1953,8 @@ mod tests {
         );
         assert_eq!(four.expected_agent_count, 4);
         assert_eq!(four.text, "Four-agent research synthesis.");
+        assert_eq!(four.usage.cost_in_usd_ticks, Some(12_500_000));
+        assert_eq!(four.usage.cost_usd(), Some(0.00125));
         assert!(four_events.iter().any(|event| matches!(
             event,
             XaiResponsesEvent::LeaderToolStarted { name, .. } if name == "web_search"
@@ -1935,6 +1967,8 @@ mod tests {
         );
         assert_eq!(sixteen.expected_agent_count, 16);
         assert_eq!(sixteen.text, "Sixteen-agent deep research synthesis.");
+        assert_eq!(sixteen.usage.cost_in_usd_ticks, Some(50_000_000));
+        assert_eq!(sixteen.usage.cost_usd(), Some(0.005));
         assert!(
             !sixteen_events
                 .iter()
@@ -1951,6 +1985,10 @@ mod tests {
         );
         assert_eq!(four_json.expected_agent_count, 4);
         assert_eq!(sixteen_json.expected_agent_count, 16);
+        assert_eq!(four_json.usage.cost_in_usd_ticks, Some(12_500_000));
+        assert_eq!(four_json.usage.cost_usd(), Some(0.00125));
+        assert_eq!(sixteen_json.usage.cost_in_usd_ticks, Some(50_000_000));
+        assert_eq!(sixteen_json.usage.cost_usd(), Some(0.005));
 
         let manifest: Value = serde_json::from_str(include_str!(
             "../tests/fixtures/ai/xai/grok-4.20-multi-agent/manifest.json"
@@ -2060,6 +2098,33 @@ mod tests {
     }
 
     #[test]
+    fn blank_sse_data_keepalives_do_not_abort_a_completed_response() {
+        let request = request(XaiReasoningEffort::High);
+        let mut state = ResponseState::new(EffectiveLimits::new(&request.limits).unwrap());
+        let stream = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            "data:\n\n",
+            "event: ping\n",
+            "data: \n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"finished\"}]}]}}\n\n"
+        );
+
+        read_sse_response(
+            stream.as_bytes(),
+            &mut state,
+            &request,
+            &AtomicBool::new(false),
+            None,
+            &mut |_| {},
+        )
+        .unwrap();
+        let outcome = state.finish(&request, &mut |_| {}).unwrap();
+
+        assert_eq!(outcome.response_id, "resp_1");
+        assert_eq!(outcome.text, "finished");
+    }
+
+    #[test]
     fn completed_fixture_reconciles_text_usage_and_session() {
         let request = request(XaiReasoningEffort::High);
         let limits = EffectiveLimits::new(&request.limits).unwrap();
@@ -2093,6 +2158,18 @@ mod tests {
                 .iter()
                 .any(|event| format!("{event:?}").contains("Child"))
         );
+    }
+
+    #[test]
+    fn missing_provider_cost_remains_unknown_instead_of_becoming_zero() {
+        let outcome = replay_json_fixture(
+            r#"{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}"#,
+            XaiReasoningEffort::Low,
+        );
+
+        assert_eq!(outcome.usage.input_tokens, Some(10));
+        assert_eq!(outcome.usage.cost_in_usd_ticks, None);
+        assert_eq!(outcome.usage.cost_usd(), None);
     }
 
     #[test]
