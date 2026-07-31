@@ -1901,10 +1901,10 @@ mod tests {
     #[test]
     fn series_tested_label_names_both_versions() {
         let label = availability_label(&AgentAvailability::DetectedSeriesTested {
-            version: CliVersion::parse("0.2.114").expect("version"),
-            tested: CliVersion::parse("0.2.111").expect("version"),
+            version: CliVersion::parse("0.2.115").expect("version"),
+            tested: CliVersion::parse("0.2.114").expect("version"),
         });
-        assert_eq!(label, "Detected v0.2.114 · tested series (v0.2.111)");
+        assert_eq!(label, "Detected v0.2.115 · tested series (v0.2.114)");
     }
 
     #[test]
