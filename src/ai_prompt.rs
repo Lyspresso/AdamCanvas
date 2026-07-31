@@ -121,8 +121,8 @@ pub struct SystemInstructions {
 /// Ordered per-turn notices.
 ///
 /// Replay order is task mode, tools-off, first-turn orientation, memory, then
-/// task-tool guidance. Resume repeats only task mode and tools-off because the
-/// provider session already holds session-stable and replay-derived material.
+/// task-tool guidance. Resume repeats task mode, tools-off, and task-tool
+/// guidance; provider sessions already hold the other stable orientation.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PromptNotices {
     pub task_mode: Option<String>,
@@ -265,13 +265,16 @@ pub fn build_prompt(input: &PromptInput) -> BuiltPrompt {
 
     push_optional(&mut parts, input.notices.task_mode.as_deref());
     push_optional(&mut parts, input.notices.tools_off.as_deref());
+    // App-owned task tools are run-scoped. Repeat their usage guidance on
+    // native resume turns so a provider cannot silently lose the checklist
+    // contract after the first request.
+    push_optional(&mut parts, input.notices.task_tool_hint.as_deref());
 
     if input.continuity == PromptContinuity::Replay {
         if input.history.is_empty() {
             push_optional(&mut parts, input.notices.first_turn_orientation.as_deref());
         }
         push_optional(&mut parts, input.notices.memory_hint.as_deref());
-        push_optional(&mut parts, input.notices.task_tool_hint.as_deref());
 
         if selection.kept_turns > 0 {
             if selection.omitted_turns > 0 {
@@ -671,10 +674,10 @@ mod tests {
         assert_before(prompt, BEHAVIOR_HEADER, "FINAL BEHAVIOR RULE");
         assert_before(prompt, "FINAL BEHAVIOR RULE", "TASK MODE");
         assert_before(prompt, "TASK MODE", "TOOLS OFF");
-        assert_before(prompt, "TOOLS OFF", "FIRST TURN ORIENTATION");
+        assert_before(prompt, "TOOLS OFF", "TASK TOOL HINT");
+        assert_before(prompt, "TASK TOOL HINT", "FIRST TURN ORIENTATION");
         assert_before(prompt, "FIRST TURN ORIENTATION", "MEMORY HINT");
-        assert_before(prompt, "MEMORY HINT", "TASK TOOL HINT");
-        assert_before(prompt, "TASK TOOL HINT", "WORKSPACE BLOCK");
+        assert_before(prompt, "MEMORY HINT", "WORKSPACE BLOCK");
         assert_before(prompt, "WORKSPACE BLOCK", "ATTACHMENT CONTENT");
         assert_before(prompt, "ATTACHMENT CONTENT", "NEW MESSAGE");
         assert!(prompt.contains(PERSONA_AUTHORITY_HAND_BACK));
@@ -747,7 +750,6 @@ mod tests {
             "FINAL BEHAVIOR RULE",
             "FIRST TURN ORIENTATION",
             "MEMORY HINT",
-            "TASK TOOL HINT",
             "OLD USER TURN",
             TRANSCRIPT_HEADER,
         ] {
@@ -756,6 +758,7 @@ mod tests {
         for retained in [
             "TASK MODE",
             "TOOLS OFF",
+            "TASK TOOL HINT",
             "WORKSPACE BLOCK",
             "ATTACHMENT CONTENT",
             "NEW MESSAGE",

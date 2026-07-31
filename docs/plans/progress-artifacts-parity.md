@@ -28,7 +28,7 @@ Verified against EarlIt source (`AgentTaskStore.swift`, `AgentActivityModels.swi
 
 - Three agent-facing tools, **no delete**: `task_create{content required, activeForm}` → returns `task_id`; `task_update{task_id required, status, content, activeForm}` — **unknown id creates** with that id; `task_list{}` read-only, emits no events.
 - Every mutating call emits **two** events: a `TaskMutation` (transcript row) then a `PlanUpdate` carrying the **entire re-reduced list**. Whole-list snapshots, never deltas — the accumulator replaces the previous plan in place.
-- Statuses: `pending | inProgress | completed | cancelled`. `activeForm` is present-continuous ("Synthesizing findings…") and is what the UI shows while in progress.
+- Statuses: `pending | in_progress | completed | cancelled`. `activeForm` is present-continuous ("Synthesizing findings…") and is what the UI shows while in progress. *(Wire spelling aligned 2026-07-30 to Adam's implementation and provider spellings; EarlIt's Swift source uses `inProgress`, which is the same status, not a different one.)*
 - Origin tracking: `Native` vs `AppTools`. A native snapshot **replaces** native-origin rows; app-tool rows survive and re-append after. Adam already implements this in `merge_plan_snapshot` — keep it.
 - **Exposure gate:** an agent sees exactly one channel. Claude/Codex CLIs → native plan stream, task tools withheld. Grok/custom/HTTP → task tools exposed, gated at tool-list time AND call time. Fail closed for dead runs.
 - Field hygiene: trim, reject empty, cap field bytes (EarlIt: 512), reject unknown arguments.
@@ -50,10 +50,13 @@ Verified against EarlIt source (`AgentTaskStore.swift`, `AgentActivityModels.swi
 - Persist live snapshots with the turn; relaunch restores.
 - Task tools remain independent of canvas access.
 
+*PR 2 merged 2026-07-30 (77467b4) after re-review; carried P2 follow-ups: Grok `{slug}-{hash}`/`.cwd` long-path session discovery, replay tool-call map accounting vs max_events, permission-tool label preservation on PermissionResolved, >512-byte native task ids, stale denied-permission diagnostic clearing.*
+
 ### PR 3 — `codex/subagent-progress`
 - Child lifecycle with stable child ids + parent linkage; every task/text event scoped `Main` or a specific child.
 - Aggregate line ("3/5 done · 2 working"); expandable child detail; child checklist **only** from real child task events; otherwise status + current activity — never invented steps.
 - Per-child prose cells; **re-enabling Grok subagents requires a genuinely scoped child channel** (e.g. the session updates file, which does carry `subagent_id`/`child_session_id`) — live stdout cannot provide it on Grok 0.2.111 (see PR 1 deviation). `supports_scoped_child_text` flips per version only with fixture proof.
+- *Candidate channel (pending PR 2 review, 2026-07-30):* Codex's in-flight work adds a Grok **ACP** (Agent Client Protocol) transport (`src/grok_acp.rs`) that may supersede session-file polling and provide the scoped channel directly. Not yet accepted spec — evaluated on evidence (fixtures + tests) when PR 2 opens; if accepted, this section's mechanism updates accordingly.
 
 ### PR 4 — `codex/artifacts`
 - User-facing rename Outputs → Artifacts. Sources: confirmed successful `FileChange` (failed/declined excluded) + **created** canvas entities (emit `HostMutation` from production canvas tools; creations only — annotate/move don't count).
@@ -62,6 +65,7 @@ Verified against EarlIt source (`AgentTaskStore.swift`, `AgentActivityModels.swi
 
 ### PR 5 — `task-rail` (Claude, `work/claude`)
 - Card rail per the target structure; Resources collapsed by default; Activity/diagnostics moved out of Progress.
+  *Shipped 2026-07-30:* the stepper; Activity relocated out of the Progress card; cards renamed Agents/Artifacts (rename moved up from PR 4's scope — rendering is Claude's lane); Working folder demoted — count dropped from its header, opens only when a folder is needed but unset; header status chip now reflects the terminal outcome (Completed / Stopped / Needs attention). Working folder + Context remain sibling collapsed cards rather than one Resources wrapper — same demotion intent, simpler tree.
 - EarlIt stepper grammar: filled circle + check (done) / stroked circle + spinner (active, label = `activeForm`) / hollow circle (pending) / slash (cancelled); short connector stub under each glyph; completed rows full-strength text, others secondary, cancelled struck.
 - Empty states: live-run-no-plan → spinner + elapsed timer; idle → decorative placeholder + "Steps will show as the task unfolds."; finished-without-checklist → "Completed without a checklist." (never bare "No task list yet." on a finished run); persisted plan on idle → "Task complete."
 - Accessibility: AccessKit labels, contrast, reduced-motion (static glyph instead of spinner), large-text reflow.
@@ -80,6 +84,6 @@ Verified against EarlIt source (`AgentTaskStore.swift`, `AgentActivityModels.swi
 
 ## Conflict protocol for this effort
 
-`src/app.rs` is the shared hot file. Codex PRs 1–2 should avoid the inspector render functions (`render_ai_workspace_panel` and its section fns); Claude's PR 5 stays inside them + new widget modules. PR 3/4 card-content handoffs: Codex lands the projection/data change first, Claude follows with rendering. Merge order: 1 → 2 → (3, 5 in parallel) → 4.
+`src/app.rs` is the shared hot file. Codex PRs 1–2 should avoid the inspector render functions (`render_ai_inspector` and its section fns); Claude's PR 5 stays inside them + new widget modules. PR 3/4 card-content handoffs: Codex lands the projection/data change first, Claude follows with rendering. Merge order: 1 → 2 → (3, 5 in parallel) → 4.
 
-**Fixed points from the Agents-panel insert (branch `work/claude-agents`, outside this effort's numbering):** `src/ai.rs` gained one additive accessor — `pub struct ProviderProbe` + `pub fn probe_installed_provider(provider_id: &str, refresh: bool)` + a private cache-invalidation helper, placed directly after `clamp_provider_preferences` — and `src/app.rs` gained the module `src/agents_panel.rs`'s wiring: `agents: AgentsPanelState` field, a poll in `fn logic`, `show_agents_panel`, one quick-bar slot, `AiWorkspaceUiAction.open_agents_panel`, and one `preflight` parameter threaded into `render_ai_chat_page`. PR 2 should treat these as fixed points; none of them touch stream handling or projections. The follow-up branch `work/claude-agents-install` additionally threads an `AgentsChatView` parameter through `render_ai_chat_page`, embeds an `AgentsPanelAction` in `AiWorkspaceUiAction`, and conditionally renders the chat empty state as the agents setup screen — still no contact with stream handling or projections.
+**Fixed points from the Agents-panel insert (branch `work/claude-agents`, outside this effort's numbering):** `src/ai.rs` gained one additive accessor — `pub struct ProviderProbe` + `pub fn probe_installed_provider(provider_id: &str, refresh: bool)` + a private cache-invalidation helper, placed directly after `clamp_provider_preferences` — and `src/app.rs` gained the module `src/agents_panel.rs`'s wiring: `agents: AgentsPanelState` field, a poll in `fn logic`, `show_agents_panel`, one quick-bar slot, `AiWorkspaceUiAction.open_agents_panel`, and one `preflight` parameter threaded into `render_ai_chat_page`. PR 2 should treat these as fixed points; none of them touch stream handling or projections. *(Stack ordering note resolved 2026-07-30: PR 2 merged first as planned; PR A merged with post-PR-2 main by the integrator (merge commit, history preserved).)* The follow-up branch `work/claude-agents-install` additionally threads an `AgentsChatView` parameter through `render_ai_chat_page`, embeds an `AgentsPanelAction` in `AiWorkspaceUiAction`, and conditionally renders the chat empty state as the agents setup screen — still no contact with stream handling or projections.
