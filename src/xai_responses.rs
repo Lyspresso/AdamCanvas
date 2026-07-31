@@ -29,6 +29,7 @@ const HARD_MAX_OUTPUT_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const HARD_MAX_PROVIDER_MESSAGE_BYTES: usize = 16 * 1024;
 const HARD_MAX_LEADER_TOOL_CALLS: usize = 256;
 const HARD_MAX_WALL_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const UNREQUESTED_TOOL_NOTICE: &str = "xAI reported a server-side tool call that Adam did not enable. Adam did not expose or execute a local tool, and preserved the leader response.";
 
 /// The xAI effort spelling accepted by the multi-agent model.
 ///
@@ -243,6 +244,9 @@ pub struct XaiResponsesOutcome {
     pub response_id: String,
     pub usage: XaiUsage,
     pub expected_agent_count: u32,
+    /// A bounded provider-contract notice retained on an otherwise successful
+    /// response. Adam never executes quarantined output items locally.
+    pub provider_notice: Option<String>,
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
@@ -481,7 +485,7 @@ where
 
     let result = run_xai_responses_inner(request, cancelled, read_in_progress, &mut emit);
     let (status, detail) = match &result {
-        Ok(_) => (XaiGroupStatus::Completed, None),
+        Ok(outcome) => (XaiGroupStatus::Completed, outcome.provider_notice.clone()),
         Err(error) => (error.group_status(), Some(public_error_detail(error))),
     };
     emit(XaiResponsesEvent::GroupFinished {
@@ -814,6 +818,7 @@ struct ResponseState {
     tools: HashMap<String, LeaderTool>,
     terminal: Option<TerminalResponse>,
     saw_done_marker: bool,
+    quarantined_unrequested_tool: bool,
 }
 
 impl ResponseState {
@@ -826,6 +831,7 @@ impl ResponseState {
             tools: HashMap::new(),
             terminal: None,
             saw_done_marker: false,
+            quarantined_unrequested_tool: false,
         }
     }
 
@@ -863,18 +869,18 @@ impl ResponseState {
                 self.start_output_item(index, &item, request, emit)?;
             }
             XaiDecodedEvent::OutputItemDone { index, item } => {
-                self.finish_output_item(index, &item, emit)?;
+                self.finish_output_item(index, &item, request, emit)?;
             }
             XaiDecodedEvent::WebSearchProgress { item_id, phase } => {
-                self.update_web_search(&item_id, &phase, emit)?;
+                self.update_web_search(&item_id, &phase, request, emit)?;
             }
             XaiDecodedEvent::ResponseCompleted { response } => {
-                self.capture_terminal_response(&response, emit)?;
+                self.capture_terminal_response(&response, request, emit)?;
                 self.finish_open_tools(false, emit);
                 self.terminal = Some(TerminalResponse::Completed);
             }
             XaiDecodedEvent::ResponseIncomplete { response } => {
-                self.capture_terminal_response(&response, emit)?;
+                self.capture_terminal_response(&response, request, emit)?;
                 self.finish_open_tools(true, emit);
                 self.terminal = Some(TerminalResponse::Incomplete(incomplete_reason(&response)));
             }
@@ -952,11 +958,13 @@ impl ResponseState {
     fn capture_terminal_response<E>(
         &mut self,
         response: &Value,
+        request: &XaiResponsesRequest,
         emit: &mut E,
     ) -> Result<(), XaiResponsesError>
     where
         E: FnMut(XaiResponsesEvent),
     {
+        self.inspect_terminal_output_items(response, request)?;
         self.capture_response_id_from_value(response, emit)?;
         let complete_text = collect_output_text(response);
         if !complete_text.is_empty() {
@@ -974,6 +982,28 @@ impl ResponseState {
             }
         }
         self.capture_usage(response, emit);
+        Ok(())
+    }
+
+    fn inspect_terminal_output_items(
+        &mut self,
+        response: &Value,
+        request: &XaiResponsesRequest,
+    ) -> Result<(), XaiResponsesError> {
+        for item in response
+            .get("output")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+            if is_client_tool_call(item_type) {
+                return Err(unexpected_client_tool_error());
+            }
+            if is_unrequested_call_item(item_type, request) {
+                self.quarantine_unrequested_tool();
+            }
+        }
         Ok(())
     }
 
@@ -1015,24 +1045,15 @@ impl ResponseState {
         if matches!(item_type, "message" | "reasoning") {
             return Ok(());
         }
-        if item_type == "function_call" || item_type == "custom_tool_call" {
-            return Err(XaiResponsesError::Protocol(
-                "provider returned a client-side function call even though Adam exposed none"
-                    .into(),
-            ));
+        if is_client_tool_call(item_type) {
+            return Err(unexpected_client_tool_error());
         }
-        if item_type != "web_search_call" {
-            if item_type.ends_with("_call") {
-                return Err(XaiResponsesError::Protocol(format!(
-                    "provider returned unsupported hosted tool type {item_type}"
-                )));
-            }
+        if is_unrequested_call_item(item_type, request) {
+            self.quarantine_unrequested_tool();
             return Ok(());
         }
-        if !request.web_search {
-            return Err(XaiResponsesError::Protocol(
-                "provider invoked web_search although it was not enabled".into(),
-            ));
+        if item_type != "web_search_call" {
+            return Ok(());
         }
         let id = output_item_id(index, item)?;
         if !self.tools.contains_key(&id) {
@@ -1062,12 +1083,20 @@ impl ResponseState {
         &mut self,
         index: Option<u64>,
         item: &Value,
+        request: &XaiResponsesRequest,
         emit: &mut E,
     ) -> Result<(), XaiResponsesError>
     where
         E: FnMut(XaiResponsesEvent),
     {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if is_client_tool_call(item_type) {
+            return Err(unexpected_client_tool_error());
+        }
+        if is_unrequested_call_item(item_type, request) {
+            self.quarantine_unrequested_tool();
+            return Ok(());
+        }
         if item_type != "web_search_call" {
             return Ok(());
         }
@@ -1094,11 +1123,16 @@ impl ResponseState {
         &mut self,
         item_id: &str,
         phase: &str,
+        request: &XaiResponsesRequest,
         emit: &mut E,
     ) -> Result<(), XaiResponsesError>
     where
         E: FnMut(XaiResponsesEvent),
     {
+        if !request.web_search {
+            self.quarantine_unrequested_tool();
+            return Ok(());
+        }
         validate_id("web_search item_id", item_id)?;
         let Some(tool) = self.tools.get_mut(item_id) else {
             // `output_item.added` is the ownership/start event. Refuse to
@@ -1123,6 +1157,10 @@ impl ResponseState {
             });
         }
         Ok(())
+    }
+
+    fn quarantine_unrequested_tool(&mut self) {
+        self.quarantined_unrequested_tool = true;
     }
 
     fn finish_open_tools<E>(&mut self, is_error: bool, emit: &mut E)
@@ -1167,6 +1205,9 @@ impl ResponseState {
                     response_id,
                     usage: self.usage,
                     expected_agent_count: xai_multi_agent_count(request.reasoning_effort),
+                    provider_notice: self
+                        .quarantined_unrequested_tool
+                        .then(|| UNREQUESTED_TOOL_NOTICE.into()),
                 })
             }
             Some(TerminalResponse::Incomplete(reason)) => Err(XaiResponsesError::Incomplete {
@@ -1299,6 +1340,20 @@ fn validate_id(field: &str, value: &str) -> Result<(), XaiResponsesError> {
 
 fn response_value(value: &Value) -> &Value {
     value.get("response").unwrap_or(value)
+}
+
+fn is_client_tool_call(item_type: &str) -> bool {
+    matches!(item_type, "function_call" | "custom_tool_call")
+}
+
+fn is_unrequested_call_item(item_type: &str, request: &XaiResponsesRequest) -> bool {
+    item_type.ends_with("_call") && !(item_type == "web_search_call" && request.web_search)
+}
+
+fn unexpected_client_tool_error() -> XaiResponsesError {
+    XaiResponsesError::Protocol(
+        "provider returned a client-side function call even though Adam exposed none".into(),
+    )
 }
 
 fn output_item_id(index: Option<u64>, item: &Value) -> Result<String, XaiResponsesError> {
@@ -1825,20 +1880,142 @@ mod tests {
     }
 
     #[test]
-    fn unexpected_function_call_fails_closed() {
+    fn unrequested_hosted_calls_are_quarantined_without_tool_projection() {
         let request = request(XaiReasoningEffort::Low);
         let mut state = ResponseState::new(EffectiveLimits::new(&request.limits).unwrap());
-        let error = state
+        let mut events = Vec::new();
+
+        for event in [
+            XaiDecodedEvent::OutputItemAdded {
+                index: None,
+                item: json!({"type":"web_search_call","status":"in_progress"}),
+            },
+            XaiDecodedEvent::WebSearchProgress {
+                item_id: String::new(),
+                phase: "searching".into(),
+            },
+            XaiDecodedEvent::OutputItemDone {
+                index: None,
+                item: json!({"type":"web_search_call","status":"completed"}),
+            },
+        ] {
+            state
+                .apply(event, &request, &mut |event| events.push(event))
+                .unwrap();
+        }
+        for _ in 0..300 {
+            state
+                .apply(
+                    XaiDecodedEvent::OutputItemAdded {
+                        index: None,
+                        item: json!({"type":"x_search_call"}),
+                    },
+                    &request,
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+        }
+        state
             .apply(
-                XaiDecodedEvent::OutputItemAdded {
-                    index: Some(0),
-                    item: json!({"id":"fn_1","type":"function_call","name":"delete_file"}),
+                XaiDecodedEvent::OutputTextDelta {
+                    delta: "preserved".into(),
+                },
+                &request,
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        state
+            .apply(
+                XaiDecodedEvent::ResponseCompleted {
+                    response: json!({
+                        "id":"resp_quarantined",
+                        "status":"completed",
+                        "output":[
+                            {"type":"code_interpreter_call"},
+                            {"type":"message","content":[{"type":"output_text","text":"preserved"}]}
+                        ]
+                    }),
+                },
+                &request,
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+
+        assert!(state.tools.is_empty());
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            XaiResponsesEvent::LeaderToolStarted { .. }
+                | XaiResponsesEvent::LeaderToolUpdated { .. }
+                | XaiResponsesEvent::LeaderToolFinished { .. }
+        )));
+        let outcome = state.finish(&request, &mut |_| {}).unwrap();
+        assert_eq!(outcome.text, "preserved");
+        assert_eq!(outcome.response_id, "resp_quarantined");
+        assert_eq!(
+            outcome.provider_notice.as_deref(),
+            Some(UNREQUESTED_TOOL_NOTICE)
+        );
+
+        let mut nonstream = ResponseState::new(EffectiveLimits::new(&request.limits).unwrap());
+        nonstream
+            .apply(
+                XaiDecodedEvent::ResponseCompleted {
+                    response: json!({
+                        "id":"resp_nonstream",
+                        "status":"completed",
+                        "output":[
+                            {"type":"mcp_call"},
+                            {"type":"message","content":[{"type":"output_text","text":"also preserved"}]}
+                        ]
+                    }),
                 },
                 &request,
                 &mut |_| {},
             )
-            .unwrap_err();
-        assert!(matches!(error, XaiResponsesError::Protocol(_)));
+            .unwrap();
+        assert_eq!(
+            nonstream
+                .finish(&request, &mut |_| {})
+                .unwrap()
+                .provider_notice
+                .as_deref(),
+            Some(UNREQUESTED_TOOL_NOTICE)
+        );
+    }
+
+    #[test]
+    fn unexpected_client_function_and_custom_calls_fail_closed() {
+        let request = request(XaiReasoningEffort::Low);
+        for item_type in ["function_call", "custom_tool_call"] {
+            let mut state = ResponseState::new(EffectiveLimits::new(&request.limits).unwrap());
+            let error = state
+                .apply(
+                    XaiDecodedEvent::OutputItemAdded {
+                        index: Some(0),
+                        item: json!({"id":"fn_1","type":item_type,"name":"delete_file"}),
+                    },
+                    &request,
+                    &mut |_| {},
+                )
+                .unwrap_err();
+            assert!(matches!(error, XaiResponsesError::Protocol(_)));
+
+            let mut terminal = ResponseState::new(EffectiveLimits::new(&request.limits).unwrap());
+            let error = terminal
+                .apply(
+                    XaiDecodedEvent::ResponseCompleted {
+                        response: json!({
+                            "id":"resp_client_tool",
+                            "status":"completed",
+                            "output":[{"id":"fn_1","type":item_type,"name":"delete_file"}]
+                        }),
+                    },
+                    &request,
+                    &mut |_| {},
+                )
+                .unwrap_err();
+            assert!(matches!(error, XaiResponsesError::Protocol(_)));
+        }
     }
 
     #[test]
@@ -1969,6 +2146,69 @@ mod tests {
                 status: XaiGroupStatus::Completed,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn transport_preserves_answer_when_provider_reports_disabled_hosted_tool() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request_text = read_request(&mut stream);
+            assert!(request_text.contains("POST /v1/responses HTTP/1.1"));
+            assert!(!request_text.contains("\"tools\""));
+            let body = concat!(
+                "event: response.created\n",
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_quarantined_live\"}}\n\n",
+                "event: response.output_item.added\n",
+                "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"ws_unrequested\",\"type\":\"web_search_call\",\"status\":\"in_progress\"}}\n\n",
+                "event: response.web_search_call.searching\n",
+                "data: {\"type\":\"response.web_search_call.searching\",\"item_id\":\"ws_unrequested\",\"output_index\":0}\n\n",
+                "event: response.output_item.done\n",
+                "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"id\":\"ws_unrequested\",\"type\":\"web_search_call\",\"status\":\"completed\"}}\n\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"preserved answer\"}\n\n",
+                "event: response.completed\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_quarantined_live\",\"status\":\"completed\",\"output\":[{\"id\":\"ws_unrequested\",\"type\":\"web_search_call\",\"status\":\"completed\"},{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"preserved answer\"}]}]}}\n\n"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let mut request = request(XaiReasoningEffort::Low);
+        request.endpoint = Url::parse(&format!("http://{address}/v1/responses")).unwrap();
+        let mut events = Vec::new();
+        let outcome = run_xai_responses(&request, &AtomicBool::new(false), |event| {
+            events.push(event)
+        })
+        .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(outcome.text, "preserved answer");
+        assert_eq!(outcome.response_id, "resp_quarantined_live");
+        assert_eq!(
+            outcome.provider_notice.as_deref(),
+            Some(UNREQUESTED_TOOL_NOTICE)
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            XaiResponsesEvent::LeaderToolStarted { .. }
+                | XaiResponsesEvent::LeaderToolUpdated { .. }
+                | XaiResponsesEvent::LeaderToolFinished { .. }
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(XaiResponsesEvent::GroupFinished {
+                status: XaiGroupStatus::Completed,
+                detail: Some(detail),
+                ..
+            }) if detail == UNREQUESTED_TOOL_NOTICE
         ));
     }
 
