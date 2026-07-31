@@ -35,7 +35,7 @@ use crate::{
         apply_rule_edit, authorize_ai_action, auto_tag_rule_sentence, resolve_pile_memberships,
     },
     dots::{self, ChromeRects},
-    grid_view::{self, CellShape, GridMetrics, GridViewState, Lightbox},
+    grid_view::{self, CellShape, GridViewState, Lightbox, ZoomMode},
     model::{
         CanvasPage, CanvasTileStyle, DEFAULT_TILE_SIZE, FileKind, PageViewState, Tile, TileContent,
         TileKind, Workspace, WorldRect,
@@ -2170,6 +2170,7 @@ impl AdamApp {
         let mut fit_content_clicked = false;
         let mut reset_zoom_clicked = false;
         let mut grid_shape_clicked = None;
+        let mut grid_mode_clicked = None;
 
         let toolbar = egui::Panel::top("adam-toolbar")
             .exact_size(TOOLBAR_HEIGHT)
@@ -2236,6 +2237,25 @@ impl AdamApp {
                             {
                                 grid_shape_clicked = Some(shape);
                             }
+                        }
+                        ui.separator();
+                        let reflowing = grid.mode == ZoomMode::Reflow;
+                        if ui
+                            .add(Button::new("Reflow").selected(reflowing))
+                            .on_hover_text(if reflowing {
+                                "On: zooming out packs more columns in. \
+                                 Click to magnify the wall instead."
+                            } else {
+                                "Off: zooming magnifies the wall. Click to make \
+                                 zooming out pack more columns in instead."
+                            })
+                            .clicked()
+                        {
+                            grid_mode_clicked = Some(if reflowing {
+                                ZoomMode::Magnify
+                            } else {
+                                ZoomMode::Reflow
+                            });
                         }
                         reset_zoom_clicked = ui
                             .add(Button::new(format!("{:.0}%", grid.camera.zoom * 100.0)))
@@ -2447,6 +2467,9 @@ impl AdamApp {
         }
         if let Some(shape) = grid_shape_clicked {
             self.set_grid_cell_shape(shape);
+        }
+        if let Some(mode) = grid_mode_clicked {
+            self.set_grid_zoom_mode(mode);
         }
         if reset_zoom_clicked {
             if self.grid_view.is_some() {
@@ -3313,14 +3336,6 @@ impl AdamApp {
                     return;
                 };
                 let count = self.workspace.active_page().tiles.len();
-                let metrics = GridMetrics::compute(
-                    view.width(),
-                    count,
-                    grid_view::TARGET_CELL,
-                    grid_view::GAP,
-                    grid_view::PADDING,
-                    state.shape,
-                );
 
                 // Tiles can be deleted or the page switched while the grid is
                 // open. Re-anchor the lightbox rather than indexing past the
@@ -3353,7 +3368,7 @@ impl AdamApp {
                             .unwrap_or_else(|| view.center());
                         let zoom_delta = context.input(|input| input.zoom_delta());
                         if zoom_delta != 1.0 {
-                            state.camera.zoom_by(zoom_delta, pointer, view);
+                            state.apply_zoom(zoom_delta, pointer, view, count);
                         } else {
                             let scroll = context.input(|input| input.smooth_scroll_delta);
                             if scroll != Vec2::ZERO {
@@ -3368,6 +3383,9 @@ impl AdamApp {
                         context.set_cursor_icon(CursorIcon::Grabbing);
                     }
                 }
+                // Zooming may have re-flowed the wall out from under the
+                // metrics above, so re-derive before clamping or hit-testing.
+                let metrics = state.metrics(view.width(), count);
                 state.camera = state.camera.clamped(metrics.content, view);
 
                 let hovered = if state.lightbox.is_some() {
@@ -3464,6 +3482,7 @@ impl AdamApp {
                     view,
                     count,
                     state.shape,
+                    state.mode,
                     state.camera.zoom,
                     state.lightbox.is_some(),
                     colors,
@@ -3509,37 +3528,19 @@ impl AdamApp {
         let Some(mut state) = self.grid_view else {
             return;
         };
-        if state.shape == shape {
-            return;
-        }
         let view = self.last_canvas_rect.unwrap_or(Rect::ZERO);
         let count = self.workspace.active_page().tiles.len();
-        let before = GridMetrics::compute(
-            view.width(),
-            count,
-            grid_view::TARGET_CELL,
-            grid_view::GAP,
-            grid_view::PADDING,
-            state.shape,
-        );
-        let after = GridMetrics::compute(
-            view.width(),
-            count,
-            grid_view::TARGET_CELL,
-            grid_view::GAP,
-            grid_view::PADDING,
-            shape,
-        );
-        // Carry the top row across by rescaling the vertical offset against
-        // each shape's row pitch.
-        let before_pitch = before.cell.y + before.gap;
-        let after_pitch = after.cell.y + after.gap;
-        if before_pitch > 0.0 {
-            let rows_down = (state.camera.offset.y - before.padding) / before_pitch;
-            state.camera.offset.y = after.padding + rows_down * after_pitch;
-        }
-        state.shape = shape;
-        state.camera = state.camera.clamped(after.content, view);
+        state.set_shape(shape, view, count);
+        self.grid_view = Some(state);
+    }
+
+    fn set_grid_zoom_mode(&mut self, mode: ZoomMode) {
+        let Some(mut state) = self.grid_view else {
+            return;
+        };
+        let view = self.last_canvas_rect.unwrap_or(Rect::ZERO);
+        let count = self.workspace.active_page().tiles.len();
+        state.set_mode(mode, view, count);
         self.grid_view = Some(state);
     }
 
@@ -3559,14 +3560,7 @@ impl AdamApp {
         };
         let count = self.workspace.active_page().tiles.len();
         let view = self.last_canvas_rect.unwrap_or(Rect::ZERO);
-        let metrics = GridMetrics::compute(
-            view.width(),
-            count,
-            grid_view::TARGET_CELL,
-            grid_view::GAP,
-            grid_view::PADDING,
-            state.shape,
-        );
+        let metrics = state.metrics(view.width(), count);
 
         let (command, escape, left, right, up, down, enter) = context.input(|input| {
             (
@@ -3583,10 +3577,10 @@ impl AdamApp {
         if command {
             if context.input(|input| input.key_pressed(Key::Plus) || input.key_pressed(Key::Equals))
             {
-                state.camera.zoom_by(1.2, view.center(), view);
+                state.apply_zoom(1.2, view.center(), view, count);
             }
             if context.input(|input| input.key_pressed(Key::Minus)) {
-                state.camera.zoom_by(1.0 / 1.2, view.center(), view);
+                state.apply_zoom(1.0 / 1.2, view.center(), view, count);
             }
             if context.input(|input| input.key_pressed(Key::Num0)) {
                 state.camera.zoom = 1.0;
@@ -3638,6 +3632,8 @@ impl AdamApp {
             state.lightbox = Some(Lightbox::opening(0));
         }
 
+        // Re-derive: a Command-zoom above may have re-flowed the wall.
+        let metrics = state.metrics(view.width(), count);
         state.camera = state.camera.clamped(metrics.content, view);
         self.grid_view = Some(state);
         true
@@ -11501,6 +11497,7 @@ fn draw_grid_view_hint(
     view: Rect,
     count: usize,
     shape: CellShape,
+    mode: ZoomMode,
     zoom: f32,
     lightbox_open: bool,
     colors: Theme,
@@ -11509,9 +11506,13 @@ fn draw_grid_view_hint(
         "← → browse · Esc back to grid".to_string()
     } else {
         format!(
-            "Grid view · {count} tile{} · {} · {:.0}% · drag to pan · pinch to zoom · Esc or G to exit",
+            "Grid view · {count} tile{} · {} · {} · {:.0}% · click to open · Esc or G to exit",
             if count == 1 { "" } else { "s" },
             shape.label().to_lowercase(),
+            match mode {
+                ZoomMode::Magnify => "drag to pan, pinch to zoom",
+                ZoomMode::Reflow => "pinch to change how many fit",
+            },
             zoom * 100.0
         )
     };

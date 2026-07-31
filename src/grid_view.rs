@@ -62,6 +62,53 @@ impl CellShape {
     }
 }
 
+/// What zooming does to the wall.
+///
+/// The two modes differ only in the width the wall is laid out at, which is
+/// enough to change the whole character of the gesture.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ZoomMode {
+    /// The wall keeps its column count and is magnified. Zooming past 100%
+    /// makes it wider than the viewport, which is what opens up sideways
+    /// panning.
+    #[default]
+    Magnify,
+    /// The wall always spans the viewport exactly, so zooming out shrinks the
+    /// cells and packs **more columns** in — rows that were below the fold get
+    /// pulled up into the space at the sides instead of leaving empty margins.
+    /// Nothing ever overflows horizontally, so there is nothing to pan to.
+    Reflow,
+}
+
+impl ZoomMode {
+    /// Width, in layout points, that the wall is laid out at.
+    pub fn layout_width(self, view_width: f32, zoom: f32) -> f32 {
+        let view_width = if view_width.is_finite() {
+            view_width.max(1.0)
+        } else {
+            1.0
+        };
+        match self {
+            Self::Magnify => view_width,
+            Self::Reflow => {
+                let zoom = if zoom.is_finite() && zoom > 0.0 {
+                    zoom.clamp(GridCamera::MIN_ZOOM, GridCamera::MAX_ZOOM)
+                } else {
+                    1.0
+                };
+                (view_width / zoom).max(1.0)
+            }
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Magnify => "Magnify",
+            Self::Reflow => "Reflow",
+        }
+    }
+}
+
 /// The uv rect covering an entire texture.
 pub fn full_uv() -> Rect {
     Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0))
@@ -208,6 +255,35 @@ impl GridMetrics {
             .saturating_mul(columns)
             .min(self.count);
         start..end.max(start)
+    }
+
+    /// First cell of the topmost row touching the viewport.
+    ///
+    /// Re-flowing moves every tile to a different row, so this is the anchor
+    /// to preserve across a zoom change — without it, zooming out jumps you to
+    /// an unrelated part of a long page.
+    pub fn top_index(&self, offset_y: f32) -> usize {
+        if self.count == 0 {
+            return 0;
+        }
+        let step = self.cell.y + self.gap;
+        if !step.is_finite() || step <= 0.0 || !offset_y.is_finite() {
+            return 0;
+        }
+        // Divide by the pitch alone, with no padding term: `offset_for_row_of`
+        // already subtracts the padding, so these two are exact inverses.
+        // Clamp to a real row before multiplying — a wild offset casts to a
+        // saturated usize, and row * columns would then overflow.
+        // The nudge matters: `row * step` then `/ step` lands a hair under the
+        // integer in f32, so a bare floor() reports the row above.
+        let row = (offset_y / step + 1e-3).floor().max(0.0) as usize;
+        let row = row.min(self.rows.saturating_sub(1));
+        row.saturating_mul(self.columns.max(1)).min(self.count - 1)
+    }
+
+    /// Vertical offset that puts `index`'s row at the top of the viewport.
+    pub fn offset_for_row_of(&self, index: usize) -> f32 {
+        self.cell_rect(index).top() - self.padding
     }
 
     /// Smallest camera offset change that brings `index` fully into view. Used
@@ -489,8 +565,67 @@ impl Lightbox {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GridViewState {
     pub shape: CellShape,
+    pub mode: ZoomMode,
     pub camera: GridCamera,
     pub lightbox: Option<Lightbox>,
+}
+
+impl GridViewState {
+    /// Metrics for the wall as it currently stands.
+    pub fn metrics(&self, view_width: f32, count: usize) -> GridMetrics {
+        GridMetrics::compute(
+            self.mode.layout_width(view_width, self.camera.zoom),
+            count,
+            TARGET_CELL,
+            GAP,
+            PADDING,
+            self.shape,
+        )
+    }
+
+    /// Applies a change that re-flows the wall, keeping the row you were
+    /// reading at the top. Every such change moves tiles between rows, so
+    /// without this a toggle drops you somewhere unrelated in a long page.
+    fn reanchored(&mut self, view: Rect, count: usize, change: impl FnOnce(&mut Self)) {
+        let before = self.metrics(view.width(), count);
+        let anchor = before.top_index(self.camera.offset.y);
+        change(self);
+        let after = self.metrics(view.width(), count);
+        self.camera.offset.y = after.offset_for_row_of(anchor);
+        self.camera = self.camera.clamped(after.content, view);
+    }
+
+    /// Zooms, preserving whatever the user is looking at.
+    ///
+    /// Magnify anchors on the pointer, since the layout does not move.
+    /// Reflow cannot — the column count itself changes — so it anchors on the
+    /// top row instead.
+    pub fn apply_zoom(&mut self, factor: f32, pointer: Pos2, view: Rect, count: usize) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        match self.mode {
+            ZoomMode::Magnify => self.camera.zoom_by(factor, pointer, view),
+            ZoomMode::Reflow => self.reanchored(view, count, |state| {
+                state.camera.zoom =
+                    (state.camera.zoom * factor).clamp(GridCamera::MIN_ZOOM, GridCamera::MAX_ZOOM);
+                // A reflowed wall never overflows sideways.
+                state.camera.offset.x = 0.0;
+            }),
+        }
+    }
+
+    pub fn set_shape(&mut self, shape: CellShape, view: Rect, count: usize) {
+        if self.shape != shape {
+            self.reanchored(view, count, |state| state.shape = shape);
+        }
+    }
+
+    pub fn set_mode(&mut self, mode: ZoomMode, view: Rect, count: usize) {
+        if self.mode != mode {
+            self.reanchored(view, count, |state| state.mode = mode);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -684,6 +819,238 @@ mod tests {
             metrics(0, CellShape::Square).visible_range(0.0, 600.0),
             0..0
         );
+    }
+
+    #[test]
+    fn reflow_turns_zooming_out_into_more_columns_rather_than_empty_margins() {
+        let view_width = 1000.0;
+        let count = 200;
+        let at = |mode: ZoomMode, zoom: f32| {
+            GridMetrics::compute(
+                mode.layout_width(view_width, zoom),
+                count,
+                TARGET_CELL,
+                GAP,
+                PADDING,
+                CellShape::Square,
+            )
+        };
+
+        let resting = at(ZoomMode::Reflow, 1.0);
+        let out = at(ZoomMode::Reflow, 0.5);
+        assert!(
+            out.columns > resting.columns,
+            "zooming out should add columns: {} -> {}",
+            resting.columns,
+            out.columns
+        );
+        assert!(out.rows < resting.rows, "more columns means fewer rows");
+
+        // Magnify keeps the wall as it was and just scales it.
+        assert_eq!(at(ZoomMode::Magnify, 0.5).columns, resting.columns);
+        assert_eq!(at(ZoomMode::Magnify, 2.0).columns, resting.columns);
+
+        // Zooming in under reflow goes the other way: fewer, bigger cells.
+        let inward = at(ZoomMode::Reflow, 2.0);
+        assert!(inward.columns < resting.columns);
+    }
+
+    #[test]
+    fn a_reflowed_wall_always_spans_the_viewport_so_nothing_pans_sideways() {
+        let view = view();
+        for zoom in [0.35, 0.5, 1.0, 2.0, 5.0] {
+            let metrics = GridMetrics::compute(
+                ZoomMode::Reflow.layout_width(view.width(), zoom),
+                200,
+                TARGET_CELL,
+                GAP,
+                PADDING,
+                CellShape::Square,
+            );
+            let camera = GridCamera {
+                zoom,
+                offset: vec2(400.0, 0.0),
+            }
+            .clamped(metrics.content, view);
+            assert!(
+                camera.offset.x.abs() < 0.01,
+                "reflow at zoom {zoom} should not pan sideways, got {}",
+                camera.offset.x
+            );
+            // On-screen the wall is exactly viewport-wide at every zoom.
+            let painted = metrics.content.x * zoom;
+            assert!(
+                (painted - view.width()).abs() < 0.5,
+                "reflow at zoom {zoom} painted {painted} wide, viewport is {}",
+                view.width()
+            );
+        }
+    }
+
+    #[test]
+    fn reflow_layout_width_survives_a_broken_zoom_or_viewport() {
+        for zoom in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let width = ZoomMode::Reflow.layout_width(1000.0, zoom);
+            assert!(
+                width.is_finite() && width > 0.0,
+                "bad width for zoom {zoom}"
+            );
+        }
+        for view_width in [0.0, -10.0, f32::NAN] {
+            for mode in [ZoomMode::Magnify, ZoomMode::Reflow] {
+                let width = mode.layout_width(view_width, 1.0);
+                assert!(width.is_finite() && width > 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn the_top_row_survives_a_reflow() {
+        let view_width = 1000.0;
+        let count = 400;
+        let before = GridMetrics::compute(
+            ZoomMode::Reflow.layout_width(view_width, 1.0),
+            count,
+            TARGET_CELL,
+            GAP,
+            PADDING,
+            CellShape::Square,
+        );
+        // Scrolled well down the wall.
+        let offset_y = before.content.y * 0.4;
+        let anchor = before.top_index(offset_y);
+        assert!(anchor > 0, "test needs to be scrolled off the first row");
+
+        let after = GridMetrics::compute(
+            ZoomMode::Reflow.layout_width(view_width, 0.5),
+            count,
+            TARGET_CELL,
+            GAP,
+            PADDING,
+            CellShape::Square,
+        );
+        let carried = after.offset_for_row_of(anchor);
+        // The anchor tile's row becomes the top row. It need not be first in
+        // that row — re-flowing changes the column count, so a tile that
+        // started a row before may now sit mid-row.
+        assert!(
+            (after.cell_rect(anchor).top() - carried - after.padding).abs() < 0.01,
+            "anchor row did not land at the top of the viewport"
+        );
+        assert!(
+            after.top_index(carried) <= anchor,
+            "the top row must start at or before the anchor tile"
+        );
+        assert!(
+            anchor - after.top_index(carried) < after.columns,
+            "the anchor tile must still be within the top row"
+        );
+
+        // The two are exact inverses on any row start, in both modes and
+        // shapes — the property the whole re-anchoring depends on.
+        for shape in [CellShape::Square, CellShape::Portrait] {
+            for zoom in [0.35, 0.5, 1.0, 2.0] {
+                let metrics = GridMetrics::compute(
+                    ZoomMode::Reflow.layout_width(view_width, zoom),
+                    count,
+                    TARGET_CELL,
+                    GAP,
+                    PADDING,
+                    shape,
+                );
+                for row in 0..metrics.rows {
+                    let start = row * metrics.columns;
+                    assert_eq!(
+                        metrics.top_index(metrics.offset_for_row_of(start)),
+                        start,
+                        "row {row} did not round-trip at zoom {zoom}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn top_index_is_safe_on_an_empty_or_broken_wall() {
+        assert_eq!(metrics(0, CellShape::Square).top_index(500.0), 0);
+        let metrics = metrics(10, CellShape::Square);
+        assert_eq!(metrics.top_index(f32::NAN), 0);
+        assert_eq!(metrics.top_index(-999.0), 0);
+        assert!(metrics.top_index(f32::MAX) < 10);
+    }
+
+    #[test]
+    fn every_reflowing_change_keeps_you_on_the_row_you_were_reading() {
+        let view = view();
+        let count = 400;
+        // Each case is a change that moves tiles between rows.
+        let changes: Vec<(&str, fn(&mut GridViewState, Rect, usize))> = vec![
+            ("shape", |state, view, count| {
+                state.set_shape(CellShape::Portrait, view, count)
+            }),
+            ("mode", |state, view, count| {
+                state.set_mode(ZoomMode::Reflow, view, count)
+            }),
+            ("zoom out", |state, view, count| {
+                state.mode = ZoomMode::Reflow;
+                state.apply_zoom(0.5, view.center(), view, count)
+            }),
+            ("zoom in", |state, view, count| {
+                state.mode = ZoomMode::Reflow;
+                state.apply_zoom(2.0, view.center(), view, count)
+            }),
+        ];
+
+        for (name, change) in changes {
+            let mut state = GridViewState::default();
+            let before = state.metrics(view.width(), count);
+            state.camera.offset.y = before.content.y * 0.4;
+            let anchor = before.top_index(state.camera.offset.y);
+            assert!(anchor > 0, "{name}: test must start scrolled down");
+
+            change(&mut state, view, count);
+
+            let after = state.metrics(view.width(), count);
+            let top = after.top_index(state.camera.offset.y);
+            assert!(
+                top <= anchor && anchor - top < after.columns,
+                "{name}: anchor {anchor} left the top row (which starts at {top})"
+            );
+            assert!(state.camera.offset.y.is_finite());
+        }
+    }
+
+    #[test]
+    fn magnify_zoom_still_anchors_on_the_pointer_not_the_top_row() {
+        let view = view();
+        let mut state = GridViewState::default();
+        assert_eq!(state.mode, ZoomMode::Magnify);
+        let pointer = pos2(700.0, 450.0);
+        let before = state.camera.to_layout(pointer, view);
+        state.apply_zoom(1.8, pointer, view, 300);
+        let after = state.camera.to_layout(pointer, view);
+        assert!((after.x - before.x).abs() < 0.01 && (after.y - before.y).abs() < 0.01);
+        // ...and magnifying leaves the column count alone.
+        assert_eq!(
+            state.metrics(view.width(), 300).columns,
+            GridViewState::default().metrics(view.width(), 300).columns
+        );
+    }
+
+    #[test]
+    fn a_broken_zoom_factor_is_ignored_rather_than_poisoning_the_camera() {
+        let view = view();
+        for mode in [ZoomMode::Magnify, ZoomMode::Reflow] {
+            for factor in [0.0, -2.0, f32::NAN, f32::INFINITY] {
+                let mut state = GridViewState {
+                    mode,
+                    ..Default::default()
+                };
+                state.apply_zoom(factor, view.center(), view, 100);
+                assert!(state.camera.zoom.is_finite() && state.camera.zoom > 0.0);
+                assert!(state.camera.offset.x.is_finite() && state.camera.offset.y.is_finite());
+            }
+        }
     }
 
     #[test]
