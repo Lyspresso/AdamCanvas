@@ -2219,6 +2219,16 @@ impl<'a> ProtocolState<'a> {
             update_kind,
             "subagent_spawned" | "subagent_progress" | "subagent_finished"
         );
+        if self.child_tracking_degraded && lifecycle_update {
+            let unknown_child = update_kind == "subagent_spawned"
+                || update
+                    .get("child_session_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|child_session_id| !self.children.contains_key(child_session_id));
+            if unknown_child {
+                return Ok(());
+            }
+        }
         let scoped_event_id_required = matches!(
             update_kind,
             "agent_message_chunk"
@@ -3081,6 +3091,14 @@ impl<'a> ProtocolState<'a> {
             self.permission_scope(params)?.ok_or_else(|| {
                 GrokAcpError::Protocol("permission request used an unknown session ID".into())
             })?;
+        if self.child_tracking_degraded && envelope_scope == GrokAcpSessionScope::Root {
+            // Once child projection has degraded, a root envelope can no
+            // longer prove whether a tool belongs to the root or to a dropped
+            // child. Installed Grok legitimately uses root envelopes for
+            // child permissions, so cancel every ambiguous root-envelope
+            // request instead of risking an authority upgrade.
+            return Ok(None);
+        }
         let tool_call = params
             .get("toolCall")
             .ok_or_else(|| GrokAcpError::Protocol("permission request omitted toolCall".into()))
@@ -6174,6 +6192,21 @@ mod tests {
     fn cumulative_child_registry_degrades_without_aborting_the_root_turn() {
         let mut state = scoped_state();
         let mut events = Vec::new();
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "known-root-tool",
+                        "title": "Root write",
+                        "kind": "edit",
+                        "status": "pending"
+                    }
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
         for index in 0..MAX_TRACKED_CHILDREN {
             let subagent_id = format!("agent-{index}");
             let child_session_id = format!("child-{index}");
@@ -6183,6 +6216,24 @@ mod tests {
                     &mut |event| events.push(event),
                 )
                 .unwrap();
+            if index == 0 {
+                state
+                    .apply_session_update(
+                        &json!({
+                            "sessionId": child_session_id.clone(),
+                            "update": {
+                                "sessionUpdate": "tool_call",
+                                "toolCallId": "known-child-tool",
+                                "title": "Child write",
+                                "kind": "edit",
+                                "status": "pending"
+                            },
+                            "_meta": {"eventId": "known-child-tool-event"}
+                        }),
+                        &mut |event| events.push(event),
+                    )
+                    .unwrap();
+            }
             state
                 .apply_session_update(
                     &finish_update(&subagent_id, &child_session_id, &format!("finish-{index}")),
@@ -6217,7 +6268,16 @@ mod tests {
             .unwrap();
         state
             .apply_session_update(
-                &finish_update("agent-overflow", "child-overflow", "finish-overflow"),
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "subagent_finished",
+                        "subagent_id": "agent-overflow",
+                        "parent_session_id": "root",
+                        "child_session_id": "child-overflow",
+                        "status": "completed"
+                    }
+                }),
                 &mut |event| events.push(event),
             )
             .unwrap();
@@ -6227,24 +6287,30 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            state
-                .parse_permission_request(&json!({
-                    "sessionId": "root",
-                    "toolCall": {
-                        "toolCallId": "untracked-child-tool",
-                        "title": "Write file",
-                        "kind": "edit"
-                    },
-                    "options": [{
-                        "optionId": "allow",
-                        "name": "Allow once",
-                        "kind": "allow_once"
-                    }]
-                }))
-                .unwrap()
-                .is_none()
-        );
+        for tool_call_id in [
+            "known-root-tool",
+            "known-child-tool",
+            "untracked-child-tool",
+        ] {
+            assert!(
+                state
+                    .parse_permission_request(&json!({
+                        "sessionId": "root",
+                        "toolCall": {
+                            "toolCallId": tool_call_id,
+                            "title": "Write file",
+                            "kind": "edit"
+                        },
+                        "options": [{
+                            "optionId": "allow",
+                            "name": "Allow once",
+                            "kind": "allow_once"
+                        }]
+                    }))
+                    .unwrap()
+                    .is_none()
+            );
+        }
         state
             .apply_session_update(
                 &json!({
