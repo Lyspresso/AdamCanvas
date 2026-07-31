@@ -639,19 +639,25 @@ impl ActivityAccumulator {
     }
 
     pub fn ingest(&mut self, incoming: ActivityEvent) {
-        // 1. Consecutive text or thinking deltas merge and keep the first
-        // record's identity/start time, but never cross an actor boundary.
+        // 1. Main assistant text and actor-scoped thinking may arrive as
+        // deltas, so consecutive chunks merge without replacing identity.
+        // Child AssistantText is already one adapter-aggregated response cell
+        // and must remain distinct from the child's next response.
         if let Some(last) = self.events.last_mut() {
-            match (&mut last.kind, &incoming.kind, last.scope == incoming.scope) {
+            let same_scope = last.scope == incoming.scope;
+            let main_scope = last.scope.is_main();
+            match (&mut last.kind, &incoming.kind, same_scope, main_scope) {
                 (
                     ActivityKind::AssistantText { text: existing },
                     ActivityKind::AssistantText { text: delta },
+                    true,
                     true,
                 )
                 | (
                     ActivityKind::Thinking { text: existing },
                     ActivityKind::Thinking { text: delta },
                     true,
+                    _,
                 ) => {
                     existing.push_str(delta);
                     return;
@@ -2799,6 +2805,31 @@ mod tests {
                 text: "Read docs".into()
             }
         );
+    }
+
+    #[test]
+    fn child_assistant_text_is_a_complete_response_cell() {
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest(child_event(
+            1,
+            10,
+            "child-1",
+            ActivityKind::AssistantText {
+                text: "First response".into(),
+            },
+        ));
+        accumulator.ingest(child_event(
+            2,
+            20,
+            "child-1",
+            ActivityKind::AssistantText {
+                text: "Second response".into(),
+            },
+        ));
+
+        assert_eq!(accumulator.len(), 2);
+        assert_eq!(accumulator.events[0].id, Uuid::from_u128(1));
+        assert_eq!(accumulator.events[1].id, Uuid::from_u128(2));
     }
 
     #[test]

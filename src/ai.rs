@@ -2553,6 +2553,9 @@ struct OutputDecoder {
     subagent_aliases: HashMap<String, String>,
     subagent_messages: HashMap<String, String>,
     subagent_output_bytes: usize,
+    claude_child_streamed_text: HashMap<String, String>,
+    claude_child_pending_text: Vec<(String, String)>,
+    claude_child_streamed_thinking_bytes: HashMap<String, usize>,
     grok_tool_names: HashMap<String, String>,
     grok_native_plan: Vec<PlanItem>,
     codex_streamed_items: HashSet<String>,
@@ -2604,6 +2607,9 @@ impl OutputDecoder {
             subagent_aliases: HashMap::new(),
             subagent_messages: HashMap::new(),
             subagent_output_bytes: 0,
+            claude_child_streamed_text: HashMap::new(),
+            claude_child_pending_text: Vec::new(),
+            claude_child_streamed_thinking_bytes: HashMap::new(),
             grok_tool_names: HashMap::new(),
             grok_native_plan: Vec::new(),
             codex_streamed_items: HashSet::new(),
@@ -2694,11 +2700,14 @@ impl OutputDecoder {
                 if self.poisoned {
                     self.emit_stream_reset(&mut emit);
                     self.refresh_poison_salvage(&mut emit);
-                } else if self.output.is_empty() && self.valid_json_lines == 0 {
-                    let salvage = self.cleaned_raw_salvage();
-                    if !salvage.is_empty() {
-                        self.record_assistant_text(salvage, false, false, &mut emit);
+                } else {
+                    if self.output.is_empty() && self.valid_json_lines == 0 {
+                        let salvage = self.cleaned_raw_salvage();
+                        if !salvage.is_empty() {
+                            self.record_assistant_text(salvage, false, false, &mut emit);
+                        }
                     }
+                    self.flush_claude_child_text(&mut emit);
                 }
             }
         }
@@ -2748,7 +2757,8 @@ impl OutputDecoder {
                 self.non_empty_lines = self.non_empty_lines.saturating_add(1);
                 self.valid_json_lines = self.valid_json_lines.saturating_add(1);
                 self.consecutive_non_json = 0;
-                let result = self.decode_provider_event(&value);
+                let mut result = self.decode_provider_event(&value);
+                self.prepend_claude_pending_child_text(&mut result.kinds);
                 if !result.recognized {
                     self.skipped_unknown = self.skipped_unknown.saturating_add(1);
                 }
@@ -2775,7 +2785,9 @@ impl OutputDecoder {
                             emit(Decoded::Activity(scoped_activity_event(scope, kind)));
                         }
                         kind @ ActivityKind::Thinking { .. } => {
-                            self.saw_thinking_delta |= result.thinking_delta;
+                            if scope.is_main() {
+                                self.saw_thinking_delta |= result.thinking_delta;
+                            }
                             emit(Decoded::Activity(scoped_activity_event(scope, kind)));
                         }
                         kind @ ActivityKind::SessionInfo { .. } => {
@@ -3397,6 +3409,19 @@ impl OutputDecoder {
         current
     }
 
+    fn claude_envelope_scope(&self, value: &Value) -> Option<AgentScope> {
+        let parent = value
+            .get("parent_tool_use_id")
+            .or_else(|| value.get("parentToolUseId"));
+        match parent {
+            None | Some(Value::Null) => Some(AgentScope::Main),
+            Some(Value::String(id)) if !id.trim().is_empty() => Some(AgentScope::Child {
+                id: self.canonical_subagent_id(id),
+            }),
+            Some(_) => None,
+        }
+    }
+
     fn bind_subagent_alias(&mut self, alias: String, canonical_id: String) {
         if !alias.is_empty() && alias != canonical_id {
             self.subagent_aliases.insert(alias, canonical_id);
@@ -3414,6 +3439,14 @@ impl OutputDecoder {
             metadata.status.is_some_and(SubagentStatus::is_terminal) && !status.is_terminal();
         if resumed {
             self.subagent_messages.remove(canonical_id);
+            if let Some(buffered) = self.claude_child_streamed_text.remove(canonical_id) {
+                self.claude_child_pending_text
+                    .push((canonical_id.to_owned(), buffered));
+            }
+        }
+        if resumed || status.is_terminal() {
+            self.claude_child_streamed_thinking_bytes
+                .remove(canonical_id);
         }
         if incoming.detail.is_none() && (resumed || status.is_terminal()) {
             metadata.detail = None;
@@ -3469,6 +3502,169 @@ impl OutputDecoder {
         self.subagent_messages
             .insert(canonical_id.to_owned(), text.clone());
         Some(text)
+    }
+
+    fn remember_claude_child_text_delta(
+        &mut self,
+        canonical_id: &str,
+        text: &str,
+    ) -> Option<String> {
+        if text.is_empty() || self.subagent_output_bytes >= MAX_SUBAGENT_OUTPUT_BYTES {
+            return None;
+        }
+        let message_bytes = self
+            .claude_child_streamed_text
+            .get(canonical_id)
+            .map_or(0, String::len);
+        let message_remaining = MAX_SUBAGENT_MESSAGE_BYTES.saturating_sub(message_bytes);
+        let total_remaining = MAX_SUBAGENT_OUTPUT_BYTES - self.subagent_output_bytes;
+        let bounded = truncate_utf8(text, message_remaining.min(total_remaining));
+        if bounded.is_empty() {
+            return None;
+        }
+        self.subagent_output_bytes = self.subagent_output_bytes.saturating_add(bounded.len());
+        let streamed = self
+            .claude_child_streamed_text
+            .entry(canonical_id.to_owned())
+            .or_default();
+        streamed.push_str(bounded);
+        Some(bounded.to_owned())
+    }
+
+    fn remember_claude_child_thinking_delta(
+        &mut self,
+        canonical_id: &str,
+        text: &str,
+    ) -> Option<String> {
+        if text.is_empty() || self.subagent_output_bytes >= MAX_SUBAGENT_OUTPUT_BYTES {
+            return None;
+        }
+        let message_bytes = self
+            .claude_child_streamed_thinking_bytes
+            .get(canonical_id)
+            .copied()
+            .unwrap_or_default();
+        let message_remaining = MAX_SUBAGENT_MESSAGE_BYTES.saturating_sub(message_bytes);
+        let total_remaining = MAX_SUBAGENT_OUTPUT_BYTES - self.subagent_output_bytes;
+        let bounded = truncate_utf8(text, message_remaining.min(total_remaining));
+        if bounded.is_empty() {
+            return None;
+        }
+        self.subagent_output_bytes = self.subagent_output_bytes.saturating_add(bounded.len());
+        self.claude_child_streamed_thinking_bytes
+            .insert(canonical_id.to_owned(), message_bytes + bounded.len());
+        Some(bounded.to_owned())
+    }
+
+    fn complete_claude_child_thinking(&mut self, canonical_id: &str, text: &str) -> Option<String> {
+        if self
+            .claude_child_streamed_thinking_bytes
+            .remove(canonical_id)
+            .is_some()
+            || text.is_empty()
+            || self.subagent_output_bytes >= MAX_SUBAGENT_OUTPUT_BYTES
+        {
+            return None;
+        }
+        let per_message = truncate_utf8(text, MAX_SUBAGENT_MESSAGE_BYTES);
+        let total_remaining = MAX_SUBAGENT_OUTPUT_BYTES - self.subagent_output_bytes;
+        let bounded = truncate_utf8(per_message, total_remaining);
+        if bounded.is_empty() {
+            return None;
+        }
+        self.subagent_output_bytes = self.subagent_output_bytes.saturating_add(bounded.len());
+        Some(bounded.to_owned())
+    }
+
+    fn complete_claude_child_text(&mut self, canonical_id: &str, text: String) -> Option<String> {
+        let streamed = self.claude_child_streamed_text.remove(canonical_id);
+        if let Some(streamed) = &streamed {
+            // Streamed child text is buffered, not emitted. Replace its
+            // provisional byte charge with the authoritative assistant
+            // snapshot so revised or multi-block snapshots remain bounded.
+            self.subagent_output_bytes = self.subagent_output_bytes.saturating_sub(streamed.len());
+        }
+        let candidate = if text.trim().is_empty() {
+            streamed.unwrap_or_default()
+        } else {
+            text
+        };
+        if candidate.trim().is_empty() || self.subagent_output_bytes >= MAX_SUBAGENT_OUTPUT_BYTES {
+            return None;
+        }
+        let per_message = truncate_utf8(&candidate, MAX_SUBAGENT_MESSAGE_BYTES);
+        let remaining = MAX_SUBAGENT_OUTPUT_BYTES - self.subagent_output_bytes;
+        let bounded = truncate_utf8(per_message, remaining);
+        if bounded.trim().is_empty() {
+            return None;
+        }
+        self.subagent_output_bytes = self.subagent_output_bytes.saturating_add(bounded.len());
+        let remembered = bounded.to_owned();
+        self.subagent_messages
+            .insert(canonical_id.to_owned(), remembered.clone());
+        Some(remembered)
+    }
+
+    fn complete_or_dedupe_claude_child_result(
+        &mut self,
+        canonical_id: &str,
+        text: String,
+    ) -> Option<String> {
+        if self.claude_child_streamed_text.contains_key(canonical_id) {
+            self.complete_claude_child_text(canonical_id, text)
+        } else if self
+            .subagent_messages
+            .get(canonical_id)
+            .is_some_and(|existing| claude_terminal_result_repeats(existing, &text))
+        {
+            None
+        } else {
+            self.remember_subagent_message(canonical_id, text)
+        }
+    }
+
+    fn prepend_claude_pending_child_text(&mut self, kinds: &mut DecodedActivities) {
+        if self.claude_child_pending_text.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.claude_child_pending_text);
+        let mut prefix = pending
+            .into_iter()
+            .filter(|(_, text)| !text.trim().is_empty())
+            .map(|(child_id, text)| DecodedActivity {
+                scope: AgentScope::Child { id: child_id },
+                kind: ActivityKind::AssistantText { text },
+            })
+            .collect::<Vec<_>>();
+        prefix.append(&mut kinds.0);
+        kinds.0 = prefix;
+    }
+
+    fn flush_claude_child_text(&mut self, emit: &mut impl FnMut(Decoded)) {
+        for (child_id, text) in std::mem::take(&mut self.claude_child_pending_text) {
+            if text.trim().is_empty() {
+                continue;
+            }
+            emit(Decoded::Activity(scoped_activity_event(
+                AgentScope::Child { id: child_id },
+                ActivityKind::AssistantText { text },
+            )));
+        }
+        let mut pending = std::mem::take(&mut self.claude_child_streamed_text)
+            .into_iter()
+            .collect::<Vec<_>>();
+        pending.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (child_id, text) in pending {
+            if text.trim().is_empty() {
+                continue;
+            }
+            self.subagent_messages
+                .insert(child_id.clone(), text.clone());
+            emit(Decoded::Activity(scoped_activity_event(
+                AgentScope::Child { id: child_id },
+                ActivityKind::AssistantText { text },
+            )));
+        }
     }
 
     fn decode_grok(&mut self, value: &Value) -> JsonDecodeResult {
@@ -3820,6 +4016,11 @@ impl OutputDecoder {
                 self.decode_claude_tool_progress(value, &mut decoded);
             }
             Some("stream_event") => {
+                let Some(scope) = self.claude_envelope_scope(value) else {
+                    decoded.recognized = true;
+                    return decoded;
+                };
+                let child_id = scope.child_id().map(str::to_owned);
                 let delta = value.pointer("/event/delta");
                 match delta
                     .and_then(|delta| delta.get("type"))
@@ -3832,9 +4033,18 @@ impl OutputDecoder {
                             .and_then(|delta| delta.get("text"))
                             .and_then(Value::as_str)
                         {
-                            decoded.kinds.push(ActivityKind::AssistantText {
-                                text: text.to_owned(),
-                            });
+                            let text = if let Some(child_id) = child_id.as_deref() {
+                                let _ = self.remember_claude_child_text_delta(child_id, text);
+                                None
+                            } else {
+                                Some(text.to_owned())
+                            };
+                            if let Some(text) = text {
+                                decoded.kinds.push_scoped(
+                                    scope.clone(),
+                                    ActivityKind::AssistantText { text },
+                                );
+                            }
                         }
                     }
                     Some("thinking_delta") => {
@@ -3844,9 +4054,16 @@ impl OutputDecoder {
                             .and_then(|delta| delta.get("thinking").or_else(|| delta.get("text")))
                             .and_then(Value::as_str)
                         {
-                            decoded
-                                .kinds
-                                .push(ActivityKind::Thinking { text: text.into() });
+                            let text = if let Some(child_id) = child_id.as_deref() {
+                                self.remember_claude_child_thinking_delta(child_id, text)
+                            } else {
+                                Some(text.to_owned())
+                            };
+                            if let Some(text) = text {
+                                decoded
+                                    .kinds
+                                    .push_scoped(scope, ActivityKind::Thinking { text });
+                            }
                         }
                     }
                     _ => {}
@@ -3854,27 +4071,90 @@ impl OutputDecoder {
             }
             Some("assistant") => {
                 decoded.recognized = true;
-                for block in content_blocks(value) {
+                let Some(scope) = self.claude_envelope_scope(value) else {
+                    return decoded;
+                };
+                let child_id = scope.child_id().map(str::to_owned);
+                let blocks = content_blocks(value).collect::<Vec<_>>();
+                let child_text = child_id.as_ref().map(|_| {
+                    blocks
+                        .iter()
+                        .filter_map(|block| {
+                            (block.get("type").and_then(Value::as_str) == Some("text"))
+                                .then(|| block.get("text").and_then(Value::as_str))
+                                .flatten()
+                        })
+                        .collect::<String>()
+                });
+                let child_thinking = child_id.as_ref().map(|_| {
+                    blocks
+                        .iter()
+                        .filter_map(|block| {
+                            (block.get("type").and_then(Value::as_str) == Some("thinking"))
+                                .then(|| {
+                                    block
+                                        .get("thinking")
+                                        .or_else(|| block.get("text"))
+                                        .and_then(Value::as_str)
+                                })
+                                .flatten()
+                        })
+                        .collect::<String>()
+                });
+                let mut emitted_child_text = false;
+                let mut emitted_child_thinking = false;
+                for block in blocks {
                     match block.get("type").and_then(Value::as_str) {
-                        Some("text") if !self.saw_text_delta => {
-                            if let Some(text) = block.get("text").and_then(Value::as_str)
-                                && !text.is_empty()
-                            {
-                                decoded.kinds.push(ActivityKind::AssistantText {
-                                    text: text.to_owned(),
-                                });
+                        Some("text") => {
+                            let text = if let Some(child_id) = child_id.as_deref() {
+                                if emitted_child_text {
+                                    None
+                                } else {
+                                    emitted_child_text = true;
+                                    child_text.as_deref().and_then(|text| {
+                                        self.complete_claude_child_text(child_id, text.to_owned())
+                                    })
+                                }
+                            } else if !self.saw_text_delta {
+                                block
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .filter(|text| !text.is_empty())
+                                    .map(str::to_owned)
+                            } else {
+                                None
+                            };
+                            if let Some(text) = text {
+                                decoded.kinds.push_scoped(
+                                    scope.clone(),
+                                    ActivityKind::AssistantText { text },
+                                );
                             }
                         }
-                        Some("thinking") if !self.saw_thinking_delta => {
-                            if let Some(text) = block
-                                .get("thinking")
-                                .or_else(|| block.get("text"))
-                                .and_then(Value::as_str)
-                                && !text.is_empty()
-                            {
+                        Some("thinking") => {
+                            let text = if let Some(child_id) = child_id.as_deref() {
+                                if emitted_child_thinking {
+                                    None
+                                } else {
+                                    emitted_child_thinking = true;
+                                    child_thinking.as_deref().and_then(|text| {
+                                        self.complete_claude_child_thinking(child_id, text)
+                                    })
+                                }
+                            } else if !self.saw_thinking_delta {
+                                block
+                                    .get("thinking")
+                                    .or_else(|| block.get("text"))
+                                    .and_then(Value::as_str)
+                                    .filter(|text| !text.is_empty())
+                                    .map(str::to_owned)
+                            } else {
+                                None
+                            };
+                            if let Some(text) = text {
                                 decoded
                                     .kinds
-                                    .push(ActivityKind::Thinking { text: text.into() });
+                                    .push_scoped(scope.clone(), ActivityKind::Thinking { text });
                             }
                         }
                         Some("tool_use") => {
@@ -3885,15 +4165,21 @@ impl OutputDecoder {
                                 self.decode_tool_use(block)
                             };
                             if let Some(kind) = kind {
-                                decoded.kinds.push(kind);
+                                decoded.kinds.push_scoped(scope.clone(), kind);
                             }
                         }
                         _ => {}
                     }
                 }
+                if let Some(child_id) = child_id {
+                    self.claude_child_streamed_thinking_bytes.remove(&child_id);
+                }
             }
             Some("user") => {
                 decoded.recognized = true;
+                let Some(scope) = self.claude_envelope_scope(value) else {
+                    return decoded;
+                };
                 if value.pointer("/origin/kind").and_then(Value::as_str)
                     == Some("task-notification")
                     && let Some(content) = value.pointer("/message/content").and_then(Value::as_str)
@@ -3919,14 +4205,15 @@ impl OutputDecoder {
                         {
                             decoded.subagent_duration_ms.insert(id.clone(), duration_ms);
                         }
-                        decoded.kinds.push(kind);
-                        if let Some((child_id, text)) = child_message
-                            && let Some(text) = self.remember_subagent_message(&child_id, text)
-                        {
-                            decoded.kinds.push_scoped(
-                                AgentScope::Child { id: child_id },
-                                ActivityKind::AssistantText { text },
-                            );
+                        decoded.kinds.push_scoped(scope.clone(), kind);
+                        if let Some((child_id, text)) = child_message {
+                            let text = self.complete_or_dedupe_claude_child_result(&child_id, text);
+                            if let Some(text) = text {
+                                decoded.kinds.push_scoped(
+                                    AgentScope::Child { id: child_id },
+                                    ActivityKind::AssistantText { text },
+                                );
+                            }
                         }
                     }
                 }
@@ -4035,7 +4322,7 @@ impl OutputDecoder {
         if status.is_terminal()
             && let Some(text) = tagged_text(content, "result")
                 .map(|text| unescape_claude_notification_entities(&text))
-            && let Some(text) = self.remember_subagent_message(&canonical_id, text)
+            && let Some(text) = self.complete_or_dedupe_claude_child_result(&canonical_id, text)
         {
             decoded.kinds.push_scoped(
                 AgentScope::Child { id: canonical_id },
@@ -6031,6 +6318,47 @@ fn claude_subagent_result_text(block: &Value, envelope: Option<&Value>) -> Optio
         })
         .or_else(|| flattened_content(block.get("content")))
         .filter(|text| !text.trim().is_empty())
+}
+
+fn claude_terminal_result_repeats(existing: &str, candidate: &str) -> bool {
+    let existing = existing.trim();
+    let candidate = candidate.trim();
+    if existing.is_empty() || candidate.is_empty() {
+        return false;
+    }
+    if candidate.len() > MAX_SUBAGENT_MESSAGE_BYTES
+        && truncate_utf8(candidate, MAX_SUBAGENT_MESSAGE_BYTES).trim() == existing
+    {
+        return true;
+    }
+    if candidate == existing
+        || candidate
+            .strip_suffix(existing)
+            .is_some_and(|prefix| prefix.chars().last().is_some_and(char::is_whitespace))
+    {
+        return true;
+    }
+    if candidate
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .eq(existing
+            .chars()
+            .filter(|character| !character.is_whitespace()))
+    {
+        return true;
+    }
+    if !candidate.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let mut candidate = candidate
+        .chars()
+        .rev()
+        .filter(|character| !character.is_whitespace());
+    existing
+        .chars()
+        .rev()
+        .filter(|character| !character.is_whitespace())
+        .all(|character| candidate.next() == Some(character))
 }
 
 fn tagged_text(value: &str, tag: &str) -> Option<String> {
@@ -10056,6 +10384,248 @@ send({
     }
 
     #[test]
+    fn claude_foreground_child_never_leaks_prose_or_tools_into_main() {
+        let stream = include_str!("../tests/fixtures/ai/claude/2.1.128/foreground-subagent.jsonl");
+        assert_jsonl_fixture(stream);
+        for chunk_size in [1, 11, stream.len()] {
+            let (decoder, decoded) = decode_in_chunks("claude_cli", stream, chunk_size);
+            assert_eq!(
+                decoder.output, "PARENT_FOREGROUND_OK",
+                "parent capture changed at chunk size {chunk_size}"
+            );
+            let deltas = decoded
+                .iter()
+                .filter_map(|event| match event {
+                    Decoded::Delta(text) => Some(text.as_str()),
+                    Decoded::Activity(_) | Decoded::StreamReset => None,
+                })
+                .collect::<String>();
+            assert_eq!(deltas, "PARENT_FOREGROUND_OK");
+
+            let accumulator = accumulated(&decoded);
+            assert_eq!(
+                crate::chat_core::assistant_flat_text(&accumulator.events),
+                "PARENT_FOREGROUND_OK"
+            );
+            let children = crate::chat_core::project_subagents(&accumulator.events);
+            assert_eq!(children.len(), 1);
+            assert_eq!(children[0].id, "claude-foreground-agent");
+            assert_eq!(children[0].status, SubagentStatus::Completed);
+            assert_eq!(children[0].aliases, vec!["claude-foreground-task"]);
+            assert_eq!(children[0].prose_cells.len(), 1);
+            assert_eq!(children[0].prose_cells[0].text, "CHILD_FOREGROUND_OK");
+
+            let child_scope = AgentScope::Child {
+                id: "claude-foreground-agent".into(),
+            };
+            assert!(accumulator.events.iter().all(|event| {
+                let text = match &event.kind {
+                    ActivityKind::AssistantText { text } | ActivityKind::Thinking { text } => text,
+                    _ => return true,
+                };
+                if event.scope.is_main() {
+                    !text.contains("CHILD_")
+                } else {
+                    event.scope == child_scope && !text.contains("PARENT_")
+                }
+            }));
+            assert!(accumulator.events.iter().any(|event| {
+                event.scope == child_scope
+                    && matches!(
+                        &event.kind,
+                        ActivityKind::Thinking { text } if text == "CHILD_THINKING"
+                    )
+            }));
+            assert!(accumulator.events.iter().any(|event| {
+                event.scope.is_main()
+                    && matches!(
+                        &event.kind,
+                        ActivityKind::Thinking { text } if text == "PARENT_THINKING"
+                    )
+            }));
+
+            let command_scope = |id: &str| {
+                accumulator
+                    .events
+                    .iter()
+                    .filter_map(|event| match &event.kind {
+                        ActivityKind::Command {
+                            id: command_id,
+                            status,
+                            ..
+                        } if command_id == id => Some((&event.scope, *status)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                command_scope("child-command"),
+                vec![(&child_scope, ActivityStatus::Completed)]
+            );
+            assert_eq!(
+                command_scope("parent-command"),
+                vec![(&AgentScope::Main, ActivityStatus::Completed)]
+            );
+        }
+    }
+
+    #[test]
+    fn claude_explicit_child_identity_never_falls_back_to_main() {
+        let stream = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"root\"}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"orphan\",\"session_id\":\"root\",\"parent_tool_use_id\":\"orphan-child\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ORPHAN_CHILD\"}}}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":7,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"MALFORMED_CHILD\"}]}}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":\"\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"EMPTY_CHILD\"}]}}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"MAIN_ONLY\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 7);
+        assert_eq!(decoder.output, "MAIN_ONLY");
+        let accumulator = accumulated(&decoded);
+        assert_eq!(
+            crate::chat_core::assistant_flat_text(&accumulator.events),
+            "MAIN_ONLY"
+        );
+        assert!(accumulator.events.iter().any(|event| {
+            event.scope.child_id() == Some("orphan-child")
+                && matches!(
+                    &event.kind,
+                    ActivityKind::AssistantText { text } if text == "ORPHAN_CHILD"
+                )
+        }));
+        assert!(!accumulator.events.iter().any(|event| match &event.kind {
+            ActivityKind::AssistantText { text } => {
+                text.contains("MALFORMED_CHILD") || text.contains("EMPTY_CHILD")
+            }
+            _ => false,
+        }));
+        assert!(
+            crate::chat_core::project_subagents(&accumulator.events).is_empty(),
+            "an orphan scope must not invent a lifecycle row"
+        );
+    }
+
+    #[test]
+    fn claude_foreground_children_keep_independent_snapshot_state() {
+        let stream = concat!(
+            "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"root\"}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"child-a\",\"name\":\"Agent\",\"input\":{\"description\":\"Child A\",\"prompt\":\"A\",\"subagent_type\":\"Explore\"}},{\"type\":\"tool_use\",\"id\":\"child-b\",\"name\":\"Agent\",\"input\":{\"description\":\"Child B\",\"prompt\":\"B\",\"subagent_type\":\"Explore\"}}]}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"a-delta\",\"session_id\":\"root\",\"parent_tool_use_id\":\"child-a\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"A_\"}}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"b-delta\",\"session_id\":\"root\",\"parent_tool_use_id\":\"child-b\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"B_OK\"}}}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":\"child-a\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"A_OK\"}]}}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":\"child-b\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"B_OK\"}]}}\n",
+            "{\"type\":\"assistant\",\"session_id\":\"root\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PARENT_OK\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 5);
+        assert_eq!(decoder.output, "PARENT_OK");
+        let accumulator = accumulated(&decoded);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 2);
+        for (id, expected) in [("child-a", "A_OK"), ("child-b", "B_OK")] {
+            let child = children.iter().find(|child| child.id == id).unwrap();
+            assert_eq!(child.prose_cells.len(), 1);
+            assert_eq!(child.prose_cells[0].text, expected);
+        }
+        assert_eq!(
+            crate::chat_core::assistant_flat_text(&accumulator.events),
+            "PARENT_OK"
+        );
+    }
+
+    #[test]
+    fn claude_child_multiblock_snapshot_and_terminal_echo_stay_single() {
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"parent-call\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"child-1\",\"name\":\"Agent\",\"input\":{\"description\":\"Child\",\"prompt\":\"Work\",\"subagent_type\":\"Explore\"}}]}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"alpha-delta\",\"parent_tool_use_id\":\"child-1\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Alpha\"}}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"beta-delta\",\"parent_tool_use_id\":\"child-1\",\"event\":{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"Beta\"}}}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"child-snapshot\",\"parent_tool_use_id\":\"child-1\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Alpha\"},{\"type\":\"text\",\"text\":\"Beta\"}]}}\n",
+            "{\"type\":\"user\",\"uuid\":\"parent-result\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"child-1\",\"content\":\"\",\"is_error\":false}]},\"tool_use_result\":{\"agentId\":\"child-1\",\"status\":\"completed\",\"content\":[{\"type\":\"text\",\"text\":\"Agent preamble\"},{\"type\":\"text\",\"text\":\"Alpha\"},{\"type\":\"text\",\"text\":\"Beta\"}]}}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"parent-final\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PARENT_OK\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 3);
+        assert_eq!(decoder.output, "PARENT_OK");
+        let accumulator = accumulated(&decoded);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].prose_cells.len(), 1);
+        assert_eq!(children[0].prose_cells[0].text, "AlphaBeta");
+        assert_eq!(
+            crate::chat_core::assistant_flat_text(&accumulator.events),
+            "PARENT_OK"
+        );
+    }
+
+    #[test]
+    fn claude_unfinished_child_stream_flushes_one_bounded_partial_cell() {
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"parent-call\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"child-1\",\"name\":\"Agent\",\"input\":{\"description\":\"Child\",\"prompt\":\"Work\",\"subagent_type\":\"Explore\"}}]}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"partial\",\"parent_tool_use_id\":\"child-1\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PARTIAL_CHILD\"}}}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"parent-final\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PARENT_OK\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 2);
+        assert_eq!(decoder.output, "PARENT_OK");
+        let accumulator = accumulated(&decoded);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].prose_cells.len(), 1);
+        assert_eq!(children[0].prose_cells[0].text, "PARTIAL_CHILD");
+    }
+
+    #[test]
+    fn claude_terminal_result_completes_an_unfinished_child_stream_once() {
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"parent-call\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"child-1\",\"name\":\"Agent\",\"input\":{\"description\":\"Child\",\"prompt\":\"Work\",\"subagent_type\":\"Explore\"}}]}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"partial\",\"parent_tool_use_id\":\"child-1\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PARTIAL\"}}}\n",
+            "{\"type\":\"user\",\"uuid\":\"parent-result\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"child-1\",\"content\":\"\",\"is_error\":false}]},\"tool_use_result\":{\"agentId\":\"child-1\",\"status\":\"completed\",\"content\":[{\"type\":\"text\",\"text\":\"COMPLETE_CHILD\"}]}}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"parent-final\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PARENT_OK\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 5);
+        assert_eq!(decoder.output, "PARENT_OK");
+        let accumulator = accumulated(&decoded);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].prose_cells.len(), 1);
+        assert_eq!(children[0].prose_cells[0].text, "COMPLETE_CHILD");
+    }
+
+    #[test]
+    fn claude_task_notification_completes_an_unfinished_child_stream_once() {
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"parent-call\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"child-1\",\"name\":\"Agent\",\"input\":{\"description\":\"Child\",\"prompt\":\"Work\",\"subagent_type\":\"Explore\"}}]}}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"partial\",\"parent_tool_use_id\":\"child-1\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PARTIAL\"}}}\n",
+            "{\"type\":\"user\",\"uuid\":\"task-result\",\"parent_tool_use_id\":null,\"origin\":{\"kind\":\"task-notification\"},\"message\":{\"content\":\"<task-notification>\\n<task-id>child-task</task-id>\\n<tool-use-id>child-1</tool-use-id>\\n<status>completed</status>\\n<result>COMPLETE_CHILD</result>\\n</task-notification>\"}}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"parent-final\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PARENT_OK\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 5);
+        assert_eq!(decoder.output, "PARENT_OK");
+        let accumulator = accumulated(&decoded);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].prose_cells.len(), 1);
+        assert_eq!(children[0].prose_cells[0].text, "COMPLETE_CHILD");
+    }
+
+    #[test]
+    fn claude_resumed_child_preserves_its_pre_resume_partial_response() {
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"uuid\":\"parent-call\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"child-1\",\"name\":\"Agent\",\"input\":{\"description\":\"Child\",\"prompt\":\"Work\",\"subagent_type\":\"Explore\"}}]}}\n",
+            "{\"type\":\"system\",\"subtype\":\"task_started\",\"uuid\":\"start-1\",\"task_id\":\"child-task\",\"tool_use_id\":\"child-1\",\"task_type\":\"local_agent\"}\n",
+            "{\"type\":\"stream_event\",\"uuid\":\"before-resume\",\"parent_tool_use_id\":\"child-1\",\"event\":{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"BEFORE_RESUME\"}}}\n",
+            "{\"type\":\"system\",\"subtype\":\"task_notification\",\"uuid\":\"cancel-1\",\"task_id\":\"child-task\",\"tool_use_id\":\"child-1\",\"task_type\":\"local_agent\",\"status\":\"cancelled\"}\n",
+            "{\"type\":\"system\",\"subtype\":\"task_started\",\"uuid\":\"start-2\",\"task_id\":\"child-task\",\"tool_use_id\":\"child-1\",\"task_type\":\"local_agent\"}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"after-resume\",\"parent_tool_use_id\":\"child-1\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"AFTER_RESUME\"}]}}\n",
+            "{\"type\":\"assistant\",\"uuid\":\"parent-final\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"PARENT_OK\"}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 3);
+        assert_eq!(decoder.output, "PARENT_OK");
+        let accumulator = accumulated(&decoded);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].prose_cells.len(), 2);
+        assert_eq!(children[0].prose_cells[0].text, "BEFORE_RESUME");
+        assert_eq!(children[0].prose_cells[1].text, "AFTER_RESUME");
+    }
+
+    #[test]
     fn scoped_child_output_and_lifecycle_detail_are_strictly_bounded() {
         let mut decoder = OutputDecoder::new("codex_cli".into(), OutputMode::JsonLines);
         let oversized = "é".repeat(MAX_SUBAGENT_MESSAGE_BYTES);
@@ -10079,6 +10649,143 @@ send({
         let detail = compact_subagent_detail("é".repeat(MAX_SUBAGENT_DETAIL_BYTES));
         assert!(detail.len() <= MAX_SUBAGENT_DETAIL_BYTES);
         assert!(detail.ends_with('…'));
+
+        let mut foreground = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
+        let oversized_delta = "x".repeat(MAX_SUBAGENT_MESSAGE_BYTES + 1);
+        let first = foreground
+            .remember_claude_child_text_delta("foreground-child", &oversized_delta)
+            .expect("bounded foreground delta");
+        assert_eq!(first.len(), MAX_SUBAGENT_MESSAGE_BYTES);
+        assert!(
+            foreground
+                .remember_claude_child_text_delta("foreground-child", "overflow")
+                .is_none(),
+            "one foreground message cannot exceed its per-message cap"
+        );
+        assert!(foreground.subagent_output_bytes <= MAX_SUBAGENT_OUTPUT_BYTES);
+
+        foreground.subagent_output_bytes = MAX_SUBAGENT_OUTPUT_BYTES;
+        for index in 0..32 {
+            let child_id = format!("post-cap-child-{index}");
+            assert!(
+                foreground
+                    .remember_claude_child_text_delta(&child_id, "dropped")
+                    .is_none()
+            );
+            assert!(
+                foreground
+                    .complete_claude_child_text(&child_id, "x".repeat(MAX_SUBAGENT_MESSAGE_BYTES))
+                    .is_none()
+            );
+        }
+        assert!(
+            foreground
+                .claude_child_streamed_text
+                .keys()
+                .all(|child_id| !child_id.starts_with("post-cap-child-"))
+        );
+        let retained_message_bytes = foreground
+            .subagent_messages
+            .values()
+            .map(String::len)
+            .sum::<usize>();
+        assert!(
+            retained_message_bytes <= MAX_SUBAGENT_OUTPUT_BYTES,
+            "post-cap snapshots must not create unaccounted retained output"
+        );
+
+        let mut terminal_echo = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
+        assert_eq!(
+            terminal_echo.complete_claude_child_text("child-echo", "SAME".into()),
+            Some("SAME".into())
+        );
+        terminal_echo.subagent_output_bytes = MAX_SUBAGENT_OUTPUT_BYTES - 2;
+        let before_echo = terminal_echo.subagent_output_bytes;
+        assert!(
+            terminal_echo
+                .complete_or_dedupe_claude_child_result("child-echo", "SAME".into())
+                .is_none(),
+            "remaining capacity must not turn an exact terminal echo into a partial duplicate"
+        );
+        assert_eq!(terminal_echo.subagent_output_bytes, before_echo);
+
+        let oversized_echo = "x".repeat(MAX_SUBAGENT_MESSAGE_BYTES + 64);
+        let mut truncated_echo = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
+        assert_eq!(
+            truncated_echo
+                .complete_claude_child_text("child-echo", oversized_echo.clone())
+                .map(|text| text.len()),
+            Some(MAX_SUBAGENT_MESSAGE_BYTES)
+        );
+        truncated_echo.subagent_output_bytes = MAX_SUBAGENT_OUTPUT_BYTES - 2;
+        let before_echo = truncated_echo.subagent_output_bytes;
+        assert!(
+            truncated_echo
+                .complete_or_dedupe_claude_child_result("child-echo", oversized_echo)
+                .is_none(),
+            "a capped authoritative response must suppress its full terminal echo"
+        );
+        assert_eq!(truncated_echo.subagent_output_bytes, before_echo);
+    }
+
+    #[test]
+    fn claude_child_thinking_obeys_output_bounds_and_lifecycle_cleanup() {
+        let mut decoder = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
+        let oversized = "é".repeat(MAX_SUBAGENT_MESSAGE_BYTES);
+        let first = decoder
+            .remember_claude_child_thinking_delta("child-1", &oversized)
+            .expect("bounded child thinking");
+        assert!(first.len() <= MAX_SUBAGENT_MESSAGE_BYTES);
+        assert!(first.is_char_boundary(first.len()));
+        assert!(
+            decoder
+                .remember_claude_child_thinking_delta("child-1", "overflow")
+                .is_none(),
+            "one child reasoning message cannot exceed its per-message cap"
+        );
+        assert!(
+            decoder
+                .complete_claude_child_thinking("child-1", &oversized)
+                .is_none(),
+            "the terminal thinking snapshot must not repeat streamed reasoning"
+        );
+        assert!(decoder.claude_child_streamed_thinking_bytes.is_empty());
+
+        let child = KnownSubagent {
+            label: "Reasoning child".into(),
+            ..KnownSubagent::default()
+        };
+        assert_eq!(
+            decoder.remember_claude_child_thinking_delta("child-1", "fresh"),
+            Some("fresh".into())
+        );
+        decoder.remember_subagent("child-1", child.clone(), SubagentStatus::Cancelled);
+        assert!(
+            decoder.claude_child_streamed_thinking_bytes.is_empty(),
+            "terminal lifecycle must clear unterminated reasoning state"
+        );
+        decoder.remember_subagent("child-1", child, SubagentStatus::InProgress);
+        assert_eq!(
+            decoder.remember_claude_child_thinking_delta("child-1", "resumed"),
+            Some("resumed".into())
+        );
+
+        decoder.claude_child_streamed_thinking_bytes.clear();
+        decoder.subagent_output_bytes = MAX_SUBAGENT_OUTPUT_BYTES;
+        for index in 0..32 {
+            assert!(
+                decoder
+                    .remember_claude_child_thinking_delta(
+                        &format!("post-cap-thinking-{index}"),
+                        "dropped"
+                    )
+                    .is_none()
+            );
+        }
+        assert!(
+            decoder.claude_child_streamed_thinking_bytes.is_empty(),
+            "post-cap reasoning must not retain child ids"
+        );
     }
 
     #[test]
