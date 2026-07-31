@@ -13761,6 +13761,59 @@ fn render_ai_subagent_detail_row(
                             },
                         ));
                     }
+                    // What this child is doing right now, when the provider
+                    // says so — never inferred from its prose.
+                    if !agent.status.is_terminal()
+                        && let Some(activity) = agent
+                            .current_activity
+                            .as_deref()
+                            .filter(|activity| !activity.trim().is_empty())
+                    {
+                        ui.label(
+                            RichText::new(truncate(activity, 90))
+                                .size(10.0)
+                                .color(colors.secondary_text),
+                        );
+                    }
+
+                    // A child's own checklist only when it genuinely published
+                    // one; `None` means it never did, which is not the same as
+                    // an empty list and must not render as an empty plan.
+                    if let Some(checklist) = agent.checklist.as_ref()
+                        && !checklist.items.is_empty()
+                    {
+                        ui.add_space(4.0);
+                        let rows = crate::progress_stepper::step_rows(&checklist.items, 60);
+                        crate::progress_stepper::stepper_ui(
+                            ui,
+                            &rows,
+                            &progress_stepper_palette(colors),
+                        );
+                    }
+
+                    // The child's own words, in its own cell. Keeping these
+                    // scoped here is the entire point of the child channel:
+                    // before it, they interleaved into the parent transcript.
+                    if !agent.prose_cells.is_empty() {
+                        ui.add_space(4.0);
+                        for cell in &agent.prose_cells {
+                            let text = cell.text.trim();
+                            if text.is_empty() {
+                                continue;
+                            }
+                            Frame::NONE
+                                .fill(colors.selection_fill)
+                                .corner_radius(6)
+                                .inner_margin(Margin::symmetric(8, 6))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(text).size(10.5).color(colors.secondary_text),
+                                    );
+                                });
+                            ui.add_space(3.0);
+                        }
+                    }
+
                     let mut metadata = Vec::new();
                     if let Some(parent_id) = agent.parent_id.as_deref() {
                         metadata.push(format!("parent {}", truncate(parent_id, 20)));
