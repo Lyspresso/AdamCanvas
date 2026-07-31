@@ -51,6 +51,9 @@ const CANCEL_WRITE_GRACE: Duration = Duration::from_millis(100);
 const STDIN_WRITER_SHUTDOWN_GRACE: Duration = Duration::from_millis(250);
 const MAX_QUARANTINED_NOTIFICATIONS: usize = 256;
 const MAX_QUARANTINED_BYTES: usize = 1024 * 1024;
+const MAX_DETAIL_EVENTS_PER_SESSION: usize = 512;
+const MAX_TRACKED_CHILDREN: usize = 256;
+const MAX_TRACKED_STREAM_ITEMS: usize = 65_536;
 
 /// One HTTP MCP endpoint supplied to the Grok session.
 ///
@@ -491,8 +494,6 @@ pub enum GrokAcpError {
     UnexpectedEof,
     #[error("Grok ACP exceeded the {limit}-byte line limit")]
     LineTooLarge { limit: usize },
-    #[error("Grok ACP exceeded the {limit}-event limit")]
-    EventLimit { limit: usize },
     #[error("Grok ACP exceeded the {limit}-byte streamed-text limit")]
     TextLimit { limit: usize },
     #[error("Grok ACP exceeded the {limit}-byte protocol limit")]
@@ -1147,8 +1148,19 @@ where
         started_at,
         &mut state,
     );
+    finish_protocol_result(result, &mut state, emit)
+}
+
+fn finish_protocol_result<E>(
+    result: Result<GrokAcpOutcome, GrokAcpError>,
+    state: &mut ProtocolState<'_>,
+    emit: &mut E,
+) -> Result<GrokAcpOutcome, GrokAcpError>
+where
+    E: FnMut(GrokAcpEvent),
+{
     if result.is_err() {
-        let _ = state.close_active_children(emit);
+        state.flush_error_projection(emit);
     }
     result
 }
@@ -1284,6 +1296,8 @@ where
     state.ensure_quarantine_resolved()?;
     state.close_active_children(emit)?;
     state.flush_text_streams(emit)?;
+    state.flush_pending_tool_calls(&session_id, emit)?;
+    state.flush_pending_plan(&session_id, emit)?;
     state.emit(
         emit,
         GrokAcpEvent::Terminal {
@@ -1480,6 +1494,12 @@ where
                 }
                 return Ok(AgentMessageDisposition::Continue);
             };
+            // Detail pressure may have coalesced tool/plan updates that
+            // happened before this permission request. Publish that context
+            // first so a terminal flush cannot later masquerade as recovery
+            // from a denied permission.
+            state.flush_pending_tool_calls(&permission_request.session_id, emit)?;
+            state.flush_pending_plan(&permission_request.session_id, emit)?;
             state.emit(
                 emit,
                 GrokAcpEvent::PermissionRequested {
@@ -1831,6 +1851,8 @@ struct SessionStreamState {
     agent_message_order: Vec<String>,
     thought_message_order: Vec<String>,
     tool_calls: HashMap<String, GrokAcpToolCall>,
+    tool_call_order: Vec<String>,
+    dirty_tool_calls: HashSet<String>,
     closed: bool,
 }
 
@@ -1846,6 +1868,8 @@ impl SessionStreamState {
             agent_message_order: Vec::new(),
             thought_message_order: Vec::new(),
             tool_calls: HashMap::new(),
+            tool_call_order: Vec::new(),
+            dirty_tool_calls: HashSet::new(),
             closed: false,
         }
     }
@@ -1855,6 +1879,7 @@ struct ChildRegistration {
     spawned: GrokAcpSubagentSpawned,
     closed: bool,
     last_progress: Option<GrokAcpSubagentProgress>,
+    progress_dirty: bool,
 }
 
 struct QuarantinedUpdate {
@@ -1873,6 +1898,8 @@ struct ProtocolState<'a> {
     subagents_enabled: bool,
     response_text: String,
     event_count: usize,
+    detail_event_count: usize,
+    detail_events_by_session: HashMap<String, usize>,
     cleanup_event_count: usize,
     text_bytes: usize,
     protocol_bytes: usize,
@@ -1882,10 +1909,13 @@ struct ProtocolState<'a> {
     sessions: HashMap<String, SessionStreamState>,
     children: HashMap<String, ChildRegistration>,
     child_order: Vec<String>,
+    child_tracking_degraded: bool,
     seen_event_ids: HashSet<(String, String)>,
     quarantined_event_ids: HashSet<(String, String)>,
     quarantine: VecDeque<QuarantinedUpdate>,
     quarantine_bytes: usize,
+    pending_plans: HashMap<String, Vec<GrokAcpPlanEntry>>,
+    suppressed_root_text_start: Option<usize>,
     cancel_sent: bool,
 }
 
@@ -1905,6 +1935,8 @@ impl<'a> ProtocolState<'a> {
             subagents_enabled: false,
             response_text: String::new(),
             event_count: 0,
+            detail_event_count: 0,
+            detail_events_by_session: HashMap::new(),
             cleanup_event_count: 0,
             text_bytes: 0,
             protocol_bytes: 0,
@@ -1914,10 +1946,13 @@ impl<'a> ProtocolState<'a> {
             sessions: HashMap::new(),
             children: HashMap::new(),
             child_order: Vec::new(),
+            child_tracking_degraded: false,
             seen_event_ids: HashSet::new(),
             quarantined_event_ids: HashSet::new(),
             quarantine: VecDeque::new(),
             quarantine_bytes: 0,
+            pending_plans: HashMap::new(),
+            suppressed_root_text_start: None,
             cancel_sent: false,
         }
     }
@@ -1984,14 +2019,33 @@ impl<'a> ProtocolState<'a> {
     where
         E: FnMut(GrokAcpEvent),
     {
-        if self.event_count >= self.max_events {
-            return Err(GrokAcpError::EventLimit {
-                limit: self.max_events,
-            });
-        }
-        self.event_count += 1;
+        // Authoritative events are bounded by the protocol byte/text limits
+        // and the explicit child/stream registries. They must not disappear
+        // merely because high-volume presentation detail exhausted its quota.
+        self.event_count = self.event_count.saturating_add(1);
         emit(event);
         Ok(())
+    }
+
+    fn emit_detail<E>(&mut self, session_id: &str, emit: &mut E, event: GrokAcpEvent) -> bool
+    where
+        E: FnMut(GrokAcpEvent),
+    {
+        let per_session_limit = self.max_events.min(MAX_DETAIL_EVENTS_PER_SESSION);
+        let session_count = self
+            .detail_events_by_session
+            .get(session_id)
+            .copied()
+            .unwrap_or_default();
+        if self.detail_event_count >= self.max_events || session_count >= per_session_limit {
+            return false;
+        }
+        self.detail_event_count = self.detail_event_count.saturating_add(1);
+        self.detail_events_by_session
+            .insert(session_id.to_owned(), session_count.saturating_add(1));
+        self.event_count = self.event_count.saturating_add(1);
+        emit(event);
+        true
     }
 
     fn emit_cleanup<E>(&mut self, emit: &mut E, event: GrokAcpEvent)
@@ -2075,7 +2129,7 @@ impl<'a> ProtocolState<'a> {
         let bytes = serde_json::to_vec(params)
             .map(|value| value.len())
             .unwrap_or_default();
-        let max_entries = std::cmp::min(self.max_events, MAX_QUARANTINED_NOTIFICATIONS);
+        let max_entries = MAX_QUARANTINED_NOTIFICATIONS;
         let max_bytes = std::cmp::min(self.max_protocol_bytes, MAX_QUARANTINED_BYTES);
         if self.quarantine.len() >= max_entries
             || self.quarantine_bytes.saturating_add(bytes) > max_bytes
@@ -2158,10 +2212,23 @@ impl<'a> ProtocolState<'a> {
         let event_id = self.event_id(params, update)?;
 
         let scope = self.scope_for_session(&session_id)?;
+        if scope.is_none() && self.child_tracking_degraded && self.subagents_enabled {
+            return Ok(());
+        }
         let lifecycle_update = matches!(
             update_kind,
             "subagent_spawned" | "subagent_progress" | "subagent_finished"
         );
+        if self.child_tracking_degraded && lifecycle_update {
+            let unknown_child = update_kind == "subagent_spawned"
+                || update
+                    .get("child_session_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|child_session_id| !self.children.contains_key(child_session_id));
+            if unknown_child {
+                return Ok(());
+            }
+        }
         let scoped_event_id_required = matches!(
             update_kind,
             "agent_message_chunk"
@@ -2197,11 +2264,10 @@ impl<'a> ProtocolState<'a> {
             if self.seen_event_ids.contains(&event_key) {
                 return Ok(());
             }
-            if self.seen_event_ids.len() >= self.max_events {
-                return Err(GrokAcpError::EventLimit {
-                    limit: self.max_events,
-                });
-            }
+            // The wire-byte ceiling already strictly bounds the number and
+            // total identity bytes of notifications in one turn. Keeping the
+            // exact set prevents an old replayed text/lifecycle event from
+            // becoming visible twice after presentation detail is thinned.
             self.seen_event_ids.insert(event_key);
         }
 
@@ -2243,18 +2309,41 @@ impl<'a> ProtocolState<'a> {
                         .get(&session_id)
                         .is_some_and(|stream| stream.tool_calls.contains_key(&tool_call.id)),
                 )?;
-                self.sessions
-                    .get_mut(&session_id)
+                let is_new = !self
+                    .sessions
+                    .get(&session_id)
                     .expect("a routed session must have stream state")
                     .tool_calls
-                    .insert(tool_call.id.clone(), tool_call.clone());
-                self.emit(
+                    .contains_key(&tool_call.id);
+                let tool_call_id = tool_call.id.clone();
+                let stream = self
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("a routed session must have stream state");
+                stream
+                    .tool_calls
+                    .insert(tool_call_id.clone(), tool_call.clone());
+                if is_new {
+                    stream.tool_call_order.push(tool_call_id.clone());
+                }
+                let emitted = self.emit_detail(
+                    &session_id,
                     emit,
                     GrokAcpEvent::ToolCall {
-                        session_id,
+                        session_id: session_id.clone(),
                         tool_call,
                     },
-                )
+                );
+                let stream = self
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("a routed session must have stream state");
+                if emitted {
+                    stream.dirty_tool_calls.remove(&tool_call_id);
+                } else {
+                    stream.dirty_tool_calls.insert(tool_call_id);
+                }
+                Ok(())
             }
             "tool_call_update" => {
                 let patch = parse_tool_call_patch(update, self.authorization, false)?;
@@ -2267,27 +2356,50 @@ impl<'a> ProtocolState<'a> {
                     .sessions
                     .get_mut(&session_id)
                     .expect("a routed session must have stream state");
+                let is_new = !stream.tool_calls.contains_key(&patch.id);
                 let tool_call = merge_tool_call(stream.tool_calls.get(&patch.id), patch);
+                let tool_call_id = tool_call.id.clone();
                 stream
                     .tool_calls
                     .insert(tool_call.id.clone(), tool_call.clone());
-                self.emit(
+                if is_new {
+                    stream.tool_call_order.push(tool_call_id.clone());
+                }
+                let emitted = self.emit_detail(
+                    &session_id,
                     emit,
                     GrokAcpEvent::ToolCallUpdate {
-                        session_id,
+                        session_id: session_id.clone(),
                         tool_call,
                     },
-                )
+                );
+                let stream = self
+                    .sessions
+                    .get_mut(&session_id)
+                    .expect("a routed session must have stream state");
+                if emitted {
+                    stream.dirty_tool_calls.remove(&tool_call_id);
+                } else {
+                    stream.dirty_tool_calls.insert(tool_call_id);
+                }
+                Ok(())
             }
             "plan" => {
                 let entries = parse_plan_entries(update, &session_id, self.authorization)?;
-                self.emit(
+                let emitted = self.emit_detail(
+                    &session_id,
                     emit,
                     GrokAcpEvent::PlanSnapshot {
-                        session_id,
-                        entries,
+                        session_id: session_id.clone(),
+                        entries: entries.clone(),
                     },
-                )
+                );
+                if emitted {
+                    self.pending_plans.remove(&session_id);
+                } else {
+                    self.pending_plans.insert(session_id, entries);
+                }
+                Ok(())
             }
             _ => Ok(()),
         }
@@ -2307,11 +2419,14 @@ impl<'a> ProtocolState<'a> {
                         .get(session_id)
                         .is_some_and(|stream| stream.tool_calls.contains_key(&tool_call.id)),
                 )?;
-                self.sessions
+                let stream = self
+                    .sessions
                     .get_mut(session_id)
-                    .expect("a routed session must have stream state")
-                    .tool_calls
-                    .insert(tool_call.id.clone(), tool_call);
+                    .expect("a routed session must have stream state");
+                if !stream.tool_calls.contains_key(&tool_call.id) {
+                    stream.tool_call_order.push(tool_call.id.clone());
+                }
+                stream.tool_calls.insert(tool_call.id.clone(), tool_call);
             }
             "tool_call_update" => {
                 let patch = parse_tool_call_patch(update, self.authorization, false)?;
@@ -2324,7 +2439,11 @@ impl<'a> ProtocolState<'a> {
                     .sessions
                     .get_mut(session_id)
                     .expect("a routed session must have stream state");
+                let is_new = !stream.tool_calls.contains_key(&patch.id);
                 let tool_call = merge_tool_call(stream.tool_calls.get(&patch.id), patch);
+                if is_new {
+                    stream.tool_call_order.push(tool_call.id.clone());
+                }
                 stream.tool_calls.insert(tool_call.id.clone(), tool_call);
             }
             _ => {}
@@ -2344,10 +2463,10 @@ impl<'a> ProtocolState<'a> {
     }
 
     fn ensure_stream_item_capacity(&self, already_exists: bool) -> Result<(), GrokAcpError> {
-        if !already_exists && self.total_stream_items() >= self.max_events {
-            Err(GrokAcpError::EventLimit {
-                limit: self.max_events,
-            })
+        if !already_exists && self.total_stream_items() >= MAX_TRACKED_STREAM_ITEMS {
+            Err(GrokAcpError::Protocol(format!(
+                "Grok exceeded Adam's bounded {MAX_TRACKED_STREAM_ITEMS}-item stream registry"
+            )))
         } else {
             Ok(())
         }
@@ -2364,7 +2483,6 @@ impl<'a> ProtocolState<'a> {
     {
         let raw_text = content_text(update)?;
         self.account_text(raw_text)?;
-        let max_events = self.max_events;
         let authorization = self.authorization;
         let total_stream_items = self.total_stream_items();
         let stream = self
@@ -2382,8 +2500,10 @@ impl<'a> ProtocolState<'a> {
                     .clone()
             });
         if !stream.agent_message_redactors.contains_key(&message_id) {
-            if total_stream_items >= max_events {
-                return Err(GrokAcpError::EventLimit { limit: max_events });
+            if total_stream_items >= MAX_TRACKED_STREAM_ITEMS {
+                return Err(GrokAcpError::Protocol(format!(
+                    "Grok exceeded Adam's bounded {MAX_TRACKED_STREAM_ITEMS}-item stream registry"
+                )));
             }
             stream.agent_message_redactors.insert(
                 message_id.clone(),
@@ -2400,15 +2520,21 @@ impl<'a> ProtocolState<'a> {
             return Ok(());
         }
         if stream.scope == GrokAcpSessionScope::Root {
+            let start = self.response_text.len();
             self.response_text.push_str(&text);
-            self.emit(
+            if !self.emit_detail(
+                session_id,
                 emit,
                 GrokAcpEvent::AgentMessageChunk {
                     session_id: session_id.to_owned(),
                     message_id,
                     text,
                 },
-            )
+            ) && self.suppressed_root_text_start.is_none()
+            {
+                self.suppressed_root_text_start = Some(start);
+            }
+            Ok(())
         } else {
             stream
                 .agent_message_text
@@ -2430,7 +2556,6 @@ impl<'a> ProtocolState<'a> {
     {
         let raw_text = content_text(update)?;
         self.account_text(raw_text)?;
-        let max_events = self.max_events;
         let authorization = self.authorization;
         let total_stream_items = self.total_stream_items();
         let stream = self
@@ -2448,8 +2573,10 @@ impl<'a> ProtocolState<'a> {
                     .clone()
             });
         if !stream.thought_message_redactors.contains_key(&message_id) {
-            if total_stream_items >= max_events {
-                return Err(GrokAcpError::EventLimit { limit: max_events });
+            if total_stream_items >= MAX_TRACKED_STREAM_ITEMS {
+                return Err(GrokAcpError::Protocol(format!(
+                    "Grok exceeded Adam's bounded {MAX_TRACKED_STREAM_ITEMS}-item stream registry"
+                )));
             }
             stream.thought_message_redactors.insert(
                 message_id.clone(),
@@ -2465,14 +2592,16 @@ impl<'a> ProtocolState<'a> {
         if text.is_empty() {
             return Ok(());
         }
-        self.emit(
+        self.emit_detail(
+            session_id,
             emit,
             GrokAcpEvent::AgentThoughtChunk {
                 session_id: session_id.to_owned(),
                 message_id,
                 text,
             },
-        )
+        );
+        Ok(())
     }
 
     fn apply_subagent_update<E>(
@@ -2526,10 +2655,14 @@ impl<'a> ProtocolState<'a> {
                     }
                     return Ok(());
                 }
-                if self.children.len() >= self.max_events {
-                    return Err(GrokAcpError::EventLimit {
-                        limit: self.max_events,
-                    });
+                if self.children.len() >= MAX_TRACKED_CHILDREN {
+                    // Lifecycle projection is optional detail; the root turn is
+                    // authoritative. Once the bounded registry is full, stop
+                    // registering additional children and ignore their scoped
+                    // updates instead of aborting completed root work.
+                    self.child_tracking_degraded = true;
+                    self.clear_quarantine();
+                    return Ok(());
                 }
                 if self.sessions.contains_key(&spawned.child_session_id) {
                     return Err(GrokAcpError::Protocol(
@@ -2551,6 +2684,7 @@ impl<'a> ProtocolState<'a> {
                         spawned: spawned.clone(),
                         closed: false,
                         last_progress: None,
+                        progress_dirty: false,
                     },
                 );
                 if visible {
@@ -2579,6 +2713,9 @@ impl<'a> ProtocolState<'a> {
                     self.authorization,
                 )?;
                 let Some(registration) = self.children.get(&child_session_id) else {
+                    if self.child_tracking_degraded {
+                        return Ok(());
+                    }
                     return Err(GrokAcpError::Protocol(
                         "subagent progress referenced an unregistered child".into(),
                     ));
@@ -2590,16 +2727,30 @@ impl<'a> ProtocolState<'a> {
                 }
                 let progress =
                     parse_subagent_progress(update, &registration.spawned, self.authorization)?;
-                let registration = self
+                if self
                     .children
-                    .get_mut(&child_session_id)
-                    .expect("child registration was just validated");
-                if registration.closed || registration.last_progress.as_ref() == Some(&progress) {
+                    .get(&child_session_id)
+                    .is_some_and(|registration| {
+                        registration.closed
+                            || registration.last_progress.as_ref() == Some(&progress)
+                    })
+                {
                     return Ok(());
                 }
-                registration.last_progress = Some(progress.clone());
+                self.children
+                    .get_mut(&child_session_id)
+                    .expect("child registration was just validated")
+                    .last_progress = Some(progress.clone());
                 if visible {
-                    self.emit(emit, GrokAcpEvent::SubagentProgress { progress })?;
+                    let emitted = self.emit_detail(
+                        &child_session_id,
+                        emit,
+                        GrokAcpEvent::SubagentProgress { progress },
+                    );
+                    self.children
+                        .get_mut(&child_session_id)
+                        .expect("child registration was just validated")
+                        .progress_dirty = !emitted;
                 }
                 Ok(())
             }
@@ -2611,6 +2762,9 @@ impl<'a> ProtocolState<'a> {
                     self.authorization,
                 )?;
                 let Some(registration) = self.children.get(&child_session_id) else {
+                    if self.child_tracking_degraded {
+                        return Ok(());
+                    }
                     return Err(GrokAcpError::Protocol(
                         "subagent result referenced an unregistered child".into(),
                     ));
@@ -2626,6 +2780,9 @@ impl<'a> ProtocolState<'a> {
                 let spawned = registration.spawned.clone();
                 let result = parse_subagent_finished(update, &spawned, self.authorization)?;
                 if visible {
+                    self.flush_pending_plan(&child_session_id, emit)?;
+                    self.flush_pending_tool_calls(&child_session_id, emit)?;
+                    self.flush_pending_child_progress(&child_session_id, emit)?;
                     let emitted_messages =
                         self.flush_child_text_streams(&child_session_id, emit)?;
                     if let Some(output) = result.output.as_ref().filter(|text| !text.is_empty()) {
@@ -2733,16 +2890,115 @@ impl<'a> ProtocolState<'a> {
             )?;
         }
         for (message_id, text) in thought_tails {
-            self.emit(
+            self.emit_detail(
+                session_id,
                 emit,
                 GrokAcpEvent::AgentThoughtChunk {
                     session_id: session_id.to_owned(),
                     message_id,
                     text,
                 },
-            )?;
+            );
         }
         Ok(emitted_messages)
+    }
+
+    fn flush_pending_plan<E>(&mut self, session_id: &str, emit: &mut E) -> Result<(), GrokAcpError>
+    where
+        E: FnMut(GrokAcpEvent),
+    {
+        if let Some(entries) = self.pending_plans.remove(session_id) {
+            self.emit(
+                emit,
+                GrokAcpEvent::PlanSnapshot {
+                    session_id: session_id.to_owned(),
+                    entries,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_tool_calls<E>(
+        &mut self,
+        session_id: &str,
+        emit: &mut E,
+    ) -> Result<(), GrokAcpError>
+    where
+        E: FnMut(GrokAcpEvent),
+    {
+        let pending = self
+            .sessions
+            .get_mut(session_id)
+            .map(|stream| {
+                let dirty = std::mem::take(&mut stream.dirty_tool_calls);
+                stream
+                    .tool_call_order
+                    .iter()
+                    .filter(|id| dirty.contains(*id))
+                    .filter_map(|id| stream.tool_calls.get(id).cloned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for tool_call in pending {
+            self.emit(
+                emit,
+                GrokAcpEvent::ToolCallUpdate {
+                    session_id: session_id.to_owned(),
+                    tool_call,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending_child_progress<E>(
+        &mut self,
+        child_session_id: &str,
+        emit: &mut E,
+    ) -> Result<(), GrokAcpError>
+    where
+        E: FnMut(GrokAcpEvent),
+    {
+        let progress = self
+            .children
+            .get_mut(child_session_id)
+            .and_then(|registration| {
+                if !registration.progress_dirty {
+                    return None;
+                }
+                registration.progress_dirty = false;
+                registration.last_progress.clone()
+            });
+        if let Some(progress) = progress {
+            self.emit(emit, GrokAcpEvent::SubagentProgress { progress })?;
+        }
+        Ok(())
+    }
+
+    fn flush_suppressed_root_text<E>(
+        &mut self,
+        session_id: &str,
+        emit: &mut E,
+    ) -> Result<(), GrokAcpError>
+    where
+        E: FnMut(GrokAcpEvent),
+    {
+        let Some(start) = self.suppressed_root_text_start.take() else {
+            return Ok(());
+        };
+        let text = self.response_text[start..].to_owned();
+        if !text.is_empty() {
+            self.emit(
+                emit,
+                GrokAcpEvent::AgentMessageChunk {
+                    session_id: session_id.to_owned(),
+                    message_id: format!("{session_id}:coalesced-final"),
+                    text,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn flush_text_streams<E>(&mut self, emit: &mut E) -> Result<(), GrokAcpError>
@@ -2783,27 +3039,33 @@ impl<'a> ProtocolState<'a> {
             (agent_tails, thought_tails)
         };
         for (message_id, text) in agent_tails {
+            let start = self.response_text.len();
             self.response_text.push_str(&text);
-            self.emit(
+            if !self.emit_detail(
+                &session_id,
                 emit,
                 GrokAcpEvent::AgentMessageChunk {
                     session_id: session_id.clone(),
                     message_id,
                     text,
                 },
-            )?;
+            ) && self.suppressed_root_text_start.is_none()
+            {
+                self.suppressed_root_text_start = Some(start);
+            }
         }
         for (message_id, text) in thought_tails {
-            self.emit(
+            self.emit_detail(
+                &session_id,
                 emit,
                 GrokAcpEvent::AgentThoughtChunk {
                     session_id: session_id.clone(),
                     message_id,
                     text,
                 },
-            )?;
+            );
         }
-        Ok(())
+        self.flush_suppressed_root_text(&session_id, emit)
     }
 
     fn permission_scope(
@@ -2829,6 +3091,14 @@ impl<'a> ProtocolState<'a> {
             self.permission_scope(params)?.ok_or_else(|| {
                 GrokAcpError::Protocol("permission request used an unknown session ID".into())
             })?;
+        if self.child_tracking_degraded && envelope_scope == GrokAcpSessionScope::Root {
+            // Once child projection has degraded, a root envelope can no
+            // longer prove whether a tool belongs to the root or to a dropped
+            // child. Installed Grok legitimately uses root envelopes for
+            // child permissions, so cancel every ambiguous root-envelope
+            // request instead of risking an authority upgrade.
+            return Ok(None);
+        }
         let tool_call = params
             .get("toolCall")
             .ok_or_else(|| GrokAcpError::Protocol("permission request omitted toolCall".into()))
@@ -2925,6 +3195,17 @@ impl<'a> ProtocolState<'a> {
             if registration.closed {
                 continue;
             }
+            for result in [
+                self.flush_pending_plan(&child_session_id, emit),
+                self.flush_pending_tool_calls(&child_session_id, emit),
+                self.flush_pending_child_progress(&child_session_id, emit),
+            ] {
+                if let Err(error) = result
+                    && first_flush_error.is_none()
+                {
+                    first_flush_error = Some(error);
+                }
+            }
             if let Err(error) = self.flush_child_text_streams(&child_session_id, emit)
                 && first_flush_error.is_none()
             {
@@ -2961,6 +3242,23 @@ impl<'a> ProtocolState<'a> {
         first_flush_error.map_or(Ok(()), Err)
     }
 
+    fn flush_error_projection<E>(&mut self, emit: &mut E)
+    where
+        E: FnMut(GrokAcpEvent),
+    {
+        // Preserve the original provider/protocol error while making every
+        // already-accepted piece of user-visible state observable. Each flush
+        // is independently best-effort so one malformed child cannot prevent
+        // the root's partial answer, tools, or plan from being recovered.
+        let _ = self.close_active_children(emit);
+        self.clear_quarantine();
+        let _ = self.flush_text_streams(emit);
+        if let Some(session_id) = self.session_id.clone() {
+            let _ = self.flush_pending_tool_calls(&session_id, emit);
+            let _ = self.flush_pending_plan(&session_id, emit);
+        }
+    }
+
     fn outcome(&self, stop_reason: GrokAcpStopReason) -> GrokAcpOutcome {
         GrokAcpOutcome {
             session_id: self.session_id.clone(),
@@ -2976,6 +3274,18 @@ impl<'a> ProtocolState<'a> {
     {
         self.close_active_children(emit)?;
         self.clear_quarantine();
+        if let Some(session_id) = self.session_id.clone() {
+            self.flush_text_streams(emit)?;
+            self.flush_pending_tool_calls(&session_id, emit)?;
+            self.flush_pending_plan(&session_id, emit)?;
+            self.emit(
+                emit,
+                GrokAcpEvent::Terminal {
+                    session_id,
+                    stop_reason: GrokAcpStopReason::Cancelled,
+                },
+            )?;
+        }
         Ok(self.outcome(GrokAcpStopReason::Cancelled))
     }
 }
@@ -4439,21 +4749,26 @@ mod tests {
                 "_meta": {"eventId": event_id}
             })
         };
-        state
-            .apply_session_update(&update("first-child", "first-1"), &mut |_| {})
-            .unwrap();
+        for index in 0..MAX_QUARANTINED_NOTIFICATIONS {
+            state
+                .apply_session_update(
+                    &update(&format!("child-{index}"), &format!("event-{index}")),
+                    &mut |_| {},
+                )
+                .unwrap();
+        }
         assert!(matches!(
-            state.apply_session_update(&update("second-child", "second-1"), &mut |_| {}),
+            state.apply_session_update(&update("overflow-child", "overflow-event"), &mut |_| {}),
             Err(GrokAcpError::Protocol(message))
                 if message.contains("bounded pre-registration")
         ));
-        assert_eq!(state.quarantine.len(), 1);
+        assert_eq!(state.quarantine.len(), MAX_QUARANTINED_NOTIFICATIONS);
         assert_eq!(
             state
                 .quarantine
                 .front()
                 .map(|entry| entry.session_id.as_str()),
-            Some("first-child")
+            Some("child-0")
         );
     }
 
@@ -4709,42 +5024,46 @@ mod tests {
     }
 
     #[test]
-    fn replay_event_ids_sessions_and_stream_maps_are_bounded() {
+    fn projection_budget_does_not_bound_protocol_state() {
         let mut event_ids = ProtocolState::new("", 1, 1_000, 10_000).with_subagents(true);
         event_ids.set_root_session("root".into()).unwrap();
         event_ids.session_load_pending = true;
-        for (index, expected_error) in [(1, false), (2, true)] {
-            let result = event_ids.apply_session_update(
-                &json!({
-                    "sessionId": "root",
-                    "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": "history"}
-                    },
-                    "_meta": {"eventId": format!("root-{index}")}
-                }),
-                &mut |_| {},
-            );
-            assert_eq!(result.is_err(), expected_error);
+        for index in 1..=2 {
+            event_ids
+                .apply_session_update(
+                    &json!({
+                        "sessionId": "root",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "history"}
+                        },
+                        "_meta": {"eventId": format!("root-{index}")}
+                    }),
+                    &mut |_| {},
+                )
+                .unwrap();
         }
+        assert_eq!(event_ids.seen_event_ids.len(), 2);
 
         let mut tools = ProtocolState::new("", 1, 1_000, 10_000).with_subagents(true);
         tools.set_root_session("root".into()).unwrap();
         tools.session_load_pending = true;
-        for (index, expected_error) in [(1, false), (2, true)] {
-            let result = tools.apply_session_update(
-                &json!({
-                    "sessionId": "root",
-                    "update": {
-                        "sessionUpdate": "tool_call",
-                        "toolCallId": format!("tool-{index}"),
-                        "title": "Replay tool"
-                    }
-                }),
-                &mut |_| {},
-            );
-            assert_eq!(result.is_err(), expected_error);
+        for index in 1..=2 {
+            tools
+                .apply_session_update(
+                    &json!({
+                        "sessionId": "root",
+                        "update": {
+                            "sessionUpdate": "tool_call",
+                            "toolCallId": format!("tool-{index}"),
+                            "title": "Replay tool"
+                        }
+                    }),
+                    &mut |_| {},
+                )
+                .unwrap();
         }
+        assert_eq!(tools.sessions["root"].tool_calls.len(), 2);
 
         let mut children = ProtocolState::new("", 1, 1_000, 10_000).with_subagents(true);
         children.set_root_session("root".into()).unwrap();
@@ -4754,10 +5073,10 @@ mod tests {
             .apply_session_update(&first_spawn, &mut |_| {})
             .unwrap();
         let second_spawn = spawn_update("agent-2", "child-2", "root-2");
-        assert!(matches!(
-            children.apply_session_update(&second_spawn, &mut |_| {}),
-            Err(GrokAcpError::EventLimit { limit: 1 })
-        ));
+        children
+            .apply_session_update(&second_spawn, &mut |_| {})
+            .unwrap();
+        assert_eq!(children.children.len(), 2);
     }
 
     #[test]
@@ -5124,12 +5443,23 @@ mod tests {
     #[test]
     fn child_permission_cancellation_never_cancels_the_root_protocol() {
         let mut state = scoped_state();
+        state.max_events = 1;
         state
             .apply_session_update(
                 &spawn_update("child-agent", "child-session", "root-1"),
                 &mut |_| {},
             )
             .unwrap();
+        let mut events = Vec::new();
+        assert!(state.emit_detail(
+            "root",
+            &mut |event| events.push(event),
+            GrokAcpEvent::AgentThoughtChunk {
+                session_id: "root".into(),
+                message_id: "budget".into(),
+                text: "consume detail budget".into(),
+            },
+        ));
         state
             .apply_session_update(
                 &json!({
@@ -5143,7 +5473,24 @@ mod tests {
                     },
                     "_meta": {"eventId": "child-web-1"}
                 }),
-                &mut |_| {},
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "child-session",
+                    "update": {
+                        "sessionUpdate": "plan",
+                        "entries": [{
+                            "content": "Fetch the source",
+                            "priority": "high",
+                            "status": "in_progress"
+                        }]
+                    },
+                    "_meta": {"eventId": "child-plan-1"}
+                }),
+                &mut |event| events.push(event),
             )
             .unwrap();
         let cancelled = AtomicBool::new(false);
@@ -5162,7 +5509,6 @@ mod tests {
             10_000,
         );
         let mut delegated = false;
-        let mut events = Vec::new();
         let disposition = handle_agent_message(
             "session/request_permission",
             &json!({
@@ -5202,21 +5548,205 @@ mod tests {
         assert!(!delegated, "disabled web policy should decide locally");
         assert!(!state.cancel_sent);
         assert_eq!(response["result"]["outcome"]["outcome"], "cancelled");
-        assert!(matches!(
-            events.as_slice(),
-            [
-                GrokAcpEvent::PermissionRequested {
-                    request: GrokAcpPermissionRequest {
-                        scope: GrokAcpSessionScope::Child { .. },
+        let tool_index = events
+            .iter()
+            .position(|event| matches!(event, GrokAcpEvent::ToolCallUpdate { .. }))
+            .unwrap();
+        let plan_index = events
+            .iter()
+            .position(|event| matches!(event, GrokAcpEvent::PlanSnapshot { .. }))
+            .unwrap();
+        let permission_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    GrokAcpEvent::PermissionRequested {
+                        request: GrokAcpPermissionRequest {
+                            scope: GrokAcpSessionScope::Child { .. },
+                            ..
+                        }
+                    }
+                )
+            })
+            .unwrap();
+        let resolved_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    GrokAcpEvent::PermissionResolved {
+                        resolution: GrokAcpPermissionResolution::Cancelled,
                         ..
                     }
-                },
-                GrokAcpEvent::PermissionResolved {
-                    resolution: GrokAcpPermissionResolution::Cancelled,
-                    ..
-                }
-            ]
+                )
+            })
+            .unwrap();
+        assert!(tool_index < permission_index);
+        assert!(plan_index < permission_index);
+        assert!(permission_index < resolved_index);
+        assert!(
+            !state.children["child-session"].closed,
+            "a child permission cancellation must not cancel the root protocol"
+        );
+    }
+
+    #[test]
+    fn detail_pressure_preserves_root_permission_cause_through_cancel_terminal() {
+        let mut state = scoped_state();
+        state.max_events = 1;
+        let mut events = Vec::new();
+        assert!(state.emit_detail(
+            "root",
+            &mut |event| events.push(event),
+            GrokAcpEvent::AgentThoughtChunk {
+                session_id: "root".into(),
+                message_id: "budget".into(),
+                text: "consume detail budget".into(),
+            },
         ));
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "root-write",
+                        "title": "Write file",
+                        "kind": "edit",
+                        "status": "pending"
+                    }
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "plan",
+                        "entries": [{
+                            "content": "Write the file",
+                            "priority": "high",
+                            "status": "in_progress"
+                        }]
+                    }
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+
+        let cancelled = AtomicBool::new(false);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let writer = thread::spawn(move || {
+            let request: StdinWriteRequest = receiver.recv().unwrap();
+            let value: Value = serde_json::from_slice(&request.bytes).unwrap();
+            request.result.send(Ok(())).unwrap();
+            value
+        });
+        let mut stdin = ProtocolStdin::new(
+            sender,
+            &cancelled,
+            Instant::now(),
+            Duration::from_secs(1),
+            10_000,
+        );
+        let disposition = handle_agent_message(
+            "session/request_permission",
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 44,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "root",
+                    "toolCall": {
+                        "toolCallId": "root-write",
+                        "title": "Write file",
+                        "kind": "edit"
+                    },
+                    "options": [{
+                        "optionId": "reject",
+                        "name": "Reject once",
+                        "kind": "reject_once"
+                    }]
+                }
+            }),
+            true,
+            &mut |_| GrokAcpPermissionDecision::Cancel,
+            &mut |event| events.push(event),
+            &mut stdin,
+            &mut state,
+        )
+        .unwrap();
+        drop(stdin);
+        let response = writer.join().unwrap();
+        assert_eq!(disposition, AgentMessageDisposition::Cancelled);
+        assert_eq!(response["result"]["outcome"]["outcome"], "cancelled");
+
+        state
+            .cancelled_outcome(&mut |event| events.push(event))
+            .unwrap();
+        let tool_index = events
+            .iter()
+            .position(|event| matches!(event, GrokAcpEvent::ToolCallUpdate { .. }))
+            .unwrap();
+        let plan_index = events
+            .iter()
+            .position(|event| matches!(event, GrokAcpEvent::PlanSnapshot { .. }))
+            .unwrap();
+        let permission_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    GrokAcpEvent::PermissionRequested {
+                        request: GrokAcpPermissionRequest {
+                            scope: GrokAcpSessionScope::Root,
+                            ..
+                        }
+                    }
+                )
+            })
+            .unwrap();
+        let resolved_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    GrokAcpEvent::PermissionResolved {
+                        resolution: GrokAcpPermissionResolution::Cancelled,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        let terminal_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    GrokAcpEvent::Terminal {
+                        stop_reason: GrokAcpStopReason::Cancelled,
+                        ..
+                    }
+                )
+            })
+            .unwrap();
+        assert!(tool_index < permission_index);
+        assert!(plan_index < permission_index);
+        assert!(permission_index < resolved_index);
+        assert!(resolved_index < terminal_index);
+        assert!(
+            !events[resolved_index + 1..terminal_index]
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    GrokAcpEvent::ToolCall { .. }
+                        | GrokAcpEvent::ToolCallUpdate { .. }
+                        | GrokAcpEvent::PlanSnapshot { .. }
+                ))
+        );
     }
 
     #[test]
@@ -5269,7 +5799,7 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_event_budget_still_emits_one_synthetic_child_finish() {
+    fn exhausted_detail_budget_still_emits_terminal_and_one_synthetic_child_finish() {
         let mut state = ProtocolState::new("", 1, 1_000, 10_000).with_subagents(true);
         state.set_root_session("root".into()).unwrap();
         let mut events = Vec::new();
@@ -5279,16 +5809,33 @@ mod tests {
                 &mut |event| events.push(event),
             )
             .unwrap();
-        assert!(matches!(
-            state.emit(
+        assert!(state.emit_detail(
+            "root",
+            &mut |event| events.push(event),
+            GrokAcpEvent::AgentThoughtChunk {
+                session_id: "root".into(),
+                message_id: "thought-1".into(),
+                text: "detail".into(),
+            }
+        ));
+        assert!(!state.emit_detail(
+            "root",
+            &mut |event| events.push(event),
+            GrokAcpEvent::AgentThoughtChunk {
+                session_id: "root".into(),
+                message_id: "thought-2".into(),
+                text: "suppressed".into(),
+            }
+        ));
+        state
+            .emit(
                 &mut |event| events.push(event),
                 GrokAcpEvent::Terminal {
                     session_id: "root".into(),
                     stop_reason: GrokAcpStopReason::EndTurn,
-                }
-            ),
-            Err(GrokAcpError::EventLimit { limit: 1 })
-        ));
+                },
+            )
+            .unwrap();
         state
             .close_active_children(&mut |event| events.push(event))
             .unwrap();
@@ -5304,9 +5851,640 @@ mod tests {
             1
         );
         assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::Terminal { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
             state.outcome(GrokAcpStopReason::Cancelled).event_count,
             events.len()
         );
+    }
+
+    #[test]
+    fn detail_pressure_preserves_root_and_sibling_final_state() {
+        let mut state = ProtocolState::new("", 1, 100_000, 1_000_000).with_subagents(true);
+        state.set_root_session("root".into()).unwrap();
+        let mut events = Vec::new();
+        assert!(state.emit_detail(
+            "root",
+            &mut |event| events.push(event),
+            GrokAcpEvent::AgentThoughtChunk {
+                session_id: "root".into(),
+                message_id: "budget".into(),
+                text: "consume detail budget".into(),
+            },
+        ));
+
+        for (agent, child, suffix) in [("agent-a", "child-a", "A"), ("agent-b", "child-b", "B")] {
+            state
+                .apply_session_update(
+                    &spawn_update(agent, child, &format!("spawn-{suffix}")),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+            state
+                .apply_session_update(
+                    &json!({
+                        "sessionId": child,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": "answer",
+                            "content": {"type": "text", "text": format!("child {suffix} final")}
+                        },
+                        "_meta": {"eventId": format!("message-{suffix}")}
+                    }),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+            state
+                .apply_session_update(
+                    &json!({
+                        "sessionId": child,
+                        "update": {
+                            "sessionUpdate": "plan",
+                            "entries": [{"content": format!("Plan {suffix}"), "priority": "high", "status": "completed"}]
+                        },
+                        "_meta": {"eventId": format!("plan-{suffix}")}
+                    }),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+        }
+
+        for (agent, child, suffix) in [("agent-a", "child-a", "A"), ("agent-b", "child-b", "B")] {
+            state
+                .apply_session_update(
+                    &finish_update(agent, child, &format!("finish-{suffix}")),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+        }
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "root-answer",
+                        "content": {"type": "text", "text": "root final"}
+                    }
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        for content in ["Root plan stale", "Root plan final"] {
+            state
+                .apply_session_update(
+                    &json!({
+                        "sessionId": "root",
+                        "update": {
+                            "sessionUpdate": "plan",
+                            "entries": [{"content": content, "priority": "high", "status": "completed"}]
+                        }
+                    }),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+        }
+        state
+            .flush_text_streams(&mut |event| events.push(event))
+            .unwrap();
+        state
+            .flush_pending_plan("root", &mut |event| events.push(event))
+            .unwrap();
+        state
+            .emit(
+                &mut |event| events.push(event),
+                GrokAcpEvent::Terminal {
+                    session_id: "root".into(),
+                    stop_reason: GrokAcpStopReason::EndTurn,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::SubagentSpawned { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::SubagentFinished { .. }))
+                .count(),
+            2
+        );
+        for expected in ["child A final", "child B final"] {
+            assert!(events.iter().any(|event| matches!(
+                event,
+                GrokAcpEvent::ChildMessage { text, .. } if text == expected
+            )));
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GrokAcpEvent::AgentMessageChunk { text, .. } if text == "root final"
+        )));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::PlanSnapshot { .. }))
+                .count(),
+            3
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GrokAcpEvent::PlanSnapshot { session_id, entries }
+                if session_id == "root"
+                    && entries.first().is_some_and(|entry| entry.content == "Root plan final")
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, GrokAcpEvent::Terminal { .. }))
+        );
+    }
+
+    #[test]
+    fn error_projection_recovers_suppressed_root_child_tool_and_plan_state_once() {
+        let mut state = ProtocolState::new("", 1, 100_000, 1_000_000).with_subagents(true);
+        state.set_root_session("root".into()).unwrap();
+        state.session_negotiated = true;
+        let mut events = Vec::new();
+        assert!(state.emit_detail(
+            "root",
+            &mut |event| events.push(event),
+            GrokAcpEvent::AgentThoughtChunk {
+                session_id: "root".into(),
+                message_id: "budget".into(),
+                text: "consume detail budget".into(),
+            },
+        ));
+        state
+            .apply_session_update(
+                &spawn_update("child-agent", "child-session", "spawn-child"),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        for (session_id, text, event_id) in [
+            ("root", "root partial answer", "root-message"),
+            ("child-session", "child partial answer", "child-message"),
+        ] {
+            state
+                .apply_session_update(
+                    &json!({
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": "answer",
+                            "content": {"type": "text", "text": text}
+                        },
+                        "_meta": {"eventId": event_id}
+                    }),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+        }
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "root-tool",
+                        "title": "Inspect files",
+                        "kind": "read",
+                        "status": "completed"
+                    },
+                    "_meta": {"eventId": "root-tool-event"}
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "plan",
+                        "entries": [{
+                            "content": "Preserve partial work",
+                            "priority": "high",
+                            "status": "in_progress"
+                        }]
+                    },
+                    "_meta": {"eventId": "root-plan-event"}
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+
+        state.flush_error_projection(&mut |event| events.push(event));
+        state.flush_error_projection(&mut |event| events.push(event));
+
+        assert_eq!(state.response_text, "root partial answer");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GrokAcpEvent::AgentMessageChunk { text, .. }
+                        if text == "root partial answer"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GrokAcpEvent::ChildMessage { text, .. }
+                        if text == "child partial answer"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::ToolCallUpdate { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::PlanSnapshot { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::SubagentFinished { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn every_post_session_error_preserves_suppressed_root_text_and_original_cause() {
+        let errors = [
+            GrokAcpError::TimedOut { seconds: 60 },
+            GrokAcpError::UnexpectedEof,
+            GrokAcpError::Exited { code: Some(7) },
+            GrokAcpError::ProtocolByteLimit { limit: 64 },
+            GrokAcpError::TextLimit { limit: 32 },
+            GrokAcpError::Protocol("fixture protocol failure".into()),
+        ];
+        for error in errors {
+            let expected_error = error.to_string();
+            let mut state = ProtocolState::new("", 1, 100_000, 1_000_000);
+            state.set_root_session("root".into()).unwrap();
+            let mut events = Vec::new();
+            assert!(state.emit_detail(
+                "root",
+                &mut |event| events.push(event),
+                GrokAcpEvent::AgentThoughtChunk {
+                    session_id: "root".into(),
+                    message_id: "budget".into(),
+                    text: "consume budget".into(),
+                },
+            ));
+            state
+                .apply_session_update(
+                    &json!({
+                        "sessionId": "root",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": "answer",
+                            "content": {"type": "text", "text": "preserved partial answer"}
+                        }
+                    }),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+
+            let result =
+                finish_protocol_result(Err(error), &mut state, &mut |event| events.push(event));
+
+            assert_eq!(result.unwrap_err().to_string(), expected_error);
+            assert_eq!(state.response_text, "preserved partial answer");
+            assert!(events.iter().any(|event| matches!(
+                event,
+                GrokAcpEvent::AgentMessageChunk { text, .. }
+                    if text == "preserved partial answer"
+            )));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, GrokAcpEvent::Terminal { .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn cumulative_child_registry_degrades_without_aborting_the_root_turn() {
+        let mut state = scoped_state();
+        let mut events = Vec::new();
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "known-root-tool",
+                        "title": "Root write",
+                        "kind": "edit",
+                        "status": "pending"
+                    }
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        for index in 0..MAX_TRACKED_CHILDREN {
+            let subagent_id = format!("agent-{index}");
+            let child_session_id = format!("child-{index}");
+            state
+                .apply_session_update(
+                    &spawn_update(&subagent_id, &child_session_id, &format!("spawn-{index}")),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+            if index == 0 {
+                state
+                    .apply_session_update(
+                        &json!({
+                            "sessionId": child_session_id.clone(),
+                            "update": {
+                                "sessionUpdate": "tool_call",
+                                "toolCallId": "known-child-tool",
+                                "title": "Child write",
+                                "kind": "edit",
+                                "status": "pending"
+                            },
+                            "_meta": {"eventId": "known-child-tool-event"}
+                        }),
+                        &mut |event| events.push(event),
+                    )
+                    .unwrap();
+            }
+            state
+                .apply_session_update(
+                    &finish_update(&subagent_id, &child_session_id, &format!("finish-{index}")),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+        }
+        state
+            .apply_session_update(
+                &spawn_update("agent-overflow", "child-overflow", "spawn-overflow"),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        assert!(state.child_tracking_degraded);
+        assert_eq!(state.children.len(), MAX_TRACKED_CHILDREN);
+        assert_eq!(state.child_order.len(), MAX_TRACKED_CHILDREN);
+
+        // Updates from children beyond the projection bound are discarded,
+        // including malformed detail without an event ID, while root output
+        // remains live and the provider turn continues.
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "child-overflow",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "untracked child detail"}
+                    }
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "subagent_finished",
+                        "subagent_id": "agent-overflow",
+                        "parent_session_id": "root",
+                        "child_session_id": "child-overflow",
+                        "status": "completed"
+                    }
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        assert!(
+            state
+                .permission_scope(&json!({"sessionId": "child-overflow"}))
+                .unwrap()
+                .is_none()
+        );
+        for tool_call_id in [
+            "known-root-tool",
+            "known-child-tool",
+            "untracked-child-tool",
+        ] {
+            assert!(
+                state
+                    .parse_permission_request(&json!({
+                        "sessionId": "root",
+                        "toolCall": {
+                            "toolCallId": tool_call_id,
+                            "title": "Write file",
+                            "kind": "edit"
+                        },
+                        "options": [{
+                            "optionId": "allow",
+                            "name": "Allow once",
+                            "kind": "allow_once"
+                        }]
+                    }))
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "root-answer",
+                        "content": {"type": "text", "text": "root still completes."}
+                    }
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        state
+            .flush_text_streams(&mut |event| events.push(event))
+            .unwrap();
+
+        assert_eq!(state.response_text, "root still completes.");
+        assert!(state.ensure_quarantine_resolved().is_ok());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::SubagentSpawned { .. }))
+                .count(),
+            MAX_TRACKED_CHILDREN
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::SubagentFinished { .. }))
+                .count(),
+            MAX_TRACKED_CHILDREN
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    GrokAcpEvent::AgentMessageChunk { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            "root still completes."
+        );
+    }
+
+    #[test]
+    fn five_child_field_volume_over_ten_thousand_degrades_without_losing_final_state() {
+        let mut state =
+            ProtocolState::new("", DEFAULT_MAX_EVENTS, 1_000_000, 4_000_000).with_subagents(true);
+        state.set_root_session("root".into()).unwrap();
+        let mut events = Vec::new();
+        let child_sessions = (0..5)
+            .map(|index| format!("child-{index}"))
+            .collect::<Vec<_>>();
+        for (index, child_session) in child_sessions.iter().enumerate() {
+            state
+                .apply_session_update(
+                    &spawn_update(
+                        &format!("agent-{index}"),
+                        child_session,
+                        &format!("spawn-{index}"),
+                    ),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+        }
+
+        let mut sessions = vec!["root".to_owned()];
+        sessions.extend(child_sessions.iter().cloned());
+        let mut suppressed = 0;
+        for index in 0..=DEFAULT_MAX_EVENTS {
+            let session_id = &sessions[index % sessions.len()];
+            if !state.emit_detail(
+                session_id,
+                &mut |_| {},
+                GrokAcpEvent::AgentThoughtChunk {
+                    session_id: session_id.clone(),
+                    message_id: format!("detail-{index}"),
+                    text: "detail".into(),
+                },
+            ) {
+                suppressed += 1;
+            }
+        }
+        assert!(suppressed > 0);
+        assert_eq!(
+            state.detail_event_count,
+            sessions.len() * MAX_DETAIL_EVENTS_PER_SESSION
+        );
+
+        for (index, child_session) in child_sessions.iter().enumerate() {
+            let final_text = format!("child {index} final");
+            state
+                .apply_session_update(
+                    &json!({
+                        "sessionId": child_session,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "messageId": "answer",
+                            "content": {"type": "text", "text": final_text}
+                        },
+                        "_meta": {"eventId": format!("message-{index}")}
+                    }),
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+            let mut finish = finish_update(
+                &format!("agent-{index}"),
+                child_session,
+                &format!("finish-{index}"),
+            );
+            finish["update"]["output"] = Value::String(final_text);
+            state
+                .apply_session_update(&finish, &mut |event| events.push(event))
+                .unwrap();
+        }
+        state
+            .apply_session_update(
+                &json!({
+                    "sessionId": "root",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "messageId": "root-answer",
+                        "content": {"type": "text", "text": "root final"}
+                    }
+                }),
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        state
+            .flush_text_streams(&mut |event| events.push(event))
+            .unwrap();
+        state
+            .emit(
+                &mut |event| events.push(event),
+                GrokAcpEvent::Terminal {
+                    session_id: "root".into(),
+                    stop_reason: GrokAcpStopReason::EndTurn,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::SubagentSpawned { .. }))
+                .count(),
+            5
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, GrokAcpEvent::SubagentFinished { .. }))
+                .count(),
+            5
+        );
+        for index in 0..5 {
+            let expected = format!("child {index} final");
+            assert!(events.iter().any(|event| matches!(
+                event,
+                GrokAcpEvent::ChildMessage { text, .. } if text == &expected
+            )));
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GrokAcpEvent::AgentMessageChunk { text, .. } if text == "root final"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GrokAcpEvent::Terminal {
+                stop_reason: GrokAcpStopReason::EndTurn,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -5992,7 +7170,7 @@ mod tests {
     }
 
     #[test]
-    fn text_and_event_limits_fail_closed() {
+    fn text_and_protocol_limits_fail_closed_while_detail_degrades() {
         let params = json!({
             "sessionId": "s1",
             "update": {
@@ -6009,25 +7187,35 @@ mod tests {
 
         let mut state = ProtocolState::new("", 1, 100, 100);
         state.session_id = Some("s1".into());
+        let mut events = Vec::new();
+        assert!(state.emit_detail(
+            "s1",
+            &mut |event| events.push(event),
+            GrokAcpEvent::AgentThoughtChunk {
+                session_id: "s1".into(),
+                message_id: "one".into(),
+                text: "one".into(),
+            },
+        ));
+        assert!(!state.emit_detail(
+            "s1",
+            &mut |event| events.push(event),
+            GrokAcpEvent::AgentThoughtChunk {
+                session_id: "s1".into(),
+                message_id: "two".into(),
+                text: "two".into(),
+            },
+        ));
         state
             .emit(
-                &mut |_| {},
+                &mut |event| events.push(event),
                 GrokAcpEvent::Terminal {
                     session_id: "s1".into(),
                     stop_reason: GrokAcpStopReason::EndTurn,
                 },
             )
             .unwrap();
-        assert!(matches!(
-            state.emit(
-                &mut |_| {},
-                GrokAcpEvent::Terminal {
-                    session_id: "s1".into(),
-                    stop_reason: GrokAcpStopReason::EndTurn,
-                },
-            ),
-            Err(GrokAcpError::EventLimit { limit: 1 })
-        ));
+        assert_eq!(events.len(), 2);
 
         let mut state = ProtocolState::new("", 10, 100, 4);
         state.account_protocol_bytes(3).unwrap();
