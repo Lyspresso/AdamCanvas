@@ -35,7 +35,7 @@ use crate::{
         apply_rule_edit, authorize_ai_action, auto_tag_rule_sentence, resolve_pile_memberships,
     },
     dots::{self, ChromeRects},
-    grid_view::{self, GridMetrics, GridViewState, Lightbox},
+    grid_view::{self, CellShape, GridMetrics, GridViewState, Lightbox},
     model::{
         CanvasPage, CanvasTileStyle, DEFAULT_TILE_SIZE, FileKind, PageViewState, Tile, TileContent,
         TileKind, Workspace, WorldRect,
@@ -2169,6 +2169,7 @@ impl AdamApp {
         let mut fit_clicked = false;
         let mut fit_content_clicked = false;
         let mut reset_zoom_clicked = false;
+        let mut grid_shape_clicked = None;
 
         let toolbar = egui::Panel::top("adam-toolbar")
             .exact_size(TOOLBAR_HEIGHT)
@@ -2219,19 +2220,42 @@ impl AdamApp {
                         }
                     });
                     ui.separator();
-                    fit_clicked = ui
-                        .add(Button::new("Fit page"))
-                        .on_hover_text("Show the entire canvas (Command-0)")
-                        .clicked();
-                    fit_content_clicked = ui
-                        .add(Button::new("Fit content"))
-                        .on_hover_text("Resize the canvas around every tile")
-                        .clicked();
-                    let zoom = self.active_camera().zoom;
-                    reset_zoom_clicked = ui
-                        .add(Button::new(format!("{:.0}%", zoom * 100.0)))
-                        .on_hover_text("Reset zoom to 100%")
-                        .clicked();
+                    // In the grid view the canvas fit controls address a
+                    // camera the user cannot see, so the cell-shape toggle
+                    // takes their place.
+                    if let Some(grid) = self.grid_view {
+                        for shape in [CellShape::Square, CellShape::Portrait] {
+                            let selected = grid.shape == shape;
+                            if ui
+                                .add(Button::new(shape.label()).selected(selected))
+                                .on_hover_text(match shape {
+                                    CellShape::Square => "Crop every tile to a square",
+                                    CellShape::Portrait => "Crop every tile to 2:3 portrait",
+                                })
+                                .clicked()
+                            {
+                                grid_shape_clicked = Some(shape);
+                            }
+                        }
+                        reset_zoom_clicked = ui
+                            .add(Button::new(format!("{:.0}%", grid.camera.zoom * 100.0)))
+                            .on_hover_text("Reset the grid to 100% (Command-0)")
+                            .clicked();
+                    } else {
+                        fit_clicked = ui
+                            .add(Button::new("Fit page"))
+                            .on_hover_text("Show the entire canvas (Command-0)")
+                            .clicked();
+                        fit_content_clicked = ui
+                            .add(Button::new("Fit content"))
+                            .on_hover_text("Resize the canvas around every tile")
+                            .clicked();
+                        let zoom = self.active_camera().zoom;
+                        reset_zoom_clicked = ui
+                            .add(Button::new(format!("{:.0}%", zoom * 100.0)))
+                            .on_hover_text("Reset zoom to 100%")
+                            .clicked();
+                    }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let page_size = self.workspace.active_page().size;
@@ -2421,10 +2445,17 @@ impl AdamApp {
         if fit_content_clicked {
             self.fit_content(&context);
         }
+        if let Some(shape) = grid_shape_clicked {
+            self.set_grid_cell_shape(shape);
+        }
         if reset_zoom_clicked {
-            let mut camera = self.active_camera();
-            camera.zoom = 1.0;
-            self.set_active_camera(camera);
+            if self.grid_view.is_some() {
+                self.reset_grid_view_zoom();
+            } else {
+                let mut camera = self.active_camera();
+                camera.zoom = 1.0;
+                self.set_active_camera(camera);
+            }
         }
         toolbar.response.rect
     }
@@ -3288,6 +3319,7 @@ impl AdamApp {
                     grid_view::TARGET_CELL,
                     grid_view::GAP,
                     grid_view::PADDING,
+                    state.shape,
                 );
 
                 // Tiles can be deleted or the page switched while the grid is
@@ -3310,12 +3342,33 @@ impl AdamApp {
                     }
                 }
 
-                // The grid scrolls; an open lightbox owns the wheel instead so
+                // Camera gestures mirror the canvas: pinch or Command-scroll
+                // zooms about the pointer, a plain scroll pans both axes, and
+                // dragging moves the wall. An open lightbox owns the input so
                 // the photo does not slide out from under itself.
-                if state.lightbox.is_none() && response.contains_pointer() {
-                    state.scroll -= context.input(|input| input.smooth_scroll_delta.y);
+                if state.lightbox.is_none() {
+                    if response.contains_pointer() {
+                        let pointer = context
+                            .input(|input| input.pointer.hover_pos())
+                            .unwrap_or_else(|| view.center());
+                        let zoom_delta = context.input(|input| input.zoom_delta());
+                        if zoom_delta != 1.0 {
+                            state.camera.zoom_by(zoom_delta, pointer, view);
+                        } else {
+                            let scroll = context.input(|input| input.smooth_scroll_delta);
+                            if scroll != Vec2::ZERO {
+                                state.camera.offset -= scroll / state.camera.zoom;
+                            }
+                        }
+                    }
+                    if response.dragged_by(PointerButton::Primary)
+                        || response.dragged_by(PointerButton::Middle)
+                    {
+                        state.camera.offset -= response.drag_delta() / state.camera.zoom;
+                        context.set_cursor_icon(CursorIcon::Grabbing);
+                    }
                 }
-                state.scroll = metrics.clamp_scroll(state.scroll, view.height());
+                state.camera = state.camera.clamped(metrics.content, view);
 
                 let hovered = if state.lightbox.is_some() {
                     None
@@ -3323,15 +3376,18 @@ impl AdamApp {
                     context
                         .input(|input| input.pointer.hover_pos())
                         .filter(|pointer| view.contains(*pointer))
-                        .and_then(|pointer| metrics.index_at(view, state.scroll, pointer))
+                        .and_then(|pointer| metrics.index_at(state.camera.to_layout(pointer, view)))
                 };
-                if hovered.is_some() {
+                if hovered.is_some() && !response.dragged() {
                     context.set_cursor_icon(CursorIcon::PointingHand);
                 }
 
                 let pixels_per_point = context.pixels_per_point().max(1.0);
                 let focused = state.lightbox.map(|lightbox| lightbox.index);
-                let visible = metrics.visible_range(view.height(), state.scroll);
+                let cell_aspect = state.shape.aspect();
+                let zoom = state.camera.zoom;
+                let top = state.camera.offset.y;
+                let visible = metrics.visible_range(top, top + state.camera.visible_size(view).y);
 
                 {
                     let page = self.workspace.active_page();
@@ -3341,7 +3397,7 @@ impl AdamApp {
                         let Some(tile) = page.tiles.get(index) else {
                             continue;
                         };
-                        let rect = metrics.cell_rect(index, view, state.scroll);
+                        let rect = state.camera.to_screen(metrics.cell_rect(index), view);
                         if !rect.intersects(view) {
                             continue;
                         }
@@ -3361,6 +3417,8 @@ impl AdamApp {
                             tile,
                             previews,
                             pixels_per_point,
+                            cell_aspect,
+                            zoom,
                             hovered == Some(index),
                             selection.contains(&tile.id),
                             colors,
@@ -3382,7 +3440,9 @@ impl AdamApp {
                 if let Some(lightbox) = state.lightbox {
                     let page = self.workspace.active_page();
                     if let Some(tile) = page.tiles.get(lightbox.index) {
-                        let cell = metrics.cell_rect(lightbox.index, view, state.scroll);
+                        let cell = state
+                            .camera
+                            .to_screen(metrics.cell_rect(lightbox.index), view);
                         let photo = draw_grid_lightbox(
                             &painter,
                             view,
@@ -3391,6 +3451,7 @@ impl AdamApp {
                             lightbox,
                             &mut self.previews,
                             pixels_per_point,
+                            cell_aspect,
                             colors,
                         );
                         draw_grid_lightbox_caption(&painter, photo, tile, lightbox, colors);
@@ -3398,7 +3459,15 @@ impl AdamApp {
                     }
                 }
 
-                draw_grid_view_hint(&painter, view, count, state.lightbox.is_some(), colors);
+                draw_grid_view_hint(
+                    &painter,
+                    view,
+                    count,
+                    state.shape,
+                    state.camera.zoom,
+                    state.lightbox.is_some(),
+                    colors,
+                );
 
                 if response.clicked() {
                     if state.lightbox.is_some() {
@@ -3413,7 +3482,7 @@ impl AdamApp {
                         }
                     } else if let Some(index) = context
                         .input(|input| input.pointer.interact_pos())
-                        .and_then(|pointer| metrics.index_at(view, state.scroll, pointer))
+                        .and_then(|pointer| metrics.index_at(state.camera.to_layout(pointer, view)))
                     {
                         state.lightbox = Some(Lightbox::opening(index));
                         context.request_repaint();
@@ -3425,12 +3494,61 @@ impl AdamApp {
     }
 
     /// Enters or leaves the grid view. Opening always starts at the top of the
-    /// page with no photo expanded.
+    /// page at 100% with no photo expanded.
     fn toggle_grid_view(&mut self) {
         self.grid_view = match self.grid_view {
             Some(_) => None,
             None => Some(GridViewState::default()),
         };
+    }
+
+    /// Switches cell shape, keeping the wall anchored on whatever row is at
+    /// the top of the viewport — otherwise a toggle throws you somewhere else
+    /// in a long page.
+    fn set_grid_cell_shape(&mut self, shape: CellShape) {
+        let Some(mut state) = self.grid_view else {
+            return;
+        };
+        if state.shape == shape {
+            return;
+        }
+        let view = self.last_canvas_rect.unwrap_or(Rect::ZERO);
+        let count = self.workspace.active_page().tiles.len();
+        let before = GridMetrics::compute(
+            view.width(),
+            count,
+            grid_view::TARGET_CELL,
+            grid_view::GAP,
+            grid_view::PADDING,
+            state.shape,
+        );
+        let after = GridMetrics::compute(
+            view.width(),
+            count,
+            grid_view::TARGET_CELL,
+            grid_view::GAP,
+            grid_view::PADDING,
+            shape,
+        );
+        // Carry the top row across by rescaling the vertical offset against
+        // each shape's row pitch.
+        let before_pitch = before.cell.y + before.gap;
+        let after_pitch = after.cell.y + after.gap;
+        if before_pitch > 0.0 {
+            let rows_down = (state.camera.offset.y - before.padding) / before_pitch;
+            state.camera.offset.y = after.padding + rows_down * after_pitch;
+        }
+        state.shape = shape;
+        state.camera = state.camera.clamped(after.content, view);
+        self.grid_view = Some(state);
+    }
+
+    fn reset_grid_view_zoom(&mut self) {
+        let Some(mut state) = self.grid_view else {
+            return;
+        };
+        state.camera.zoom = 1.0;
+        self.grid_view = Some(state);
     }
 
     /// Grid-view key handling. Returns `true` when the grid consumed the
@@ -3440,22 +3558,19 @@ impl AdamApp {
             return false;
         };
         let count = self.workspace.active_page().tiles.len();
-        let view_height = self
-            .last_canvas_rect
-            .map(|rect| rect.height())
-            .unwrap_or(1.0);
+        let view = self.last_canvas_rect.unwrap_or(Rect::ZERO);
         let metrics = GridMetrics::compute(
-            self.last_canvas_rect
-                .map(|rect| rect.width())
-                .unwrap_or(1.0),
+            view.width(),
             count,
             grid_view::TARGET_CELL,
             grid_view::GAP,
             grid_view::PADDING,
+            state.shape,
         );
 
-        let (escape, left, right, up, down, enter) = context.input(|input| {
+        let (command, escape, left, right, up, down, enter) = context.input(|input| {
             (
+                input.modifiers.command,
                 input.key_pressed(Key::Escape),
                 input.key_pressed(Key::ArrowLeft),
                 input.key_pressed(Key::ArrowRight),
@@ -3464,6 +3579,19 @@ impl AdamApp {
                 input.key_pressed(Key::Enter),
             )
         });
+
+        if command {
+            if context.input(|input| input.key_pressed(Key::Plus) || input.key_pressed(Key::Equals))
+            {
+                state.camera.zoom_by(1.2, view.center(), view);
+            }
+            if context.input(|input| input.key_pressed(Key::Minus)) {
+                state.camera.zoom_by(1.0 / 1.2, view.center(), view);
+            }
+            if context.input(|input| input.key_pressed(Key::Num0)) {
+                state.camera.zoom = 1.0;
+            }
+        }
 
         if escape {
             // First Escape closes the photo, a second leaves the grid.
@@ -3486,18 +3614,21 @@ impl AdamApp {
         if let Some(step) = step
             && count > 0
         {
+            let visible = state.camera.visible_size(view);
             match &mut state.lightbox {
                 Some(lightbox) => {
                     lightbox.step(step, count);
-                    state.scroll =
-                        metrics.scroll_to_reveal(lightbox.index, view_height, state.scroll);
+                    state.camera.offset =
+                        metrics.reveal_offset(lightbox.index, visible, state.camera.offset);
                 }
                 None => {
-                    // Without a photo open the arrows scroll the wall.
-                    state.scroll = metrics.clamp_scroll(
-                        state.scroll + step.signum() as f32 * metrics.cell,
-                        view_height,
-                    );
+                    // Without a photo open the arrows walk the wall itself.
+                    let pitch = if step.abs() == 1 {
+                        vec2(step.signum() as f32 * (metrics.cell.x + metrics.gap), 0.0)
+                    } else {
+                        vec2(0.0, step.signum() as f32 * (metrics.cell.y + metrics.gap))
+                    };
+                    state.camera.offset += pitch;
                 }
             }
             context.request_repaint();
@@ -3507,6 +3638,7 @@ impl AdamApp {
             state.lightbox = Some(Lightbox::opening(0));
         }
 
+        state.camera = state.camera.clamped(metrics.content, view);
         self.grid_view = Some(state);
         true
     }
@@ -11137,7 +11269,11 @@ fn grid_expanded_aspect(tile: &Tile, texture: Option<f32>) -> f32 {
         })
 }
 
-/// Paints one square cell of the contact sheet.
+/// Paints one cell of the contact sheet.
+///
+/// `cell_aspect` is the current shape's width/height, which drives how hard
+/// the source is cropped; `zoom` scales the chrome so captions stay legible
+/// rather than shrinking into nothing as the wall is magnified.
 #[allow(clippy::too_many_arguments)]
 fn draw_grid_cell(
     painter: &Painter,
@@ -11145,10 +11281,15 @@ fn draw_grid_cell(
     tile: &Tile,
     previews: &mut PreviewCache,
     pixels_per_point: f32,
+    cell_aspect: f32,
+    zoom: f32,
     hovered: bool,
     selected: bool,
     colors: Theme,
 ) {
+    let scale = zoom.clamp(0.5, 2.0);
+    let caption_height = (GRID_CAPTION_HEIGHT * scale).min(rect.height() * 0.4);
+    let caption_font = (11.5 * scale).clamp(8.0, 20.0);
     let radius = CornerRadius::same(4);
     painter.rect_filled(rect, radius, colors.tile);
 
@@ -11166,7 +11307,7 @@ fn draw_grid_cell(
         if let Some(texture) = texture {
             let uv = grid_view::cover_uv(
                 texture_aspect(texture.size_vec2()),
-                1.0,
+                cell_aspect,
                 grid_crop_anchor(*kind),
             );
             painter.image(texture.id(), rect, uv, Color32::WHITE);
@@ -11174,18 +11315,19 @@ fn draw_grid_cell(
         } else {
             draw_file_placeholder(
                 painter,
-                rect.shrink(12.0),
+                rect.shrink(12.0 * scale),
                 *kind,
                 path,
                 colors.accent,
                 colors,
-                1.0,
+                scale,
             );
         }
     } else {
+        let inset = 10.0 * scale;
         let body = Rect::from_min_max(
-            rect.min + Vec2::splat(10.0),
-            pos2(rect.right() - 10.0, rect.bottom() - GRID_CAPTION_HEIGHT),
+            rect.min + Vec2::splat(inset),
+            pos2(rect.right() - inset, rect.bottom() - caption_height),
         );
         let (glyph, detail) = match &tile.content {
             TileContent::Note { text } => ("¶", truncate(&text.replace(['\n', '\r'], " "), 64)),
@@ -11200,24 +11342,21 @@ fn draw_grid_cell(
                 pos2(body.left(), body.top()),
                 Align2::LEFT_TOP,
                 glyph,
-                FontId::proportional(20.0),
+                FontId::proportional(20.0 * scale),
                 colors.accent,
             );
             painter.text(
-                pos2(body.left(), body.top() + 28.0),
+                pos2(body.left(), body.top() + 28.0 * scale),
                 Align2::LEFT_TOP,
                 detail,
-                FontId::proportional(11.5),
+                FontId::proportional(caption_font),
                 colors.secondary_text,
             );
         }
     }
 
-    // Caption sits inside the cell so every cell stays exactly square.
-    let caption = Rect::from_min_max(
-        pos2(rect.left(), rect.bottom() - GRID_CAPTION_HEIGHT),
-        rect.max,
-    );
+    // Caption sits inside the cell so every cell keeps the exact shape.
+    let caption = Rect::from_min_max(pos2(rect.left(), rect.bottom() - caption_height), rect.max);
     if painted_texture {
         painter.rect_filled(
             caption,
@@ -11235,12 +11374,12 @@ fn draw_grid_cell(
     } else {
         colors.text
     };
-    let characters = ((rect.width() - 16.0) / 6.0).max(4.0) as usize;
+    let characters = ((rect.width() - 16.0) / (6.0 * scale)).max(4.0) as usize;
     painter.text(
         pos2(caption.left() + 8.0, caption.center().y),
         Align2::LEFT_CENTER,
         truncate(&tile.title, characters),
-        FontId::proportional(11.5),
+        FontId::proportional(caption_font),
         title_color,
     );
 
@@ -11272,6 +11411,7 @@ fn draw_grid_lightbox(
     lightbox: Lightbox,
     previews: &mut PreviewCache,
     pixels_per_point: f32,
+    cell_aspect: f32,
     colors: Theme,
 ) -> Rect {
     let factor = lightbox.factor();
@@ -11302,7 +11442,9 @@ fn draw_grid_lightbox(
             let aspect = texture_aspect(texture.size_vec2());
             let expanded = grid_view::expanded_rect(aspect, view, grid_view::LIGHTBOX_MARGIN);
             let rect = grid_view::lerp_rect(cell, expanded, factor);
-            let cropped = grid_view::cover_uv(aspect, 1.0, grid_crop_anchor(*kind));
+            // Start from exactly the crop the cell was showing, whatever the
+            // current shape, so the expansion has no visible jump on frame one.
+            let cropped = grid_view::cover_uv(aspect, cell_aspect, grid_crop_anchor(*kind));
             let uv = grid_view::lerp_rect(cropped, grid_view::full_uv(), factor);
             painter.image(texture.id(), rect, uv, Color32::WHITE);
             return rect;
@@ -11353,10 +11495,13 @@ fn draw_grid_lightbox_caption(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_grid_view_hint(
     painter: &Painter,
     view: Rect,
     count: usize,
+    shape: CellShape,
+    zoom: f32,
     lightbox_open: bool,
     colors: Theme,
 ) {
@@ -11364,8 +11509,10 @@ fn draw_grid_view_hint(
         "← → browse · Esc back to grid".to_string()
     } else {
         format!(
-            "Grid view · {count} tile{} · click to open · Esc or G to exit",
-            if count == 1 { "" } else { "s" }
+            "Grid view · {count} tile{} · {} · {:.0}% · drag to pan · pinch to zoom · Esc or G to exit",
+            if count == 1 { "" } else { "s" },
+            shape.label().to_lowercase(),
+            zoom * 100.0
         )
     };
     // Lay the text out first so the pill can be sized to it, rather than

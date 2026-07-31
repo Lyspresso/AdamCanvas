@@ -1,12 +1,18 @@
-//! Layout and animation math for the grid view — a uniform contact sheet of
-//! the active page's tiles.
+//! Layout, camera and animation math for the grid view — a uniform contact
+//! sheet of the active page's tiles.
 //!
 //! The grid view never touches tile geometry. It is a lens: cells are laid out
 //! on the fly from the page's tile order, and every image is *cover*-cropped
-//! into a square so the wall reads as one uniform surface. Clicking a cell
-//! opens a lightbox that expands the cell back to the source aspect and
-//! simultaneously walks the crop back out to the full texture, which is what
-//! makes an image look like it un-crops rather than merely growing.
+//! into the current cell shape so the wall reads as one uniform surface.
+//! Clicking a cell opens a lightbox that expands it back to the source aspect
+//! and simultaneously walks the crop back out to the full texture, which is
+//! what makes an image look like it un-crops rather than merely growing.
+//!
+//! Positions here live in **layout space**: an origin-at-zero coordinate system
+//! whose width is fixed by the viewport, independent of zoom. [`GridCamera`]
+//! maps layout space onto the screen, which is what lets the wall be panned in
+//! both axes once it is zoomed past the viewport — the same feel as the canvas
+//! rather than a document that only scrolls vertically.
 //!
 //! Everything here is pure geometry so the interaction can be tested without a
 //! render surface. The painting side lives in `app.rs`, which owns the theme,
@@ -14,8 +20,8 @@
 
 use egui::{Pos2, Rect, Vec2, pos2, vec2};
 
-/// Preferred cell edge in points. Actual cells stretch from this so each row
-/// fills the viewport exactly, leaving no ragged right margin.
+/// Preferred cell width in layout points. Cells stretch from this so each row
+/// fills the layout width exactly, leaving no ragged right margin.
 pub const TARGET_CELL: f32 = 168.0;
 pub const GAP: f32 = 12.0;
 pub const PADDING: f32 = 20.0;
@@ -25,6 +31,36 @@ pub const PADDING: f32 = 20.0;
 pub const LIGHTBOX_SECONDS: f32 = 0.18;
 /// Breathing room between an expanded photo and the viewport edge.
 pub const LIGHTBOX_MARGIN: f32 = 56.0;
+
+/// The shape every cell is cropped into.
+///
+/// Column count is identical in both shapes — only the cell height changes —
+/// so toggling re-flows the wall vertically without shuffling which tile sits
+/// in which column.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum CellShape {
+    #[default]
+    Square,
+    Portrait,
+}
+
+impl CellShape {
+    /// Width divided by height.
+    pub fn aspect(self) -> f32 {
+        match self {
+            Self::Square => 1.0,
+            // 2:3, the ordinary portrait photo proportion.
+            Self::Portrait => 2.0 / 3.0,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Square => "Square",
+            Self::Portrait => "Portrait",
+        }
+    }
+}
 
 /// The uv rect covering an entire texture.
 pub fn full_uv() -> Rect {
@@ -36,25 +72,29 @@ pub struct GridMetrics {
     pub count: usize,
     pub columns: usize,
     pub rows: usize,
-    pub cell: f32,
+    /// Cell size in layout points.
+    pub cell: Vec2,
     pub gap: f32,
     pub padding: f32,
-    pub content_height: f32,
+    /// Full extent of the wall in layout points, padding included.
+    pub content: Vec2,
 }
 
 impl GridMetrics {
-    /// Chooses a column count from `target_cell`, then grows the cell so the
-    /// row fills `view_width` exactly.
+    /// Chooses a column count from `target_cell_width`, then grows the cell so
+    /// the row fills `layout_width` exactly.
     ///
     /// Column count deliberately ignores `count`: three tiles in a wide window
     /// occupy the first three slots at ordinary size rather than stretching to
-    /// a third of the screen each.
+    /// a third of the screen each. It also ignores zoom — zooming magnifies the
+    /// wall, it does not re-flow it.
     pub fn compute(
-        view_width: f32,
+        layout_width: f32,
         count: usize,
-        target_cell: f32,
+        target_cell_width: f32,
         gap: f32,
         padding: f32,
+        shape: CellShape,
     ) -> Self {
         let gap = if gap.is_finite() { gap.max(0.0) } else { 0.0 };
         let padding = if padding.is_finite() {
@@ -62,25 +102,35 @@ impl GridMetrics {
         } else {
             0.0
         };
-        let target_cell = if target_cell.is_finite() {
-            target_cell.max(1.0)
+        let target_cell_width = if target_cell_width.is_finite() {
+            target_cell_width.max(1.0)
         } else {
             TARGET_CELL
         };
-        let view_width = if view_width.is_finite() {
-            view_width
+        let layout_width = if layout_width.is_finite() {
+            layout_width
         } else {
             0.0
         };
 
-        let usable = (view_width - padding * 2.0).max(1.0);
-        let columns = (((usable + gap) / (target_cell + gap)).floor() as i64).max(1) as usize;
-        let cell = ((usable - gap * (columns.saturating_sub(1)) as f32) / columns as f32).max(1.0);
+        let usable = (layout_width - padding * 2.0).max(1.0);
+        let columns = (((usable + gap) / (target_cell_width + gap)).floor() as i64).max(1) as usize;
+        let width = ((usable - gap * (columns.saturating_sub(1)) as f32) / columns as f32).max(1.0);
+        let aspect = {
+            let aspect = shape.aspect();
+            if aspect.is_finite() && aspect > 0.0 {
+                aspect
+            } else {
+                1.0
+            }
+        };
+        let cell = vec2(width, (width / aspect).max(1.0));
+
         let rows = count.div_ceil(columns.max(1));
         let content_height = if rows == 0 {
             padding * 2.0
         } else {
-            padding * 2.0 + rows as f32 * cell + gap * (rows - 1) as f32
+            padding * 2.0 + rows as f32 * cell.y + gap * (rows - 1) as f32
         };
 
         Self {
@@ -90,106 +140,202 @@ impl GridMetrics {
             cell,
             gap,
             padding,
-            content_height,
+            content: vec2(layout_width.max(1.0), content_height),
         }
     }
 
-    /// Screen rect for a cell, already offset by the current scroll.
-    pub fn cell_rect(&self, index: usize, view: Rect, scroll: f32) -> Rect {
+    /// Cell position in layout space.
+    pub fn cell_rect(&self, index: usize) -> Rect {
         let columns = self.columns.max(1);
         let column = index % columns;
         let row = index / columns;
-        let step = self.cell + self.gap;
         let min = pos2(
-            view.left() + self.padding + column as f32 * step,
-            view.top() + self.padding + row as f32 * step - scroll,
+            self.padding + column as f32 * (self.cell.x + self.gap),
+            self.padding + row as f32 * (self.cell.y + self.gap),
         );
-        Rect::from_min_size(min, Vec2::splat(self.cell))
+        Rect::from_min_size(min, self.cell)
     }
 
-    /// The cell under `pointer`, or `None` for gutters, padding, and the
-    /// trailing empty slots of the last row.
-    pub fn index_at(&self, view: Rect, scroll: f32, pointer: Pos2) -> Option<usize> {
+    /// The cell at a layout-space point, or `None` for gutters, padding, and
+    /// the trailing empty slots of the last row.
+    pub fn index_at(&self, layout: Pos2) -> Option<usize> {
         if self.count == 0 {
             return None;
         }
         let columns = self.columns.max(1);
-        let step = self.cell + self.gap;
-        if step <= 0.0 {
+        let step = vec2(self.cell.x + self.gap, self.cell.y + self.gap);
+        if step.x <= 0.0 || step.y <= 0.0 {
             return None;
         }
-        let local = pointer - view.min - vec2(self.padding, self.padding - scroll);
+        let local = layout - vec2(self.padding, self.padding);
         if local.x < 0.0 || local.y < 0.0 {
             return None;
         }
-        let column = (local.x / step).floor();
-        let row = (local.y / step).floor();
+        let column = (local.x / step.x).floor();
+        let row = (local.y / step.y).floor();
         if column < 0.0 || row < 0.0 || column >= columns as f32 {
             return None;
         }
-        // Reject the gutter: the remainder past `cell` belongs to no cell.
-        if local.x - column * step > self.cell || local.y - row * step > self.cell {
+        // Reject the gutter: the remainder past the cell belongs to no cell.
+        if local.x - column * step.x > self.cell.x || local.y - row * step.y > self.cell.y {
             return None;
         }
         let index = row as usize * columns + column as usize;
         (index < self.count).then_some(index)
     }
 
-    /// Half-open range of cells worth painting at this scroll position.
+    /// Half-open range of cells worth painting for a layout-space y band.
     ///
     /// Culling is the difference between a page of 30 tiles and a page of
-    /// 3,000 staying responsive, but a range that is even one row too tight
-    /// makes cells blink out at the viewport edge — so this deliberately
-    /// overshoots by a row on each side.
-    pub fn visible_range(&self, view_height: f32, scroll: f32) -> std::ops::Range<usize> {
+    /// 3,000 staying responsive, but a range even one row too tight makes
+    /// cells blink out at the viewport edge — so this overshoots by a row on
+    /// each side.
+    pub fn visible_range(&self, top: f32, bottom: f32) -> std::ops::Range<usize> {
         if self.count == 0 {
             return 0..0;
         }
         let columns = self.columns.max(1);
-        let step = self.cell + self.gap;
-        if !step.is_finite() || step <= 0.0 || !view_height.is_finite() {
+        let step = self.cell.y + self.gap;
+        if !step.is_finite() || step <= 0.0 || !top.is_finite() || !bottom.is_finite() {
             return 0..self.count;
         }
-        let scroll = if scroll.is_finite() { scroll } else { 0.0 };
 
-        let first_row = (((scroll - self.padding) / step).floor() - 1.0).max(0.0) as usize;
-        let spanned_rows = (view_height.max(0.0) / step).ceil() as usize + 2;
+        let first_row = (((top - self.padding) / step).floor() - 1.0).max(0.0) as usize;
+        let last_row = (((bottom - self.padding) / step).ceil() + 1.0).max(0.0) as usize;
         let start = (first_row * columns).min(self.count);
-        let end = first_row
-            .saturating_add(spanned_rows)
+        let end = last_row
+            .saturating_add(1)
             .saturating_mul(columns)
             .min(self.count);
         start..end.max(start)
     }
 
-    pub fn max_scroll(&self, view_height: f32) -> f32 {
-        (self.content_height - view_height).max(0.0)
-    }
-
-    pub fn clamp_scroll(&self, scroll: f32, view_height: f32) -> f32 {
-        if !scroll.is_finite() {
-            return 0.0;
-        }
-        scroll.clamp(0.0, self.max_scroll(view_height))
-    }
-
-    /// Smallest scroll adjustment that brings `index` fully into view. Used
+    /// Smallest camera offset change that brings `index` fully into view. Used
     /// when arrow keys walk the lightbox past the visible rows, so closing the
     /// lightbox leaves you looking at the cell you landed on.
-    pub fn scroll_to_reveal(&self, index: usize, view_height: f32, scroll: f32) -> f32 {
-        let columns = self.columns.max(1);
-        let row = index / columns;
-        let step = self.cell + self.gap;
-        let top = self.padding + row as f32 * step;
-        let bottom = top + self.cell;
-        let scroll = if scroll > top - self.padding {
-            top - self.padding
-        } else if scroll < bottom + self.padding - view_height {
-            bottom + self.padding - view_height
+    pub fn reveal_offset(&self, index: usize, visible: Vec2, offset: Vec2) -> Vec2 {
+        let rect = self.cell_rect(index);
+        let mut offset = offset;
+        for (axis, min, max, span) in [
+            (0, rect.left(), rect.right(), visible.x),
+            (1, rect.top(), rect.bottom(), visible.y),
+        ] {
+            let current = offset[axis];
+            let padded_min = min - self.padding;
+            let padded_max = max + self.padding - span;
+            offset[axis] = if current > padded_min {
+                padded_min
+            } else if current < padded_max {
+                padded_max
+            } else {
+                current
+            };
+        }
+        offset
+    }
+}
+
+/// Maps layout space onto the screen.
+///
+/// `offset` is the layout-space point drawn at the viewport's top-left corner,
+/// so panning is a translation in layout units and stays stable across zoom
+/// changes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GridCamera {
+    pub zoom: f32,
+    pub offset: Vec2,
+}
+
+impl Default for GridCamera {
+    fn default() -> Self {
+        Self {
+            zoom: 1.0,
+            offset: Vec2::ZERO,
+        }
+    }
+}
+
+impl GridCamera {
+    pub const MIN_ZOOM: f32 = 0.35;
+    pub const MAX_ZOOM: f32 = 5.0;
+
+    fn sanitized(self) -> Self {
+        let zoom = if self.zoom.is_finite() && self.zoom > 0.0 {
+            self.zoom.clamp(Self::MIN_ZOOM, Self::MAX_ZOOM)
         } else {
-            scroll
+            1.0
         };
-        self.clamp_scroll(scroll, view_height)
+        let offset = Vec2::new(
+            if self.offset.x.is_finite() {
+                self.offset.x
+            } else {
+                0.0
+            },
+            if self.offset.y.is_finite() {
+                self.offset.y
+            } else {
+                0.0
+            },
+        );
+        Self { zoom, offset }
+    }
+
+    /// Layout extent currently spanned by the viewport.
+    pub fn visible_size(&self, view: Rect) -> Vec2 {
+        let camera = self.sanitized();
+        vec2(
+            view.width().max(0.0) / camera.zoom,
+            view.height().max(0.0) / camera.zoom,
+        )
+    }
+
+    pub fn to_screen(&self, layout: Rect, view: Rect) -> Rect {
+        let camera = self.sanitized();
+        let map = |point: Pos2| {
+            view.min
+                + vec2(
+                    (point.x - camera.offset.x) * camera.zoom,
+                    (point.y - camera.offset.y) * camera.zoom,
+                )
+        };
+        Rect::from_min_max(map(layout.min), map(layout.max))
+    }
+
+    pub fn to_layout(&self, screen: Pos2, view: Rect) -> Pos2 {
+        let camera = self.sanitized();
+        pos2(
+            camera.offset.x + (screen.x - view.min.x) / camera.zoom,
+            camera.offset.y + (screen.y - view.min.y) / camera.zoom,
+        )
+    }
+
+    /// Zooms about a screen point, keeping whatever sits under it in place.
+    pub fn zoom_by(&mut self, factor: f32, anchor: Pos2, view: Rect) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let before = self.to_layout(anchor, view);
+        let mut next = self.sanitized();
+        next.zoom = (next.zoom * factor).clamp(Self::MIN_ZOOM, Self::MAX_ZOOM);
+        *self = next;
+        let after = self.to_layout(anchor, view);
+        self.offset += before - after;
+    }
+
+    /// Keeps the wall reachable: an axis smaller than the viewport is centred,
+    /// a larger one is bounded so the content edges cannot be panned away.
+    pub fn clamped(self, content: Vec2, view: Rect) -> Self {
+        let mut camera = self.sanitized();
+        let visible = camera.visible_size(view);
+        for (axis, content, visible) in [(0, content.x, visible.x), (1, content.y, visible.y)] {
+            let content = if content.is_finite() { content } else { 0.0 };
+            camera.offset[axis] = if content <= visible {
+                (content - visible) * 0.5
+            } else {
+                camera.offset[axis].clamp(0.0, content - visible)
+            };
+        }
+        camera
     }
 }
 
@@ -229,7 +375,8 @@ pub fn cover_uv(texture_aspect: f32, cell_aspect: f32, anchor: [f32; 2]) -> Rect
 }
 
 /// Contains `aspect` inside `view` less `margin` — where an expanded photo
-/// lands once the lightbox is fully open.
+/// lands once the lightbox is fully open. Independent of the grid camera: the
+/// lightbox always fills the viewport, however far the wall is zoomed.
 pub fn expanded_rect(aspect: f32, view: Rect, margin: f32) -> Rect {
     let aspect = if aspect.is_finite() && aspect > 0.0 {
         aspect.clamp(0.05, 20.0)
@@ -337,11 +484,12 @@ impl Lightbox {
     }
 }
 
-/// Per-page grid view state. Scroll is kept per session, not persisted: the
-/// grid is a way to find something, and it should open at the top.
+/// Per-session grid view state. Not persisted: the grid is a way to find
+/// something, and it should open at the top at 100%.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GridViewState {
-    pub scroll: f32,
+    pub shape: CellShape,
+    pub camera: GridCamera,
     pub lightbox: Option<Lightbox>,
 }
 
@@ -353,106 +501,130 @@ mod tests {
         Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 600.0))
     }
 
+    fn metrics(count: usize, shape: CellShape) -> GridMetrics {
+        GridMetrics::compute(1000.0, count, TARGET_CELL, GAP, PADDING, shape)
+    }
+
     #[test]
-    fn columns_stretch_to_fill_the_viewport_width_exactly() {
-        let metrics = GridMetrics::compute(1000.0, 40, TARGET_CELL, GAP, PADDING);
+    fn columns_stretch_to_fill_the_layout_width_exactly() {
+        let metrics = metrics(40, CellShape::Square);
         let usable = 1000.0 - PADDING * 2.0;
-        let occupied = metrics.cell * metrics.columns as f32 + GAP * (metrics.columns - 1) as f32;
+        let occupied = metrics.cell.x * metrics.columns as f32 + GAP * (metrics.columns - 1) as f32;
         assert!(
             (occupied - usable).abs() < 0.01,
             "row should fill {usable} exactly, got {occupied}"
         );
-        // The stretch must not drift far from the requested cell size.
-        assert!(metrics.cell >= TARGET_CELL && metrics.cell < TARGET_CELL + GAP + TARGET_CELL);
+        assert!(metrics.cell.x >= TARGET_CELL);
+    }
+
+    #[test]
+    fn portrait_keeps_the_columns_and_only_makes_cells_taller() {
+        let square = metrics(40, CellShape::Square);
+        let portrait = metrics(40, CellShape::Portrait);
+        assert_eq!(square.columns, portrait.columns);
+        assert_eq!(square.cell.x, portrait.cell.x, "column width must not move");
+        assert!(
+            portrait.cell.y > square.cell.y,
+            "portrait cells should be taller: {} vs {}",
+            portrait.cell.y,
+            square.cell.y
+        );
+        assert!((square.cell.x / square.cell.y - 1.0).abs() < 0.001);
+        assert!((portrait.cell.x / portrait.cell.y - 2.0 / 3.0).abs() < 0.001);
+        // Same tiles, same columns, so the wall only grows downward.
+        assert_eq!(square.rows, portrait.rows);
+        assert!(portrait.content.y > square.content.y);
+    }
+
+    #[test]
+    fn a_tile_keeps_its_column_when_the_shape_changes() {
+        let square = metrics(40, CellShape::Square);
+        let portrait = metrics(40, CellShape::Portrait);
+        for index in 0..40 {
+            assert_eq!(
+                square.cell_rect(index).left(),
+                portrait.cell_rect(index).left(),
+                "tile {index} changed column on a shape toggle"
+            );
+        }
     }
 
     #[test]
     fn column_count_ignores_tile_count_so_few_tiles_stay_ordinary_sized() {
-        let many = GridMetrics::compute(1000.0, 40, TARGET_CELL, GAP, PADDING);
-        let few = GridMetrics::compute(1000.0, 3, TARGET_CELL, GAP, PADDING);
+        let many = metrics(40, CellShape::Square);
+        let few = metrics(3, CellShape::Square);
         assert_eq!(many.columns, few.columns);
         assert_eq!(many.cell, few.cell);
         assert_eq!(few.rows, 1);
     }
 
     #[test]
-    fn degenerate_viewports_and_counts_stay_finite() {
+    fn degenerate_layouts_and_counts_stay_finite() {
         for width in [0.0, -50.0, f32::NAN, f32::INFINITY, 1.0] {
-            let metrics = GridMetrics::compute(width, 7, TARGET_CELL, GAP, PADDING);
-            assert!(metrics.columns >= 1);
-            assert!(metrics.cell.is_finite() && metrics.cell > 0.0);
-            assert!(metrics.content_height.is_finite());
+            for shape in [CellShape::Square, CellShape::Portrait] {
+                let metrics = GridMetrics::compute(width, 7, TARGET_CELL, GAP, PADDING, shape);
+                assert!(metrics.columns >= 1);
+                assert!(metrics.cell.x.is_finite() && metrics.cell.x > 0.0);
+                assert!(metrics.cell.y.is_finite() && metrics.cell.y > 0.0);
+                assert!(metrics.content.x.is_finite() && metrics.content.y.is_finite());
+            }
         }
-        let empty = GridMetrics::compute(1000.0, 0, TARGET_CELL, GAP, PADDING);
+        let empty = metrics(0, CellShape::Square);
         assert_eq!(empty.rows, 0);
-        assert_eq!(empty.content_height, PADDING * 2.0);
-        assert_eq!(empty.index_at(view(), 0.0, pos2(100.0, 100.0)), None);
+        assert_eq!(empty.content.y, PADDING * 2.0);
+        assert_eq!(empty.index_at(pos2(100.0, 100.0)), None);
     }
 
     #[test]
     fn rows_wrap_after_the_column_count() {
-        let metrics = GridMetrics::compute(1000.0, 13, TARGET_CELL, GAP, PADDING);
-        let columns = metrics.columns;
-        let first = metrics.cell_rect(0, view(), 0.0);
-        let next_column = metrics.cell_rect(1, view(), 0.0);
-        let next_row = metrics.cell_rect(columns, view(), 0.0);
-        assert!((next_column.left() - first.left() - (metrics.cell + GAP)).abs() < 0.01);
-        assert!((next_column.top() - first.top()).abs() < 0.01);
-        assert!((next_row.top() - first.top() - (metrics.cell + GAP)).abs() < 0.01);
-        assert!((next_row.left() - first.left()).abs() < 0.01);
-        assert_eq!(metrics.rows, 13_usize.div_ceil(columns));
-    }
-
-    #[test]
-    fn scrolling_shifts_cells_up_by_exactly_the_scroll_amount() {
-        let metrics = GridMetrics::compute(1000.0, 40, TARGET_CELL, GAP, PADDING);
-        let resting = metrics.cell_rect(9, view(), 0.0);
-        let scrolled = metrics.cell_rect(9, view(), 120.0);
-        assert!((resting.top() - scrolled.top() - 120.0).abs() < 0.01);
-        assert!((resting.left() - scrolled.left()).abs() < 0.01);
+        for shape in [CellShape::Square, CellShape::Portrait] {
+            let metrics = metrics(13, shape);
+            let columns = metrics.columns;
+            let first = metrics.cell_rect(0);
+            let next_column = metrics.cell_rect(1);
+            let next_row = metrics.cell_rect(columns);
+            assert!((next_column.left() - first.left() - (metrics.cell.x + GAP)).abs() < 0.01);
+            assert!((next_column.top() - first.top()).abs() < 0.01);
+            assert!((next_row.top() - first.top() - (metrics.cell.y + GAP)).abs() < 0.01);
+            assert!((next_row.left() - first.left()).abs() < 0.01);
+            assert_eq!(metrics.rows, 13_usize.div_ceil(columns));
+        }
     }
 
     #[test]
     fn index_at_round_trips_cell_centres_and_rejects_gutters() {
-        let metrics = GridMetrics::compute(1000.0, 20, TARGET_CELL, GAP, PADDING);
-        for scroll in [0.0, 75.0] {
+        for shape in [CellShape::Square, CellShape::Portrait] {
+            let metrics = metrics(20, shape);
             for index in 0..20 {
-                let rect = metrics.cell_rect(index, view(), scroll);
                 assert_eq!(
-                    metrics.index_at(view(), scroll, rect.center()),
+                    metrics.index_at(metrics.cell_rect(index).center()),
                     Some(index),
-                    "centre of cell {index} at scroll {scroll}"
+                    "centre of cell {index}"
                 );
             }
+            let first = metrics.cell_rect(0);
+            let gutter = pos2(first.right() + GAP * 0.5, first.center().y);
+            assert_eq!(metrics.index_at(gutter), None);
+            assert_eq!(metrics.index_at(pos2(2.0, 2.0)), None);
         }
-        // A point in the gutter between two columns belongs to neither.
-        let first = metrics.cell_rect(0, view(), 0.0);
-        let gutter = pos2(first.right() + GAP * 0.5, first.center().y);
-        assert_eq!(metrics.index_at(view(), 0.0, gutter), None);
-        // Padding above the first row is not a cell.
-        assert_eq!(metrics.index_at(view(), 0.0, pos2(2.0, 2.0)), None);
     }
 
     #[test]
     fn index_at_rejects_the_empty_slots_of_a_partial_last_row() {
-        let columns = GridMetrics::compute(1000.0, 1, TARGET_CELL, GAP, PADDING).columns;
+        let columns = metrics(1, CellShape::Square).columns;
         assert!(columns >= 2, "test needs at least two columns");
-        // One tile on the final row leaves the rest of that row empty.
         let count = columns * 3 + 1;
-        let metrics = GridMetrics::compute(1000.0, count, TARGET_CELL, GAP, PADDING);
-        assert_eq!(metrics.columns, columns);
+        let metrics = metrics(count, CellShape::Square);
         assert_eq!(metrics.rows, 4);
 
-        let last = metrics.cell_rect(count - 1, view(), 0.0);
         assert_eq!(
-            metrics.index_at(view(), 0.0, last.center()),
+            metrics.index_at(metrics.cell_rect(count - 1).center()),
             Some(count - 1),
             "the one filled slot on the last row is still hittable"
         );
         for empty in count..columns * 4 {
-            let rect = metrics.cell_rect(empty, view(), 0.0);
             assert_eq!(
-                metrics.index_at(view(), 0.0, rect.center()),
+                metrics.index_at(metrics.cell_rect(empty).center()),
                 None,
                 "empty slot {empty} of the last row must not be hittable"
             );
@@ -462,30 +634,42 @@ mod tests {
     #[test]
     fn visible_range_covers_every_cell_that_touches_the_viewport() {
         let view = view();
-        let metrics = GridMetrics::compute(1000.0, 500, TARGET_CELL, GAP, PADDING);
-        let max = metrics.max_scroll(view.height());
-        for scroll in [0.0, 1.0, 137.0, max * 0.5, max - 1.0, max] {
-            let range = metrics.visible_range(view.height(), scroll);
-            for index in 0..metrics.count {
-                let touches = metrics.cell_rect(index, view, scroll).intersects(view);
-                if touches {
-                    assert!(
-                        range.contains(&index),
-                        "cell {index} is on screen at scroll {scroll} but outside {range:?}"
-                    );
+        for shape in [CellShape::Square, CellShape::Portrait] {
+            let metrics = metrics(500, shape);
+            for zoom in [0.5, 1.0, 2.5] {
+                for scroll in [0.0, 137.0, metrics.content.y * 0.5] {
+                    let camera = GridCamera {
+                        zoom,
+                        offset: vec2(0.0, scroll),
+                    }
+                    .clamped(metrics.content, view);
+                    let top = camera.offset.y;
+                    let bottom = top + camera.visible_size(view).y;
+                    let range = metrics.visible_range(top, bottom);
+                    for index in 0..metrics.count {
+                        let on_screen = camera
+                            .to_screen(metrics.cell_rect(index), view)
+                            .intersects(view);
+                        if on_screen {
+                            assert!(
+                                range.contains(&index),
+                                "cell {index} on screen at zoom {zoom} scroll {scroll} \
+                                 but outside {range:?}"
+                            );
+                        }
+                    }
+                    assert!(range.end <= metrics.count && range.start <= range.end);
                 }
             }
-            assert!(range.end <= metrics.count);
-            assert!(range.start <= range.end);
         }
     }
 
     #[test]
     fn visible_range_actually_culls_a_tall_page() {
-        let metrics = GridMetrics::compute(1000.0, 5_000, TARGET_CELL, GAP, PADDING);
-        let range = metrics.visible_range(600.0, 0.0);
+        let metrics = metrics(5_000, CellShape::Square);
+        let range = metrics.visible_range(0.0, 600.0);
         assert!(
-            range.len() < 100,
+            range.len() < 120,
             "a 5,000-tile page should not paint {} cells per frame",
             range.len()
         );
@@ -493,59 +677,165 @@ mod tests {
 
     #[test]
     fn visible_range_degrades_to_everything_rather_than_nothing() {
-        let metrics = GridMetrics::compute(1000.0, 20, TARGET_CELL, GAP, PADDING);
-        assert_eq!(metrics.visible_range(f32::NAN, 0.0), 0..20);
-        // A non-finite scroll must not silently blank the wall.
-        assert!(!metrics.visible_range(600.0, f32::NAN).is_empty());
-        let empty = GridMetrics::compute(1000.0, 0, TARGET_CELL, GAP, PADDING);
-        assert_eq!(empty.visible_range(600.0, 0.0), 0..0);
-    }
-
-    #[test]
-    fn scroll_clamps_to_content_and_never_goes_negative() {
-        let metrics = GridMetrics::compute(1000.0, 200, TARGET_CELL, GAP, PADDING);
-        assert_eq!(metrics.clamp_scroll(-40.0, 600.0), 0.0);
+        let populated = metrics(20, CellShape::Square);
+        assert_eq!(populated.visible_range(f32::NAN, 600.0), 0..20);
+        assert!(!populated.visible_range(0.0, f32::NAN).is_empty());
         assert_eq!(
-            metrics.clamp_scroll(f32::MAX, 600.0),
-            metrics.content_height - 600.0
+            metrics(0, CellShape::Square).visible_range(0.0, 600.0),
+            0..0
         );
-        assert_eq!(metrics.clamp_scroll(f32::NAN, 600.0), 0.0);
-        // Content shorter than the viewport cannot scroll at all.
-        let short = GridMetrics::compute(1000.0, 2, TARGET_CELL, GAP, PADDING);
-        assert_eq!(short.clamp_scroll(500.0, 600.0), 0.0);
     }
 
     #[test]
-    fn scroll_to_reveal_moves_only_when_the_cell_is_off_screen() {
-        let metrics = GridMetrics::compute(1000.0, 200, TARGET_CELL, GAP, PADDING);
-        let visible = metrics.scroll_to_reveal(1, 600.0, 0.0);
-        assert_eq!(visible, 0.0, "an already-visible cell must not scroll");
+    fn camera_maps_layout_to_screen_and_back() {
+        let view = view();
+        let camera = GridCamera {
+            zoom: 2.0,
+            offset: vec2(40.0, 90.0),
+        };
+        let point = pos2(140.0, 190.0);
+        let screen = camera
+            .to_screen(Rect::from_min_size(point, Vec2::ZERO), view)
+            .min;
+        // (140-40)*2 = 200, (190-90)*2 = 200 from the viewport corner.
+        assert!((screen.x - 200.0).abs() < 0.01);
+        assert!((screen.y - 200.0).abs() < 0.01);
+        let back = camera.to_layout(screen, view);
+        assert!((back.x - point.x).abs() < 0.01 && (back.y - point.y).abs() < 0.01);
+    }
 
-        let far = metrics.scroll_to_reveal(150, 600.0, 0.0);
-        assert!(far > 0.0);
-        let rect = metrics.cell_rect(150, view(), far);
+    #[test]
+    fn zooming_keeps_the_point_under_the_cursor_still() {
+        let view = view();
+        let mut camera = GridCamera::default();
+        let anchor = pos2(700.0, 450.0);
+        let before = camera.to_layout(anchor, view);
+        for factor in [1.3, 1.3, 0.5, 2.2] {
+            camera.zoom_by(factor, anchor, view);
+            let after = camera.to_layout(anchor, view);
+            assert!(
+                (after.x - before.x).abs() < 0.01 && (after.y - before.y).abs() < 0.01,
+                "anchor drifted from {before:?} to {after:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zoom_is_bounded_in_both_directions() {
+        let view = view();
+        let mut camera = GridCamera::default();
+        for _ in 0..40 {
+            camera.zoom_by(2.0, view.center(), view);
+        }
+        assert_eq!(camera.zoom, GridCamera::MAX_ZOOM);
+        for _ in 0..80 {
+            camera.zoom_by(0.5, view.center(), view);
+        }
+        assert_eq!(camera.zoom, GridCamera::MIN_ZOOM);
+    }
+
+    #[test]
+    fn a_wall_narrower_than_the_viewport_is_centred_not_pinned() {
+        let view = view();
+        let metrics = metrics(4, CellShape::Square);
+        // Zoomed out, the wall is narrower and shorter than the viewport.
+        let camera = GridCamera {
+            zoom: 0.5,
+            offset: vec2(900.0, 900.0),
+        }
+        .clamped(metrics.content, view);
+        let visible = camera.visible_size(view);
+        assert!((camera.offset.x - (metrics.content.x - visible.x) * 0.5).abs() < 0.01);
+        assert!((camera.offset.y - (metrics.content.y - visible.y) * 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn zooming_in_opens_up_horizontal_panning_that_stops_at_the_edges() {
+        let view = view();
+        let metrics = metrics(200, CellShape::Square);
+
+        // At 100% the wall is exactly viewport-wide: there is nowhere to go.
+        let resting = GridCamera {
+            zoom: 1.0,
+            offset: vec2(500.0, 0.0),
+        }
+        .clamped(metrics.content, view);
         assert!(
-            rect.top() >= view().top() - 0.01 && rect.bottom() <= view().bottom() + 0.01,
-            "revealed cell {rect:?} should sit inside {:?}",
-            view()
+            resting.offset.x.abs() < 0.01,
+            "unzoomed wall should not pan sideways, got {}",
+            resting.offset.x
         );
 
-        // Walking back up scrolls up again.
-        let back = metrics.scroll_to_reveal(0, 600.0, far);
-        assert!(back < far);
-        let rect = metrics.cell_rect(0, view(), back);
-        assert!(rect.top() >= view().top() - 0.01);
+        // Zoomed in, the wall is wider than the viewport and pans.
+        let zoomed = GridCamera {
+            zoom: 2.0,
+            offset: vec2(120.0, 0.0),
+        }
+        .clamped(metrics.content, view);
+        assert!((zoomed.offset.x - 120.0).abs() < 0.01);
+
+        // ...but not past either edge.
+        let visible = zoomed.visible_size(view);
+        let far = GridCamera {
+            zoom: 2.0,
+            offset: vec2(99_999.0, 99_999.0),
+        }
+        .clamped(metrics.content, view);
+        assert!((far.offset.x - (metrics.content.x - visible.x)).abs() < 0.01);
+        assert!((far.offset.y - (metrics.content.y - visible.y)).abs() < 0.01);
+        let near = GridCamera {
+            zoom: 2.0,
+            offset: vec2(-500.0, -500.0),
+        }
+        .clamped(metrics.content, view);
+        assert_eq!(near.offset, Vec2::ZERO);
+    }
+
+    #[test]
+    fn a_non_finite_camera_recovers_instead_of_poisoning_the_view() {
+        let view = view();
+        let metrics = metrics(50, CellShape::Square);
+        let camera = GridCamera {
+            zoom: f32::NAN,
+            offset: vec2(f32::INFINITY, f32::NAN),
+        }
+        .clamped(metrics.content, view);
+        assert!(camera.zoom.is_finite() && camera.zoom > 0.0);
+        assert!(camera.offset.x.is_finite() && camera.offset.y.is_finite());
+    }
+
+    #[test]
+    fn reveal_offset_moves_only_when_the_cell_is_off_screen() {
+        let view = view();
+        let metrics = metrics(200, CellShape::Square);
+        let visible = GridCamera::default().visible_size(view);
+
+        let resting = metrics.reveal_offset(1, visible, Vec2::ZERO);
+        assert_eq!(resting, Vec2::ZERO, "an already-visible cell must not move");
+
+        let far = metrics.reveal_offset(150, visible, Vec2::ZERO);
+        assert!(far.y > 0.0);
+        let camera = GridCamera {
+            zoom: 1.0,
+            offset: far,
+        };
+        let rect = camera.to_screen(metrics.cell_rect(150), view);
+        assert!(
+            rect.top() >= view.top() - 0.01 && rect.bottom() <= view.bottom() + 0.01,
+            "revealed cell {rect:?} should sit inside {view:?}"
+        );
+
+        let back = metrics.reveal_offset(0, visible, far);
+        assert!(back.y < far.y);
     }
 
     #[test]
     fn cover_uv_trims_the_long_axis_and_leaves_the_short_one_whole() {
-        // 2:1 landscape into a square cell: half the width survives.
         let wide = cover_uv(2.0, 1.0, [0.5, 0.5]);
         assert!((wide.width() - 0.5).abs() < 0.001);
         assert!((wide.height() - 1.0).abs() < 0.001);
         assert!((wide.center().x - 0.5).abs() < 0.001);
 
-        // 1:2 portrait into a square cell: half the height survives.
         let tall = cover_uv(0.5, 1.0, [0.5, 0.5]);
         assert!((tall.width() - 1.0).abs() < 0.001);
         assert!((tall.height() - 0.5).abs() < 0.001);
@@ -553,7 +843,19 @@ mod tests {
     }
 
     #[test]
-    fn a_square_source_in_a_square_cell_is_not_cropped_at_all() {
+    fn a_portrait_cell_crops_landscape_harder_and_leaves_portrait_alone() {
+        let portrait_cell = CellShape::Portrait.aspect();
+        // A 3:2 landscape loses much more of its width to a 2:3 cell than to a
+        // square one.
+        let into_square = cover_uv(1.5, CellShape::Square.aspect(), [0.5, 0.5]);
+        let into_portrait = cover_uv(1.5, portrait_cell, [0.5, 0.5]);
+        assert!(into_portrait.width() < into_square.width());
+
+        // A source already matching the cell is not cropped at all.
+        assert_eq!(
+            cover_uv(portrait_cell, portrait_cell, [0.5, 0.5]),
+            full_uv()
+        );
         assert_eq!(cover_uv(1.0, 1.0, [0.5, 0.5]), full_uv());
     }
 
@@ -563,8 +865,6 @@ mod tests {
         assert!((top.top() - 0.0).abs() < 0.001);
         let bottom = cover_uv(0.5, 1.0, [0.5, 1.0]);
         assert!((bottom.bottom() - 1.0).abs() < 0.001);
-        // Out-of-range and non-finite anchors clamp rather than sampling
-        // outside the texture, which would wrap or smear at the edges.
         for anchor in [[-3.0, 9.0], [f32::NAN, f32::INFINITY]] {
             let uv = cover_uv(0.5, 1.0, anchor);
             assert!(uv.left() >= -0.001 && uv.right() <= 1.001);
@@ -607,7 +907,6 @@ mod tests {
         assert_eq!(ease_out_cubic(1.0), 1.0);
         assert_eq!(ease_out_cubic(-5.0), 0.0);
         assert_eq!(ease_out_cubic(5.0), 1.0);
-        // Ease-out is ahead of linear in the middle.
         assert!(ease_out_cubic(0.5) > 0.5);
 
         let from = Rect::from_min_size(pos2(0.0, 0.0), vec2(10.0, 10.0));
@@ -684,7 +983,6 @@ mod tests {
             "an arrow key mid-dismiss should re-open, not keep closing"
         );
 
-        // A step on an empty page must not panic or move.
         let mut empty = Lightbox::opening(0);
         empty.step(1, 0);
         assert_eq!(empty.index, 0);
