@@ -717,6 +717,7 @@ impl ActivityAccumulator {
                     aliases: previous_aliases,
                     parent_id: previous_parent,
                     label: previous_label,
+                    status: previous_status,
                     model: previous_model,
                     detail: previous_detail,
                     tool_calls: previous_tool_calls,
@@ -726,6 +727,7 @@ impl ActivityAccumulator {
                     aliases,
                     parent_id,
                     label,
+                    status,
                     model,
                     detail,
                     tool_calls,
@@ -748,7 +750,13 @@ impl ActivityAccumulator {
                     *model = previous_model;
                 }
                 if detail.is_none() {
-                    *detail = previous_detail;
+                    if status.is_terminal()
+                        || (previous_status.is_terminal() && !status.is_terminal())
+                    {
+                        *detail = None;
+                    } else {
+                        *detail = previous_detail;
+                    }
                 }
                 if tool_calls.is_none() {
                     *tool_calls = previous_tool_calls;
@@ -1095,6 +1103,7 @@ pub fn project_subagents(events: &[ActivityEvent]) -> Vec<SubagentProjection> {
         let canonical_id = resolve_subagent_alias(&aliases, id);
         if let Some(index) = indices.get(&canonical_id).copied() {
             let existing = &mut projected[index];
+            let resumed = existing.status.is_terminal() && !status.is_terminal();
             merge_subagent_aliases(&mut existing.aliases, event_aliases, &canonical_id);
             if id != &canonical_id && !existing.aliases.contains(id) {
                 existing.aliases.push(id.clone());
@@ -1111,6 +1120,8 @@ pub fn project_subagents(events: &[ActivityEvent]) -> Vec<SubagentProjection> {
             }
             if detail.is_some() {
                 existing.detail.clone_from(detail);
+            } else if resumed || status.is_terminal() {
+                existing.detail = None;
             }
             if tool_calls.is_some() {
                 existing.tool_calls = *tool_calls;
@@ -4462,6 +4473,51 @@ mod tests {
         assert_eq!(projected[0].status, SubagentStatus::Completed);
         assert_eq!(projected[0].duration_ms, Some(1_500));
         assert_eq!(projected[0].prose_cells[0].text, "Scoped result");
+    }
+
+    #[test]
+    fn resumed_child_does_not_reuse_terminal_prose_as_current_activity() {
+        let completed = event(
+            1,
+            100,
+            ActivityKind::Subagent {
+                id: "child-1".into(),
+                aliases: Vec::new(),
+                parent_id: Some("root".into()),
+                label: "Research".into(),
+                status: SubagentStatus::Completed,
+                model: None,
+                detail: Some("Previous final report".into()),
+                tool_calls: None,
+            },
+        );
+        let resumed = event(
+            2,
+            200,
+            ActivityKind::Subagent {
+                id: "child-1".into(),
+                aliases: Vec::new(),
+                parent_id: None,
+                label: String::new(),
+                status: SubagentStatus::InProgress,
+                model: None,
+                detail: None,
+                tool_calls: None,
+            },
+        );
+
+        let raw = project_subagents(&[completed.clone(), resumed.clone()]);
+        assert_eq!(raw[0].status, SubagentStatus::InProgress);
+        assert!(raw[0].detail.is_none());
+        assert!(raw[0].current_activity.is_none());
+
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest(completed);
+        accumulator.ingest(resumed);
+        let accumulated = project_subagents(&accumulator.events);
+        assert_eq!(accumulated[0].status, SubagentStatus::InProgress);
+        assert!(accumulated[0].detail.is_none());
+        assert!(accumulated[0].current_activity.is_none());
     }
 
     #[test]

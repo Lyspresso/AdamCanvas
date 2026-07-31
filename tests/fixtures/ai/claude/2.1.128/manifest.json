@@ -8,5 +8,5 @@
     "session and event ids replaced",
     "cwd, tools, commands, plugins, and memory paths omitted"
   ],
-  "note": "auth-error.jsonl is the local signed-out capture. subagent.jsonl is a redacted schema-backed Agent/Task lifecycle contract for decoder coverage; only its explicitly identified tool result is treated as child prose."
+  "note": "auth-error.jsonl is the local signed-out capture. subagent.jsonl is a redacted contract derived from the exact 2.1.128 async Agent renderer, embedded task schemas, and local task-notification transcripts; only the origin-tagged notification result is treated as child prose."
 }

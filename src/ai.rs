@@ -53,6 +53,9 @@ const MAX_JSON_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RAW_SALVAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ACTIVITY_OUTPUT_BYTES: usize = 4 * 1024;
+const MAX_SUBAGENT_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_SUBAGENT_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SUBAGENT_DETAIL_BYTES: usize = 1024;
 const MAX_GROK_SESSION_LINE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_GROK_SESSION_UPDATES: usize = 2_048;
 const MAX_GROK_SESSION_POLL_LINES: usize = 256;
@@ -2514,6 +2517,7 @@ struct KnownSubagent {
     label: String,
     model: Option<String>,
     detail: Option<String>,
+    status: Option<SubagentStatus>,
 }
 
 struct OutputDecoder {
@@ -2548,6 +2552,7 @@ struct OutputDecoder {
     subagents: HashMap<String, KnownSubagent>,
     subagent_aliases: HashMap<String, String>,
     subagent_messages: HashMap<String, String>,
+    subagent_output_bytes: usize,
     grok_tool_names: HashMap<String, String>,
     grok_native_plan: Vec<PlanItem>,
     codex_streamed_items: HashSet<String>,
@@ -2598,6 +2603,7 @@ impl OutputDecoder {
             subagents: HashMap::new(),
             subagent_aliases: HashMap::new(),
             subagent_messages: HashMap::new(),
+            subagent_output_bytes: 0,
             grok_tool_names: HashMap::new(),
             grok_native_plan: Vec::new(),
             codex_streamed_items: HashSet::new(),
@@ -3281,11 +3287,15 @@ impl OutputDecoder {
             let child_message = (status == SubagentStatus::Completed)
                 .then(|| state_message.clone())
                 .flatten();
-            let detail = state_message.or_else(|| {
-                effort
-                    .as_deref()
-                    .map(|effort| format!("Reasoning: {effort}"))
-            });
+            let detail = if status.is_terminal() {
+                None
+            } else {
+                state_message.or_else(|| {
+                    effort
+                        .as_deref()
+                        .map(|effort| format!("Reasoning: {effort}"))
+                })
+            };
             let metadata = self.remember_subagent(
                 &canonical_id,
                 KnownSubagent {
@@ -3293,7 +3303,9 @@ impl OutputDecoder {
                     label,
                     model: model.clone(),
                     detail,
+                    status: None,
                 },
+                status,
             );
             decoded.kinds.push(ActivityKind::Subagent {
                 id: canonical_id.clone(),
@@ -3352,6 +3364,7 @@ impl OutputDecoder {
                 detail: path_detail,
                 ..KnownSubagent::default()
             },
+            status,
         );
         decoded.kinds.push(ActivityKind::Subagent {
             id: canonical_id.clone(),
@@ -3390,8 +3403,18 @@ impl OutputDecoder {
         }
     }
 
-    fn remember_subagent(&mut self, canonical_id: &str, incoming: KnownSubagent) -> KnownSubagent {
+    fn remember_subagent(
+        &mut self,
+        canonical_id: &str,
+        incoming: KnownSubagent,
+        status: SubagentStatus,
+    ) -> KnownSubagent {
         let metadata = self.subagents.entry(canonical_id.to_owned()).or_default();
+        let resumed =
+            metadata.status.is_some_and(SubagentStatus::is_terminal) && !status.is_terminal();
+        if incoming.detail.is_none() && (resumed || status.is_terminal()) {
+            metadata.detail = None;
+        }
         if incoming.parent_id.is_some() {
             metadata.parent_id = incoming.parent_id;
         }
@@ -3401,9 +3424,10 @@ impl OutputDecoder {
         if incoming.model.is_some() {
             metadata.model = incoming.model;
         }
-        if incoming.detail.is_some() {
-            metadata.detail = incoming.detail;
+        if let Some(detail) = incoming.detail {
+            metadata.detail = Some(compact_subagent_detail(detail));
         }
+        metadata.status = Some(status);
         if metadata.label.trim().is_empty() {
             metadata.label = "Subagent".into();
         }
@@ -3423,14 +3447,22 @@ impl OutputDecoder {
     }
 
     fn remember_subagent_message(&mut self, canonical_id: &str, text: String) -> Option<String> {
-        if text.trim().is_empty()
+        if text.trim().is_empty() || self.subagent_output_bytes >= MAX_SUBAGENT_OUTPUT_BYTES {
+            return None;
+        }
+        let per_message = truncate_utf8(&text, MAX_SUBAGENT_MESSAGE_BYTES);
+        let remaining = MAX_SUBAGENT_OUTPUT_BYTES - self.subagent_output_bytes;
+        let bounded = truncate_utf8(per_message, remaining);
+        if bounded.trim().is_empty()
             || self
                 .subagent_messages
                 .get(canonical_id)
-                .is_some_and(|existing| existing == &text)
+                .is_some_and(|existing| existing == bounded)
         {
             return None;
         }
+        let text = bounded.to_owned();
+        self.subagent_output_bytes = self.subagent_output_bytes.saturating_add(text.len());
         self.subagent_messages
             .insert(canonical_id.to_owned(), text.clone());
         Some(text)
@@ -3859,17 +3891,26 @@ impl OutputDecoder {
             }
             Some("user") => {
                 decoded.recognized = true;
+                if value.pointer("/origin/kind").and_then(Value::as_str)
+                    == Some("task-notification")
+                    && let Some(content) = value.pointer("/message/content").and_then(Value::as_str)
+                {
+                    self.decode_claude_task_notification_text(content, value, &mut decoded);
+                }
                 for block in content_blocks(value) {
                     if block.get("type").and_then(Value::as_str) == Some("tool_result")
                         && let Some(kind) = self.decode_tool_result(block, Some(value))
                     {
                         let child_message = match &kind {
-                            ActivityKind::Subagent {
-                                id,
-                                status: SubagentStatus::Completed,
-                                detail: Some(text),
-                                ..
-                            } if !text.trim().is_empty() => Some((id.clone(), text.clone())),
+                            ActivityKind::Subagent { id, status, .. }
+                                if matches!(
+                                    status,
+                                    SubagentStatus::Completed | SubagentStatus::Failed
+                                ) =>
+                            {
+                                claude_subagent_result_text(block, Some(value))
+                                    .map(|text| (id.clone(), text))
+                            }
                             _ => None,
                         };
                         if let ActivityKind::Subagent { id, .. } = &kind
@@ -3927,6 +3968,81 @@ impl OutputDecoder {
         decoded
     }
 
+    fn decode_claude_task_notification_text(
+        &mut self,
+        content: &str,
+        envelope: &Value,
+        decoded: &mut JsonDecodeResult,
+    ) {
+        let content = content.trim();
+        if !content.starts_with("<task-notification>") || !content.ends_with("</task-notification>")
+        {
+            return;
+        }
+        let task_id = tagged_text(content, "task-id").unwrap_or_default();
+        let tool_use_id = tagged_text(content, "tool-use-id").unwrap_or_default();
+        let seed_id = if !tool_use_id.is_empty() && self.is_known_subagent(&tool_use_id) {
+            tool_use_id.as_str()
+        } else if !task_id.is_empty() && self.is_known_subagent(&task_id) {
+            task_id.as_str()
+        } else {
+            return;
+        };
+        let canonical_id = self.canonical_subagent_id(seed_id);
+        if !tool_use_id.is_empty() {
+            self.bind_subagent_alias(tool_use_id, canonical_id.clone());
+        }
+        if !task_id.is_empty() {
+            self.bind_subagent_alias(task_id, canonical_id.clone());
+        }
+
+        let status = claude_subagent_status(tagged_text(content, "status").as_deref());
+        let parent_id = self
+            .subagents
+            .get(&canonical_id)
+            .and_then(|metadata| metadata.parent_id.clone())
+            .or_else(|| string_at(envelope, &["session_id", "sessionId"]))
+            .or_else(|| self.session_id.clone());
+        let metadata = self.remember_subagent(
+            &canonical_id,
+            KnownSubagent {
+                parent_id,
+                label: String::new(),
+                model: None,
+                detail: tagged_text(content, "summary"),
+                status: None,
+            },
+            status,
+        );
+        decoded.kinds.push(ActivityKind::Subagent {
+            id: canonical_id.clone(),
+            aliases: self.subagent_aliases_for(&canonical_id),
+            parent_id: metadata.parent_id,
+            label: metadata.label,
+            status,
+            model: metadata.model,
+            detail: metadata.detail,
+            tool_calls: tagged_text(content, "tool_uses")
+                .and_then(|value| value.parse::<u64>().ok()),
+        });
+        if let Some(duration_ms) =
+            tagged_text(content, "duration_ms").and_then(|value| value.parse::<i64>().ok())
+        {
+            decoded
+                .subagent_duration_ms
+                .insert(canonical_id.clone(), duration_ms.max(0));
+        }
+        if status.is_terminal()
+            && let Some(text) = tagged_text(content, "result")
+            && let Some(text) = self.remember_subagent_message(&canonical_id, text)
+        {
+            decoded.kinds.push_scoped(
+                AgentScope::Child { id: canonical_id },
+                ActivityKind::AssistantText { text },
+            );
+        }
+    }
+
     fn decode_claude_system(&mut self, value: &Value, decoded: &mut JsonDecodeResult) {
         let subtype = string_at(value, &["subtype"]).unwrap_or_default();
         match normalized_token(&subtype).as_str() {
@@ -3949,7 +4065,10 @@ impl OutputDecoder {
     ) {
         let task_id = string_at(value, &["task_id", "taskId"]).unwrap_or_default();
         let tool_use_id = string_at(value, &["tool_use_id", "toolUseId"]);
-        let subagent_type = string_at(value, &["subagent_type", "subagentType"]);
+        let subagent_type = string_at(value, &["subagent_type", "subagentType"]).or_else(|| {
+            string_at(value, &["task_type", "taskType"])
+                .filter(|task_type| normalized_token(task_type).contains("agent"))
+        });
         let known = self.is_known_subagent(&task_id)
             || tool_use_id
                 .as_deref()
@@ -4027,7 +4146,9 @@ impl OutputDecoder {
                 label,
                 model: string_at(value, &["resolved_model", "resolvedModel", "model"]),
                 detail,
+                status: None,
             },
+            status,
         );
         let usage = value.get("usage");
         let tool_calls = usage
@@ -4135,7 +4256,9 @@ impl OutputDecoder {
                         ],
                     )
                 }),
+                status: None,
             },
+            SubagentStatus::InProgress,
         );
         decoded.kinds.push(ActivityKind::Subagent {
             id: canonical_id.clone(),
@@ -4213,7 +4336,9 @@ impl OutputDecoder {
                 .unwrap_or_else(|| "Subagent".into()),
                 model: string_at(&input, &["model"]),
                 detail,
+                status: None,
             },
+            SubagentStatus::InProgress,
         );
         Some(ActivityKind::Subagent {
             aliases: self.subagent_aliases_for(&canonical_id),
@@ -4701,6 +4826,11 @@ impl OutputDecoder {
                 envelope.and_then(|envelope| string_at(envelope, &["session_id", "sessionId"]))
             })
             .or_else(|| self.session_id.clone());
+        let lifecycle_detail = if status == SubagentStatus::Completed {
+            None
+        } else {
+            payload_detail.or(fallback_output)
+        };
         let metadata = self.remember_subagent(
             &canonical_id,
             KnownSubagent {
@@ -4716,8 +4846,10 @@ impl OutputDecoder {
                 model: payload.and_then(|payload| {
                     string_at(payload, &["resolved_model", "resolvedModel", "model"])
                 }),
-                detail: payload_detail.or(fallback_output),
+                detail: lifecycle_detail,
+                status: None,
             },
+            status,
         );
         Some(ActivityKind::Subagent {
             aliases: self.subagent_aliases_for(&canonical_id),
@@ -5763,6 +5895,14 @@ fn compact_subagent_label(value: &str) -> Option<String> {
     }
 }
 
+fn compact_subagent_detail(value: String) -> String {
+    if value.len() <= MAX_SUBAGENT_DETAIL_BYTES {
+        return value;
+    }
+    let maximum = MAX_SUBAGENT_DETAIL_BYTES.saturating_sub("…".len());
+    format!("{}…", truncate_utf8(&value, maximum))
+}
+
 fn codex_subagent_status(
     agent_status: Option<&str>,
     call_status: Option<&str>,
@@ -5880,6 +6020,26 @@ fn claude_tool_result_payload<'a>(
         }
     }
     value_at(block, &["tool_use_result", "toolUseResult"]).filter(|payload| !payload.is_null())
+}
+
+fn claude_subagent_result_text(block: &Value, envelope: Option<&Value>) -> Option<String> {
+    claude_tool_result_payload(block, envelope)
+        .and_then(|payload| {
+            flattened_content(payload.get("content"))
+                .or_else(|| string_at(payload, &["summary", "description"]))
+        })
+        .or_else(|| flattened_content(block.get("content")))
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn tagged_text(value: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = value.find(&start_tag)?.saturating_add(start_tag.len());
+    let relative_end = value.get(start..)?.find(&end_tag)?;
+    let end = start.saturating_add(relative_end);
+    let text = value.get(start..end)?.trim();
+    (!text.is_empty()).then(|| text.to_owned())
 }
 
 fn is_claude_agent_output(payload: &Value) -> bool {
@@ -9588,7 +9748,7 @@ send({
         assert_eq!(subagents[0].label, "Audit authentication flows");
         assert_eq!(subagents[0].status, SubagentStatus::Completed);
         assert_eq!(subagents[0].model.as_deref(), Some("gpt-5.6"));
-        assert_eq!(subagents[0].detail.as_deref(), Some("Audit complete"));
+        assert!(subagents[0].detail.is_none());
         assert_eq!(subagents[0].duration_ms, Some(3_125));
         assert_eq!(subagents[0].prose_cells.len(), 1);
         assert_eq!(subagents[0].prose_cells[0].text, "Audit complete");
@@ -9850,8 +10010,40 @@ send({
                 assert_eq!(children[0].prose_cells.len(), 1);
                 assert_eq!(children[0].prose_cells[0].text, "CHILD_FIXTURE_OK");
                 assert!(children[0].checklist.is_none());
+                if provider == "claude_cli" {
+                    assert_eq!(children[0].id, "claude-agent-call");
+                    assert_eq!(children[0].aliases, vec!["claude-durable-agent"]);
+                    assert_eq!(children[0].tool_calls, Some(1));
+                    assert_eq!(children[0].duration_ms, Some(1_000));
+                }
             }
         }
+    }
+
+    #[test]
+    fn scoped_child_output_and_lifecycle_detail_are_strictly_bounded() {
+        let mut decoder = OutputDecoder::new("codex_cli".into(), OutputMode::JsonLines);
+        let oversized = "é".repeat(MAX_SUBAGENT_MESSAGE_BYTES);
+        let first = decoder
+            .remember_subagent_message("child-0", oversized)
+            .expect("first child output");
+        assert!(first.len() <= MAX_SUBAGENT_MESSAGE_BYTES);
+        assert!(first.is_char_boundary(first.len()));
+
+        for index in 1..32 {
+            let text = format!("{index}-{}", "x".repeat(MAX_SUBAGENT_MESSAGE_BYTES));
+            let _ = decoder.remember_subagent_message(&format!("child-{index}"), text);
+        }
+        assert!(decoder.subagent_output_bytes <= MAX_SUBAGENT_OUTPUT_BYTES);
+        assert!(
+            decoder
+                .remember_subagent_message("overflow", "must not persist".into())
+                .is_none()
+        );
+
+        let detail = compact_subagent_detail("é".repeat(MAX_SUBAGENT_DETAIL_BYTES));
+        assert!(detail.len() <= MAX_SUBAGENT_DETAIL_BYTES);
+        assert!(detail.ends_with('…'));
     }
 
     #[test]
