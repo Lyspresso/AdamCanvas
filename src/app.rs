@@ -4,8 +4,9 @@ use crate::{
         agent_rows, preflight_notice,
     },
     ai::{
-        AiEngine, AiEvent, AiFailureKind, AiRunRequest, clamp_provider_preferences,
-        installed_runtime_tuning, provider_exposes_app_task_tools, resolve_effective_provider_id,
+        AiEngine, AiEngineError, AiEvent, AiFailureKind, AiRunRequest, clamp_provider_preferences,
+        installed_kimi_uses_acp, installed_runtime_tuning, provider_exposes_app_task_tools,
+        resolve_effective_provider_id,
     },
     ai_prompt::{
         BuiltPrompt, HistoricalTurn, HistoryRole, PromptAttachment, PromptBudget, PromptContinuity,
@@ -404,6 +405,7 @@ struct AiTurnLaunch {
     model_override: Option<String>,
     provider_profile_override: Option<AiProviderPreferences>,
     user_message_already_committed: bool,
+    force_replay: bool,
 }
 
 #[derive(Debug)]
@@ -6725,6 +6727,7 @@ impl AdamApp {
                 model_override: Some(provider_profile.model.clone()),
                 provider_profile_override: Some(provider_profile),
                 user_message_already_committed: true,
+                force_replay: false,
             },
             context,
         ) {
@@ -6740,6 +6743,14 @@ impl AdamApp {
         conversation: &AiConversation,
         provider_id: &str,
     ) -> Option<ResumeGate> {
+        let configured_working_directory = conversation
+            .settings
+            .working_directory
+            .as_deref()
+            .map(Path::new);
+        if provider_id == "kimi_cli" && !installed_kimi_uses_acp(configured_working_directory) {
+            return None;
+        }
         let (executable, arguments) = ai_provider_profile_inputs(
             provider_id,
             &conversation.settings.custom_command,
@@ -6836,6 +6847,8 @@ impl AdamApp {
         launch: AiTurnLaunch,
         context: &Context,
     ) -> bool {
+        let force_replay = launch.force_replay;
+        let user_message_already_committed = launch.user_message_already_committed;
         let Some(conversation) = self
             .workspace
             .domain
@@ -6907,8 +6920,18 @@ impl AdamApp {
             self.changed(false);
         }
         let model = provider_profile.model.clone();
-        let resume_gate = self.ai_resume_gate(&conversation, &provider_id);
-        let mut invalidated_resume = false;
+        let resume_gate = if force_replay {
+            None
+        } else {
+            self.ai_resume_gate(&conversation, &provider_id)
+        };
+        let mut invalidated_resume = should_forget_unavailable_kimi_resume(
+            &provider_id,
+            resume_gate.is_some(),
+            self.resume_store
+                .record(conversation_id)
+                .map(|record| record.provider_key.as_str()),
+        );
         let resume_session_id = resume_gate.as_ref().and_then(|gate| {
             match self.resume_store.eligible_record(conversation_id, gate) {
                 Ok(Some(record)) => Some(record.session_id.clone()),
@@ -6950,7 +6973,7 @@ impl AdamApp {
             } else {
                 PromptContinuity::Replay
             },
-            launch.user_message_already_committed,
+            user_message_already_committed,
         );
         let prompt_budget = built_prompt.budget;
         let turn_id = Uuid::new_v4();
@@ -6981,7 +7004,7 @@ impl AdamApp {
 
         match self.ai_engine.start(request) {
             Ok(()) => {
-                if !launch.user_message_already_committed
+                if !user_message_already_committed
                     && let Some(stored) = self
                         .workspace
                         .domain
@@ -7030,6 +7053,33 @@ impl AdamApp {
                 context.request_repaint_after(Duration::from_millis(40));
                 true
             }
+            Err(AiEngineError::NativeResumeUnavailable(message))
+                if resume_session_id.is_some() && !force_replay =>
+            {
+                log::info!(
+                    "native Kimi session for {conversation_id} changed before launch; replaying safely: {message}"
+                );
+                self.resume_store.forget(conversation_id);
+                self.save_ai_resume_store();
+                self.chat_runtimes
+                    .entry(conversation_id)
+                    .or_default()
+                    .inspector_notice =
+                    Some("Kimi changed before launch; replaying the conversation safely…".into());
+                self.launch_ai_turn(
+                    conversation_id,
+                    user_text,
+                    attachments,
+                    AiTurnLaunch {
+                        provider_override: Some(provider_id),
+                        model_override: Some(model),
+                        provider_profile_override: Some(provider_profile),
+                        user_message_already_committed,
+                        force_replay: true,
+                    },
+                    context,
+                )
+            }
             Err(error) => {
                 let runtime = self.chat_runtimes.entry(conversation_id).or_default();
                 runtime.error = Some(error.to_string());
@@ -7062,6 +7112,7 @@ impl AdamApp {
                 model_override: queued.model.clone(),
                 provider_profile_override: queued.provider_profile.clone(),
                 user_message_already_committed: false,
+                force_replay: false,
             },
             context,
         ) {
@@ -7150,6 +7201,7 @@ impl AdamApp {
                     model_override: Some(replay.model),
                     provider_profile_override: Some(replay.provider_profile),
                     user_message_already_committed: true,
+                    force_replay: true,
                 },
                 context,
             ) {
@@ -7403,7 +7455,12 @@ impl AdamApp {
                     refresh_folders.insert(conversation_id);
                     drain_queues.insert(conversation_id);
                 }
-                AiEvent::Failed { kind, message, .. } => {
+                AiEvent::Failed {
+                    kind,
+                    message,
+                    resume_rejected,
+                    ..
+                } => {
                     let retry_message = self
                         .workspace
                         .domain
@@ -7415,7 +7472,8 @@ impl AdamApp {
                         .map(|last| (last.text.clone(), last.attachments.clone()));
                     let scheduled_resume_replay = {
                         let runtime = self.chat_runtimes.entry(conversation_id).or_default();
-                        let unproductive_resume = should_replay_failed_native_session(runtime);
+                        let unproductive_resume =
+                            should_replay_failed_native_session(runtime, resume_rejected);
                         if unproductive_resume {
                             retry_message.map(|(text, attachments)| {
                                 let replay = AiResumeReplay {
@@ -12398,7 +12456,15 @@ fn ai_trace_has_productive_activity(events: &[HarnessActivityEvent]) -> bool {
 }
 
 fn provider_session_is_portable_activity(provider_id: &str) -> bool {
-    provider_id != "xai_api"
+    !matches!(provider_id, "kimi_cli" | "xai_api")
+}
+
+fn kimi_uses_legacy_print_transport(provider_id: &str, tuning: &RuntimeTuningProfile) -> bool {
+    provider_id == "kimi_cli"
+        && tuning
+            .version
+            .as_ref()
+            .is_some_and(|version| version.major == 1)
 }
 
 fn ensure_terminal_status(
@@ -12598,8 +12664,19 @@ fn turn_status_for_failure(kind: AiFailureKind) -> TurnStatus {
     }
 }
 
-fn should_replay_failed_native_session(runtime: &AiChatRuntime) -> bool {
-    runtime.active_used_resume && !runtime.active_had_productive_activity
+fn should_replay_failed_native_session(runtime: &AiChatRuntime, resume_rejected: bool) -> bool {
+    let requires_typed_rejection = runtime.active_provider_id.as_deref() == Some("xai_api");
+    runtime.active_used_resume
+        && !runtime.active_had_productive_activity
+        && (!requires_typed_rejection || resume_rejected)
+}
+
+fn should_forget_unavailable_kimi_resume(
+    provider_id: &str,
+    resume_available: bool,
+    recorded_provider_id: Option<&str>,
+) -> bool {
+    provider_id == "kimi_cli" && !resume_available && recorded_provider_id == Some("kimi_cli")
 }
 
 fn ai_activity_tool_markers(events: &[HarnessActivityEvent]) -> Vec<String> {
@@ -15467,6 +15544,18 @@ fn render_ai_composer(
                     );
                 }
             });
+            if kimi_uses_legacy_print_transport(&provider_id, &tuning)
+                && (settings.workspace_mode == AiWorkspaceMode::Chat
+                    || !matches!(*permission, PermissionMode::Auto | PermissionMode::Bypass))
+            {
+                ui.label(
+                    RichText::new(
+                        "Legacy Kimi print mode needs Cowork or Code with Automatic access because it auto-approves tools. Kimi Code 0.31 ACP supports Adam's normal permission controls.",
+                    )
+                    .size(9.5)
+                    .color(colors.danger),
+                );
+            }
             let send_with_return = response.has_focus()
                 && !runtime.draft.trim().is_empty()
                 && ui.input_mut(|input| {
@@ -17733,12 +17822,23 @@ mod tests {
     }
 
     #[test]
-    fn failed_native_resume_replays_only_before_any_productive_activity() {
+    fn xai_resume_replays_only_for_typed_stale_session_failure() {
         let mut runtime = AiChatRuntime {
             active_used_resume: true,
+            active_provider_id: Some("xai_api".into()),
             ..AiChatRuntime::default()
         };
-        assert!(should_replay_failed_native_session(&runtime));
+        assert!(
+            !should_replay_failed_native_session(&runtime, false),
+            "a generic provider or transport failure must not issue a second request"
+        );
+        assert!(should_replay_failed_native_session(&runtime, true));
+        runtime.active_provider_id = Some("codex_cli".into());
+        assert!(
+            should_replay_failed_native_session(&runtime, false),
+            "existing CLI adapters retain their bounded unproductive-resume fallback"
+        );
+        runtime.active_provider_id = Some("xai_api".into());
 
         let session_only = HarnessActivityEvent::new(
             Uuid::new_v4(),
@@ -17774,7 +17874,31 @@ mod tests {
             HarnessActivityEvent::assistant_text(Uuid::new_v4(), UnixMillis(2), "provider output");
         assert!(ai_trace_has_productive_activity(&[text]));
         runtime.active_had_productive_activity = true;
-        assert!(!should_replay_failed_native_session(&runtime));
+        assert!(!should_replay_failed_native_session(&runtime, true));
+    }
+
+    #[test]
+    fn unavailable_kimi_acp_runtime_forgets_only_its_stale_sidecar() {
+        assert!(should_forget_unavailable_kimi_resume(
+            "kimi_cli",
+            false,
+            Some("kimi_cli")
+        ));
+        assert!(!should_forget_unavailable_kimi_resume(
+            "kimi_cli",
+            true,
+            Some("kimi_cli")
+        ));
+        assert!(!should_forget_unavailable_kimi_resume(
+            "kimi_cli",
+            false,
+            Some("codex_cli")
+        ));
+        assert!(!should_forget_unavailable_kimi_resume(
+            "codex_cli",
+            false,
+            Some("kimi_cli")
+        ));
     }
 
     #[test]
@@ -18306,6 +18430,39 @@ mod tests {
     }
 
     #[test]
+    fn kimi_legacy_warning_tracks_the_actual_runtime_contract() {
+        let acp_version = crate::chat_core::CliVersion::parse("0.31.0").unwrap();
+        let unsupported_version = crate::chat_core::CliVersion::parse("0.31.1").unwrap();
+        let legacy_version = crate::chat_core::CliVersion::parse("1.49.0").unwrap();
+        let acp = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            Some(&acp_version),
+            "",
+        );
+        let legacy = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            Some(&legacy_version),
+            "",
+        );
+        let unsupported = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            Some(&unsupported_version),
+            "",
+        );
+        let unknown = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            None,
+            "",
+        );
+
+        assert!(!kimi_uses_legacy_print_transport("kimi_cli", &acp));
+        assert!(!kimi_uses_legacy_print_transport("kimi_cli", &unsupported));
+        assert!(!kimi_uses_legacy_print_transport("kimi_cli", &unknown));
+        assert!(kimi_uses_legacy_print_transport("kimi_cli", &legacy));
+        assert!(!kimi_uses_legacy_print_transport("codex_cli", &legacy));
+    }
+
+    #[test]
     fn provider_switch_materializes_legacy_model_and_restores_each_profile() {
         let mut settings = AiConversationSettings {
             provider_id: "codex_cli".into(),
@@ -18346,6 +18503,7 @@ mod tests {
         );
         assert_eq!(runtime.temporary_api_key("lm_studio"), None);
         assert!(!provider_session_is_portable_activity("xai_api"));
+        assert!(!provider_session_is_portable_activity("kimi_cli"));
         assert!(provider_session_is_portable_activity("codex_cli"));
     }
 
