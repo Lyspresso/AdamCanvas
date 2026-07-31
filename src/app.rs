@@ -13906,14 +13906,20 @@ fn render_ai_inspector_activity(
     live_events: &[HarnessActivityEvent],
     colors: Theme,
 ) {
-    let newest_reasoning = live_events
-        .iter()
-        .rposition(|event| matches!(event.kind, ActivityKind::Thinking { .. }));
+    // Main-scope only: a child's diagnostics render under that child in the
+    // Agents card, so surfacing them here too would re-attribute them to the
+    // foreground agent.
+    let newest_reasoning = live_events.iter().rposition(|event| {
+        event.scope.is_main() && matches!(event.kind, ActivityKind::Thinking { .. })
+    });
     let detailed = live_events
         .iter()
         .enumerate()
         .filter(|event| {
             let (index, event) = *event;
+            if !event.scope.is_main() {
+                return false;
+            }
             if matches!(event.kind, ActivityKind::Thinking { .. })
                 && Some(index) != newest_reasoning
             {
@@ -14776,14 +14782,21 @@ fn render_ai_activity_trace(ui: &mut Ui, events: &[HarnessActivityEvent], colors
             });
     }
 
-    let newest_reasoning = events
-        .iter()
-        .rposition(|event| matches!(event.kind, ActivityKind::Thinking { .. }));
+    // Child-scoped reasoning and tool rows belong to that child's own cell in
+    // the Agents card, not to the parent's trace. Filtering by kind alone put
+    // a child's thinking and tool calls inline with the parent's, which is the
+    // attribution mixing the scoped channel exists to remove.
+    let newest_reasoning = events.iter().rposition(|event| {
+        event.scope.is_main() && matches!(event.kind, ActivityKind::Thinking { .. })
+    });
     let detailed = events
         .iter()
         .enumerate()
         .filter(|entry| {
             let (index, event) = *entry;
+            if !event.scope.is_main() {
+                return false;
+            }
             if matches!(event.kind, ActivityKind::Thinking { .. })
                 && Some(index) != newest_reasoning
             {
