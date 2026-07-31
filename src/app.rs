@@ -35,6 +35,7 @@ use crate::{
         apply_rule_edit, authorize_ai_action, auto_tag_rule_sentence, resolve_pile_memberships,
     },
     dots::{self, ChromeRects},
+    file_watch::{self, FileWatch},
     grid_view::{self, CellShape, GridViewState, Lightbox, ZoomMode},
     model::{
         CanvasPage, CanvasTileStyle, DEFAULT_TILE_SIZE, FileKind, PageViewState, Tile, TileContent,
@@ -48,7 +49,9 @@ use crate::{
     },
     platform,
     preview::PreviewCache,
+    sheet_view::{self, SheetMetrics, SheetPalette, SheetViewState},
     spatial::{DEFAULT_CELL_SIZE, SpatialIndex},
+    spreadsheet,
     structured_preview::{StructuredPreview, StructuredPreviewCache},
 };
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -517,6 +520,7 @@ struct AiTilePreview {
 #[derive(Clone, Copy, Debug)]
 enum TileAction {
     Open(Uuid),
+    OpenInGridView(Uuid),
     QuickLook(Uuid),
     Reveal(Uuid),
     Copy(Uuid),
@@ -899,6 +903,14 @@ pub struct AdamApp {
     photo_ocr_started: HashMap<Uuid, Instant>,
     photo_file_facts: HashMap<Uuid, PhotoFileFacts>,
     last_automation_tick: Instant,
+    file_watch: FileWatch,
+    last_file_watch: Instant,
+    /// Workbooks shown as live grids in the lightbox, keyed by tile.
+    /// `None` records a failed load so a broken file is not re-parsed
+    /// every frame; the file watcher evicts entries when the file on
+    /// disk changes, which is what makes an Excel save appear here.
+    sheets: HashMap<Uuid, Option<spreadsheet::Workbook>>,
+    sheet_states: HashMap<Uuid, SheetViewState>,
     last_automation_persist: Instant,
     automation_initialized: bool,
     semantic_reconcile_needed: bool,
@@ -1186,6 +1198,10 @@ impl AdamApp {
             photo_ocr_started: HashMap::new(),
             photo_file_facts: HashMap::new(),
             last_automation_tick: Instant::now(),
+            file_watch: FileWatch::default(),
+            last_file_watch: Instant::now(),
+            sheets: HashMap::new(),
+            sheet_states: HashMap::new(),
             last_automation_persist: Instant::now(),
             automation_initialized: false,
             semantic_reconcile_needed: true,
@@ -1519,6 +1535,49 @@ impl AdamApp {
                     }
                 }
             }
+        }
+    }
+
+    /// Keeps the canvas live against the disk: when a file behind a tile is
+    /// saved by another application, its previews are rebuilt immediately.
+    fn poll_file_watch(&mut self, context: &Context) {
+        // egui runs frames only on events, and an untouched Adam sitting
+        // behind Excel receives none — the very moment this watcher exists
+        // for. The heartbeat guarantees a frame each interval so the poll
+        // below actually runs while the user is away.
+        context.request_repaint_after(file_watch::POLL_INTERVAL);
+        if self.last_file_watch.elapsed() < file_watch::POLL_INTERVAL {
+            return;
+        }
+        self.last_file_watch = Instant::now();
+
+        // Only the active page: it is what is on screen, and it bounds the
+        // stat count to tens rather than the whole library.
+        let files: Vec<(Uuid, PathBuf)> = self
+            .workspace
+            .active_page()
+            .tiles
+            .iter()
+            .filter_map(|tile| match &tile.content {
+                TileContent::File { path, .. } => Some((tile.id, path.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut any_changed = false;
+        for (id, path) in files {
+            let mtime = file_watch::modification_time(&path);
+            if self.file_watch.observe(id, mtime) == file_watch::Observation::Changed {
+                self.previews.invalidate(id);
+                self.structured_previews.invalidate(id);
+                // Drop the parsed workbook but keep its view state, so a
+                // sheet open in the lightbox reloads in place with the same
+                // scroll position and selected cell.
+                self.sheets.remove(&id);
+                any_changed = true;
+            }
+        }
+        if any_changed {
+            context.request_repaint();
         }
     }
 
@@ -3487,6 +3546,7 @@ impl AdamApp {
 
                 let mut pending_activation = None;
                 let mut expanded_photo = None;
+                let mut sheet_to_show = None;
                 if let Some(lightbox) = state.lightbox {
                     let page = self.workspace.active_page();
                     if let Some(tile) = page.tiles.get(lightbox.index) {
@@ -3507,6 +3567,15 @@ impl AdamApp {
                         );
                         draw_grid_lightbox_caption(&painter, photo, tile, lightbox, colors);
                         expanded_photo = Some(photo);
+                        // A spreadsheet's expanded form is the sheet itself,
+                        // browse mode included — the file preview only bridges
+                        // the open animation.
+                        if !lightbox.is_animating()
+                            && let TileContent::File { path, .. } = &tile.content
+                            && spreadsheet::is_spreadsheet(path)
+                        {
+                            sheet_to_show = Some((tile.id, path.clone(), photo));
+                        }
                     }
                 }
 
@@ -3576,8 +3645,171 @@ impl AdamApp {
                     self.show_grid_note_editor(ui, &context, id, photo, colors);
                 }
 
+                if let Some((id, path, photo)) = sheet_to_show {
+                    self.show_grid_sheet(ui, &context, id, &path, photo, colors);
+                }
+
                 self.grid_view = Some(state);
             });
+    }
+
+    /// Draws a workbook as a live, scrollable grid inside the expanded
+    /// lightbox cell. Read-only by design: Excel is the editor, Adam is the
+    /// live view. The file watcher evicts the parsed workbook when the file
+    /// changes on disk, so a save in Excel appears here within a second,
+    /// keeping the same scroll position and selected cell.
+    fn show_grid_sheet(
+        &mut self,
+        ui: &mut Ui,
+        context: &Context,
+        id: Uuid,
+        path: &Path,
+        rect: Rect,
+        colors: Theme,
+    ) {
+        // Parse lazily, and cache failure so a broken file is not re-read
+        // every frame. A failed load leaves the Quick Look preview showing,
+        // with the reason in the corner.
+        let workbook = self
+            .sheets
+            .entry(id)
+            .or_insert_with(|| match spreadsheet::load(path) {
+                Ok(workbook) => Some(workbook),
+                Err(error) => {
+                    log::warn!("could not read {} as a sheet: {error:#}", path.display());
+                    None
+                }
+            });
+        let Some(workbook) = workbook else {
+            ui.painter().text(
+                pos2(rect.left() + 8.0, rect.bottom() + 16.0),
+                Align2::LEFT_CENTER,
+                "Could not read this file as a spreadsheet — showing its preview instead",
+                FontId::proportional(11.5),
+                colors.chrome_secondary_text,
+            );
+            return;
+        };
+
+        let mut state = self.sheet_states.get(&id).copied().unwrap_or_default();
+        if state.sheet >= workbook.sheets.len() {
+            state.sheet = 0;
+        }
+        let Some(sheet) = workbook.sheet(state.sheet) else {
+            return;
+        };
+
+        // One digit of the cell font is what the metrics need to size
+        // columns without knowing about fonts.
+        let character_width = ui
+            .painter()
+            .layout_no_wrap("0".into(), FontId::proportional(12.0), Color32::WHITE)
+            .size()
+            .x;
+        let metrics = SheetMetrics::measure(sheet, character_width);
+
+        let response = ui.allocate_rect(rect, Sense::click_and_drag());
+        let body = Rect::from_min_max(
+            pos2(
+                rect.left() + metrics.row_header_width,
+                rect.top() + metrics.column_header_height,
+            ),
+            rect.max,
+        );
+        let viewport = body.size();
+
+        if response.contains_pointer() {
+            let scroll = context.input(|input| input.smooth_scroll_delta);
+            if scroll != Vec2::ZERO {
+                state.scroll -= scroll;
+            }
+        }
+        if response.dragged_by(PointerButton::Primary) {
+            state.scroll -= response.drag_delta();
+        }
+        state.scroll = metrics.clamp_scroll(state.scroll, viewport);
+
+        if response.clicked()
+            && let Some(pointer) = context.input(|input| input.pointer.interact_pos())
+            && body.contains(pointer)
+            && let Some((row, column)) =
+                metrics.cell_at((pointer - body.min + state.scroll).to_pos2())
+        {
+            state.selection = sheet_view::Selection { row, column };
+        }
+
+        // Double-click anywhere in the sheet hands the file to its editor
+        // (deferred past the workbook borrow).
+        let open_externally = response.double_clicked();
+
+        let (left, right, up, down) = context.input(|input| {
+            (
+                input.key_pressed(Key::ArrowLeft),
+                input.key_pressed(Key::ArrowRight),
+                input.key_pressed(Key::ArrowUp),
+                input.key_pressed(Key::ArrowDown),
+            )
+        });
+        if left || right || up || down {
+            state.selection.step(
+                isize::from(down) - isize::from(up),
+                isize::from(right) - isize::from(left),
+                sheet.rows,
+                sheet.columns,
+            );
+            state.scroll = metrics.scroll_to_reveal(
+                state.selection.row,
+                state.selection.column,
+                viewport,
+                state.scroll,
+            );
+        }
+
+        sheet_view::draw(
+            ui.painter(),
+            rect,
+            sheet,
+            &metrics,
+            &state,
+            SheetPalette {
+                surface: colors.tile,
+                header: colors.tile_footer,
+                grid_line: color_with_alpha(colors.tertiary_text, 60),
+                text: colors.text,
+                secondary_text: colors.secondary_text,
+                selection: color_with_alpha(colors.accent, 60),
+                accent: colors.accent,
+            },
+        );
+
+        // Status: selected cell, its formula or value, load truncation, and
+        // how to edit — which is Excel, not Adam.
+        let cell = sheet.cell(state.selection.row, state.selection.column);
+        let mut status = state.selection.reference();
+        if let Some(formula) = cell.and_then(|cell| cell.formula.as_deref()) {
+            status.push_str(&format!("  ={formula}"));
+        } else if let Some(cell) = cell.filter(|cell| !cell.value.is_empty()) {
+            status.push_str(&format!("  {}", truncate(&cell.value.display(), 60)));
+        }
+        if sheet.truncated {
+            status.push_str(&format!(
+                "  ·  showing {}×{} of {}×{}",
+                sheet.rows, sheet.columns, sheet.source_rows, sheet.source_columns
+            ));
+        }
+        status.push_str("  ·  live view — double-click to edit; saves appear here");
+        ui.painter().text(
+            pos2(rect.left() + 8.0, rect.bottom() + 16.0),
+            Align2::LEFT_CENTER,
+            status,
+            FontId::proportional(11.5),
+            colors.chrome_secondary_text,
+        );
+
+        self.sheet_states.insert(id, state);
+        if open_externally {
+            self.open_tile(id);
+        }
     }
 
     /// The note text field that Edit mode opens inside the expanded cell.
@@ -3630,6 +3862,40 @@ impl AdamApp {
             self.editing_note = None;
             self.editing_focus_pending = None;
         }
+    }
+
+    fn tile_id_at(&self, index: usize) -> Option<Uuid> {
+        self.workspace
+            .active_page()
+            .tiles
+            .get(index)
+            .map(|tile| tile.id)
+    }
+
+    /// Enters grid view with one tile's lightbox already expanded — the
+    /// context menu's path from a canvas spreadsheet straight to its live
+    /// sheet.
+    fn open_tile_in_grid_view(&mut self, id: Uuid) {
+        let Some(index) = self
+            .workspace
+            .active_page()
+            .tiles
+            .iter()
+            .position(|tile| tile.id == id)
+        else {
+            return;
+        };
+        let mut state = self.grid_view.unwrap_or_default();
+        // Scroll the wall to the tile first, so dismissing the lightbox
+        // leaves you looking at it rather than at the top of the page.
+        if let Some(view) = self.last_canvas_rect {
+            let metrics = state.metrics(view.width(), self.workspace.active_page().tiles.len());
+            state.camera.offset =
+                metrics.reveal_offset(index, state.camera.visible_size(view), state.camera.offset);
+            state.camera = state.camera.clamped(metrics.content, view);
+        }
+        state.lightbox = Some(Lightbox::opening(index));
+        self.grid_view = Some(state);
     }
 
     /// Enters or leaves the grid view. Opening always starts at the top of the
@@ -3725,8 +3991,16 @@ impl AdamApp {
             (_, _, false, true) => Some(metrics.columns as isize),
             _ => None,
         };
+        // While the lightbox shows a live sheet, the arrows belong to its
+        // cell selection (handled in show_grid_sheet), not to tile-stepping.
+        let sheet_owns_keys = state
+            .lightbox
+            .filter(|lightbox| !lightbox.closing)
+            .and_then(|lightbox| self.tile_id_at(lightbox.index))
+            .is_some_and(|id| self.sheets.get(&id).is_some_and(Option::is_some));
         if let Some(step) = step
             && count > 0
+            && !sheet_owns_keys
         {
             let visible = state.camera.visible_size(view);
             match &mut state.lightbox {
@@ -4213,6 +4487,7 @@ impl AdamApp {
             if let Some(action) = event.action {
                 match action {
                     TileAction::Open(id) => self.activate_tile(id),
+                    TileAction::OpenInGridView(id) => self.open_tile_in_grid_view(id),
                     TileAction::QuickLook(id) => self.quick_look_tile(id),
                     TileAction::Reveal(id) => self.reveal_tile(id),
                     TileAction::Copy(id) => {
@@ -10402,6 +10677,7 @@ impl eframe::App for AdamApp {
         self.handle_shortcuts(context);
         self.handle_external_drops(context);
         self.poll_automation(context);
+        self.poll_file_watch(context);
         self.maybe_autosave();
     }
 
@@ -11136,6 +11412,13 @@ fn draw_tile(
         if matches!(tile.content, TileContent::File { .. }) {
             if ui.button("Quick Look").clicked() {
                 event.action = Some(TileAction::QuickLook(tile.id));
+                ui.close();
+            }
+            if let TileContent::File { path, .. } = &tile.content
+                && spreadsheet::is_spreadsheet(path)
+                && ui.button("Open in Grid View").clicked()
+            {
+                event.action = Some(TileAction::OpenInGridView(tile.id));
                 ui.close();
             }
             if ui.button("Reveal in Finder").clicked() {

@@ -12,6 +12,7 @@ pub mod chat_core;
 pub mod clipboard;
 pub mod domain;
 pub mod dots;
+pub mod file_watch;
 pub mod grid_view;
 pub(crate) mod grok_acp;
 #[cfg(target_os = "macos")]
@@ -25,5 +26,7 @@ pub mod photo_details;
 pub mod platform;
 pub mod preview;
 pub mod progress_stepper;
+pub mod sheet_view;
 pub mod spatial;
+pub mod spreadsheet;
 pub mod structured_preview;

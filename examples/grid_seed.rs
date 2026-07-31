@@ -74,6 +74,53 @@ fn main() -> anyhow::Result<()> {
         WorldRect::new(760.0, 1_500.0, 260.0, 180.0),
     ));
 
+    // A real workbook with live formulas, so the in-app sheet editor has
+    // something honest to open. Written next to the images.
+    let sheet_path = images.join("budget.xlsx");
+    {
+        use rust_xlsxwriter::{Formula, Workbook as XlsxWorkbook};
+        let mut xlsx = XlsxWorkbook::new();
+        let sheet = xlsx.add_worksheet();
+        sheet.set_name("Budget").map_err(anyhow::Error::from)?;
+        for (column, header) in ["Item", "Price", "Count", "Total"].iter().enumerate() {
+            sheet
+                .write_string(0, column as u16, *header)
+                .map_err(anyhow::Error::from)?;
+        }
+        let rows: [(&str, f64, f64); 4] = [
+            ("Espresso beans", 18.5, 2.0),
+            ("Milk", 3.2, 6.0),
+            ("Filters", 9.0, 1.0),
+            ("Mugs", 12.0, 4.0),
+        ];
+        for (index, (item, price, count)) in rows.iter().enumerate() {
+            let row = index as u32 + 1;
+            sheet
+                .write_string(row, 0, *item)
+                .map_err(anyhow::Error::from)?;
+            sheet
+                .write_number(row, 1, *price)
+                .map_err(anyhow::Error::from)?;
+            sheet
+                .write_number(row, 2, *count)
+                .map_err(anyhow::Error::from)?;
+            sheet
+                .write_formula(row, 3, Formula::new(format!("=B{r}*C{r}", r = row + 1)))
+                .map_err(anyhow::Error::from)?;
+        }
+        sheet
+            .write_string(6, 0, "Grand total")
+            .map_err(anyhow::Error::from)?;
+        sheet
+            .write_formula(6, 3, Formula::new("=SUM(D2:D5)"))
+            .map_err(anyhow::Error::from)?;
+        xlsx.save(&sheet_path).map_err(anyhow::Error::from)?;
+    }
+    workspace.active_page_mut().add_tile(Tile::from_file(
+        sheet_path,
+        WorldRect::new(1_100.0, 1_500.0, 280.0, 200.0),
+    ));
+
     let paths = AppPaths::at(&root);
     fs::create_dir_all(&paths.root)?;
     save_workspace_atomic(&paths, &workspace)?;
