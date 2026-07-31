@@ -1,0 +1,2 @@
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<SESSION_ID>","update":{"sessionUpdate":"available_commands_update","availableCommands":[],"_meta":{"tools":[]}},"_meta":{"totalTokens":4266,"eventId":"<EVENT_ID>","agentTimestampMs":0,"updateType":"AvailableCommandsUpdate","updateParams":{"commandsCount":40}}}}
+{"jsonrpc":"2.0","id":2,"result":{"models":{"currentModelId":"grok-4.5","availableModels":[]},"_meta":{"capture":"redacted"}}}
