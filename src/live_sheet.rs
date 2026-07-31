@@ -27,6 +27,10 @@ use uuid::Uuid;
 pub const POLL_INTERVAL: Duration = Duration::from_millis(1_500);
 /// A poll that outlives this is killed; Excel mid-recalc can wedge a script.
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(5);
+/// The very first poll blocks on macOS's Automation permission dialog until
+/// the user answers it. Killing that process tears the dialog down before it
+/// can be answered — so the first attempt waits like a human would.
+const FIRST_RUN_TIMEOUT: Duration = Duration::from_secs(180);
 /// A mirror result older than this no longer counts as "live" in the UI.
 pub const LIVE_BADGE_TTL: Duration = Duration::from_secs(6);
 
@@ -47,11 +51,15 @@ function run(argv) {
     }
     if (!target) { return "NOT_OPEN"; }
     let sheet = null;
-    const worksheets = target.worksheets;
-    for (let i = 0; i < worksheets.length; i++) {
-        try {
-            if (worksheets[i].name() === sheetName) { sheet = worksheets[i]; break; }
-        } catch (e) {}
+    if (sheetName === "") {
+        try { sheet = target.activeSheet; sheet.name(); } catch (e) { sheet = null; }
+    } else {
+        const worksheets = target.worksheets;
+        for (let i = 0; i < worksheets.length; i++) {
+            try {
+                if (worksheets[i].name() === sheetName) { sheet = worksheets[i]; break; }
+            } catch (e) {}
+        }
     }
     if (!sheet) { return "NO_SHEET"; }
     const range = sheet.usedRange;
@@ -67,7 +75,7 @@ function run(argv) {
         const columns = columnNumber(match[3]) - columnNumber(match[1]) + 1;
         if (rows > 5000 || columns > 256) { return "TOO_BIG"; }
     }
-    return JSON.stringify({ values: range.value(), formulas: range.formula() });
+    return JSON.stringify({ sheet: sheet.name(), values: range.value(), formulas: range.formula() });
 }
 "#;
 
@@ -112,8 +120,10 @@ impl LiveSheetMirror {
         thread::Builder::new()
             .name("adam-live-sheet".into())
             .spawn(move || {
+                let mut first_run = true;
                 while let Ok(request) = request_receiver.recv() {
-                    let (outcome, payload_hash) = poll_excel(&request);
+                    let (outcome, payload_hash) = poll_excel(&request, first_run);
+                    first_run = false;
                     let _ = result_sender.send(PollResult {
                         tile: request.tile,
                         outcome,
@@ -141,15 +151,24 @@ impl LiveSheetMirror {
 }
 
 /// One round trip to Excel: run the script, classify the outcome.
-fn poll_excel(request: &PollRequest) -> (MirrorOutcome, u64) {
-    let output = match run_script_with_timeout(&request.path, &request.sheet_name) {
+fn poll_excel(request: &PollRequest, first_run: bool) -> (MirrorOutcome, u64) {
+    let timeout = if first_run {
+        FIRST_RUN_TIMEOUT
+    } else {
+        SCRIPT_TIMEOUT
+    };
+    let output = match run_script_with_timeout(&request.path, &request.sheet_name, timeout) {
         Ok(output) => output,
         Err(error) => return (MirrorOutcome::Failed(error), 0),
     };
     classify_output(&output, &request.sheet_name)
 }
 
-fn run_script_with_timeout(path: &std::path::Path, sheet_name: &str) -> Result<String, String> {
+fn run_script_with_timeout(
+    path: &std::path::Path,
+    sheet_name: &str,
+    timeout: Duration,
+) -> Result<String, String> {
     let mut child = Command::new("/usr/bin/osascript")
         .arg("-l")
         .arg("JavaScript")
@@ -162,7 +181,7 @@ fn run_script_with_timeout(path: &std::path::Path, sheet_name: &str) -> Result<S
         .spawn()
         .map_err(|error| format!("could not run osascript: {error}"))?;
 
-    let deadline = Instant::now() + SCRIPT_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
@@ -218,6 +237,10 @@ fn classify_output(output: &str, sheet_name: &str) -> (MirrorOutcome, u64) {
 fn parse_payload(payload: &str, sheet_name: &str) -> Result<Sheet, String> {
     let parsed: JsonValue =
         serde_json::from_str(payload).map_err(|error| format!("unreadable payload: {error}"))?;
+    let sheet_name = parsed
+        .get("sheet")
+        .and_then(JsonValue::as_str)
+        .unwrap_or(sheet_name);
     let values = as_grid(parsed.get("values"));
     let formulas = as_grid(parsed.get("formulas"));
 

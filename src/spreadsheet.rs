@@ -363,6 +363,37 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
+/// A bounded table snapshot of a sheet, in the shape the canvas already
+/// draws for CSV tiles — which is what lets a live workbook render on a tile
+/// with no new painting code.
+pub fn tile_table(sheet: &Sheet) -> crate::structured_preview::TablePreview {
+    // A tile shows a corner of the data, not the sheet; the lightbox is the
+    // full view. These bounds keep per-frame cost trivial.
+    const TILE_ROWS: usize = 24;
+    const TILE_COLUMNS: usize = 12;
+    let rows = sheet.rows.min(TILE_ROWS);
+    let columns = sheet.columns.min(TILE_COLUMNS);
+    let mut grid = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let mut cells = Vec::with_capacity(columns);
+        for column in 0..columns {
+            cells.push(
+                sheet
+                    .cell(row, column)
+                    .map(|cell| cell.value.display())
+                    .unwrap_or_default(),
+            );
+        }
+        grid.push(cells);
+    }
+    crate::structured_preview::TablePreview {
+        rows: grid,
+        column_count: columns,
+        delimiter: ',',
+        truncated: sheet.rows > rows || sheet.columns > columns || sheet.truncated,
+    }
+}
+
 /// Spreadsheet column name for a zero-based index: 0 → A, 25 → Z, 26 → AA.
 pub fn column_name(index: usize) -> String {
     let mut name = String::new();
@@ -624,6 +655,62 @@ mod tests {
         assert_eq!(format_duration(1.5), "36:00");
         assert_eq!(format_duration(0.0), "0:00");
         assert_eq!(format_duration(f64::NAN), "#VALUE!");
+    }
+
+    #[test]
+    fn tile_tables_are_bounded_and_flag_what_they_omit() {
+        let (_directory, path) = {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let path = directory.path().join("wide.xlsx");
+            let mut workbook = rust_xlsxwriter::Workbook::new();
+            let sheet = workbook.add_worksheet();
+            for row in 0..40u32 {
+                for column in 0..20u16 {
+                    sheet
+                        .write_number(row, column, (row * 100 + column as u32) as f64)
+                        .unwrap();
+                }
+            }
+            workbook.save(&path).expect("write fixture");
+            (directory, path)
+        };
+        let loaded = load(&path).expect("load");
+        let table = tile_table(&loaded.sheets[0]);
+        assert!(table.rows.len() <= 24, "tiles show a corner, not the sheet");
+        assert!(table.column_count <= 12);
+        assert!(table.truncated, "omitted content must be flagged");
+        assert_eq!(table.rows[0][0], "0");
+        assert_eq!(table.rows[1][1], "101");
+
+        // A small sheet fits whole and says so.
+        let small = Sheet::from_cells(
+            "S",
+            2,
+            2,
+            vec![
+                Cell {
+                    value: CellValue::Number(1.0),
+                    formula: None,
+                },
+                Cell {
+                    value: CellValue::Text("x".into()),
+                    formula: None,
+                },
+                Cell::default(),
+                Cell::default(),
+            ],
+        );
+        let table = tile_table(&small);
+        assert_eq!(table.rows.len(), 2);
+        assert!(!table.truncated);
+        assert_eq!(table.rows[0][1], "x");
+    }
+
+    #[test]
+    fn from_cells_squares_off_a_short_payload() {
+        let sheet = Sheet::from_cells("S", 2, 3, vec![Cell::default()]);
+        assert_eq!((sheet.rows, sheet.columns), (2, 3));
+        assert!(sheet.cell(1, 2).is_some(), "padded to the full rectangle");
     }
 
     #[test]

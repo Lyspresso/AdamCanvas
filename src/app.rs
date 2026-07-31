@@ -921,6 +921,11 @@ pub struct AdamApp {
     live_last_hash: HashMap<Uuid, u64>,
     live_updated_at: HashMap<Uuid, Instant>,
     live_blocked: bool,
+    /// Bounded table snapshots drawn on spreadsheet tiles in place of the
+    /// Quick Look image whenever parsed (and possibly live) data exists.
+    sheet_tile_tables: HashMap<Uuid, StructuredPreview>,
+    /// Round-robin cursor over the canvas's spreadsheet tiles.
+    live_rotation: usize,
     last_automation_persist: Instant,
     automation_initialized: bool,
     semantic_reconcile_needed: bool,
@@ -1219,6 +1224,8 @@ impl AdamApp {
             live_last_hash: HashMap::new(),
             live_updated_at: HashMap::new(),
             live_blocked: false,
+            sheet_tile_tables: HashMap::new(),
+            live_rotation: 0,
             last_automation_persist: Instant::now(),
             automation_initialized: false,
             semantic_reconcile_needed: true,
@@ -1615,25 +1622,40 @@ impl AdamApp {
                     if unchanged {
                         continue;
                     }
-                    // Apply only when the display cache is present; in the
-                    // brief window after a save-eviction the disk parse
-                    // restores the cache and the next poll lands on top.
-                    if let Some(Some(workbook)) = self.sheets.get_mut(&result.tile) {
-                        let slot = workbook
-                            .sheets
-                            .iter_mut()
-                            .find(|candidate| candidate.name == sheet.name);
-                        if let Some(slot) = slot {
-                            *slot = sheet;
-                        } else if let Some(first) = workbook.sheets.first_mut() {
-                            *first = sheet;
-                        } else {
-                            workbook.sheets.push(sheet);
+                    self.sheet_tile_tables.insert(
+                        result.tile,
+                        StructuredPreview::Table(spreadsheet::tile_table(&sheet)),
+                    );
+                    match self.sheets.get_mut(&result.tile) {
+                        Some(Some(workbook)) => {
+                            let slot = workbook
+                                .sheets
+                                .iter_mut()
+                                .find(|candidate| candidate.name == sheet.name);
+                            if let Some(slot) = slot {
+                                *slot = sheet;
+                            } else if let Some(first) = workbook.sheets.first_mut() {
+                                *first = sheet;
+                            } else {
+                                workbook.sheets.push(sheet);
+                            }
                         }
-                        self.live_last_hash.insert(result.tile, result.payload_hash);
-                        self.live_updated_at.insert(result.tile, Instant::now());
-                        context.request_repaint();
+                        // No parse from disk yet (or evicted after a save):
+                        // the live data itself becomes the cache.
+                        _ => {
+                            self.sheets.insert(
+                                result.tile,
+                                Some(spreadsheet::Workbook {
+                                    sheets: vec![sheet],
+                                    truncated_sheets: false,
+                                    source_sheet_count: 1,
+                                }),
+                            );
+                        }
                     }
+                    self.live_last_hash.insert(result.tile, result.payload_hash);
+                    self.live_updated_at.insert(result.tile, Instant::now());
+                    context.request_repaint();
                 }
                 MirrorOutcome::PermissionDenied => {
                     if !self.live_blocked {
@@ -1657,41 +1679,58 @@ impl AdamApp {
         {
             return;
         }
-        // Only the workbook actually on screen gets mirrored.
-        let Some(state) = self.grid_view else {
-            return;
-        };
-        let Some(lightbox) = state.lightbox else {
-            return;
-        };
-        let Some((tile, path)) = self
-            .workspace
-            .active_page()
-            .tiles
-            .get(lightbox.index)
-            .and_then(|tile| match &tile.content {
-                TileContent::File { path, .. } if spreadsheet::is_spreadsheet(path) => {
-                    Some((tile.id, path.clone()))
+        // The expanded lightbox sheet has priority; otherwise every
+        // spreadsheet tile on the active page takes its turn, one per tick —
+        // Excel itself bounds how many can actually be open there.
+        let lightbox_tile = self.grid_view.and_then(|state| {
+            let lightbox = state.lightbox?;
+            self.workspace
+                .active_page()
+                .tiles
+                .get(lightbox.index)
+                .and_then(|tile| match &tile.content {
+                    TileContent::File { path, .. } if spreadsheet::is_spreadsheet(path) => {
+                        Some((tile.id, path.clone()))
+                    }
+                    _ => None,
+                })
+        });
+        let (tile, path) = match lightbox_tile {
+            Some(target) => target,
+            None => {
+                let candidates: Vec<(Uuid, PathBuf)> = self
+                    .workspace
+                    .active_page()
+                    .tiles
+                    .iter()
+                    .filter_map(|tile| match &tile.content {
+                        TileContent::File { path, .. } if spreadsheet::is_spreadsheet(path) => {
+                            Some((tile.id, path.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if candidates.is_empty() {
+                    return;
                 }
-                _ => None,
-            })
-        else {
-            return;
+                self.live_rotation = self.live_rotation.wrapping_add(1);
+                candidates[self.live_rotation % candidates.len()].clone()
+            }
         };
+        // The cached workbook names the sheet on display; without one, Excel's
+        // own active sheet is the right guess and the script falls back to it.
         let sheet_index = self
             .sheet_states
             .get(&tile)
             .map(|state| state.sheet)
             .unwrap_or(0);
-        let Some(sheet_name) = self
+        let sheet_name = self
             .sheets
             .get(&tile)
             .and_then(|workbook| workbook.as_ref())
             .and_then(|workbook| workbook.sheet(sheet_index))
             .map(|sheet| sheet.name.clone())
-        else {
-            return;
-        };
+            .unwrap_or_default();
         self.last_live_poll = Instant::now();
         self.live_in_flight = self.live_sheet.request(live_sheet::PollRequest {
             tile,
@@ -3327,6 +3366,7 @@ impl AdamApp {
                     let selection = &self.selection;
                     let previews = &mut self.previews;
                     let structured_previews = &mut self.structured_previews;
+                    let sheet_tables = &self.sheet_tile_tables;
                     for index in render_indices {
                         let Some(tile) = page.tiles.get(index) else {
                             continue;
@@ -3383,6 +3423,7 @@ impl AdamApp {
                             pile_controls_enabled,
                             previews,
                             structured_previews,
+                            sheet_tables.get(&tile.id),
                             &page_targets,
                             colors,
                         );
@@ -3790,6 +3831,7 @@ impl AdamApp {
         // Parse lazily, and cache failure so a broken file is not re-read
         // every frame. A failed load leaves the Quick Look preview showing,
         // with the reason in the corner.
+        let freshly_parsed = !self.sheets.contains_key(&id);
         let workbook = self
             .sheets
             .entry(id)
@@ -3800,6 +3842,15 @@ impl AdamApp {
                     None
                 }
             });
+        if freshly_parsed
+            && let Some(first) = workbook.as_ref().and_then(|workbook| workbook.sheet(0))
+        {
+            // The tile mirrors what the lightbox has parsed, so closing the
+            // lightbox leaves the tile showing the same data.
+            self.sheet_tile_tables
+                .insert(id, StructuredPreview::Table(spreadsheet::tile_table(first)));
+        }
+        let workbook = self.sheets.get(&id).expect("entry just ensured");
         let Some(workbook) = workbook else {
             ui.painter().text(
                 pos2(rect.left() + 8.0, rect.bottom() + 16.0),
@@ -11035,6 +11086,7 @@ fn draw_tile(
     pile_controls_enabled: bool,
     previews: &mut PreviewCache,
     structured_previews: &mut StructuredPreviewCache,
+    live_table: Option<&StructuredPreview>,
     page_targets: &[(Uuid, String)],
     colors: Theme,
 ) -> TileUiEvent {
@@ -11129,7 +11181,11 @@ fn draw_tile(
 
     match &tile.content {
         TileContent::File { path, kind } => {
-            if let Some(preview) = structured_previews.preview(tile.id, path) {
+            // Parsed sheet data outranks the Quick Look image: it is the only
+            // rendering that can show a live, unsaved workbook.
+            if let Some(table) = live_table {
+                draw_structured_preview(painter, content_rect, table, accent, colors, camera.zoom);
+            } else if let Some(preview) = structured_previews.preview(tile.id, path) {
                 draw_structured_preview(
                     painter,
                     content_rect,
