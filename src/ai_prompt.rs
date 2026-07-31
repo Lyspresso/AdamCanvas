@@ -37,12 +37,19 @@ pub enum PromptContinuity {
     Resume,
 }
 
-/// Where standing instructions are delivered on a replay turn.
+/// Where standing instructions are delivered for a turn.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum SystemDelivery {
-    /// Return standing instructions in [`BuiltPrompt::system_channel`].
+    /// Return standing instructions in [`BuiltPrompt::system_channel`] only
+    /// when Adam reconstructs continuity from its transcript.
     #[default]
     Separate,
+    /// Return standing instructions in [`BuiltPrompt::system_channel`] on
+    /// every turn, including a provider-native resume.
+    ///
+    /// Some response-ID APIs retain conversation messages without carrying
+    /// request-level instructions forward.
+    SeparateEveryTurn,
     /// Fence standing instructions at the beginning of the ordinary prompt.
     InlineFenced,
 }
@@ -195,7 +202,7 @@ pub struct PromptBudget {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BuiltPrompt {
     pub prompt: String,
-    /// Present only for replay turns using [`SystemDelivery::Separate`].
+    /// Present according to the selected [`SystemDelivery`] contract.
     pub system_channel: Option<String>,
     pub budget: PromptBudget,
 }
@@ -247,20 +254,21 @@ pub fn build_prompt(input: &PromptInput) -> BuiltPrompt {
     let system = build_system(&input.system, input.persona.as_ref());
 
     let mut parts = Vec::new();
-    let system_channel = match input.continuity {
-        PromptContinuity::Resume => None,
-        PromptContinuity::Replay => match input.system_delivery {
-            SystemDelivery::Separate => nonblank(&system.combined).map(str::to_owned),
-            SystemDelivery::InlineFenced => {
-                if !system.combined.trim().is_empty() {
-                    parts.push(format!(
-                        "{INLINE_SYSTEM_OPEN}\n{}\n{INLINE_SYSTEM_CLOSE}",
-                        system.combined
-                    ));
-                }
-                None
+    let system_channel = match (input.continuity, input.system_delivery) {
+        (_, SystemDelivery::SeparateEveryTurn)
+        | (PromptContinuity::Replay, SystemDelivery::Separate) => {
+            nonblank(&system.combined).map(str::to_owned)
+        }
+        (PromptContinuity::Replay, SystemDelivery::InlineFenced) => {
+            if !system.combined.trim().is_empty() {
+                parts.push(format!(
+                    "{INLINE_SYSTEM_OPEN}\n{}\n{INLINE_SYSTEM_CLOSE}",
+                    system.combined
+                ));
             }
-        },
+            None
+        }
+        (PromptContinuity::Resume, SystemDelivery::Separate | SystemDelivery::InlineFenced) => None,
     };
 
     push_optional(&mut parts, input.notices.task_mode.as_deref());
@@ -870,5 +878,30 @@ mod tests {
         let resumed = build_prompt(&input);
         assert!(resumed.system_channel.is_none());
         assert!(!resumed.prompt.contains("SYSTEM IDENTITY"));
+    }
+
+    #[test]
+    fn separate_every_turn_repeats_system_without_replaying_history() {
+        let mut input = base_input();
+        input.system_delivery = SystemDelivery::SeparateEveryTurn;
+        input.continuity = PromptContinuity::Resume;
+        input.history = vec![
+            HistoricalTurn::user("OLD USER TURN"),
+            HistoricalTurn::assistant("OLD ASSISTANT TURN"),
+        ];
+
+        let resumed = build_prompt(&input);
+
+        assert!(
+            resumed
+                .system_channel
+                .as_deref()
+                .unwrap()
+                .contains("SYSTEM IDENTITY")
+        );
+        assert!(!resumed.prompt.contains("SYSTEM IDENTITY"));
+        assert!(!resumed.prompt.contains("OLD USER TURN"));
+        assert!(!resumed.prompt.contains("OLD ASSISTANT TURN"));
+        assert!(resumed.prompt.ends_with("NEW MESSAGE"));
     }
 }

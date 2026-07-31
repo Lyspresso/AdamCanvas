@@ -408,6 +408,29 @@ struct AiTurnLaunch {
     force_replay: bool,
 }
 
+#[derive(Default)]
+struct TemporaryApiKeys(HashMap<String, String>);
+
+impl std::fmt::Debug for TemporaryApiKeys {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TemporaryApiKeys([REDACTED])")
+    }
+}
+
+impl TemporaryApiKeys {
+    fn trimmed(&self, provider_id: &str) -> Option<String> {
+        self.0
+            .get(provider_id)
+            .map(|key| key.trim())
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+    }
+
+    fn value_mut(&mut self, provider_id: &str) -> &mut String {
+        self.0.entry(provider_id.to_owned()).or_default()
+    }
+}
+
 #[derive(Debug)]
 struct AiChatRuntime {
     draft: String,
@@ -433,7 +456,7 @@ struct AiChatRuntime {
     /// Memory-only credentials keyed by the exact provider that may receive
     /// them. A temporary xAI key must never follow a provider switch into an
     /// OpenAI-compatible endpoint (or vice versa).
-    api_keys: HashMap<String, String>,
+    api_keys: TemporaryApiKeys,
     show_inspector: bool,
     workspace_files: Vec<AiWorkspaceFile>,
     file_preview: Option<AiFilePreview>,
@@ -464,7 +487,7 @@ impl Default for AiChatRuntime {
             prompt_budget: None,
             error: None,
             inspector_notice: None,
-            api_keys: HashMap::new(),
+            api_keys: TemporaryApiKeys::default(),
             show_inspector: true,
             workspace_files: Vec::new(),
             file_preview: None,
@@ -476,15 +499,11 @@ impl Default for AiChatRuntime {
 
 impl AiChatRuntime {
     fn temporary_api_key(&self, provider_id: &str) -> Option<String> {
-        self.api_keys
-            .get(provider_id)
-            .map(|key| key.trim())
-            .filter(|key| !key.is_empty())
-            .map(str::to_owned)
+        self.api_keys.trimmed(provider_id)
     }
 
     fn temporary_api_key_mut(&mut self, provider_id: &str) -> &mut String {
-        self.api_keys.entry(provider_id.to_owned()).or_default()
+        self.api_keys.value_mut(provider_id)
     }
 }
 
@@ -7795,11 +7814,10 @@ impl AdamApp {
             &conversation.settings.api_endpoint,
         );
         let profile = capability_profile(provider_id, &executable, &arguments);
-        let system_delivery = if matches!(profile.system_prompt, SystemPromptChannel::InPrompt) {
-            SystemDelivery::InlineFenced
-        } else {
-            SystemDelivery::Separate
-        };
+        // A previous_response_id carries conversation continuity, but not
+        // request-level instructions. CLI-owned sessions keep their existing
+        // one-time native system-prompt behavior.
+        let system_delivery = ai_system_delivery(&profile);
 
         build_prompt(&HarnessPromptInput {
             continuity,
@@ -12467,6 +12485,16 @@ fn kimi_uses_legacy_print_transport(provider_id: &str, tuning: &RuntimeTuningPro
             .is_some_and(|version| version.major == 1)
 }
 
+fn ai_system_delivery(profile: &crate::chat_core::CapabilityProfile) -> SystemDelivery {
+    if matches!(profile.system_prompt, SystemPromptChannel::InPrompt) {
+        SystemDelivery::InlineFenced
+    } else if profile.resume == crate::chat_core::ResumeStrategy::PreviousResponseId {
+        SystemDelivery::SeparateEveryTurn
+    } else {
+        SystemDelivery::Separate
+    }
+}
+
 fn ensure_terminal_status(
     trace: &mut ActivityAccumulator,
     status: TurnStatus,
@@ -12963,6 +12991,12 @@ fn render_ai_inspector(
     let outputs = project_artifacts(&projected_events);
     let context_items = project_context(&projected_events);
     let usage = project_usage(&projected_events);
+    let xai_cost_unreported = conversation
+        .messages()
+        .iter()
+        .any(|message| ai_events_have_unreported_xai_cost(&message.activities))
+        || (runtime.active_turn.is_some()
+            && ai_events_have_unreported_xai_cost(&runtime.activity_trace.events));
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -13356,10 +13390,7 @@ fn render_ai_inspector(
                             usage.cached_input,
                             usage.reasoning,
                             usage.output,
-                            usage
-                                .cost_usd
-                                .map(|cost| format!(" · ${cost:.4}"))
-                                .unwrap_or_default()
+                            ai_usage_cost_suffix(usage.cost_usd, xai_cost_unreported)
                         ))
                         .size(10.0)
                         .monospace()
@@ -14433,11 +14464,17 @@ fn render_ai_chat_page(
     } else {
         64.0 + conversation.queued_turns().len().min(3) as f32 * 28.0
     };
+    let provider_notice_height = if settings.provider_id == "xai_api" {
+        36.0
+    } else {
+        0.0
+    };
     let composer_height = if runtime.pending_attachments.is_empty() {
         174.0
     } else {
         218.0
-    } + queue_height;
+    } + queue_height
+        + provider_notice_height;
     let transcript_height = (ui.available_height() - composer_height).max(180.0);
     egui::ScrollArea::vertical()
         .id_salt(("adam-ai-transcript", conversation.id))
@@ -14751,8 +14788,10 @@ fn render_ai_empty_state(
             .color(colors.text),
         );
         ui.label(
-            RichText::new("Pick any installed provider above. Your conversation stays in Adam.")
-                .color(colors.secondary_text),
+            RichText::new(
+                "Your conversation is saved in Adam; connected providers receive the turns you send.",
+            )
+            .color(colors.secondary_text),
         );
         ui.add_space(18.0);
         for suggestion in match mode {
@@ -15556,6 +15595,13 @@ fn render_ai_composer(
                     .color(colors.danger),
                 );
             }
+            if provider_id == "xai_api" {
+                ui.label(
+                    RichText::new(XAI_SERVER_STORAGE_DISCLOSURE)
+                        .size(9.5)
+                        .color(colors.tertiary_text),
+                );
+            }
             let send_with_return = response.has_focus()
                 && !runtime.draft.trim().is_empty()
                 && ui.input_mut(|input| {
@@ -15604,6 +15650,47 @@ const CLAUDE_MODEL_OPTIONS: &[(&str, &str)] = &[
 const GROK_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Provider default"), ("grok-4.5", "Grok 4.5")];
 const XAI_MULTI_AGENT_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Grok 4.20 · Multi-agent")];
 const DEFAULT_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Provider default")];
+const XAI_SERVER_STORAGE_DISCLOSURE: &str = "Privacy · xAI stores your messages and Grok Heavy responses for follow-up turns (30 days by default).";
+const XAI_COST_NOT_REPORTED: &str = "Cost not reported by xAI";
+
+fn ai_usage_cost_suffix(cost_usd: Option<f64>, xai_cost_unreported: bool) -> String {
+    let reported = match cost_usd {
+        Some(cost) => {
+            let precision = if cost != 0.0 && cost.abs() < 0.0001 {
+                8
+            } else if cost.abs() < 0.01 {
+                6
+            } else {
+                4
+            };
+            format!(" · ${cost:.precision$}")
+        }
+        None => String::new(),
+    };
+    if xai_cost_unreported {
+        format!("{reported} · {XAI_COST_NOT_REPORTED}")
+    } else {
+        reported
+    }
+}
+
+fn ai_events_have_unreported_xai_cost(events: &[HarnessActivityEvent]) -> bool {
+    let is_xai_turn = events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            ActivityKind::AgentGroup {
+                id,
+                kind: AgentGroupKind::MultiAgentInference,
+                ..
+            } if id.starts_with("xai-heavy-")
+        )
+    });
+    if !is_xai_turn {
+        return false;
+    }
+    let usage = project_usage(events);
+    usage.has_data && usage.cost_usd.is_none()
+}
 
 fn ai_model_options(provider_id: &str) -> &'static [(&'static str, &'static str)] {
     match provider_id {
@@ -15928,6 +16015,24 @@ fn render_ai_provider_configuration(
                 RichText::new(
                     "Heavy is a separate xAI API service and does not reuse Grok CLI sign-in.",
                 )
+                .size(9.0)
+                .color(colors.tertiary_text),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Server storage and billing")
+                    .size(10.5)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(XAI_SERVER_STORAGE_DISCLOSURE)
+                    .size(9.0)
+                    .color(colors.tertiary_text),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "Request cost appears in Usage when xAI reports it; otherwise Adam shows “{XAI_COST_NOT_REPORTED}”."
+                ))
                 .size(9.0)
                 .color(colors.tertiary_text),
             );
@@ -18488,6 +18593,15 @@ mod tests {
     }
 
     #[test]
+    fn response_id_resume_repeats_system_delivery_without_changing_cli_resume() {
+        let xai = capability_profile("xai_api", "", &[]);
+        let codex = capability_profile("codex_cli", "codex", &[]);
+
+        assert_eq!(ai_system_delivery(&xai), SystemDelivery::SeparateEveryTurn);
+        assert_eq!(ai_system_delivery(&codex), SystemDelivery::Separate);
+    }
+
+    #[test]
     fn temporary_api_keys_are_scoped_to_their_exact_provider() {
         let mut runtime = AiChatRuntime::default();
         *runtime.temporary_api_key_mut("xai_api") = "  xai-secret  ".into();
@@ -18505,6 +18619,100 @@ mod tests {
         assert!(!provider_session_is_portable_activity("xai_api"));
         assert!(!provider_session_is_portable_activity("kimi_cli"));
         assert!(provider_session_is_portable_activity("codex_cli"));
+    }
+
+    #[test]
+    fn temporary_api_key_debug_is_redacted_at_the_runtime_boundary() {
+        let mut runtime = AiChatRuntime::default();
+        *runtime.temporary_api_key_mut("xai_api") = "  xai-canary-secret  ".into();
+        *runtime.temporary_api_key_mut("openai_compatible") = "openai-canary-secret".into();
+
+        for debug in [format!("{:?}", runtime.api_keys), format!("{runtime:?}")] {
+            assert!(!debug.contains("xai-canary-secret"));
+            assert!(!debug.contains("openai-canary-secret"));
+            assert!(!debug.contains("xai_api"));
+            assert!(!debug.contains("openai_compatible"));
+            assert!(debug.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn xai_usage_and_storage_disclosures_are_explicit() {
+        assert!(XAI_SERVER_STORAGE_DISCLOSURE.contains("your messages"));
+        assert!(XAI_SERVER_STORAGE_DISCLOSURE.contains("Grok Heavy responses"));
+        assert!(XAI_SERVER_STORAGE_DISCLOSURE.contains("follow-up turns"));
+        assert!(XAI_SERVER_STORAGE_DISCLOSURE.contains("30 days by default"));
+        assert_eq!(
+            ai_usage_cost_suffix(None, true),
+            format!(" · {XAI_COST_NOT_REPORTED}")
+        );
+        assert_eq!(ai_usage_cost_suffix(None, false), "");
+        assert_eq!(ai_usage_cost_suffix(Some(0.125), false), " · $0.1250");
+        assert_eq!(
+            ai_usage_cost_suffix(Some(0.00001585), false),
+            " · $0.00001585"
+        );
+        assert_eq!(
+            ai_usage_cost_suffix(Some(0.125), true),
+            format!(" · $0.1250 · {XAI_COST_NOT_REPORTED}")
+        );
+    }
+
+    #[test]
+    fn xai_cost_fallback_is_derived_per_turn_across_mixed_provider_history() {
+        let codex_events = vec![HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(1),
+            ActivityKind::Usage {
+                input: Some(100),
+                output: Some(20),
+                cached_input: None,
+                reasoning: None,
+                cost_usd: Some(0.10),
+            },
+        )];
+        let xai_events = vec![
+            HarnessActivityEvent::new(
+                Uuid::new_v4(),
+                UnixMillis(2),
+                ActivityKind::AgentGroup {
+                    id: "xai-heavy-persisted-turn".into(),
+                    aliases: Vec::new(),
+                    label: "Grok Heavy".into(),
+                    kind: AgentGroupKind::MultiAgentInference,
+                    status: SubagentStatus::Completed,
+                    expected_count: Some(16),
+                    members: Vec::new(),
+                    visibility: AgentGroupVisibility::AggregateOnly,
+                    detail: None,
+                },
+            ),
+            HarnessActivityEvent::new(
+                Uuid::new_v4(),
+                UnixMillis(3),
+                ActivityKind::Usage {
+                    input: Some(200),
+                    output: Some(40),
+                    cached_input: None,
+                    reasoning: Some(10),
+                    cost_usd: None,
+                },
+            ),
+        ];
+
+        assert!(!ai_events_have_unreported_xai_cost(&codex_events));
+        assert!(ai_events_have_unreported_xai_cost(&xai_events));
+        let combined = codex_events
+            .iter()
+            .chain(xai_events.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let usage = project_usage(&combined);
+        assert_eq!(usage.cost_usd, Some(0.10));
+        assert_eq!(
+            ai_usage_cost_suffix(usage.cost_usd, true),
+            format!(" · $0.1000 · {XAI_COST_NOT_REPORTED}")
+        );
     }
 
     #[test]
