@@ -19,9 +19,10 @@ Notes and websites can be created directly in the app.
   tool to draw its exact shape, or click for the default size. Canvas text
   types in place with no card around it; drag it onto an empty or populated
   sticky note to move the text inside. Double-click a placement tool to keep
-  using it until `×` or Escape clears it. The `◎` slot opens the Agents
-  panel showing which AI provider CLIs are installed; two empty slots remain
-  available.
+  using it until `×` or Escape clears it. Three empty slots remain available.
+- The sidebar's `◎ Agent Harness` entry (under AI chats) opens a full
+  section showing which AI provider CLIs are installed, verified, or
+  one-click installable.
 - Copy, paste, duplicate, delete, and drag a selection onto another page in
   the sidebar; hovering a page opens it before the drop.
 - Double-click files and websites to open them; press Space for a Quick Look

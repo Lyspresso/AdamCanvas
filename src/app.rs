@@ -1,6 +1,7 @@
 use crate::{
     agents_panel::{
-        self, AgentsPanelAction, AgentsPanelState, PreflightNotice, agent_rows, preflight_notice,
+        self, AgentRow, AgentsPanelAction, AgentsPanelState, InstallOutcome, PreflightNotice,
+        agent_rows, preflight_notice,
     },
     ai::{
         AiEngine, AiEvent, AiFailureKind, AiRunRequest, clamp_provider_preferences,
@@ -493,6 +494,18 @@ struct AiWorkspaceUiAction {
     toggle_all_outputs: bool,
     retry_turn: Option<RetryHint>,
     open_agents_panel: bool,
+    agents_action: AgentsPanelAction,
+}
+
+/// Per-frame owned snapshot of agents state for the chat page, so the render
+/// path never borrows `AgentsPanelState` directly.
+struct AgentsChatView {
+    preflight: Option<PreflightNotice>,
+    /// Some ⇒ the empty state renders as the agents setup screen.
+    setup_rows: Option<Vec<AgentRow>>,
+    scanning: bool,
+    installing: Option<&'static str>,
+    last_install: Option<InstallOutcome>,
 }
 
 struct AiTilePreview {
@@ -2407,6 +2420,7 @@ impl AdamApp {
         let mut duplicate_page = false;
         let mut delete_page = false;
         let mut new_chat = false;
+        let mut open_agent_harness = false;
         let mut switch_to = None;
         let mut reorder_page = None;
         let mut filter_to = None;
@@ -2708,6 +2722,24 @@ impl AdamApp {
                     });
                 }
 
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                let harness_selected = self.agents.open;
+                open_agent_harness = ui
+                    .add(
+                        Button::new(RichText::new("◎  Agent Harness").size(12.5).color(
+                            if harness_selected {
+                                colors.text
+                            } else {
+                                colors.secondary_text
+                            },
+                        ))
+                        .frame(false),
+                    )
+                    .on_hover_text("Which AI provider CLIs are installed, verified, or installable")
+                    .clicked();
+
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     if ui
                         .add(
@@ -2775,6 +2807,15 @@ impl AdamApp {
             self.page_hover = None;
         }
 
+        // Any sidebar navigation leaves the Agent Harness section.
+        if switch_to.is_some() || open_chat.is_some() || filter_to.is_some() || new_page || new_chat
+        {
+            self.agents.open = false;
+        }
+        if open_agent_harness {
+            self.agents.open = true;
+            self.agents.ensure_scanned();
+        }
         if let Some(page_id) = switch_to {
             self.switch_page(page_id);
         }
@@ -3218,9 +3259,7 @@ impl AdamApp {
         let mut paste = false;
         let mut duplicate = false;
         let mut clear = false;
-        let mut open_agents = false;
         let armed = self.armed_canvas_tool;
-        let agents_open = self.agents.open;
         let area = egui::Area::new(Id::new("adam-canvas-quick-bar"))
             .order(egui::Order::Foreground)
             .fixed_pos(position)
@@ -3337,34 +3376,7 @@ impl AdamApp {
                                 .on_hover_text("Clear the active canvas tool")
                                 .clicked();
 
-                            open_agents |= ui
-                                .add(
-                                    Button::new(
-                                        RichText::new("◎")
-                                            .size(if slot_size < 36.0 { 15.0 } else { 19.0 })
-                                            .color(colors.text),
-                                    )
-                                    .min_size(vec2(slot_size, slot_size))
-                                    .fill(if agents_open {
-                                        colors.selection_fill
-                                    } else {
-                                        colors.tile
-                                    })
-                                    .stroke(Stroke::new(
-                                        if agents_open { 2.0 } else { 1.0 },
-                                        if agents_open {
-                                            colors.accent
-                                        } else {
-                                            colors.tile_border
-                                        },
-                                    )),
-                                )
-                                .on_hover_text(
-                                    "Agents\nSee which AI providers are installed and verified",
-                                )
-                                .clicked();
-
-                            for _ in 0..2 {
+                            for _ in 0..3 {
                                 ui.add_enabled(
                                     false,
                                     Button::new(RichText::new("").color(colors.tertiary_text))
@@ -3398,10 +3410,6 @@ impl AdamApp {
         if clear {
             self.armed_canvas_tool = None;
             self.note_draft = None;
-        }
-        if open_agents {
-            self.agents.open = !self.agents.open;
-            self.agents.ensure_scanned();
         }
 
         area.response.rect
@@ -6111,11 +6119,39 @@ impl AdamApp {
             .cloned();
         let mut action = AiWorkspaceUiAction::default();
         self.agents.ensure_scanned();
-        let preflight = preflight_notice(
-            &settings.provider_id,
-            !settings.api_endpoint.trim().is_empty(),
-            self.agents.snapshot.as_ref(),
-        );
+        let setup_active = conversation.messages().is_empty()
+            && runtime.streamed_text.is_empty()
+            && !self.agents.setup_dismissed
+            && self
+                .agents
+                .snapshot
+                .as_ref()
+                .is_some_and(agents_panel::needs_setup);
+        let agents_view = AgentsChatView {
+            // The setup screen already carries the install affordances; the
+            // banner would only repeat it.
+            preflight: if setup_active {
+                None
+            } else {
+                preflight_notice(
+                    &settings.provider_id,
+                    !settings.api_endpoint.trim().is_empty(),
+                    self.agents.snapshot.as_ref(),
+                )
+            },
+            setup_rows: setup_active.then(|| {
+                agent_rows(
+                    self.agents
+                        .snapshot
+                        .as_ref()
+                        .expect("setup requires a snapshot"),
+                    Some(&settings.provider_id),
+                )
+            }),
+            scanning: self.agents.scanning(),
+            installing: self.agents.installing(),
+            last_install: self.agents.last_install().cloned(),
+        };
         let show_inspector = runtime.show_inspector && root.available_width() >= 720.0;
 
         if show_inspector {
@@ -6167,9 +6203,32 @@ impl AdamApp {
                 });
         }
 
+        // Dot-shader background behind the setup screen: the shader draws
+        // opaquely inside its scissor rect, so it must be the first shape in
+        // the panel and the fill must be transparent only while it paints
+        // (falling back to the opaque desk fill whenever dots are off).
+        let dots_seconds = self.dots_seconds();
+        let setup_dots = setup_active && dots_seconds.is_some();
         egui::CentralPanel::default()
-            .frame(Frame::NONE.fill(colors.desk))
+            .frame(Frame::NONE.fill(if setup_dots {
+                Color32::TRANSPARENT
+            } else {
+                colors.desk
+            }))
             .show(root, |ui| {
+                if let (true, Some(seconds)) = (setup_dots, dots_seconds) {
+                    let rect = ui.max_rect();
+                    ui.painter().add(dots::paint_callback(
+                        rect,
+                        ChromeRects {
+                            toolbar: rect,
+                            sidebar: Rect::NOTHING,
+                        },
+                        seconds,
+                        colors.dots_tint,
+                        colors.dots_background,
+                    ));
+                }
                 render_ai_chat_page(
                     ui,
                     &conversation,
@@ -6177,7 +6236,7 @@ impl AdamApp {
                     &mut permission,
                     &mut runtime,
                     pending_action.as_ref(),
-                    preflight.as_ref(),
+                    &agents_view,
                     &mut action,
                     &mut self.markdown_cache,
                     colors,
@@ -6222,6 +6281,7 @@ impl AdamApp {
             self.agents.open = true;
             self.agents.ensure_scanned();
         }
+        self.apply_agents_panel_action(action.agents_action, context);
         if action.add_attachments {
             self.add_ai_attachments(conversation_id);
         }
@@ -8503,12 +8563,13 @@ impl AdamApp {
         self.trash_open = open;
     }
 
-    fn show_agents_panel(&mut self, context: &Context) {
-        if !self.agents.open {
-            return;
-        }
+    /// Full main-area section (like the canvas or an AI chat), entered from
+    /// the sidebar's "Agent Harness" button; the dot shader paints behind
+    /// the cards exactly as it does behind the chat setup screen.
+    fn show_agents_section(&mut self, root: &mut Ui) {
+        let context = root.ctx().clone();
+        let colors = self.theme(&context);
         self.agents.ensure_scanned();
-        let colors = self.theme(context);
         let selected_provider = self.open_chat.and_then(|conversation_id| {
             self.workspace
                 .domain
@@ -8517,34 +8578,83 @@ impl AdamApp {
                 .get(&conversation_id)
                 .map(|conversation| conversation.settings.provider_id.clone())
         });
-        let mut open = true;
         let mut action = AgentsPanelAction::default();
-        egui::Window::new("Agents")
-            .open(&mut open)
-            .default_width(560.0)
-            .show(context, |ui| match self.agents.snapshot.as_ref() {
-                Some(snapshot) => {
-                    let rows = agent_rows(snapshot, selected_provider.as_deref());
-                    agents_panel::agents_panel_ui(
-                        ui,
-                        &rows,
-                        self.agents.scanning(),
-                        &agents_panel_palette(colors),
-                        &mut action,
-                    );
+        let dots_seconds = self.dots_seconds();
+        egui::CentralPanel::default()
+            .frame(Frame::NONE.fill(if dots_seconds.is_some() {
+                Color32::TRANSPARENT
+            } else {
+                colors.desk
+            }))
+            .show(root, |ui| {
+                if let Some(seconds) = dots_seconds {
+                    let rect = ui.max_rect();
+                    ui.painter().add(dots::paint_callback(
+                        rect,
+                        ChromeRects {
+                            toolbar: rect,
+                            sidebar: Rect::NOTHING,
+                        },
+                        seconds,
+                        colors.dots_tint,
+                        colors.dots_background,
+                    ));
                 }
-                None => {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        ui.label(
-                            RichText::new("Scanning for installed agent CLIs…")
-                                .color(colors.secondary_text),
-                        );
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(30.0);
+                            ui.label(
+                                RichText::new("Agent Harness")
+                                    .size(24.0)
+                                    .strong()
+                                    .color(colors.text),
+                            );
+                            ui.add_space(14.0);
+                            ui.scope(|ui| {
+                                ui.set_max_width(640.0);
+                                match self.agents.snapshot.as_ref() {
+                                    Some(snapshot) => {
+                                        let rows =
+                                            agent_rows(snapshot, selected_provider.as_deref());
+                                        agents_panel::agents_panel_ui(
+                                            ui,
+                                            &rows,
+                                            self.agents.scanning(),
+                                            self.agents.installing(),
+                                            self.agents.last_install(),
+                                            &agents_panel_palette(colors),
+                                            &mut action,
+                                        );
+                                    }
+                                    None => {
+                                        ui.horizontal(|ui| {
+                                            ui.spinner();
+                                            ui.label(
+                                                RichText::new("Scanning for installed agent CLIs…")
+                                                    .color(colors.secondary_text),
+                                            );
+                                        });
+                                    }
+                                }
+                            });
+                            ui.add_space(24.0);
+                        });
                     });
-                }
             });
+        self.apply_agents_panel_action(action, &context);
+    }
+
+    /// Shared handler for panel-, banner-, and setup-screen actions.
+    fn apply_agents_panel_action(&mut self, action: AgentsPanelAction, context: &Context) {
         if action.refresh {
             self.agents.request_scan(true);
+        }
+        if let Some(provider_id) = action.install
+            && !self.agents.request_install(provider_id)
+        {
+            self.toast("Couldn't start the install", context);
         }
         if let Some(command) = action.copy_install {
             context.copy_text(command.to_owned());
@@ -8553,7 +8663,12 @@ impl AdamApp {
         if let Some(url) = action.open_docs {
             platform::open_url(url);
         }
-        self.agents.open = open;
+        if action.clear_install_log {
+            self.agents.clear_install_log();
+        }
+        if action.dismiss_setup {
+            self.agents.setup_dismissed = true;
+        }
     }
 
     fn handle_external_drops(&mut self, context: &Context) {
@@ -9759,6 +9874,9 @@ impl eframe::App for AdamApp {
         self.poll_asset_imports(context);
         self.poll_ai_events(context);
         self.agents.poll();
+        if self.agents.take_install_notice().is_some() {
+            self.toast("Agent installed and detected", context);
+        }
         self.handle_shortcuts(context);
         self.handle_external_drops(context);
         self.poll_automation(context);
@@ -9770,7 +9888,7 @@ impl eframe::App for AdamApp {
         let dots_seconds = self.dots_seconds();
         let root_rect = ui.max_rect();
         let dots_slot = dots_seconds.map(|_| ui.painter().add(egui::Shape::Noop));
-        let toolbar_rect = if self.open_chat.is_some() {
+        let toolbar_rect = if self.open_chat.is_some() && !self.agents.open {
             self.show_ai_toolbar(ui, dots_seconds)
         } else {
             self.show_toolbar(ui, frame, dots_seconds)
@@ -9794,7 +9912,9 @@ impl eframe::App for AdamApp {
                 ),
             );
         }
-        if self.open_chat.is_some() {
+        if self.agents.open {
+            self.show_agents_section(ui);
+        } else if self.open_chat.is_some() {
             self.show_ai_workspace(ui);
         } else {
             self.show_canvas(ui);
@@ -9807,7 +9927,6 @@ impl eframe::App for AdamApp {
         self.show_tag_management(&context);
         self.show_pile_settings(&context);
         self.show_trash(&context);
-        self.show_agents_panel(&context);
         self.show_toast(&context);
         // Tell the preview worker which tiles were actually painted this
         // frame so queued work from a pan/zoom can be discarded immediately.
@@ -13906,7 +14025,7 @@ fn render_ai_chat_page(
     permission: &mut PermissionMode,
     runtime: &mut AiChatRuntime,
     pending_action: Option<&AiActionRequest>,
-    preflight: Option<&PreflightNotice>,
+    agents_view: &AgentsChatView,
     action: &mut AiWorkspaceUiAction,
     markdown_cache: &mut CommonMarkCache,
     colors: Theme,
@@ -13931,7 +14050,19 @@ fn render_ai_chat_page(
             ui.add_space(22.0);
             ui.set_max_width(880.0);
             if conversation.messages().is_empty() && runtime.streamed_text.is_empty() {
-                render_ai_empty_state(ui, settings.workspace_mode, runtime, colors);
+                if let Some(rows) = agents_view.setup_rows.as_ref() {
+                    agents_panel::agents_setup_ui(
+                        ui,
+                        rows,
+                        agents_view.scanning,
+                        agents_view.installing,
+                        agents_view.last_install.as_ref(),
+                        &agents_panel_palette(colors),
+                        &mut action.agents_action,
+                    );
+                } else {
+                    render_ai_empty_state(ui, settings.workspace_mode, runtime, colors);
+                }
             }
             for message in conversation.messages() {
                 render_ai_message(ui, message, action, markdown_cache, colors);
@@ -14023,7 +14154,7 @@ fn render_ai_chat_page(
         ui.add_space(inset);
         ui.vertical(|ui| {
             ui.set_width((available - inset * 2.0).clamp(320.0, 880.0));
-            render_ai_preflight_banner(ui, preflight, action, colors);
+            render_ai_preflight_banner(ui, agents_view.preflight.as_ref(), action, colors);
             render_ai_chat_progress_pill(ui, runtime, colors);
             render_ai_queue_bar(ui, conversation, runtime, action, colors);
             render_ai_composer(
@@ -14050,6 +14181,8 @@ fn render_ai_preflight_banner(
     let Some(notice) = preflight else {
         return;
     };
+    // Rendered from AgentsChatView.preflight; suppressed while the setup
+    // screen is active because that screen carries the same affordances.
     Frame::NONE
         .fill(if notice.danger {
             colors

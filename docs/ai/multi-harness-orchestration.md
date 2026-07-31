@@ -66,9 +66,11 @@ local endpoints — see §5).
 ## 5. Future: two coordinated agents inside Adam (design research only)
 
 > Shipped adjacent to (not from) this section, 2026-07-30: the Agents panel
-> (`src/agents_panel.rs`, branch `work/claude-agents`) — read-only provider
-> detection and install guidance. None of the seven gates below are touched;
-> auto-install execution and sign-in probes remain future work, and seat
+> (`src/agents_panel.rs`, branches `work/claude-agents` + `-install`) —
+> provider detection, a chat setup screen, and one-click installs bounded
+> by a compiled-in allowlist of vendor-verified commands (user-initiated,
+> logged, post-verified; no agent may trigger one). None of the seven gates
+> below are touched; sign-in probes remain future work, and seat
 > eligibility surfacing can later build on its verified-version statuses.
 
 Goal stated by Lydia 2026-07-30: eventually either (a) a standing PM arrangement where

@@ -69,9 +69,9 @@ login shell just to discover commands.
 
 ## Detection preflight (Agents panel)
 
-The Agents panel (quick-bar `◎`, module `src/agents_panel.rs`) shows every
-provider with a live availability status so a missing CLI is visible before
-Send instead of after it fails. Statuses:
+The Agent Harness section (sidebar entry under AI chats, module
+`src/agents_panel.rs`) shows every provider with a live availability status
+so a missing CLI is visible before Send instead of after it fails. Statuses:
 
 - **Not detected** — the binary was not found on the discovery paths above.
 - **Detected vX.Y.Z** — found, but no captured runtime contract covers this
@@ -86,11 +86,19 @@ what a turn runs cannot drift. Scans run on a background worker
 upgraded binary re-probes. The chat composer surfaces a pre-Send banner from
 the same cached snapshot (LM Studio is exempt while an endpoint is
 configured, and Automatic only warns when all four CLI candidates are
-missing). The panel is read-only detection plus install guidance: install
-commands are compiled-in copy-only strings from `AGENT_PROVIDERS`, never
-executed, and never sourced from user-editable data. Sign-in status is a
-planned second axis; one-click install is planned behind the same
-compiled-in allowlist.
+missing). When every probed CLI is missing, the chat's empty state becomes
+a setup screen with the same rows.
+
+Install buttons execute **only** commands compiled into `AGENT_PROVIDERS`
+— vendor-official installers verified against vendor domains, never
+sourced from user-editable data (providers without a safe non-interactive
+installer get a button that opens the official download page instead).
+Execution is user-initiated, one at a time, via `/bin/zsh -lc` with
+`set -o pipefail`, output captured with both pipes drained on their own
+threads, a five-minute deadline with kill, and a post-install
+cache-bypassing re-probe: if the installer finishes but the binary still
+does not resolve on the discovery paths, the panel says so honestly and
+keeps the full command log. Sign-in status remains a planned second axis.
 
 ## Models, reasoning, and abilities
 
