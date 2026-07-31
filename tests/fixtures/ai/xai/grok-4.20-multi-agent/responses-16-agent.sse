@@ -1,0 +1,17 @@
+event: response.created
+data: {"type":"response.created","response":{"id":"<RESPONSE_16>","object":"response","model":"grok-4.20-multi-agent","status":"in_progress"}}
+
+event: response.in_progress
+data: {"type":"response.in_progress","response":{"id":"<RESPONSE_16>","object":"response","model":"grok-4.20-multi-agent","status":"in_progress"}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"<MESSAGE_16>","output_index":0,"content_index":0,"delta":"Sixteen-agent deep research synthesis."}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","item_id":"<MESSAGE_16>","output_index":0,"content_index":0,"text":"Sixteen-agent deep research synthesis."}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"id":"<MESSAGE_16>","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Sixteen-agent deep research synthesis.","annotations":[]}]}}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"<RESPONSE_16>","object":"response","model":"grok-4.20-multi-agent","status":"completed","output":[{"id":"<MESSAGE_16>","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"Sixteen-agent deep research synthesis.","annotations":[]}]}],"reasoning":{"effort":"high","summary":null},"previous_response_id":null,"usage":{"input_tokens":1600,"input_tokens_details":{"cached_tokens":0},"output_tokens":480,"output_tokens_details":{"reasoning_tokens":320},"total_tokens":2080,"num_sources_used":0,"num_server_side_tools_used":0},"store":true}}

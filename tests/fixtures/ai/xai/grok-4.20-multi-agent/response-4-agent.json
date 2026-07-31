@@ -1,0 +1,40 @@
+{
+  "id": "<RESPONSE_4>",
+  "object": "response",
+  "model": "grok-4.20-multi-agent",
+  "status": "completed",
+  "output": [
+    {
+      "id": "<MESSAGE_4>",
+      "type": "message",
+      "role": "assistant",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Four-agent research synthesis.",
+          "annotations": []
+        }
+      ]
+    }
+  ],
+  "reasoning": {
+    "effort": "low",
+    "summary": null
+  },
+  "previous_response_id": null,
+  "usage": {
+    "input_tokens": 400,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 120,
+    "output_tokens_details": {
+      "reasoning_tokens": 80
+    },
+    "total_tokens": 520,
+    "num_sources_used": 3,
+    "num_server_side_tools_used": 1
+  },
+  "store": true
+}

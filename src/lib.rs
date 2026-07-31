@@ -13,6 +13,7 @@ pub mod clipboard;
 pub mod domain;
 pub mod dots;
 pub(crate) mod grok_acp;
+pub(crate) mod kimi_acp;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_image_io;
 #[cfg(target_os = "macos")]
@@ -26,3 +27,4 @@ pub mod preview;
 pub mod progress_stepper;
 pub mod spatial;
 pub mod structured_preview;
+pub(crate) mod xai_responses;
