@@ -192,6 +192,46 @@ impl SubagentStatus {
     }
 }
 
+/// Provider-neutral category for a coordinated set of agents.
+///
+/// A group is deliberately distinct from a child agent. Some providers expose
+/// each member (Kimi AgentSwarm), while others expose only the leader and a
+/// declared member count (xAI multi-agent inference). Adam persists that
+/// visibility boundary instead of manufacturing child identities.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentGroupKind {
+    #[default]
+    Swarm,
+    Delegation,
+    Workflow,
+    MultiAgentInference,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentGroupVisibility {
+    /// The provider identifies individual members and may publish their final
+    /// outcomes, but does not expose live child telemetry.
+    DelegatedMembers,
+    /// The provider exposes only a leader-facing aggregate.
+    #[default]
+    AggregateOnly,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AgentGroupMember {
+    pub id: String,
+    pub label: String,
+    pub status: SubagentStatus,
+    pub detail: Option<String>,
+}
+
 /// Normalized terminal state for a provider turn.
 ///
 /// This deliberately keeps provider cancellation categories richer than a
@@ -378,6 +418,26 @@ pub enum ActivityKind {
         #[serde(default)]
         tool_calls: Option<u64>,
     },
+    AgentGroup {
+        #[serde(default)]
+        id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        aliases: Vec<String>,
+        #[serde(default)]
+        label: String,
+        #[serde(default)]
+        kind: AgentGroupKind,
+        #[serde(default)]
+        status: SubagentStatus,
+        #[serde(default)]
+        expected_count: Option<u32>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        members: Vec<AgentGroupMember>,
+        #[serde(default)]
+        visibility: AgentGroupVisibility,
+        #[serde(default)]
+        detail: Option<String>,
+    },
     Usage {
         #[serde(default)]
         input: Option<u64>,
@@ -436,6 +496,7 @@ impl ActivityKind {
             Self::HostRead { .. } => "hostRead",
             Self::PermissionPrompt { .. } => "permissionPrompt",
             Self::Subagent { .. } => "subagent",
+            Self::AgentGroup { .. } => "agentGroup",
             Self::Usage { .. } => "usage",
             Self::TurnError { .. } => "turnError",
             Self::TurnStatus { .. } => "turnStatus",
@@ -456,6 +517,7 @@ impl ActivityKind {
             Self::WebSearch { id, .. } => ("webSearch", id),
             Self::PermissionPrompt { id, .. } => ("permissionPrompt", id),
             Self::Subagent { id, .. } => ("subagent", id),
+            Self::AgentGroup { id, .. } => ("agentGroup", id),
             _ => return None,
         };
         Some(format!("{case_name}:{id}"))
@@ -500,6 +562,7 @@ impl ActivityKind {
                 | Self::HostMutation { .. }
                 | Self::PermissionPrompt { .. }
                 | Self::Subagent { .. }
+                | Self::AgentGroup { .. }
                 | Self::TurnError { .. }
                 | Self::TurnStatus { .. }
         )
@@ -718,55 +781,101 @@ impl ActivityAccumulator {
                 .duration_ms
                 .or_else(|| Some(incoming.at.elapsed_since(original_at)));
             self.events[index].kind = incoming.kind;
-            if let (
-                ActivityKind::Subagent {
-                    aliases: previous_aliases,
-                    parent_id: previous_parent,
-                    label: previous_label,
-                    status: previous_status,
-                    model: previous_model,
-                    detail: previous_detail,
-                    tool_calls: previous_tool_calls,
-                    ..
-                },
-                ActivityKind::Subagent {
-                    aliases,
-                    parent_id,
-                    label,
-                    status,
-                    model,
-                    detail,
-                    tool_calls,
-                    ..
-                },
-            ) = (previous_kind, &mut self.events[index].kind)
-            {
-                for alias in previous_aliases {
-                    if !aliases.contains(&alias) {
-                        aliases.push(alias);
+            match (previous_kind, &mut self.events[index].kind) {
+                (
+                    ActivityKind::Subagent {
+                        aliases: previous_aliases,
+                        parent_id: previous_parent,
+                        label: previous_label,
+                        status: previous_status,
+                        model: previous_model,
+                        detail: previous_detail,
+                        tool_calls: previous_tool_calls,
+                        ..
+                    },
+                    ActivityKind::Subagent {
+                        aliases,
+                        parent_id,
+                        label,
+                        status,
+                        model,
+                        detail,
+                        tool_calls,
+                        ..
+                    },
+                ) => {
+                    for alias in previous_aliases {
+                        if !aliases.contains(&alias) {
+                            aliases.push(alias);
+                        }
+                    }
+                    if parent_id.is_none() {
+                        *parent_id = previous_parent;
+                    }
+                    if label.trim().is_empty() {
+                        *label = previous_label;
+                    }
+                    if model.is_none() {
+                        *model = previous_model;
+                    }
+                    if detail.is_none() {
+                        if status.is_terminal()
+                            || (previous_status.is_terminal() && !status.is_terminal())
+                        {
+                            *detail = None;
+                        } else {
+                            *detail = previous_detail;
+                        }
+                    }
+                    if tool_calls.is_none() {
+                        *tool_calls = previous_tool_calls;
                     }
                 }
-                if parent_id.is_none() {
-                    *parent_id = previous_parent;
-                }
-                if label.trim().is_empty() {
-                    *label = previous_label;
-                }
-                if model.is_none() {
-                    *model = previous_model;
-                }
-                if detail.is_none() {
-                    if status.is_terminal()
-                        || (previous_status.is_terminal() && !status.is_terminal())
-                    {
-                        *detail = None;
-                    } else {
-                        *detail = previous_detail;
+                (
+                    ActivityKind::AgentGroup {
+                        aliases: previous_aliases,
+                        label: previous_label,
+                        status: previous_status,
+                        expected_count: previous_expected_count,
+                        members: previous_members,
+                        detail: previous_detail,
+                        ..
+                    },
+                    ActivityKind::AgentGroup {
+                        aliases,
+                        label,
+                        status,
+                        expected_count,
+                        members,
+                        detail,
+                        ..
+                    },
+                ) => {
+                    for alias in previous_aliases {
+                        if !aliases.contains(&alias) {
+                            aliases.push(alias);
+                        }
+                    }
+                    if label.trim().is_empty() {
+                        *label = previous_label;
+                    }
+                    if expected_count.is_none() {
+                        *expected_count = previous_expected_count;
+                    }
+                    if members.is_empty() {
+                        *members = previous_members;
+                    }
+                    if detail.is_none() {
+                        if status.is_terminal()
+                            || (previous_status.is_terminal() && !status.is_terminal())
+                        {
+                            *detail = None;
+                        } else {
+                            *detail = previous_detail;
+                        }
                     }
                 }
-                if tool_calls.is_none() {
-                    *tool_calls = previous_tool_calls;
-                }
+                _ => {}
             }
             return;
         }
@@ -936,7 +1045,10 @@ impl ActivityAccumulator {
 fn is_live_cap_evictable(event: &ActivityEvent) -> bool {
     event.kind.is_foldable()
         && !event.kind.is_plan_snapshot()
-        && !matches!(event.kind, ActivityKind::Subagent { .. })
+        && !matches!(
+            event.kind,
+            ActivityKind::Subagent { .. } | ActivityKind::AgentGroup { .. }
+        )
         && !(event.scope.child_id().is_some()
             && matches!(event.kind, ActivityKind::AssistantText { .. }))
 }
@@ -1337,6 +1449,149 @@ pub fn project_subagent_aggregate(subagents: &[SubagentProjection]) -> SubagentA
         }
     }
     aggregate
+}
+
+/// Newest known state for one real provider-owned group of agents.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AgentGroupProjection {
+    pub id: String,
+    pub aliases: Vec<String>,
+    pub label: String,
+    pub kind: AgentGroupKind,
+    pub status: SubagentStatus,
+    pub expected_count: Option<u32>,
+    pub members: Vec<AgentGroupMember>,
+    pub visibility: AgentGroupVisibility,
+    pub detail: Option<String>,
+    pub at: UnixMillis,
+    pub duration_ms: Option<i64>,
+}
+
+/// Folds group lifecycle events without converting opaque members into
+/// ordinary child-agent rows.
+pub fn project_agent_groups(events: &[ActivityEvent]) -> Vec<AgentGroupProjection> {
+    let mut groups = Vec::<AgentGroupProjection>::new();
+    let mut indices = BTreeMap::<String, usize>::new();
+    let aliases = project_agent_group_aliases(events);
+
+    for event in events {
+        let ActivityKind::AgentGroup {
+            id,
+            aliases: event_aliases,
+            label,
+            kind,
+            status,
+            expected_count,
+            members,
+            visibility,
+            detail,
+        } = &event.kind
+        else {
+            continue;
+        };
+        if id.trim().is_empty() {
+            continue;
+        }
+        let canonical_id = resolve_agent_group_alias(&aliases, id);
+        if let Some(index) = indices.get(&canonical_id).copied() {
+            let existing = &mut groups[index];
+            for alias in event_aliases {
+                if alias != &canonical_id && !existing.aliases.contains(alias) {
+                    existing.aliases.push(alias.clone());
+                }
+            }
+            if id != &canonical_id && !existing.aliases.contains(id) {
+                existing.aliases.push(id.clone());
+            }
+            if !label.trim().is_empty() {
+                existing.label.clone_from(label);
+            }
+            existing.kind = *kind;
+            existing.status = *status;
+            if expected_count.is_some() {
+                existing.expected_count = *expected_count;
+            }
+            if !members.is_empty() {
+                existing.members.clone_from(members);
+            }
+            existing.visibility = *visibility;
+            if detail.is_some() {
+                existing.detail.clone_from(detail);
+            } else if status.is_terminal() {
+                existing.detail = None;
+            }
+            existing.duration_ms = event.duration_ms.or(existing.duration_ms).or_else(|| {
+                status
+                    .is_terminal()
+                    .then(|| event.at.elapsed_since(existing.at))
+            });
+        } else {
+            indices.insert(canonical_id.clone(), groups.len());
+            groups.push(AgentGroupProjection {
+                id: canonical_id.clone(),
+                aliases: event_aliases
+                    .iter()
+                    .filter(|alias| !alias.trim().is_empty() && *alias != &canonical_id)
+                    .cloned()
+                    .collect(),
+                label: label.clone(),
+                kind: *kind,
+                status: *status,
+                expected_count: *expected_count,
+                members: members.clone(),
+                visibility: *visibility,
+                detail: detail.clone(),
+                at: event.at,
+                duration_ms: event.duration_ms,
+            });
+        }
+    }
+    for group in &mut groups {
+        group.aliases.sort();
+        group.aliases.dedup();
+    }
+    groups
+}
+
+fn project_agent_group_aliases(events: &[ActivityEvent]) -> BTreeMap<String, String> {
+    let mut aliases = BTreeMap::<String, String>::new();
+    for event in events {
+        let ActivityKind::AgentGroup {
+            id,
+            aliases: event_aliases,
+            ..
+        } = &event.kind
+        else {
+            continue;
+        };
+        if id.trim().is_empty() {
+            continue;
+        }
+        let canonical = resolve_agent_group_alias(&aliases, id);
+        aliases.insert(canonical.clone(), canonical.clone());
+        aliases.insert(id.clone(), canonical.clone());
+        for alias in event_aliases {
+            if !alias.trim().is_empty() {
+                aliases.insert(alias.clone(), canonical.clone());
+            }
+        }
+    }
+    aliases
+}
+
+fn resolve_agent_group_alias(aliases: &BTreeMap<String, String>, id: &str) -> String {
+    let mut current = id.to_owned();
+    for _ in 0..16 {
+        let Some(next) = aliases.get(&current) else {
+            break;
+        };
+        if next == &current {
+            break;
+        }
+        current.clone_from(next);
+    }
+    current
 }
 
 /// Last normalized provider-turn state in an event stream.
@@ -2126,6 +2381,7 @@ pub enum ProviderKind {
     Codex,
     Grok,
     Kimi,
+    Xai,
     LmStudio,
     Ollama,
     OpenAiCompatible,
@@ -2142,6 +2398,7 @@ pub enum TransportKind {
     CliProcess,
     HttpChatCompletions,
     LocalHttpChatCompletions,
+    HttpResponses,
 }
 
 #[derive(
@@ -2155,6 +2412,8 @@ pub enum StreamDialect {
     ClaudeStreamJson,
     GrokStreamingJson,
     KimiStreamJson,
+    KimiAcp,
+    XaiResponsesSse,
     OpenAiCompatibleJson,
 }
 
@@ -2178,6 +2437,8 @@ pub enum ResumeStrategy {
     None,
     CodexExecSubcommand,
     ResumeFlagPrepend,
+    AcpSessionLoad,
+    PreviousResponseId,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -2287,6 +2548,18 @@ pub enum ChildEventChannel {
     GrokAcpScopedSessionV1,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentGroupChannel {
+    #[default]
+    Disabled,
+    GrokAcpWorkflowV1,
+    KimiAcpToolAggregateV1,
+    XaiResponsesMultiAgentV1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeTuningProfile {
     pub version: Option<CliVersion>,
@@ -2297,6 +2570,7 @@ pub struct RuntimeTuningProfile {
     /// Compatibility summary for callers that only need an on/off gate.
     pub supports_scoped_child_text: bool,
     pub child_event_channel: ChildEventChannel,
+    pub agent_group_channel: AgentGroupChannel,
 }
 
 impl RuntimeTuningProfile {
@@ -2318,6 +2592,7 @@ const CODEX_MAX_REASONING: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const CODEX_ULTRA_REASONING: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 const CLAUDE_REASONING: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const GROK_REASONING_0_2_111: &[&str] = &["low", "medium", "high"];
+const XAI_MULTI_AGENT_REASONING: &[&str] = &["low", "medium", "high", "xhigh"];
 const OLLAMA_REASONING_0_32_1: &[&str] = &["low", "medium", "high"];
 const NO_REASONING: &[&str] = &[];
 
@@ -2328,54 +2603,96 @@ pub fn runtime_tuning_profile(
     version: Option<&CliVersion>,
     model: &str,
 ) -> RuntimeTuningProfile {
-    let (reasoning_efforts, child_event_channel, verified_runtime) = match (family, version) {
-        (ProviderKind::Codex, Some(version)) if version.is(0, 144, 1) => {
-            let efforts = if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") {
-                CODEX_ULTRA_REASONING
-            } else if model == "gpt-5.6-luna" {
-                CODEX_MAX_REASONING
-            } else {
-                CODEX_DEFAULT_REASONING
-            };
-            (efforts, ChildEventChannel::CodexExecCollabV1, true)
-        }
-        (ProviderKind::Claude, Some(version)) if version.is(2, 1, 128) => (
-            CLAUDE_REASONING,
-            ChildEventChannel::ClaudeStreamJsonAgentV1,
-            true,
-        ),
-        (ProviderKind::Grok, Some(version)) if version.is(0, 2, 111) => {
-            // The captured multiplex stream carries parent and child prose in
-            // indistinguishable type=text envelopes. Subagents must stay off
-            // until a scoped channel is available.
-            (GROK_REASONING_0_2_111, ChildEventChannel::Disabled, true)
-        }
-        (ProviderKind::Grok, Some(version)) if version.is(0, 2, 114) => {
-            // The installed 0.2.114 model metadata still advertises exactly
-            // low/medium/high for grok-4.5. ACP makes task calls structured,
-            // but this runtime has no independently verified scoped child
-            // channel, so subagents remain disabled.
-            (GROK_REASONING_0_2_111, ChildEventChannel::Disabled, true)
-        }
-        (ProviderKind::Grok, Some(version)) if version.is(0, 2, 117) => (
-            GROK_REASONING_0_2_111,
-            ChildEventChannel::GrokAcpScopedSessionV1,
-            true,
-        ),
-        (ProviderKind::Kimi, Some(version)) if version.is(1, 49, 0) => {
-            (NO_REASONING, ChildEventChannel::Disabled, true)
-        }
-        (ProviderKind::Ollama, Some(version)) if version.is(0, 32, 1) => {
-            (OLLAMA_REASONING_0_32_1, ChildEventChannel::Disabled, true)
-        }
-        _ => (NO_REASONING, ChildEventChannel::Disabled, false),
-    };
+    let (reasoning_efforts, child_event_channel, agent_group_channel, verified_runtime) =
+        match (family, version) {
+            (ProviderKind::Codex, Some(version)) if version.is(0, 144, 1) => {
+                let efforts = if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") {
+                    CODEX_ULTRA_REASONING
+                } else if model == "gpt-5.6-luna" {
+                    CODEX_MAX_REASONING
+                } else {
+                    CODEX_DEFAULT_REASONING
+                };
+                (
+                    efforts,
+                    ChildEventChannel::CodexExecCollabV1,
+                    AgentGroupChannel::Disabled,
+                    true,
+                )
+            }
+            (ProviderKind::Claude, Some(version)) if version.is(2, 1, 128) => (
+                CLAUDE_REASONING,
+                ChildEventChannel::ClaudeStreamJsonAgentV1,
+                AgentGroupChannel::Disabled,
+                true,
+            ),
+            (ProviderKind::Grok, Some(version)) if version.is(0, 2, 111) => {
+                // The captured multiplex stream carries parent and child prose in
+                // indistinguishable type=text envelopes. Subagents must stay off
+                // until a scoped channel is available.
+                (
+                    GROK_REASONING_0_2_111,
+                    ChildEventChannel::Disabled,
+                    AgentGroupChannel::Disabled,
+                    true,
+                )
+            }
+            (ProviderKind::Grok, Some(version)) if version.is(0, 2, 114) => {
+                // The installed 0.2.114 model metadata still advertises exactly
+                // low/medium/high for grok-4.5. ACP makes task calls structured,
+                // but this runtime has no independently verified scoped child
+                // channel, so subagents remain disabled.
+                (
+                    GROK_REASONING_0_2_111,
+                    ChildEventChannel::Disabled,
+                    AgentGroupChannel::Disabled,
+                    true,
+                )
+            }
+            (ProviderKind::Grok, Some(version)) if version.is(0, 2, 117) => (
+                GROK_REASONING_0_2_111,
+                ChildEventChannel::GrokAcpScopedSessionV1,
+                AgentGroupChannel::GrokAcpWorkflowV1,
+                true,
+            ),
+            (ProviderKind::Kimi, Some(version)) if version.is(1, 49, 0) => (
+                NO_REASONING,
+                ChildEventChannel::Disabled,
+                AgentGroupChannel::Disabled,
+                true,
+            ),
+            (ProviderKind::Kimi, Some(version)) if version.is(0, 31, 0) => (
+                NO_REASONING,
+                ChildEventChannel::Disabled,
+                AgentGroupChannel::KimiAcpToolAggregateV1,
+                true,
+            ),
+            (ProviderKind::Ollama, Some(version)) if version.is(0, 32, 1) => (
+                OLLAMA_REASONING_0_32_1,
+                ChildEventChannel::Disabled,
+                AgentGroupChannel::Disabled,
+                true,
+            ),
+            (ProviderKind::Xai, None) => (
+                XAI_MULTI_AGENT_REASONING,
+                ChildEventChannel::Disabled,
+                AgentGroupChannel::XaiResponsesMultiAgentV1,
+                true,
+            ),
+            _ => (
+                NO_REASONING,
+                ChildEventChannel::Disabled,
+                AgentGroupChannel::Disabled,
+                false,
+            ),
+        };
     RuntimeTuningProfile {
         version: version.cloned(),
         verified_runtime,
         reasoning_efforts,
         supports_scoped_child_text: child_event_channel != ChildEventChannel::Disabled,
         child_event_channel,
+        agent_group_channel,
     }
 }
 
@@ -2395,6 +2712,7 @@ pub struct CapabilityProfile {
     pub runtime_version: Option<CliVersion>,
     pub supported_reasoning_efforts: Vec<String>,
     pub child_event_channel: ChildEventChannel,
+    pub agent_group_channel: AgentGroupChannel,
     pub transport: TransportKind,
     pub stream_dialect: StreamDialect,
     pub plan_channel: PlanChannel,
@@ -2463,6 +2781,7 @@ pub fn capability_profile_for_runtime(
 
     let is_lm_studio_cli = runtime_family == ProviderKind::LmStudio && !basename.is_empty();
     let transport = match runtime_family {
+        ProviderKind::Xai => TransportKind::HttpResponses,
         ProviderKind::OpenAiCompatible => TransportKind::HttpChatCompletions,
         ProviderKind::LmStudio if !is_lm_studio_cli => TransportKind::LocalHttpChatCompletions,
         _ => TransportKind::CliProcess,
@@ -2473,7 +2792,9 @@ pub fn capability_profile_for_runtime(
         ProviderKind::Codex if has_argument("--json") => StreamDialect::CodexJsonLines,
         ProviderKind::Claude if has_argument("stream-json") => StreamDialect::ClaudeStreamJson,
         ProviderKind::Grok if has_argument("streaming-json") => StreamDialect::GrokStreamingJson,
+        ProviderKind::Kimi if has_argument("acp") => StreamDialect::KimiAcp,
         ProviderKind::Kimi if has_argument("stream-json") => StreamDialect::KimiStreamJson,
+        ProviderKind::Xai => StreamDialect::XaiResponsesSse,
         ProviderKind::OpenAiCompatible => StreamDialect::OpenAiCompatibleJson,
         ProviderKind::LmStudio if !is_lm_studio_cli => StreamDialect::OpenAiCompatibleJson,
         _ => StreamDialect::PlainText,
@@ -2485,13 +2806,26 @@ pub fn capability_profile_for_runtime(
             PlanChannel::AppTaskTools
         }
         ProviderKind::Grok => PlanChannel::NativeStream,
+        ProviderKind::Kimi
+            if has_argument("acp") || version.is_some_and(|version| version.is(0, 31, 0)) =>
+        {
+            PlanChannel::NativeStream
+        }
         ProviderKind::OpenAiCompatible | ProviderKind::Custom => PlanChannel::AppTaskTools,
         ProviderKind::LmStudio if !is_lm_studio_cli => PlanChannel::AppTaskTools,
-        ProviderKind::LmStudio | ProviderKind::Kimi | ProviderKind::Ollama => PlanChannel::None,
+        ProviderKind::LmStudio | ProviderKind::Kimi | ProviderKind::Ollama | ProviderKind::Xai => {
+            PlanChannel::None
+        }
     };
     let resume = match runtime_family {
         ProviderKind::Codex => ResumeStrategy::CodexExecSubcommand,
         ProviderKind::Claude | ProviderKind::Grok => ResumeStrategy::ResumeFlagPrepend,
+        ProviderKind::Kimi
+            if has_argument("acp") || version.is_some_and(|version| version.is(0, 31, 0)) =>
+        {
+            ResumeStrategy::AcpSessionLoad
+        }
+        ProviderKind::Xai => ResumeStrategy::PreviousResponseId,
         _ => ResumeStrategy::None,
     };
     let system_prompt = match runtime_family {
@@ -2504,7 +2838,7 @@ pub fn capability_profile_for_runtime(
         ProviderKind::Codex => SystemPromptChannel::ConfigOverride {
             key: "developer_instructions".into(),
         },
-        ProviderKind::OpenAiCompatible | ProviderKind::LmStudio
+        ProviderKind::OpenAiCompatible | ProviderKind::LmStudio | ProviderKind::Xai
             if transport != TransportKind::CliProcess =>
         {
             SystemPromptChannel::ApiSystemMessage
@@ -2516,7 +2850,7 @@ pub fn capability_profile_for_runtime(
         ProviderKind::Claude | ProviderKind::Grok | ProviderKind::Kimi => {
             ToolsOffStrategy::HostTokenOnly
         }
-        ProviderKind::OpenAiCompatible => ToolsOffStrategy::OmitApiTools,
+        ProviderKind::OpenAiCompatible | ProviderKind::Xai => ToolsOffStrategy::OmitApiTools,
         ProviderKind::LmStudio if transport != TransportKind::CliProcess => {
             ToolsOffStrategy::OmitApiTools
         }
@@ -2541,6 +2875,7 @@ pub fn capability_profile_for_runtime(
             .map(|effort| (*effort).to_owned())
             .collect(),
         child_event_channel: tuning.child_event_channel,
+        agent_group_channel: tuning.agent_group_channel,
         transport,
         stream_dialect,
         plan_channel,
@@ -2569,8 +2904,9 @@ fn provider_from_id(provider_id: &str) -> Option<ProviderKind> {
     match normalized.as_str() {
         "claude" | "claude_cli" | "anthropic" => Some(ProviderKind::Claude),
         "codex" | "codex_cli" | "openai_codex" => Some(ProviderKind::Codex),
-        "grok" | "grok_cli" | "xai" => Some(ProviderKind::Grok),
+        "grok" | "grok_cli" => Some(ProviderKind::Grok),
         "kimi" | "kimi_cli" | "moonshot" => Some(ProviderKind::Kimi),
+        "xai" | "xai_api" | "grok_heavy" => Some(ProviderKind::Xai),
         "lmstudio" | "lm_studio" | "lms" => Some(ProviderKind::LmStudio),
         "ollama" => Some(ProviderKind::Ollama),
         "openai" | "openai_compatible" => Some(ProviderKind::OpenAiCompatible),
@@ -2586,6 +2922,7 @@ fn provider_from_executable(basename: &str) -> Option<ProviderKind> {
         "codex" => Some(ProviderKind::Codex),
         "grok" => Some(ProviderKind::Grok),
         "kimi" => Some(ProviderKind::Kimi),
+        "xai" => Some(ProviderKind::Xai),
         "lms" | "lmstudio" => Some(ProviderKind::LmStudio),
         "ollama" => Some(ProviderKind::Ollama),
         _ => None,
@@ -4593,6 +4930,91 @@ mod tests {
         let aggregate = project_subagent_aggregate(&agents);
         assert_eq!(aggregate.permission_blocked, 1);
         assert_eq!(aggregate.summary(), "3/5 done · 1 working · 1 stopped");
+    }
+
+    #[test]
+    fn agent_groups_fold_without_fabricating_subagents() {
+        let events = vec![
+            event(
+                1,
+                100,
+                ActivityKind::AgentGroup {
+                    id: "turn-heavy".into(),
+                    aliases: Vec::new(),
+                    label: "Grok Heavy".into(),
+                    kind: AgentGroupKind::MultiAgentInference,
+                    status: SubagentStatus::InProgress,
+                    expected_count: Some(16),
+                    members: Vec::new(),
+                    visibility: AgentGroupVisibility::AggregateOnly,
+                    detail: Some("Provider-managed research".into()),
+                },
+            ),
+            event(
+                2,
+                900,
+                ActivityKind::AgentGroup {
+                    id: "turn-heavy".into(),
+                    aliases: vec!["resp-123".into()],
+                    label: String::new(),
+                    kind: AgentGroupKind::MultiAgentInference,
+                    status: SubagentStatus::Completed,
+                    expected_count: None,
+                    members: Vec::new(),
+                    visibility: AgentGroupVisibility::AggregateOnly,
+                    detail: None,
+                },
+            ),
+        ];
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest_many(events);
+        let groups = project_agent_groups(&accumulator.events);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "turn-heavy");
+        assert_eq!(groups[0].aliases, vec!["resp-123"]);
+        assert_eq!(groups[0].status, SubagentStatus::Completed);
+        assert_eq!(groups[0].expected_count, Some(16));
+        assert_eq!(groups[0].visibility, AgentGroupVisibility::AggregateOnly);
+        assert_eq!(groups[0].duration_ms, Some(800));
+        assert!(project_subagents(&accumulator.events).is_empty());
+    }
+
+    #[test]
+    fn delegated_group_members_round_trip_through_persistence() {
+        let group = event(
+            1,
+            100,
+            ActivityKind::AgentGroup {
+                id: "swarm-call".into(),
+                aliases: Vec::new(),
+                label: "Kimi AgentSwarm".into(),
+                kind: AgentGroupKind::Swarm,
+                status: SubagentStatus::Completed,
+                expected_count: Some(2),
+                members: vec![
+                    AgentGroupMember {
+                        id: "agent-0".into(),
+                        label: "Alpha".into(),
+                        status: SubagentStatus::Completed,
+                        detail: Some("A".into()),
+                    },
+                    AgentGroupMember {
+                        id: "agent-1".into(),
+                        label: "Beta".into(),
+                        status: SubagentStatus::Failed,
+                        detail: Some("B".into()),
+                    },
+                ],
+                visibility: AgentGroupVisibility::DelegatedMembers,
+                detail: Some("1 completed · 1 failed".into()),
+            },
+        );
+        let persisted = activity_events_for_persistence(&[group], 1);
+        let json = serde_json::to_string(&persisted).unwrap();
+        let decoded: Vec<ActivityEvent> = serde_json::from_str(&json).unwrap();
+        let groups = project_agent_groups(&decoded);
+        assert_eq!(groups[0].members.len(), 2);
+        assert_eq!(groups[0].members[1].status, SubagentStatus::Failed);
     }
 
     #[test]

@@ -52,7 +52,7 @@ const TESTED_VERSIONS: &[(&str, &str)] = &[
     ("claude_cli", "2.1.128"),
     ("codex_cli", "0.144.1"),
     ("grok_cli", "0.2.117"),
-    ("kimi_cli", "1.49.0"),
+    ("kimi_cli", "0.31.0"),
     ("ollama", "0.32.1"),
 ];
 
@@ -187,6 +187,20 @@ pub const AGENT_PROVIDERS: &[AgentProviderMeta] = &[
         docs_url: Some("https://ollama.com/download"),
         hover_note: Some("The binary being present does not mean the Ollama daemon is running."),
         info_note: None,
+        auth_probe: None,
+        sign_in_command: None,
+    },
+    AgentProviderMeta {
+        provider_id: "xai_api",
+        label: "Grok Heavy API",
+        binary: None,
+        install_command: None,
+        install_hint: "Set XAI_API_KEY or enter a temporary key in the chat composer.",
+        docs_url: Some("https://docs.x.ai/developers/model-capabilities/text/multi-agent"),
+        hover_note: Some(
+            "Runs xAI’s server-managed 4- or 16-agent model through the Responses API; it is separate from Grok Build.",
+        ),
+        info_note: Some("API provider · requires an xAI API key"),
         auth_probe: None,
         sign_in_command: None,
     },

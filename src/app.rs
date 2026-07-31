@@ -16,22 +16,24 @@ use crate::{
     assets::AssetStore,
     automation::{ReconcileRequest, canvas_objects_from_workspace, reconcile_workspace},
     chat_core::{
-        ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, AgentScope,
-        PlanItem, PlanItemStatus, ProgressSource, RetryHint, RuntimeTuningProfile, StreamDialect,
-        SubagentStatus, SystemPromptChannel, TurnStatus, assistant_flat_text, capability_profile,
+        ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, AgentGroupKind,
+        AgentGroupProjection, AgentGroupVisibility, AgentScope, PlanItem, PlanItemStatus,
+        ProgressSource, RetryHint, RuntimeTuningProfile, StreamDialect, SubagentStatus,
+        SystemPromptChannel, TurnStatus, assistant_flat_text, capability_profile,
         current_work_label, latest_turn_status, newest_plan, newest_plan_for_scope,
-        project_artifacts, project_context, project_progress, project_subagents, project_usage,
+        project_agent_groups, project_artifacts, project_context, project_progress,
+        project_subagents, project_usage,
     },
     clipboard::{self, PasteContent},
     domain::{
-        AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_THINKING,
-        AI_FEATURE_WEB_SEARCH, AiActionKind, AiActionOutcome, AiActionRecord, AiActionRequest,
-        AiAttachmentRef, AiCheckpoint, AiConversation, AiConversationKind, AiConversationSettings,
-        AiProviderPreferences, AiQueuedTurn, AiWorkspaceMode, ApplyMode, ApprovalEvidence,
-        AuthorizationDecision, AutoTagRule, AutoTagSettings, ContainmentMode, DomainActor,
-        EarnedTagRemovalPolicy, ExistingTilesPolicy, InitialMembership, MessageRole, PaletteColor,
-        PermissionMode, Pile, PileHistoryKind, RuleEditProgressPolicy, RuleState, TagClaim,
-        TagName, TagSource, TimeUnit, TimingMode, TrashActor, TrashItem, UnixMillis,
+        AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_SWARM,
+        AI_FEATURE_THINKING, AI_FEATURE_WEB_SEARCH, AiActionKind, AiActionOutcome, AiActionRecord,
+        AiActionRequest, AiAttachmentRef, AiCheckpoint, AiConversation, AiConversationKind,
+        AiConversationSettings, AiProviderPreferences, AiQueuedTurn, AiWorkspaceMode, ApplyMode,
+        ApprovalEvidence, AuthorizationDecision, AutoTagRule, AutoTagSettings, ContainmentMode,
+        DomainActor, EarnedTagRemovalPolicy, ExistingTilesPolicy, InitialMembership, MessageRole,
+        PaletteColor, PermissionMode, Pile, PileHistoryKind, RuleEditProgressPolicy, RuleState,
+        TagClaim, TagName, TagSource, TimeUnit, TimingMode, TrashActor, TrashItem, UnixMillis,
         apply_rule_edit, authorize_ai_action, auto_tag_rule_sentence, resolve_pile_memberships,
     },
     dots::{self, ChromeRects},
@@ -426,7 +428,10 @@ struct AiChatRuntime {
     prompt_budget: Option<PromptBudget>,
     error: Option<String>,
     inspector_notice: Option<String>,
-    api_key: String,
+    /// Memory-only credentials keyed by the exact provider that may receive
+    /// them. A temporary xAI key must never follow a provider switch into an
+    /// OpenAI-compatible endpoint (or vice versa).
+    api_keys: HashMap<String, String>,
     show_inspector: bool,
     workspace_files: Vec<AiWorkspaceFile>,
     file_preview: Option<AiFilePreview>,
@@ -457,13 +462,27 @@ impl Default for AiChatRuntime {
             prompt_budget: None,
             error: None,
             inspector_notice: None,
-            api_key: String::new(),
+            api_keys: HashMap::new(),
             show_inspector: true,
             workspace_files: Vec::new(),
             file_preview: None,
             show_subagents_detail: false,
             show_all_outputs: false,
         }
+    }
+}
+
+impl AiChatRuntime {
+    fn temporary_api_key(&self, provider_id: &str) -> Option<String> {
+        self.api_keys
+            .get(provider_id)
+            .map(|key| key.trim())
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+    }
+
+    fn temporary_api_key_mut(&mut self, provider_id: &str) -> &mut String {
+        self.api_keys.entry(provider_id.to_owned()).or_default()
     }
 }
 
@@ -6908,8 +6927,7 @@ impl AdamApp {
             self.save_ai_resume_store();
         }
         let runtime = self.chat_runtimes.entry(conversation_id).or_default();
-        let api_key =
-            (!runtime.api_key.trim().is_empty()).then(|| runtime.api_key.trim().to_owned());
+        let api_key = runtime.temporary_api_key(&provider_id);
         let task_seed =
             newest_plan(&persisted_ai_activity(&conversation)).map(|progress| progress.items);
         let built_prompt = self.compose_ai_prompt(
@@ -7322,7 +7340,11 @@ impl AdamApp {
                         runtime.active_used_resume = false;
                         runtime.active_had_productive_activity = false;
                         runtime.streamed_text.clear();
-                        if let Some(session_id) = session_id.clone() {
+                        let persist_session_activity = runtime
+                            .active_provider_id
+                            .as_deref()
+                            .is_some_and(provider_session_is_portable_activity);
+                        if persist_session_activity && let Some(session_id) = session_id.clone() {
                             runtime.activity_trace.ingest(HarnessActivityEvent::new(
                                 Uuid::new_v4(),
                                 unix_now(),
@@ -12190,6 +12212,7 @@ const AI_PROVIDER_OPTIONS: &[(&str, &str)] = &[
     ("claude_cli", "Claude CLI"),
     ("codex_cli", "Codex CLI"),
     ("grok_cli", "Grok CLI"),
+    ("xai_api", "Grok Heavy API"),
     ("kimi_cli", "Kimi CLI"),
     ("lm_studio", "LM Studio"),
     ("ollama", "Ollama"),
@@ -12288,6 +12311,48 @@ fn ai_activity_summary(kind: &ActivityKind) -> String {
                 }
             )
         }
+        ActivityKind::AgentGroup {
+            label,
+            kind,
+            status,
+            expected_count,
+            visibility,
+            ..
+        } => {
+            let count = expected_count
+                .map(|count| {
+                    format!(
+                        " · {count} {}",
+                        if *kind == AgentGroupKind::MultiAgentInference {
+                            "agents"
+                        } else {
+                            "jobs"
+                        }
+                    )
+                })
+                .unwrap_or_default();
+            let state = match status {
+                SubagentStatus::Pending => "delegated",
+                SubagentStatus::InProgress => "running",
+                SubagentStatus::Completed => "done",
+                SubagentStatus::Failed => "failed",
+                SubagentStatus::Cancelled => "cancelled",
+                SubagentStatus::PermissionBlocked => "permission needed",
+            };
+            let visibility = if *visibility == AgentGroupVisibility::AggregateOnly {
+                " · aggregate"
+            } else {
+                ""
+            };
+            format!(
+                "{}{count} · {state}{visibility}",
+                if label.trim().is_empty() {
+                    "Agent group".into()
+                } else {
+                    truncate(label, 64)
+                }
+            )
+        }
         ActivityKind::Usage { .. } => "Usage updated".into(),
         ActivityKind::TurnError { message } => format!("Error: {}", truncate(message, 72)),
         ActivityKind::TurnStatus {
@@ -12311,6 +12376,10 @@ fn ai_trace_has_productive_activity(events: &[HarnessActivityEvent]) -> bool {
         }
         ActivityKind::Usage { .. }
         | ActivityKind::SessionInfo { .. }
+        | ActivityKind::AgentGroup {
+            kind: AgentGroupKind::MultiAgentInference,
+            ..
+        }
         | ActivityKind::TurnError { .. }
         | ActivityKind::TurnStatus { .. } => false,
         ActivityKind::ToolCall { .. }
@@ -12323,8 +12392,13 @@ fn ai_trace_has_productive_activity(events: &[HarnessActivityEvent]) -> bool {
         | ActivityKind::HostMutation { .. }
         | ActivityKind::HostRead { .. }
         | ActivityKind::PermissionPrompt { .. }
-        | ActivityKind::Subagent { .. } => true,
+        | ActivityKind::Subagent { .. }
+        | ActivityKind::AgentGroup { .. } => true,
     })
+}
+
+fn provider_session_is_portable_activity(provider_id: &str) -> bool {
+    provider_id != "xai_api"
 }
 
 fn ensure_terminal_status(
@@ -12801,7 +12875,9 @@ fn render_ai_inspector(
     let projected_events = projected_ai_activity(conversation, runtime);
     let progress = project_progress(&persisted_events, live_events);
     let live_progress = project_progress(&[], live_events);
-    let subagents = project_subagents(&projected_ai_subagent_activity(conversation, runtime));
+    let projected_agent_events = projected_ai_subagent_activity(conversation, runtime);
+    let subagents = project_subagents(&projected_agent_events);
+    let agent_groups = project_agent_groups(&projected_agent_events);
     let terminal = if runtime.active_turn.is_some() {
         latest_turn_status(live_events)
     } else {
@@ -12960,6 +13036,11 @@ fn render_ai_inspector(
                     }
                 }
             });
+
+            if !agent_groups.is_empty() {
+                ui.add_space(4.0);
+                render_ai_agent_groups_panel(ui, conversation_id, &agent_groups, colors);
+            }
 
             if !subagents.is_empty() {
                 ui.add_space(4.0);
@@ -13376,6 +13457,133 @@ fn render_ai_workspace_entry(
             ui.close();
         }
     });
+}
+
+fn render_ai_agent_groups_panel(
+    ui: &mut Ui,
+    conversation_id: Uuid,
+    groups: &[AgentGroupProjection],
+    colors: Theme,
+) {
+    egui::CollapsingHeader::new(format!("Agent groups · {}", groups.len()))
+        .id_salt(("ai-inspector-agent-groups", conversation_id))
+        .default_open(true)
+        .show(ui, |ui| {
+            for group in groups {
+                let (glyph, state, color) = match group.status {
+                    SubagentStatus::Pending => ("○", "Delegated", colors.tertiary_text),
+                    SubagentStatus::InProgress => ("●", "Running", colors.accent),
+                    SubagentStatus::Completed => ("✓", "Completed", colors.accent),
+                    SubagentStatus::Failed => ("!", "Failed", colors.danger),
+                    SubagentStatus::Cancelled => ("×", "Cancelled", colors.tertiary_text),
+                    SubagentStatus::PermissionBlocked => ("!", "Permission needed", colors.danger),
+                };
+                Frame::NONE
+                    .fill(colors.panel_inset)
+                    .corner_radius(8)
+                    .inner_margin(Margin::symmetric(9, 7))
+                    .stroke(Stroke::new(1.0, colors.tile_border))
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            ui.label(RichText::new(glyph).size(11.0).color(color));
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(if group.label.trim().is_empty() {
+                                        match group.kind {
+                                            AgentGroupKind::Swarm => "Agent swarm",
+                                            AgentGroupKind::Delegation => "Agent delegation",
+                                            AgentGroupKind::Workflow => "Agent workflow",
+                                            AgentGroupKind::MultiAgentInference => {
+                                                "Multi-agent inference"
+                                            }
+                                        }
+                                    } else {
+                                        &group.label
+                                    })
+                                    .size(11.5)
+                                    .strong()
+                                    .color(colors.secondary_text),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(state).size(9.5).color(color));
+                                    if let Some(count) = group.expected_count {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{count} {}",
+                                                if group.kind == AgentGroupKind::MultiAgentInference
+                                                {
+                                                    "agents"
+                                                } else {
+                                                    "jobs"
+                                                }
+                                            ))
+                                            .size(9.5)
+                                            .color(colors.tertiary_text),
+                                        );
+                                    }
+                                    if group.visibility == AgentGroupVisibility::AggregateOnly {
+                                        ui.label(
+                                            RichText::new("provider-managed · aggregate only")
+                                                .size(9.5)
+                                                .color(colors.tertiary_text),
+                                        );
+                                    } else if !group.members.is_empty() {
+                                        let completed = group
+                                            .members
+                                            .iter()
+                                            .filter(|member| {
+                                                member.status == SubagentStatus::Completed
+                                            })
+                                            .count();
+                                        let stopped = group
+                                            .members
+                                            .iter()
+                                            .filter(|member| {
+                                                matches!(
+                                                    member.status,
+                                                    SubagentStatus::Failed
+                                                        | SubagentStatus::Cancelled
+                                                        | SubagentStatus::PermissionBlocked
+                                                )
+                                            })
+                                            .count();
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{completed} done{}",
+                                                if stopped > 0 {
+                                                    format!(" · {stopped} stopped")
+                                                } else {
+                                                    String::new()
+                                                }
+                                            ))
+                                            .size(9.5)
+                                            .color(
+                                                if stopped > 0 {
+                                                    colors.danger
+                                                } else {
+                                                    colors.tertiary_text
+                                                },
+                                            ),
+                                        );
+                                    }
+                                });
+                                if let Some(detail) = group
+                                    .detail
+                                    .as_deref()
+                                    .filter(|detail| !detail.trim().is_empty())
+                                {
+                                    ui.label(
+                                        RichText::new(truncate(detail, 100))
+                                            .size(10.0)
+                                            .color(colors.tertiary_text),
+                                    );
+                                }
+                            });
+                        });
+                    });
+                ui.add_space(4.0);
+            }
+        });
 }
 
 fn render_ai_subagents_panel(
@@ -13932,6 +14140,7 @@ fn render_ai_inspector_activity(
                     | ActivityKind::PlanUpdate { .. }
                     | ActivityKind::TaskMutation { .. }
                     | ActivityKind::Subagent { .. }
+                    | ActivityKind::AgentGroup { .. }
                     | ActivityKind::Usage { .. }
                     | ActivityKind::TurnStatus { .. }
                     | ActivityKind::SessionInfo { .. }
@@ -14746,6 +14955,60 @@ fn render_ai_activity_trace(ui: &mut Ui, events: &[HarnessActivityEvent], colors
         return;
     }
 
+    let agent_groups = project_agent_groups(events);
+    if !agent_groups.is_empty() {
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            for group in agent_groups.iter().take(3) {
+                let (glyph, color) = match group.status {
+                    SubagentStatus::Pending => ("○", colors.tertiary_text),
+                    SubagentStatus::InProgress => ("●", colors.accent),
+                    SubagentStatus::Completed => ("✓", colors.accent),
+                    SubagentStatus::Failed | SubagentStatus::PermissionBlocked => {
+                        ("!", colors.danger)
+                    }
+                    SubagentStatus::Cancelled => ("×", colors.tertiary_text),
+                };
+                Frame::NONE
+                    .fill(colors.panel_inset)
+                    .corner_radius(12)
+                    .inner_margin(Margin::symmetric(8, 4))
+                    .stroke(Stroke::new(1.0, colors.tile_border))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(glyph).size(9.5).color(color));
+                            ui.label(
+                                RichText::new(truncate(
+                                    if group.label.trim().is_empty() {
+                                        "Agent group"
+                                    } else {
+                                        &group.label
+                                    },
+                                    34,
+                                ))
+                                .size(10.5)
+                                .color(colors.secondary_text),
+                            );
+                            if let Some(count) = group.expected_count {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{count} {}",
+                                        if group.kind == AgentGroupKind::MultiAgentInference {
+                                            "agents"
+                                        } else {
+                                            "jobs"
+                                        }
+                                    ))
+                                    .size(9.5)
+                                    .color(colors.tertiary_text),
+                                );
+                            }
+                        });
+                    });
+            }
+        });
+    }
+
     let subagents = project_subagents(events);
     if !subagents.is_empty() {
         ui.add_space(8.0);
@@ -14808,6 +15071,7 @@ fn render_ai_activity_trace(ui: &mut Ui, events: &[HarnessActivityEvent], colors
                 ActivityKind::AssistantText { .. }
                     | ActivityKind::PlanUpdate { .. }
                     | ActivityKind::Subagent { .. }
+                    | ActivityKind::AgentGroup { .. }
                     | ActivityKind::Usage { .. }
                     | ActivityKind::SessionInfo { .. }
                     | ActivityKind::TurnError { .. }
@@ -15156,11 +15420,7 @@ fn render_ai_composer(
                     action.send |= ui
                         .add_enabled(
                             !runtime.draft.trim().is_empty(),
-                            Button::new(if running {
-                                "Queue  ↵"
-                            } else {
-                                "Send  ↵"
-                            }),
+                            Button::new(if running { "Queue  ↵" } else { "Send  ↵" }),
                         )
                         .clicked();
                 });
@@ -15193,6 +15453,7 @@ fn render_ai_composer(
                         render_ai_reasoning_selector(
                             ui,
                             conversation_id,
+                            &provider_id,
                             &mut provider_profile,
                             &tuning,
                         );
@@ -15206,18 +15467,6 @@ fn render_ai_composer(
                     );
                 }
             });
-            if provider_id == "kimi_cli"
-                && (settings.workspace_mode == AiWorkspaceMode::Chat
-                    || !matches!(*permission, PermissionMode::Auto | PermissionMode::Bypass))
-            {
-                ui.label(
-                    RichText::new(
-                        "Kimi CLI needs Cowork or Code with Automatic access because its print mode auto-approves tools.",
-                    )
-                    .size(9.5)
-                    .color(colors.danger),
-                );
-            }
             let send_with_return = response.has_focus()
                 && !runtime.draft.trim().is_empty()
                 && ui.input_mut(|input| {
@@ -15264,6 +15513,7 @@ const CLAUDE_MODEL_OPTIONS: &[(&str, &str)] = &[
     ("haiku", "Haiku"),
 ];
 const GROK_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Provider default"), ("grok-4.5", "Grok 4.5")];
+const XAI_MULTI_AGENT_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Grok 4.20 · Multi-agent")];
 const DEFAULT_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Provider default")];
 
 fn ai_model_options(provider_id: &str) -> &'static [(&'static str, &'static str)] {
@@ -15271,6 +15521,7 @@ fn ai_model_options(provider_id: &str) -> &'static [(&'static str, &'static str)
         "codex_cli" => CODEX_MODEL_OPTIONS,
         "claude_cli" => CLAUDE_MODEL_OPTIONS,
         "grok_cli" => GROK_MODEL_OPTIONS,
+        "xai_api" => XAI_MULTI_AGENT_MODEL_OPTIONS,
         _ => DEFAULT_MODEL_OPTIONS,
     }
 }
@@ -15303,16 +15554,18 @@ fn render_ai_model_selector(
             for (model, label) in ai_model_options(provider_id) {
                 ui.selectable_value(&mut profile.model, (*model).to_owned(), *label);
             }
-            ui.separator();
-            ui.label(RichText::new("Custom model ID").size(10.0));
-            ui.add(
-                TextEdit::singleline(&mut profile.model)
-                    .hint_text(match provider_id {
-                        "lm_studio" | "ollama" | "openai_compatible" => "Required model ID",
-                        _ => "Optional model ID",
-                    })
-                    .desired_width(220.0),
-            );
+            if provider_id != "xai_api" {
+                ui.separator();
+                ui.label(RichText::new("Custom model ID").size(10.0));
+                ui.add(
+                    TextEdit::singleline(&mut profile.model)
+                        .hint_text(match provider_id {
+                            "lm_studio" | "ollama" | "openai_compatible" => "Required model ID",
+                            _ => "Optional model ID",
+                        })
+                        .desired_width(220.0),
+                );
+            }
         });
 }
 
@@ -15333,6 +15586,7 @@ fn reasoning_effort_label(value: &str) -> String {
 fn render_ai_reasoning_selector(
     ui: &mut Ui,
     conversation_id: Uuid,
+    provider_id: &str,
     profile: &mut AiProviderPreferences,
     tuning: &RuntimeTuningProfile,
 ) {
@@ -15341,22 +15595,44 @@ fn render_ai_reasoning_selector(
         return;
     }
     egui::ComboBox::from_id_salt(("ai-composer-reasoning", conversation_id))
-        .selected_text(format!(
-            "Reasoning · {}",
-            reasoning_effort_label(&profile.reasoning_effort)
-        ))
+        .selected_text(if provider_id == "xai_api" {
+            match profile.reasoning_effort.as_str() {
+                "high" | "xhigh" => "Heavy · 16 agents".to_owned(),
+                "low" | "medium" => "Multi-agent · 4 agents".to_owned(),
+                _ => "Multi-agent · 4 agents".to_owned(),
+            }
+        } else {
+            format!(
+                "Reasoning · {}",
+                reasoning_effort_label(&profile.reasoning_effort)
+            )
+        })
         .width(150.0)
         .show_ui(ui, |ui| {
             ui.selectable_value(
                 &mut profile.reasoning_effort,
                 String::new(),
-                reasoning_effort_label(""),
+                if provider_id == "xai_api" {
+                    "Default · 4 agents".into()
+                } else {
+                    reasoning_effort_label("")
+                },
             );
             for effort in tuning.reasoning_efforts {
                 ui.selectable_value(
                     &mut profile.reasoning_effort,
                     (*effort).to_owned(),
-                    reasoning_effort_label(effort),
+                    if provider_id == "xai_api" {
+                        match *effort {
+                            "low" => "Low · 4 agents".into(),
+                            "medium" => "Medium · 4 agents".into(),
+                            "high" => "High · 16 agents (Heavy)".into(),
+                            "xhigh" => "Extra high · 16 agents (Heavy)".into(),
+                            _ => reasoning_effort_label(effort),
+                        }
+                    } else {
+                        reasoning_effort_label(effort)
+                    },
                 );
             }
         });
@@ -15365,14 +15641,14 @@ fn render_ai_reasoning_selector(
 fn ai_provider_has_abilities(provider_id: &str) -> bool {
     matches!(
         provider_id,
-        "claude_cli" | "codex_cli" | "grok_cli" | "kimi_cli" | "ollama"
+        "claude_cli" | "codex_cli" | "grok_cli" | "xai_api" | "kimi_cli" | "ollama"
     )
 }
 
 fn ai_provider_has_configuration(provider_id: &str) -> bool {
     matches!(
         provider_id,
-        "claude_cli" | "grok_cli" | "lm_studio" | "openai_compatible" | "custom_cli"
+        "claude_cli" | "grok_cli" | "xai_api" | "lm_studio" | "openai_compatible" | "custom_cli"
     )
 }
 
@@ -15462,7 +15738,53 @@ fn render_ai_provider_abilities(
             }
             render_ai_feature_choice(ui, profile, AI_FEATURE_MEMORY, "Memory", true, true);
         }
-        "kimi_cli" | "ollama" => {
+        "xai_api" => {
+            render_ai_feature_choice(
+                ui,
+                profile,
+                AI_FEATURE_WEB_SEARCH,
+                "Web research",
+                true,
+                true,
+            );
+            ui.label(
+                RichText::new(
+                    "This is xAI’s server-managed multi-agent model. Low/medium uses 4 agents; high/extra-high uses 16.",
+                )
+                .size(9.0)
+                .color(colors.tertiary_text),
+            );
+        }
+        "kimi_cli" => {
+            if tuning.verified_runtime {
+                render_ai_feature_choice(ui, profile, AI_FEATURE_THINKING, "Thinking", true, true);
+            } else {
+                ui.label(
+                    RichText::new("Thinking · available after a compatible Kimi CLI is detected")
+                        .size(10.5)
+                        .color(colors.secondary_text),
+                );
+            }
+            if tuning.agent_group_channel
+                == crate::chat_core::AgentGroupChannel::KimiAcpToolAggregateV1
+            {
+                render_ai_feature_choice(ui, profile, AI_FEATURE_SWARM, "AgentSwarm", true, true);
+                ui.label(
+                    RichText::new(
+                        "AgentSwarm delegates real foreground Kimi child jobs. Kimi ACP reports final member results, not live child prose.",
+                    )
+                    .size(9.0)
+                    .color(colors.tertiary_text),
+                );
+            } else {
+                ui.label(
+                    RichText::new("AgentSwarm · requires verified Kimi Code 0.31.0")
+                        .size(10.5)
+                        .color(colors.secondary_text),
+                );
+            }
+        }
+        "ollama" => {
             render_ai_feature_choice(ui, profile, AI_FEATURE_THINKING, "Thinking", true, true);
         }
         _ => {}
@@ -15500,6 +15822,27 @@ fn render_ai_provider_configuration(
                 );
             }
         }
+        "xai_api" => {
+            ui.label(RichText::new("Authentication").size(10.5).strong());
+            ui.label(
+                RichText::new("Uses XAI_API_KEY, or the temporary key below.")
+                    .size(9.5)
+                    .color(colors.tertiary_text),
+            );
+            ui.add(
+                TextEdit::singleline(runtime.temporary_api_key_mut(provider_id))
+                    .password(true)
+                    .hint_text("Temporary xAI API key; never saved")
+                    .desired_width(280.0),
+            );
+            ui.label(
+                RichText::new(
+                    "Heavy is a separate xAI API service and does not reuse Grok CLI sign-in.",
+                )
+                .size(9.0)
+                .color(colors.tertiary_text),
+            );
+        }
         "lm_studio" | "openai_compatible" => {
             ui.label(RichText::new("Server endpoint").size(10.5).strong());
             ui.add(
@@ -15517,7 +15860,7 @@ fn render_ai_provider_configuration(
             }
             ui.label(RichText::new("Temporary API key").size(10.5));
             ui.add(
-                TextEdit::singleline(&mut runtime.api_key)
+                TextEdit::singleline(runtime.temporary_api_key_mut(provider_id))
                     .password(true)
                     .hint_text("Optional; never saved")
                     .desired_width(280.0),
@@ -15811,6 +16154,8 @@ fn ai_stream_dialect_key(dialect: StreamDialect) -> &'static str {
         StreamDialect::ClaudeStreamJson => "claude-stream-json:v1",
         StreamDialect::GrokStreamingJson => "grok-streaming-json:v1",
         StreamDialect::KimiStreamJson => "kimi-stream-json:v1",
+        StreamDialect::KimiAcp => "kimi-acp:v1",
+        StreamDialect::XaiResponsesSse => "xai-responses-sse:v1",
         StreamDialect::OpenAiCompatibleJson => "openai-compatible-json:v1",
     }
 }
@@ -15831,10 +16176,8 @@ fn ai_provider_profile_inputs(
             "grok".into(),
             vec!["--output-format".into(), "streaming-json".into()],
         ),
-        "kimi_cli" => (
-            "kimi".into(),
-            vec!["--output-format".into(), "stream-json".into()],
-        ),
+        "kimi_cli" => ("kimi".into(), vec!["acp".into()]),
+        "xai_api" => ("xai".into(), vec!["responses".into()]),
         // A configured endpoint uses LM Studio's OpenAI-compatible server;
         // clearing it intentionally selects the `lms` command-line client.
         "lm_studio" if !endpoint.trim().is_empty() => (String::new(), Vec::new()),
@@ -17407,6 +17750,26 @@ mod tests {
         );
         assert!(!ai_trace_has_productive_activity(&[session_only]));
 
+        let opaque_group_start = HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(1),
+            ActivityKind::AgentGroup {
+                id: "xai-turn".into(),
+                aliases: Vec::new(),
+                label: "Grok Heavy".into(),
+                kind: AgentGroupKind::MultiAgentInference,
+                status: SubagentStatus::InProgress,
+                expected_count: Some(16),
+                members: Vec::new(),
+                visibility: AgentGroupVisibility::AggregateOnly,
+                detail: None,
+            },
+        );
+        assert!(
+            !ai_trace_has_productive_activity(&[opaque_group_start]),
+            "adapter-owned aggregate startup must not suppress stale-id replay"
+        );
+
         let text =
             HarnessActivityEvent::assistant_text(Uuid::new_v4(), UnixMillis(2), "provider output");
         assert!(ai_trace_has_productive_activity(&[text]));
@@ -17965,6 +18328,25 @@ mod tests {
         assert_eq!(settings.model, "gpt-5.6-sol");
         select_ai_provider(&mut settings, "claude_cli");
         assert_eq!(settings.model, "sonnet");
+    }
+
+    #[test]
+    fn temporary_api_keys_are_scoped_to_their_exact_provider() {
+        let mut runtime = AiChatRuntime::default();
+        *runtime.temporary_api_key_mut("xai_api") = "  xai-secret  ".into();
+        *runtime.temporary_api_key_mut("openai_compatible") = "openai-secret".into();
+
+        assert_eq!(
+            runtime.temporary_api_key("xai_api").as_deref(),
+            Some("xai-secret")
+        );
+        assert_eq!(
+            runtime.temporary_api_key("openai_compatible").as_deref(),
+            Some("openai-secret")
+        );
+        assert_eq!(runtime.temporary_api_key("lm_studio"), None);
+        assert!(!provider_session_is_portable_activity("xai_api"));
+        assert!(provider_session_is_portable_activity("codex_cli"));
     }
 
     #[test]

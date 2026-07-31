@@ -1,0 +1,14 @@
+{
+  "model": "grok-4.20-multi-agent",
+  "input": "Research the question and cite primary sources.",
+  "reasoning": {
+    "effort": "low"
+  },
+  "tools": [
+    {
+      "type": "web_search"
+    }
+  ],
+  "stream": true,
+  "store": true
+}

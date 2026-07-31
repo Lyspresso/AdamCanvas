@@ -1,0 +1,14 @@
+{
+  "model": "grok-4.20-multi-agent",
+  "input": "Perform a deep, multi-perspective research synthesis.",
+  "reasoning": {
+    "effort": "high"
+  },
+  "tools": [
+    {
+      "type": "web_search"
+    }
+  ],
+  "stream": true,
+  "store": true
+}
