@@ -1124,6 +1124,24 @@ fn preset_process_spec_with_tuning(
             (PromptInput::SecureFile, OutputMode::JsonLines)
         }
         "kimi_cli" => {
+            // Kimi Code CLI (0.x) supersedes the legacy kimi-cli (1.x) and is
+            // what the vendor installer now delivers, but it is a different
+            // interface: the prompt moves to `-p <text>` (no stdin form —
+            // Commander has no dash convention, so `-p -` would send a literal
+            // dash), `--thinking` is gone, and its stream-json shape is
+            // uncaptured. The arguments below drive the legacy CLI only.
+            // Refuse clearly instead of launching a command we cannot drive.
+            // Port target: its `kimi acp` subcommand, alongside the Grok ACP work.
+            if tuning
+                .version
+                .as_ref()
+                .is_some_and(|version| version.major == 0)
+            {
+                return Err(AiEngineError::InvalidConfiguration(
+                    "This is Kimi Code CLI, which replaced the legacy kimi-cli and uses a different command interface. Adam cannot drive it yet — pick another provider, or connect Kimi as an OpenAI-compatible endpoint."
+                        .into(),
+                ));
+            }
             if request.workspace_mode == AiWorkspaceMode::Chat
                 || !matches!(
                     request.permission_mode,
@@ -9081,6 +9099,27 @@ send({
         assert!(arguments.contains(&"--print".into()));
         assert!(arguments.contains(&"stream-json".into()));
         assert!(!arguments.contains(&automatic.prompt));
+    }
+
+    #[test]
+    fn kimi_code_cli_is_refused_rather_than_launched_with_legacy_arguments() {
+        let mut run = request("kimi_cli");
+        run.permission_mode = PermissionMode::Auto;
+        run.workspace_mode = AiWorkspaceMode::Cowork;
+
+        // 0.x is Kimi Code CLI, whose interface differs from the legacy 1.x
+        // kimi-cli these arguments target; launching it produces a bare
+        // "unknown option '--print'" from the provider.
+        let error =
+            preset_process_spec_for_version("kimi_cli", PathBuf::from("/tmp/kimi"), &run, "0.31.0")
+                .unwrap_err();
+        assert!(error.to_string().contains("Kimi Code CLI"));
+
+        // The legacy line still launches.
+        let legacy =
+            preset_process_spec_for_version("kimi_cli", PathBuf::from("/tmp/kimi"), &run, "1.49.0")
+                .unwrap();
+        assert!(argument_strings(&legacy).contains(&"--print".into()));
     }
 
     #[test]
