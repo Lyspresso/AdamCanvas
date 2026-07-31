@@ -2171,6 +2171,7 @@ impl AdamApp {
         let mut reset_zoom_clicked = false;
         let mut grid_shape_clicked = None;
         let mut grid_mode_clicked = None;
+        let mut grid_edit_clicked = false;
 
         let toolbar = egui::Panel::top("adam-toolbar")
             .exact_size(TOOLBAR_HEIGHT)
@@ -2237,6 +2238,22 @@ impl AdamApp {
                             {
                                 grid_shape_clicked = Some(shape);
                             }
+                        }
+                        ui.separator();
+                        if ui
+                            .add(Button::new("Edit").selected(grid.editing))
+                            .on_hover_text(if grid.editing {
+                                "On: clicking a tile edits it. Notes open a text \
+                                 field here; documents and spreadsheets open in \
+                                 the app that owns them. Click to go back to \
+                                 browsing."
+                            } else {
+                                "Off: clicking a tile opens it to look at. Click \
+                                 to edit tiles instead."
+                            })
+                            .clicked()
+                        {
+                            grid_edit_clicked = true;
                         }
                         ui.separator();
                         // Two opt-in modes; clicking the active one returns to
@@ -2476,6 +2493,14 @@ impl AdamApp {
         }
         if let Some(mode) = grid_mode_clicked {
             self.set_grid_zoom_mode(mode);
+        }
+        if grid_edit_clicked && let Some(state) = &mut self.grid_view {
+            state.editing = !state.editing;
+            if !state.editing {
+                // Leaving edit mode abandons any open text field.
+                self.editing_note = None;
+                self.editing_focus_pending = None;
+            }
         }
         if reset_zoom_clicked {
             if self.grid_view.is_some() {
@@ -3460,6 +3485,7 @@ impl AdamApp {
                     );
                 }
 
+                let mut pending_activation = None;
                 let mut expanded_photo = None;
                 if let Some(lightbox) = state.lightbox {
                     let page = self.workspace.active_page();
@@ -3476,6 +3502,7 @@ impl AdamApp {
                             &mut self.previews,
                             pixels_per_point,
                             cell_aspect,
+                            state.editing && self.editing_note == Some(tile.id),
                             colors,
                         );
                         draw_grid_lightbox_caption(&painter, photo, tile, lightbox, colors);
@@ -3489,6 +3516,7 @@ impl AdamApp {
                     count,
                     state.shape,
                     state.mode,
+                    state.editing,
                     state.camera.zoom,
                     state.lightbox.is_some(),
                     colors,
@@ -3511,11 +3539,97 @@ impl AdamApp {
                     {
                         state.lightbox = Some(Lightbox::opening(index));
                         context.request_repaint();
+                        if state.editing {
+                            pending_activation =
+                                self.workspace.active_page().tiles.get(index).map(|tile| {
+                                    (tile.id, matches!(tile.content, TileContent::Note { .. }))
+                                });
+                        }
                     }
+                }
+
+                // A note is edited here, in the expanded cell. Everything else
+                // is handed to whatever already owns it — Word for a .docx,
+                // Excel for a .xlsx, the pile and tag sheets for those. Adam
+                // has no rich-text or spreadsheet engine of its own.
+                if let Some((id, is_note)) = pending_activation {
+                    if is_note {
+                        self.checkpoint();
+                        self.editing_note = Some(id);
+                        self.editing_focus_pending = Some(id);
+                    } else {
+                        self.activate_tile(id);
+                        // The file may come back changed, so the cached
+                        // thumbnail can no longer be trusted.
+                        self.previews.invalidate(id);
+                        self.structured_previews.invalidate(id);
+                    }
+                }
+
+                if state.editing
+                    && let Some(id) = self.editing_note
+                    && let Some(photo) = expanded_photo
+                    && state
+                        .lightbox
+                        .is_some_and(|lightbox| lightbox.progress >= 1.0)
+                {
+                    self.show_grid_note_editor(ui, &context, id, photo, colors);
                 }
 
                 self.grid_view = Some(state);
             });
+    }
+
+    /// The note text field that Edit mode opens inside the expanded cell.
+    ///
+    /// Separate from `show_note_editor`, which positions itself with the
+    /// canvas camera the grid does not use.
+    fn show_grid_note_editor(
+        &mut self,
+        ui: &mut Ui,
+        context: &Context,
+        id: Uuid,
+        photo: Rect,
+        colors: Theme,
+    ) {
+        let editor_rect = photo.shrink(20.0);
+        if editor_rect.width() < 60.0 || editor_rect.height() < 40.0 {
+            return;
+        }
+        let request_focus = self.editing_focus_pending == Some(id);
+        if request_focus {
+            self.editing_focus_pending = None;
+        }
+        let Some(Tile {
+            content: TileContent::Note { text },
+            ..
+        }) = self.workspace.active_page_mut().tile_mut(id)
+        else {
+            self.editing_note = None;
+            return;
+        };
+        let response = ui.put(
+            editor_rect,
+            TextEdit::multiline(text)
+                .desired_width(editor_rect.width())
+                .desired_rows(6)
+                .frame(Frame::NONE)
+                .hint_text("Type here…")
+                .text_color(colors.text),
+        );
+        if request_focus {
+            response.request_focus();
+        }
+        if response.changed() {
+            self.changed(false);
+        }
+        if context.input(|input| {
+            input.key_pressed(Key::Escape)
+                || (input.modifiers.command && input.key_pressed(Key::Enter))
+        }) {
+            self.editing_note = None;
+            self.editing_focus_pending = None;
+        }
     }
 
     /// Enters or leaves the grid view. Opening always starts at the top of the
@@ -11414,6 +11528,7 @@ fn draw_grid_lightbox(
     previews: &mut PreviewCache,
     pixels_per_point: f32,
     cell_aspect: f32,
+    editing: bool,
     colors: Theme,
 ) -> Rect {
     let factor = lightbox.factor();
@@ -11462,7 +11577,10 @@ fn draw_grid_lightbox(
     );
     let rect = grid_view::lerp_rect(cell, expanded, factor);
     painter.rect_filled(rect, CornerRadius::same(6), colors.tile);
+    // A live text field is about to be placed here; painting the same words
+    // underneath it would show through the editor's transparent frame.
     if let TileContent::Note { text } = &tile.content
+        && !editing
         && rect.height() > 60.0
     {
         painter.text(
@@ -11504,12 +11622,23 @@ fn draw_grid_view_hint(
     count: usize,
     shape: CellShape,
     mode: ZoomMode,
+    editing: bool,
     zoom: f32,
     lightbox_open: bool,
     colors: Theme,
 ) {
     let hint = if lightbox_open {
-        "← → browse · Esc back to grid".to_string()
+        if editing {
+            "Editing · Esc when done".to_string()
+        } else {
+            "← → browse · Esc back to grid".to_string()
+        }
+    } else if editing {
+        format!(
+            "Grid view · editing · {count} tile{} · {} · click a tile to edit it · Esc or G to exit",
+            if count == 1 { "" } else { "s" },
+            shape.label().to_lowercase(),
+        )
     } else {
         format!(
             "Grid view · {count} tile{} · {} · {} · {:.0}% · click to open · Esc or G to exit",

@@ -614,6 +614,9 @@ impl Lightbox {
 pub struct GridViewState {
     pub shape: CellShape,
     pub mode: ZoomMode,
+    /// Edit mode: a click activates the tile for its own kind of editing
+    /// rather than opening it to look at.
+    pub editing: bool,
     pub camera: GridCamera,
     pub lightbox: Option<Lightbox>,
 }
@@ -1182,6 +1185,21 @@ mod tests {
         let after = state.camera.to_layout(pointer, view);
         assert!((after.x - before.x).abs() < 0.01 && (after.y - before.y).abs() < 0.01);
         assert_eq!(state.metrics(view.width(), 300).columns, WALL_COLUMNS);
+    }
+
+    #[test]
+    fn edit_mode_is_off_by_default_and_outlives_shape_and_mode_changes() {
+        let view = view();
+        let mut state = GridViewState::default();
+        assert!(!state.editing, "the grid must open in browsing mode");
+
+        state.editing = true;
+        state.set_shape(CellShape::Portrait, view, 200);
+        assert!(state.editing, "a shape toggle must not drop edit mode");
+        state.set_mode(ZoomMode::Wall, view, 200);
+        assert!(state.editing, "a mode toggle must not drop edit mode");
+        state.apply_zoom(0.5, view.center(), view, 200);
+        assert!(state.editing, "zooming must not drop edit mode");
     }
 
     #[test]
