@@ -15,6 +15,7 @@ pub mod dots;
 pub mod file_watch;
 pub mod grid_view;
 pub(crate) mod grok_acp;
+pub mod live_sheet;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_image_io;
 #[cfg(target_os = "macos")]

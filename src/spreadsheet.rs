@@ -122,6 +122,23 @@ impl Sheet {
         self.rows == 0 || self.columns == 0
     }
 
+    /// Builds a sheet directly from cells — the live-mirror path, where the
+    /// grid comes from a running application instead of a file. The vector is
+    /// resized to exactly `rows * columns` so a short payload cannot leave
+    /// the row-major indexing misaligned.
+    pub fn from_cells(name: &str, rows: usize, columns: usize, mut cells: Vec<Cell>) -> Self {
+        cells.resize(rows * columns, Cell::default());
+        Self {
+            name: name.to_string(),
+            rows,
+            columns,
+            cells,
+            truncated: false,
+            source_rows: rows,
+            source_columns: columns,
+        }
+    }
+
     /// Grows the grid to at least `rows` × `columns`, padding with blanks.
     ///
     /// Editing needs room past the file's used range — adding a row of data

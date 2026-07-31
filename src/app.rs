@@ -37,6 +37,7 @@ use crate::{
     dots::{self, ChromeRects},
     file_watch::{self, FileWatch},
     grid_view::{self, CellShape, GridViewState, Lightbox, ZoomMode},
+    live_sheet::{self, LiveSheetMirror, MirrorOutcome},
     model::{
         CanvasPage, CanvasTileStyle, DEFAULT_TILE_SIZE, FileKind, PageViewState, Tile, TileContent,
         TileKind, Workspace, WorldRect,
@@ -911,6 +912,15 @@ pub struct AdamApp {
     /// disk changes, which is what makes an Excel save appear here.
     sheets: HashMap<Uuid, Option<spreadsheet::Workbook>>,
     sheet_states: HashMap<Uuid, SheetViewState>,
+    /// Mirrors the open lightbox's workbook live from Excel, unsaved
+    /// edits included. The save-watcher stays the fallback whenever the
+    /// workbook is not open there.
+    live_sheet: LiveSheetMirror,
+    last_live_poll: Instant,
+    live_in_flight: bool,
+    live_last_hash: HashMap<Uuid, u64>,
+    live_updated_at: HashMap<Uuid, Instant>,
+    live_blocked: bool,
     last_automation_persist: Instant,
     automation_initialized: bool,
     semantic_reconcile_needed: bool,
@@ -1115,6 +1125,7 @@ impl AdamApp {
         let saves = SaveWorker::start_with_base(paths.clone(), persistence_base);
         let previews = PreviewCache::start(paths.clone(), creation.egui_ctx.clone());
         let structured_previews = StructuredPreviewCache::start(creation.egui_ctx.clone());
+        let live_sheet = LiveSheetMirror::start(creation.egui_ctx.clone());
         let (image_paste_jobs, image_paste_results) =
             start_image_paste_worker(creation.egui_ctx.clone());
         let (asset_import_jobs, asset_import_results) =
@@ -1202,6 +1213,12 @@ impl AdamApp {
             last_file_watch: Instant::now(),
             sheets: HashMap::new(),
             sheet_states: HashMap::new(),
+            live_sheet,
+            last_live_poll: Instant::now(),
+            live_in_flight: false,
+            live_last_hash: HashMap::new(),
+            live_updated_at: HashMap::new(),
+            live_blocked: false,
             last_automation_persist: Instant::now(),
             automation_initialized: false,
             semantic_reconcile_needed: true,
@@ -1583,6 +1600,104 @@ impl AdamApp {
         if any_changed {
             context.request_repaint();
         }
+    }
+
+    /// Feeds the sheet view from Excel's in-memory workbook while its file's
+    /// lightbox is open — edits mirror as they are typed, before any save.
+    fn poll_live_sheet(&mut self, context: &Context) {
+        // Results first, whatever the request cadence.
+        while let Some(result) = self.live_sheet.poll() {
+            self.live_in_flight = false;
+            match result.outcome {
+                MirrorOutcome::Updated(sheet) => {
+                    let unchanged =
+                        self.live_last_hash.get(&result.tile) == Some(&result.payload_hash);
+                    if unchanged {
+                        continue;
+                    }
+                    // Apply only when the display cache is present; in the
+                    // brief window after a save-eviction the disk parse
+                    // restores the cache and the next poll lands on top.
+                    if let Some(Some(workbook)) = self.sheets.get_mut(&result.tile) {
+                        let slot = workbook
+                            .sheets
+                            .iter_mut()
+                            .find(|candidate| candidate.name == sheet.name);
+                        if let Some(slot) = slot {
+                            *slot = sheet;
+                        } else if let Some(first) = workbook.sheets.first_mut() {
+                            *first = sheet;
+                        } else {
+                            workbook.sheets.push(sheet);
+                        }
+                        self.live_last_hash.insert(result.tile, result.payload_hash);
+                        self.live_updated_at.insert(result.tile, Instant::now());
+                        context.request_repaint();
+                    }
+                }
+                MirrorOutcome::PermissionDenied => {
+                    if !self.live_blocked {
+                        self.live_blocked = true;
+                        self.toast(
+                            "Live Excel mirroring needs permission: System Settings →                              Privacy & Security → Automation → Adam → Microsoft Excel",
+                            context,
+                        );
+                    }
+                }
+                MirrorOutcome::TooBig | MirrorOutcome::Unavailable => {}
+                MirrorOutcome::Failed(error) => {
+                    log::debug!("live sheet mirror: {error}");
+                }
+            }
+        }
+
+        if self.live_blocked
+            || self.live_in_flight
+            || self.last_live_poll.elapsed() < live_sheet::POLL_INTERVAL
+        {
+            return;
+        }
+        // Only the workbook actually on screen gets mirrored.
+        let Some(state) = self.grid_view else {
+            return;
+        };
+        let Some(lightbox) = state.lightbox else {
+            return;
+        };
+        let Some((tile, path)) = self
+            .workspace
+            .active_page()
+            .tiles
+            .get(lightbox.index)
+            .and_then(|tile| match &tile.content {
+                TileContent::File { path, .. } if spreadsheet::is_spreadsheet(path) => {
+                    Some((tile.id, path.clone()))
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let sheet_index = self
+            .sheet_states
+            .get(&tile)
+            .map(|state| state.sheet)
+            .unwrap_or(0);
+        let Some(sheet_name) = self
+            .sheets
+            .get(&tile)
+            .and_then(|workbook| workbook.as_ref())
+            .and_then(|workbook| workbook.sheet(sheet_index))
+            .map(|sheet| sheet.name.clone())
+        else {
+            return;
+        };
+        self.last_live_poll = Instant::now();
+        self.live_in_flight = self.live_sheet.request(live_sheet::PollRequest {
+            tile,
+            path,
+            sheet_name,
+        });
     }
 
     fn poll_automation(&mut self, context: &Context) {
@@ -3802,7 +3917,15 @@ impl AdamApp {
                 sheet.rows, sheet.columns, sheet.source_rows, sheet.source_columns
             ));
         }
-        status.push_str("  ·  live view — double-click to edit; saves appear here");
+        let mirrored_live = self
+            .live_updated_at
+            .get(&id)
+            .is_some_and(|at| at.elapsed() < live_sheet::LIVE_BADGE_TTL);
+        status.push_str(if mirrored_live {
+            "  ·  live from Excel — updates as you type"
+        } else {
+            "  ·  live view — double-click to edit; saves appear here"
+        });
         ui.painter().text(
             pos2(rect.left() + 8.0, rect.bottom() + 16.0),
             Align2::LEFT_CENTER,
@@ -10683,6 +10806,7 @@ impl eframe::App for AdamApp {
         self.handle_external_drops(context);
         self.poll_automation(context);
         self.poll_file_watch(context);
+        self.poll_live_sheet(context);
         self.maybe_autosave();
     }
 
