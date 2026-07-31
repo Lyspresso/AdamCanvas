@@ -8,11 +8,11 @@ use crate::{
     ai_task_bridge::TaskToolBridge,
     ai_task_tools::{TaskToolOutcome, TaskToolRegistry},
     chat_core::{
-        ActivityEvent, ActivityKind, ActivityStatus, CliVersion, FileChange, FileChangeKind,
-        PermissionResolution, PlanChannel, PlanItem, PlanItemOrigin, PlanItemStatus, ProviderKind,
-        ResumeStrategy, RetryHint, RuntimeTuningProfile, SubagentStatus, SystemPromptChannel,
-        TaskMutationKind, TurnStatus, capability_profile, capability_profile_for_runtime,
-        runtime_tuning_profile,
+        ActivityEvent, ActivityKind, ActivityStatus, AgentScope, CliVersion, FileChange,
+        FileChangeKind, PermissionResolution, PlanChannel, PlanItem, PlanItemOrigin,
+        PlanItemStatus, ProviderKind, ResumeStrategy, RetryHint, RuntimeTuningProfile,
+        SubagentStatus, SystemPromptChannel, TaskMutationKind, TurnStatus, capability_profile,
+        capability_profile_for_runtime, runtime_tuning_profile,
     },
     domain::{
         AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_THINKING,
@@ -666,7 +666,7 @@ pub fn clamp_provider_preferences(
     } else {
         preferences.reasoning_effort.clear();
     }
-    if provider_id == "grok_cli" && !tuning.supports_scoped_child_text {
+    if provider_id == "grok_cli" && !tuning.supports_scoped_child_text() {
         preferences.set_feature(AI_FEATURE_SUBAGENTS, Some(false));
     }
     *preferences != original
@@ -1107,7 +1107,7 @@ fn preset_process_spec_with_tuning(
             if request.provider_preferences.feature(AI_FEATURE_PLANNING) == Some(false) {
                 arguments.push("--no-plan".into());
             }
-            if !tuning.supports_scoped_child_text
+            if !tuning.supports_scoped_child_text()
                 || request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) == Some(false)
             {
                 arguments.push("--no-subagents".into());
@@ -1725,7 +1725,7 @@ fn run_grok_acp_transport(
         .normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
         .map(str::to_owned);
     let mut rules = request.system_prompt.clone().unwrap_or_default();
-    if !tuning.supports_scoped_child_text
+    if !tuning.supports_scoped_child_text()
         || request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) == Some(false)
     {
         if !rules.is_empty() {
@@ -2490,11 +2490,15 @@ fn emit_decoded(request: &AiRunRequest, sender: &Sender<AiEvent>, decoded: Decod
 }
 
 fn activity_event(kind: ActivityKind) -> ActivityEvent {
+    scoped_activity_event(AgentScope::Main, kind)
+}
+
+fn scoped_activity_event(scope: AgentScope, kind: ActivityKind) -> ActivityEvent {
     let at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
-    ActivityEvent::new(Uuid::new_v4(), UnixMillis(at), kind)
+    ActivityEvent::scoped(Uuid::new_v4(), UnixMillis(at), scope, kind)
 }
 
 struct PendingTaskUpdate {
@@ -2543,6 +2547,7 @@ struct OutputDecoder {
     task_subjects: HashMap<String, String>,
     subagents: HashMap<String, KnownSubagent>,
     subagent_aliases: HashMap<String, String>,
+    subagent_messages: HashMap<String, String>,
     grok_tool_names: HashMap<String, String>,
     grok_native_plan: Vec<PlanItem>,
     codex_streamed_items: HashSet<String>,
@@ -2592,6 +2597,7 @@ impl OutputDecoder {
             task_subjects: HashMap::new(),
             subagents: HashMap::new(),
             subagent_aliases: HashMap::new(),
+            subagent_messages: HashMap::new(),
             grok_tool_names: HashMap::new(),
             grok_native_plan: Vec::new(),
             codex_streamed_items: HashSet::new(),
@@ -2747,10 +2753,11 @@ impl OutputDecoder {
                     self.failure_kind.get_or_insert(kind);
                 }
                 let subagent_duration_ms = result.subagent_duration_ms;
-                for kind in result.kinds {
+                for activity in result.kinds {
                     self.recognized_events = self.recognized_events.saturating_add(1);
-                    match kind {
-                        ActivityKind::AssistantText { text } => {
+                    let scope = activity.scope;
+                    match activity.kind {
+                        ActivityKind::AssistantText { text } if scope.is_main() => {
                             self.record_assistant_text(
                                 text,
                                 result.text_delta,
@@ -2758,18 +2765,25 @@ impl OutputDecoder {
                                 emit,
                             );
                         }
-                        ActivityKind::Thinking { .. } => {
-                            self.saw_thinking_delta |= result.thinking_delta;
-                            emit(Decoded::Activity(activity_event(kind)));
+                        kind @ ActivityKind::AssistantText { .. } => {
+                            emit(Decoded::Activity(scoped_activity_event(scope, kind)));
                         }
-                        ActivityKind::SessionInfo { ref session_id, .. } => {
-                            if let Some(session_id) = session_id.as_ref() {
+                        kind @ ActivityKind::Thinking { .. } => {
+                            self.saw_thinking_delta |= result.thinking_delta;
+                            emit(Decoded::Activity(scoped_activity_event(scope, kind)));
+                        }
+                        kind @ ActivityKind::SessionInfo { .. } => {
+                            if let ActivityKind::SessionInfo {
+                                session_id: Some(session_id),
+                                ..
+                            } = &kind
+                            {
                                 self.session_id = Some(session_id.clone());
                             }
-                            emit(Decoded::Activity(activity_event(kind)));
+                            emit(Decoded::Activity(scoped_activity_event(scope, kind)));
                         }
-                        _ => {
-                            let mut event = activity_event(kind);
+                        kind => {
+                            let mut event = scoped_activity_event(scope, kind);
                             if let ActivityKind::Subagent { id, .. } = &event.kind {
                                 event.duration_ms = subagent_duration_ms.get(id).copied();
                             }
@@ -2912,9 +2926,55 @@ enum Decoded {
     StreamReset,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct DecodedActivity {
+    scope: AgentScope,
+    kind: ActivityKind,
+}
+
+#[derive(Default)]
+struct DecodedActivities(Vec<DecodedActivity>);
+
+impl DecodedActivities {
+    fn push(&mut self, kind: ActivityKind) {
+        self.0.push(DecodedActivity {
+            scope: AgentScope::Main,
+            kind,
+        });
+    }
+
+    fn push_scoped(&mut self, scope: AgentScope, kind: ActivityKind) {
+        self.0.push(DecodedActivity { scope, kind });
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[cfg(test)]
+    fn into_main_kinds(self) -> Vec<ActivityKind> {
+        self.0
+            .into_iter()
+            .map(|activity| {
+                assert!(activity.scope.is_main());
+                activity.kind
+            })
+            .collect()
+    }
+}
+
+impl IntoIterator for DecodedActivities {
+    type Item = DecodedActivity;
+    type IntoIter = std::vec::IntoIter<DecodedActivity>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 #[derive(Default)]
 struct JsonDecodeResult {
-    kinds: Vec<ActivityKind>,
+    kinds: DecodedActivities,
     subagent_duration_ms: HashMap<String, i64>,
     fatal_error: Option<String>,
     fatal_kind: Option<AiFailureKind>,
@@ -3148,7 +3208,10 @@ impl OutputDecoder {
                     });
                 }
             }
-            "collab_agent_tool_call" | "collabAgentToolCall" => {
+            "collab_tool_call"
+            | "collabToolCall"
+            | "collab_agent_tool_call"
+            | "collabAgentToolCall" => {
                 decoded.recognized = true;
                 self.decode_codex_collab_item(phase, item, &mut decoded);
             }
@@ -3169,7 +3232,8 @@ impl OutputDecoder {
     ) {
         let tool = string_at(item, &["tool"]).unwrap_or_else(|| "spawnAgent".into());
         let tool_token = normalized_token(&tool);
-        let sender = string_at(item, &["sender_thread_id", "senderThreadId"]);
+        let sender = string_at(item, &["sender_thread_id", "senderThreadId"])
+            .map(|sender| self.canonical_subagent_id(&sender));
         let prompt = string_at(item, &["prompt"]);
         let model = string_at(item, &["model"]);
         let effort = string_at(item, &["reasoning_effort", "reasoningEffort"]);
@@ -3214,6 +3278,9 @@ impl OutputDecoder {
             } else {
                 String::new()
             };
+            let child_message = (status == SubagentStatus::Completed)
+                .then(|| state_message.clone())
+                .flatten();
             let detail = state_message.or_else(|| {
                 effort
                     .as_deref()
@@ -3230,6 +3297,7 @@ impl OutputDecoder {
             );
             decoded.kinds.push(ActivityKind::Subagent {
                 id: canonical_id.clone(),
+                aliases: self.subagent_aliases_for(&canonical_id),
                 parent_id: metadata.parent_id,
                 label: metadata.label,
                 status,
@@ -3237,6 +3305,16 @@ impl OutputDecoder {
                 detail: metadata.detail,
                 tool_calls: None,
             });
+            if let Some(text) =
+                child_message.and_then(|text| self.remember_subagent_message(&canonical_id, text))
+            {
+                decoded.kinds.push_scoped(
+                    AgentScope::Child {
+                        id: canonical_id.clone(),
+                    },
+                    ActivityKind::AssistantText { text },
+                );
+            }
             if let Some(duration_ms) = duration_ms {
                 decoded
                     .subagent_duration_ms
@@ -3277,6 +3355,7 @@ impl OutputDecoder {
         );
         decoded.kinds.push(ActivityKind::Subagent {
             id: canonical_id.clone(),
+            aliases: self.subagent_aliases_for(&canonical_id),
             parent_id: metadata.parent_id,
             label: metadata.label,
             status,
@@ -3329,6 +3408,32 @@ impl OutputDecoder {
             metadata.label = "Subagent".into();
         }
         metadata.clone()
+    }
+
+    fn subagent_aliases_for(&self, canonical_id: &str) -> Vec<String> {
+        let mut aliases = self
+            .subagent_aliases
+            .keys()
+            .filter(|alias| self.canonical_subagent_id(alias) == canonical_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        aliases.sort();
+        aliases.dedup();
+        aliases
+    }
+
+    fn remember_subagent_message(&mut self, canonical_id: &str, text: String) -> Option<String> {
+        if text.trim().is_empty()
+            || self
+                .subagent_messages
+                .get(canonical_id)
+                .is_some_and(|existing| existing == &text)
+        {
+            return None;
+        }
+        self.subagent_messages
+            .insert(canonical_id.to_owned(), text.clone());
+        Some(text)
     }
 
     fn decode_grok(&mut self, value: &Value) -> JsonDecodeResult {
@@ -3413,6 +3518,7 @@ impl OutputDecoder {
                 self.task_subjects.insert(id.clone(), label.clone());
                 decoded.kinds.push(ActivityKind::Subagent {
                     id: id.clone(),
+                    aliases: self.subagent_aliases_for(&id),
                     parent_id: string_at(update, &["parent_session_id"]),
                     label: label.clone(),
                     status: SubagentStatus::InProgress,
@@ -3442,12 +3548,53 @@ impl OutputDecoder {
                 let label = self.task_subjects.get(&id).cloned().unwrap_or_default();
                 decoded.kinds.push(ActivityKind::Subagent {
                     id: id.clone(),
+                    aliases: self.subagent_aliases_for(&id),
                     parent_id: string_at(update, &["parent_session_id"]),
                     label: label.clone(),
                     status: subagent_status,
                     model: string_at(update, &["model"]),
                     detail: detail.clone(),
                     tool_calls: update.get("tool_calls").and_then(Value::as_u64),
+                });
+                if subagent_status == SubagentStatus::Completed
+                    && let Some(text) = string_at(update, &["output"])
+                    && let Some(text) = self.remember_subagent_message(&id, text)
+                {
+                    decoded.kinds.push_scoped(
+                        AgentScope::Child { id },
+                        ActivityKind::AssistantText { text },
+                    );
+                }
+            }
+            "subagent_progress" => {
+                let Some(id) = string_at(update, &["subagent_id", "child_session_id"])
+                    .filter(|id| !id.is_empty())
+                else {
+                    return decoded;
+                };
+                decoded.recognized = true;
+                let label = self.task_subjects.get(&id).cloned().unwrap_or_default();
+                let tool_calls = update.get("tool_call_count").and_then(Value::as_u64);
+                let detail = string_list_at(update, &["tools_used"])
+                    .last()
+                    .map(|tool| format!("Using {}", activity_tool_name(tool)))
+                    .or_else(|| {
+                        update
+                            .get("turn_count")
+                            .and_then(Value::as_u64)
+                            .map(|turns| {
+                                format!("{turns} turn{}", if turns == 1 { "" } else { "s" })
+                            })
+                    });
+                decoded.kinds.push(ActivityKind::Subagent {
+                    id: id.clone(),
+                    aliases: self.subagent_aliases_for(&id),
+                    parent_id: string_at(update, &["parent_session_id"]),
+                    label,
+                    status: SubagentStatus::InProgress,
+                    model: string_at(update, &["model"]),
+                    detail,
+                    tool_calls,
                 });
             }
             "tool_call" => {
@@ -3716,6 +3863,15 @@ impl OutputDecoder {
                     if block.get("type").and_then(Value::as_str) == Some("tool_result")
                         && let Some(kind) = self.decode_tool_result(block, Some(value))
                     {
+                        let child_message = match &kind {
+                            ActivityKind::Subagent {
+                                id,
+                                status: SubagentStatus::Completed,
+                                detail: Some(text),
+                                ..
+                            } if !text.trim().is_empty() => Some((id.clone(), text.clone())),
+                            _ => None,
+                        };
                         if let ActivityKind::Subagent { id, .. } = &kind
                             && let Some(duration_ms) =
                                 claude_subagent_duration_ms(block, Some(value))
@@ -3723,6 +3879,14 @@ impl OutputDecoder {
                             decoded.subagent_duration_ms.insert(id.clone(), duration_ms);
                         }
                         decoded.kinds.push(kind);
+                        if let Some((child_id, text)) = child_message
+                            && let Some(text) = self.remember_subagent_message(&child_id, text)
+                        {
+                            decoded.kinds.push_scoped(
+                                AgentScope::Child { id: child_id },
+                                ActivityKind::AssistantText { text },
+                            );
+                        }
                     }
                 }
             }
@@ -3891,6 +4055,7 @@ impl OutputDecoder {
             });
         decoded.kinds.push(ActivityKind::Subagent {
             id: canonical_id.clone(),
+            aliases: self.subagent_aliases_for(&canonical_id),
             parent_id: metadata.parent_id,
             label: metadata.label,
             status,
@@ -3974,6 +4139,7 @@ impl OutputDecoder {
         );
         decoded.kinds.push(ActivityKind::Subagent {
             id: canonical_id.clone(),
+            aliases: self.subagent_aliases_for(&canonical_id),
             parent_id: metadata.parent_id,
             label: metadata.label,
             status: SubagentStatus::InProgress,
@@ -4050,6 +4216,7 @@ impl OutputDecoder {
             },
         );
         Some(ActivityKind::Subagent {
+            aliases: self.subagent_aliases_for(&canonical_id),
             id: canonical_id,
             parent_id: metadata.parent_id,
             label: metadata.label,
@@ -4489,10 +4656,9 @@ impl OutputDecoder {
             .and_then(|payload| string_at(payload, &["agent_id", "agentId", "task_id", "taskId"]));
         let canonical_id = if self.is_known_subagent(&tool_use_id) {
             self.canonical_subagent_id(&tool_use_id)
-        } else if let Some(provider_agent_id) = provider_agent_id.as_deref() {
-            self.canonical_subagent_id(provider_agent_id)
         } else {
-            return None;
+            let provider_agent_id = provider_agent_id.as_deref()?;
+            self.canonical_subagent_id(provider_agent_id)
         };
         self.bind_subagent_alias(tool_use_id, canonical_id.clone());
         if let Some(provider_agent_id) = provider_agent_id {
@@ -4554,6 +4720,7 @@ impl OutputDecoder {
             },
         );
         Some(ActivityKind::Subagent {
+            aliases: self.subagent_aliases_for(&canonical_id),
             id: canonical_id,
             parent_id: metadata.parent_id,
             label: metadata.label,
@@ -4971,7 +5138,13 @@ fn is_grok_session_activity_update(value: &Value) -> bool {
         grok_session_update(value)
             .get("sessionUpdate")
             .and_then(Value::as_str),
-        Some("subagent_spawned" | "subagent_finished" | "tool_call" | "tool_call_update")
+        Some(
+            "subagent_spawned"
+                | "subagent_progress"
+                | "subagent_finished"
+                | "tool_call"
+                | "tool_call_update"
+        )
     )
 }
 
@@ -4982,10 +5155,10 @@ fn decode_grok_session_activity_events(
     let result = decoder.decode_grok_session_update(update);
     let timestamp = grok_session_timestamp_ms(update);
     let mut events = Vec::with_capacity(result.kinds.len());
-    for kind in result.kinds {
+    for activity in result.kinds {
         decoder.recognized_events = decoder.recognized_events.saturating_add(1);
-        let is_subagent = matches!(kind, ActivityKind::Subagent { .. });
-        let mut event = activity_event(kind);
+        let is_subagent = matches!(&activity.kind, ActivityKind::Subagent { .. });
+        let mut event = scoped_activity_event(activity.scope, activity.kind);
         if let Some(timestamp) = timestamp {
             event.at = UnixMillis(timestamp);
         }
@@ -5200,6 +5373,7 @@ fn harvest_grok_subagent_metadata(
         };
         let mut event = activity_event(ActivityKind::Subagent {
             id: id.clone(),
+            aliases: decoder.subagent_aliases_for(&id),
             parent_id: Some(parent_session_id.into()),
             label: label.clone(),
             status,
@@ -9347,8 +9521,12 @@ send({
     fn kimi_and_codex_shapes_normalize_to_text_and_activity() {
         let kimi = json!({"role":"assistant","content":"Kimi answer"});
         let mut kimi_decoder = OutputDecoder::new("kimi_cli".into(), OutputMode::JsonLines);
+        let kimi_kinds = kimi_decoder
+            .decode_provider_event(&kimi)
+            .kinds
+            .into_main_kinds();
         assert!(matches!(
-            kimi_decoder.decode_provider_event(&kimi).kinds.as_slice(),
+            kimi_kinds.as_slice(),
             [ActivityKind::AssistantText { text }] if text == "Kimi answer"
         ));
 
@@ -9357,8 +9535,12 @@ send({
             "item":{"id":"answer-1","type":"agent_message","text":"Codex answer"}
         });
         let mut codex_decoder = OutputDecoder::new("codex_cli".into(), OutputMode::JsonLines);
+        let codex_kinds = codex_decoder
+            .decode_provider_event(&codex)
+            .kinds
+            .into_main_kinds();
         assert!(matches!(
-            codex_decoder.decode_provider_event(&codex).kinds.as_slice(),
+            codex_kinds.as_slice(),
             [ActivityKind::AssistantText { text }] if text == "Codex answer"
         ));
 
@@ -9372,8 +9554,12 @@ send({
             }]}
         });
         let mut claude_decoder = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
+        let claude_kinds = claude_decoder
+            .decode_provider_event(&tool)
+            .kinds
+            .into_main_kinds();
         assert!(matches!(
-            claude_decoder.decode_provider_event(&tool).kinds.as_slice(),
+            claude_kinds.as_slice(),
             [ActivityKind::ToolCall { name, .. }] if name == "Read"
         ));
     }
@@ -9382,12 +9568,18 @@ send({
     fn codex_native_collab_items_project_one_stable_subagent_with_aliases() {
         let stream = concat!(
             "{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"root-thread\"}}}\n",
-            "{\"method\":\"item/started\",\"params\":{\"item\":{\"id\":\"collab-1\",\"type\":\"collabAgentToolCall\",\"tool\":\"spawnAgent\",\"status\":\"inProgress\",\"senderThreadId\":\"root-thread\",\"receiverThreadIds\":[\"child-thread\"],\"prompt\":\"Audit authentication flows\\nReturn concise findings\",\"model\":\"gpt-5.6\",\"reasoningEffort\":\"high\",\"agentsStates\":{\"child-thread\":{\"status\":\"running\",\"message\":\"Reading auth files\"}}}}}\n",
+            "{\"type\":\"item.started\",\"item\":{\"id\":\"collab-1\",\"type\":\"collab_tool_call\",\"tool\":\"spawn_agent\",\"status\":\"in_progress\",\"sender_thread_id\":\"root-thread\",\"receiver_thread_ids\":[\"child-thread\"],\"prompt\":\"Audit authentication flows\\nReturn concise findings\",\"model\":\"gpt-5.6\",\"reasoning_effort\":\"high\",\"agents_states\":{\"child-thread\":{\"status\":\"running\",\"message\":\"Reading auth files\"}}}}\n",
             "{\"type\":\"item.completed\",\"item\":{\"id\":\"activity-1\",\"type\":\"sub_agent_activity\",\"kind\":\"interacted\",\"agent_thread_id\":\"child-thread\",\"agent_path\":\"root/child-thread\"}}\n",
-            "{\"method\":\"item/completed\",\"params\":{\"item\":{\"id\":\"collab-1\",\"type\":\"collabAgentToolCall\",\"tool\":\"wait\",\"status\":\"completed\",\"senderThreadId\":\"root-thread\",\"receiverThreadIds\":[\"child-thread\"],\"durationMs\":3125,\"agentsStates\":{\"child-thread\":{\"status\":\"completed\",\"message\":\"Audit complete\"}}}}}\n"
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"collab-1\",\"type\":\"collab_tool_call\",\"tool\":\"wait\",\"status\":\"completed\",\"sender_thread_id\":\"root-thread\",\"receiver_thread_ids\":[\"child-thread\"],\"duration_ms\":3125,\"agents_states\":{\"child-thread\":{\"status\":\"completed\",\"message\":\"Audit complete\"}}}}\n"
         );
         let (decoder, decoded) = decode_in_chunks("codex_cli", stream, 9);
         assert_eq!(decoder.session_id.as_deref(), Some("root-thread"));
+        assert!(decoder.output.is_empty());
+        assert!(
+            !decoded
+                .iter()
+                .any(|event| matches!(event, Decoded::Delta(_)))
+        );
         let accumulator = accumulated(&decoded);
         let subagents = crate::chat_core::project_subagents(&accumulator.events);
         assert_eq!(subagents.len(), 1);
@@ -9398,6 +9590,9 @@ send({
         assert_eq!(subagents[0].model.as_deref(), Some("gpt-5.6"));
         assert_eq!(subagents[0].detail.as_deref(), Some("Audit complete"));
         assert_eq!(subagents[0].duration_ms, Some(3_125));
+        assert_eq!(subagents[0].prose_cells.len(), 1);
+        assert_eq!(subagents[0].prose_cells[0].text, "Audit complete");
+        assert!(crate::chat_core::assistant_flat_text(&accumulator.events).is_empty());
         assert!(!accumulator.events.iter().any(|event| matches!(
             event.kind,
             ActivityKind::TaskMutation { .. } | ActivityKind::PlanUpdate { .. }
@@ -9418,6 +9613,12 @@ send({
         );
         let (decoder, decoded) = decode_in_chunks("claude_cli", stream, 13);
         assert_eq!(decoder.session_id.as_deref(), Some("claude-root"));
+        assert!(decoder.output.is_empty());
+        assert!(
+            !decoded
+                .iter()
+                .any(|event| matches!(event, Decoded::Delta(_)))
+        );
         let accumulator = accumulated(&decoded);
         let subagents = crate::chat_core::project_subagents(&accumulator.events);
         assert_eq!(subagents.len(), 1);
@@ -9429,6 +9630,16 @@ send({
         assert_eq!(subagents[0].detail.as_deref(), Some("Auth audit delivered"));
         assert_eq!(subagents[0].tool_calls, Some(8));
         assert_eq!(subagents[0].duration_ms, Some(5_000));
+        assert_eq!(
+            subagents[0].aliases,
+            vec!["background-agent-7", "claude-agent-real"]
+        );
+        assert_eq!(subagents[0].prose_cells.len(), 1);
+        assert_eq!(
+            subagents[0].prose_cells[0].text,
+            "Found two validation gaps"
+        );
+        assert!(crate::chat_core::assistant_flat_text(&accumulator.events).is_empty());
         assert!(!accumulator.events.iter().any(|event| matches!(
             event.kind,
             ActivityKind::TaskMutation { .. } | ActivityKind::PlanUpdate { .. }
@@ -9599,6 +9810,46 @@ send({
                     decoder.output, expected,
                     "{provider} changed at chunk size {chunk_size}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn version_pinned_child_fixtures_keep_parent_and_child_prose_separate() {
+        for (provider, stream) in [
+            (
+                "codex_cli",
+                include_str!("../tests/fixtures/ai/codex/0.144.1/subagent.jsonl"),
+            ),
+            (
+                "claude_cli",
+                include_str!("../tests/fixtures/ai/claude/2.1.128/subagent.jsonl"),
+            ),
+        ] {
+            assert_jsonl_fixture(stream);
+            for chunk_size in [1, 11, stream.len()] {
+                let (decoder, decoded) = decode_in_chunks(provider, stream, chunk_size);
+                assert_eq!(decoder.output, "PARENT_FIXTURE_OK");
+                let streamed = decoded
+                    .iter()
+                    .filter_map(|event| match event {
+                        Decoded::Delta(text) => Some(text.as_str()),
+                        Decoded::Activity(_) | Decoded::StreamReset => None,
+                    })
+                    .collect::<String>();
+                assert_eq!(streamed, "PARENT_FIXTURE_OK");
+
+                let accumulator = accumulated(&decoded);
+                assert_eq!(
+                    crate::chat_core::assistant_flat_text(&accumulator.events),
+                    "PARENT_FIXTURE_OK"
+                );
+                let children = crate::chat_core::project_subagents(&accumulator.events);
+                assert_eq!(children.len(), 1);
+                assert_eq!(children[0].status, SubagentStatus::Completed);
+                assert_eq!(children[0].prose_cells.len(), 1);
+                assert_eq!(children[0].prose_cells[0].text, "CHILD_FIXTURE_OK");
+                assert!(children[0].checklist.is_none());
             }
         }
     }
@@ -10100,6 +10351,54 @@ send({
         assert_eq!(
             decoder.protocol_error.as_deref(),
             Some("Web access approval could not be answered in this non-interactive Grok run.")
+        );
+    }
+
+    #[test]
+    fn grok_session_child_output_is_scoped_but_does_not_enable_the_runtime_gate() {
+        let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
+        let updates = [
+            json!({"params":{"update":{
+                "sessionUpdate":"subagent_spawned",
+                "subagent_id":"child-1",
+                "child_session_id":"child-1",
+                "parent_session_id":"root-1",
+                "description":"Research sources"
+            }}}),
+            json!({"params":{"update":{
+                "sessionUpdate":"subagent_progress",
+                "subagent_id":"child-1",
+                "child_session_id":"child-1",
+                "parent_session_id":"root-1",
+                "turn_count":2,
+                "tool_call_count":3,
+                "tools_used":["WebSearch"]
+            }}}),
+            json!({"params":{"update":{
+                "sessionUpdate":"subagent_finished",
+                "subagent_id":"child-1",
+                "child_session_id":"child-1",
+                "status":"completed",
+                "tool_calls":3,
+                "duration_ms":1200,
+                "output":"CHILD_ONLY"
+            }}}),
+        ];
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for update in updates {
+            accumulator.ingest_many(decode_grok_session_activity_events(&mut decoder, &update));
+        }
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, SubagentStatus::Completed);
+        assert_eq!(children[0].tool_calls, Some(3));
+        assert_eq!(children[0].prose_cells[0].text, "CHILD_ONLY");
+        assert!(crate::chat_core::assistant_flat_text(&accumulator.events).is_empty());
+
+        let version = CliVersion::parse("grok 0.2.117 (f1c06093089f)").unwrap();
+        assert!(
+            !runtime_tuning_profile(ProviderKind::Grok, Some(&version), "grok-4.5")
+                .supports_scoped_child_text()
         );
     }
 

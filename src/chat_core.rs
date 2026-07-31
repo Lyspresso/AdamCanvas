@@ -139,6 +139,34 @@ pub enum PermissionResolution {
     Denied,
 }
 
+/// The provider actor that produced one normalized activity event.
+///
+/// Missing scope on legacy persisted events is Main. A child scope is emitted
+/// only when the provider exposes a stable child identifier on that exact
+/// event; Adam never infers ownership from ordering or prose.
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum AgentScope {
+    #[default]
+    Main,
+    Child {
+        id: String,
+    },
+}
+
+impl AgentScope {
+    pub const fn is_main(&self) -> bool {
+        matches!(self, Self::Main)
+    }
+
+    pub fn child_id(&self) -> Option<&str> {
+        match self {
+            Self::Main => None,
+            Self::Child { id } => Some(id),
+        }
+    }
+}
+
 /// Provider-neutral state for a child agent linked to the current turn.
 ///
 /// Providers use different names for these workers (subagents, collaborators,
@@ -333,6 +361,10 @@ pub enum ActivityKind {
     Subagent {
         #[serde(default)]
         id: String,
+        /// Provider identifiers observed for this same child. These make
+        /// tool-call → durable-agent joins survive persistence and resume.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        aliases: Vec<String>,
         #[serde(default)]
         parent_id: Option<String>,
         #[serde(default)]
@@ -496,6 +528,9 @@ pub struct ActivityEvent {
     pub at: UnixMillis,
     /// Filled by lifecycle completion as `completion.at - start.at`.
     pub duration_ms: Option<i64>,
+    /// Legacy events omit this field and therefore remain Main-owned.
+    #[serde(default, skip_serializing_if = "AgentScope::is_main")]
+    pub scope: AgentScope,
     pub kind: ActivityKind,
 }
 
@@ -505,8 +540,35 @@ impl ActivityEvent {
             id,
             at,
             duration_ms: None,
+            scope: AgentScope::Main,
             kind,
         }
+    }
+
+    pub fn scoped(id: Uuid, at: UnixMillis, scope: AgentScope, kind: ActivityKind) -> Self {
+        Self {
+            id,
+            at,
+            duration_ms: None,
+            scope,
+            kind,
+        }
+    }
+
+    pub fn child(
+        id: Uuid,
+        at: UnixMillis,
+        child_id: impl Into<String>,
+        kind: ActivityKind,
+    ) -> Self {
+        Self::scoped(
+            id,
+            at,
+            AgentScope::Child {
+                id: child_id.into(),
+            },
+            kind,
+        )
     }
 
     pub fn assistant_text(id: Uuid, at: UnixMillis, text: impl Into<String>) -> ActivityEvent {
@@ -578,16 +640,18 @@ impl ActivityAccumulator {
 
     pub fn ingest(&mut self, incoming: ActivityEvent) {
         // 1. Consecutive text or thinking deltas merge and keep the first
-        // record's identity/start time.
+        // record's identity/start time, but never cross an actor boundary.
         if let Some(last) = self.events.last_mut() {
-            match (&mut last.kind, &incoming.kind) {
+            match (&mut last.kind, &incoming.kind, last.scope == incoming.scope) {
                 (
                     ActivityKind::AssistantText { text: existing },
                     ActivityKind::AssistantText { text: delta },
+                    true,
                 )
                 | (
                     ActivityKind::Thinking { text: existing },
                     ActivityKind::Thinking { text: delta },
+                    true,
                 ) => {
                     existing.push_str(delta);
                     return;
@@ -600,7 +664,7 @@ impl ActivityAccumulator {
         // identity when no task mutation sits between them. Mutations form a
         // semantic boundary and must remain in provider order.
         if let ActivityKind::PlanUpdate {
-            tasks: incoming,
+            tasks: incoming_tasks,
             authoritative: incoming_authoritative,
             compacted: incoming_compacted,
             replaces_native: incoming_replaces_native,
@@ -608,10 +672,11 @@ impl ActivityAccumulator {
             && let Some(index) = self
                 .events
                 .iter()
-                .rposition(|event| event.kind.is_plan_snapshot())
-            && !self.events[index + 1..]
-                .iter()
-                .any(|event| matches!(event.kind, ActivityKind::TaskMutation { .. }))
+                .rposition(|event| event.scope == incoming.scope && event.kind.is_plan_snapshot())
+            && !self.events[index + 1..].iter().any(|event| {
+                event.scope == incoming.scope
+                    && matches!(event.kind, ActivityKind::TaskMutation { .. })
+            })
             && let ActivityKind::PlanUpdate {
                 tasks: existing,
                 authoritative: existing_authoritative,
@@ -620,11 +685,11 @@ impl ActivityAccumulator {
             } = &mut self.events[index].kind
         {
             *existing = if *incoming_authoritative {
-                incoming.clone()
+                incoming_tasks.clone()
             } else {
                 merge_plan_snapshot(
                     existing,
-                    incoming,
+                    incoming_tasks,
                     !*incoming_compacted || *incoming_replaces_native,
                 )
             };
@@ -636,10 +701,10 @@ impl ActivityAccumulator {
 
         // 3. Lifecycle completions replace only their case-prefixed match.
         if let Some(key) = incoming.kind.lifecycle_key()
-            && let Some(index) = self
-                .events
-                .iter()
-                .position(|event| event.kind.lifecycle_key().as_deref() == Some(key.as_str()))
+            && let Some(index) = self.events.iter().position(|event| {
+                event.scope == incoming.scope
+                    && event.kind.lifecycle_key().as_deref() == Some(key.as_str())
+            })
         {
             let original_at = self.events[index].at;
             let previous_kind = self.events[index].kind.clone();
@@ -649,6 +714,7 @@ impl ActivityAccumulator {
             self.events[index].kind = incoming.kind;
             if let (
                 ActivityKind::Subagent {
+                    aliases: previous_aliases,
                     parent_id: previous_parent,
                     label: previous_label,
                     model: previous_model,
@@ -657,6 +723,7 @@ impl ActivityAccumulator {
                     ..
                 },
                 ActivityKind::Subagent {
+                    aliases,
                     parent_id,
                     label,
                     model,
@@ -666,6 +733,11 @@ impl ActivityAccumulator {
                 },
             ) = (previous_kind, &mut self.events[index].kind)
             {
+                for alias in previous_aliases {
+                    if !aliases.contains(&alias) {
+                        aliases.push(alias);
+                    }
+                }
                 if parent_id.is_none() {
                     *parent_id = previous_parent;
                 }
@@ -698,28 +770,26 @@ impl ActivityAccumulator {
 
     fn enforce_live_cap(&mut self) {
         while self.events.len() > self.max_events {
-            let Some(eviction) = self
-                .events
-                .iter()
-                .position(|event| event.kind.is_foldable() && !event.kind.is_plan_snapshot())
-            else {
-                // A plan, errors, and permission prompts are all exempt.
-                // Their combined must-keep set may therefore exceed the soft
-                // live cap rather than silently deleting authoritative state.
+            let Some(eviction) = self.events.iter().position(is_live_cap_evictable) else {
+                // Plans, errors, permission prompts, child lifecycle, and
+                // scoped child prose are exempt. Their combined must-keep set
+                // may exceed the soft live cap rather than silently deleting
+                // authoritative state.
                 break;
             };
             if self.events[eviction].kind.is_task_state() {
-                if self.compact_task_state() {
+                let scope = self.events[eviction].scope.clone();
+                if self.compact_task_state(&scope) {
                     continue;
                 }
                 // A subjectless id-only mutation can be meaningful only when
                 // projected onto a saved task list. Without that seed it
                 // cannot be folded safely, so evict another ordinary record.
-                if let Some(alternative) = self.events.iter().position(|event| {
-                    event.kind.is_foldable()
-                        && !event.kind.is_task_state()
-                        && !event.kind.is_plan_snapshot()
-                }) {
+                if let Some(alternative) = self
+                    .events
+                    .iter()
+                    .position(|event| is_live_cap_evictable(event) && !event.kind.is_task_state())
+                {
                     self.events.remove(alternative);
                     continue;
                 }
@@ -733,15 +803,15 @@ impl ActivityAccumulator {
     /// This is deliberately a cap-pressure operation: normal traces retain
     /// TaskMutation provenance, while very long traces cannot lose the task
     /// list merely because an early create/update record was evicted.
-    fn compact_task_state(&mut self) -> bool {
+    fn compact_task_state(&mut self, scope: &AgentScope) -> bool {
         let Some(first_task_index) = self
             .events
             .iter()
-            .position(|event| event.kind.is_task_state())
+            .position(|event| event.scope == *scope && event.kind.is_task_state())
         else {
             return false;
         };
-        let Some(progress) = newest_plan(&self.events) else {
+        let Some(progress) = newest_plan_for_scope(&self.events, scope) else {
             // This may be an id-only resumed update whose matching task lives
             // in persisted progress. Preserve it for project_progress.
             return false;
@@ -756,7 +826,8 @@ impl ActivityAccumulator {
                     content,
                     task_id: Some(task_id),
                     ..
-                } if content.trim().is_empty()
+                } if event.scope == *scope
+                    && content.trim().is_empty()
                     && !progress.items.iter().any(|item| {
                         task_mutation_origin_matches(*origin, item.origin)
                             && item.task_id.as_deref() == Some(task_id)
@@ -770,34 +841,40 @@ impl ActivityAccumulator {
         let snapshot_identity = self
             .events
             .iter()
-            .find(|event| event.kind.is_plan_snapshot())
+            .find(|event| event.scope == *scope && event.kind.is_plan_snapshot())
             .cloned()
             .or_else(|| {
                 self.events
                     .iter()
-                    .find(|event| event.kind.is_task_state() && !unresolved.contains(&event.id))
+                    .find(|event| {
+                        event.scope == *scope
+                            && event.kind.is_task_state()
+                            && !unresolved.contains(&event.id)
+                    })
                     .cloned()
             })
             .expect("a locally projectable task event supplies snapshot identity");
         let replaces_native = self
             .events
             .iter()
-            .any(|event| event.kind.plan_replaces_native());
+            .any(|event| event.scope == *scope && event.kind.plan_replaces_native());
         let authoritative = self.events.iter().any(|event| {
-            matches!(
-                event.kind,
-                ActivityKind::PlanUpdate {
-                    authoritative: true,
-                    ..
-                }
-            )
+            event.scope == *scope
+                && matches!(
+                    event.kind,
+                    ActivityKind::PlanUpdate {
+                        authoritative: true,
+                        ..
+                    }
+                )
         });
         let provenance_budget = self.max_events.saturating_sub(1).min(8);
         let bounded_provenance = self
             .events
             .iter()
             .filter(|event| {
-                matches!(event.kind, ActivityKind::TaskMutation { .. })
+                event.scope == *scope
+                    && matches!(event.kind, ActivityKind::TaskMutation { .. })
                     && event.id != snapshot_identity.id
                     && !unresolved.contains(&event.id)
             })
@@ -809,7 +886,8 @@ impl ActivityAccumulator {
             .events
             .iter()
             .filter(|event| {
-                matches!(event.kind, ActivityKind::TaskMutation { .. })
+                event.scope == *scope
+                    && matches!(event.kind, ActivityKind::TaskMutation { .. })
                     && event.id != snapshot_identity.id
                     && (unresolved.contains(&event.id) || bounded_provenance.contains(&event.id))
             })
@@ -817,16 +895,18 @@ impl ActivityAccumulator {
             .collect::<Vec<_>>();
         let insertion_index = self.events[..first_task_index]
             .iter()
-            .filter(|event| !event.kind.is_task_state())
+            .filter(|event| event.scope != *scope || !event.kind.is_task_state())
             .count();
         let before = self.events.clone();
-        self.events.retain(|event| !event.kind.is_task_state());
+        self.events
+            .retain(|event| event.scope != *scope || !event.kind.is_task_state());
         self.events.splice(
             insertion_index..insertion_index,
             provenance.into_iter().chain(std::iter::once(ActivityEvent {
                 id: snapshot_identity.id,
                 at: snapshot_identity.at,
                 duration_ms: snapshot_identity.duration_ms,
+                scope: scope.clone(),
                 kind: ActivityKind::PlanUpdate {
                     tasks: progress.items,
                     authoritative,
@@ -837,6 +917,14 @@ impl ActivityAccumulator {
         );
         self.events != before
     }
+}
+
+fn is_live_cap_evictable(event: &ActivityEvent) -> bool {
+    event.kind.is_foldable()
+        && !event.kind.is_plan_snapshot()
+        && !matches!(event.kind, ActivityKind::Subagent { .. })
+        && !(event.scope.child_id().is_some()
+            && matches!(event.kind, ActivityKind::AssistantText { .. }))
 }
 
 /// Applies the persistence must-keep contract while preserving original
@@ -850,12 +938,17 @@ pub fn activity_events_for_persistence(events: &[ActivityEvent], cap: usize) -> 
         return Vec::new();
     }
 
-    let trailing_plan = events
-        .iter()
-        .rposition(|event| event.kind.is_plan_snapshot());
+    let mut trailing_plans = BTreeMap::<AgentScope, usize>::new();
+    for (index, event) in events.iter().enumerate() {
+        if event.kind.is_plan_snapshot() {
+            trailing_plans.insert(event.scope.clone(), index);
+        }
+    }
     let mut retained = BTreeSet::new();
     for (index, event) in events.iter().enumerate() {
-        if event.kind.is_persist_must_keep() || trailing_plan == Some(index) {
+        if event.kind.is_persist_must_keep()
+            || trailing_plans.get(&event.scope).copied() == Some(index)
+        {
             retained.insert(index);
         }
     }
@@ -878,9 +971,16 @@ pub fn activity_events_for_persistence(events: &[ActivityEvent], cap: usize) -> 
 
 /// Flattens normalized assistant prose without re-reading raw provider output.
 pub fn assistant_flat_text(events: &[ActivityEvent]) -> String {
+    assistant_flat_text_for_scope(events, &AgentScope::Main)
+}
+
+/// Flattens normalized assistant prose produced by one exact provider actor.
+pub fn assistant_flat_text_for_scope(events: &[ActivityEvent], scope: &AgentScope) -> String {
     let mut text = String::new();
     for event in events {
-        if let ActivityKind::AssistantText { text: delta } = &event.kind {
+        if event.scope == *scope
+            && let ActivityKind::AssistantText { text: delta } = &event.kind
+        {
             text.push_str(delta);
         }
     }
@@ -933,11 +1033,21 @@ impl ProgressProjection {
     }
 }
 
-/// Newest-known state for one provider child agent.
+/// One persisted prose cell owned by a specific child agent.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SubagentProseCell {
+    pub event_id: Uuid,
+    pub at: UnixMillis,
+    pub text: String,
+}
+
+/// Newest-known state and genuinely scoped detail for one provider child.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct SubagentProjection {
     pub id: String,
+    pub aliases: Vec<String>,
     pub parent_id: Option<String>,
     pub label: String,
     pub status: SubagentStatus,
@@ -946,7 +1056,14 @@ pub struct SubagentProjection {
     pub tool_calls: Option<u64>,
     pub at: UnixMillis,
     pub duration_ms: Option<i64>,
+    /// None means this child never published task events. Some(empty)
+    /// preserves an explicit empty child snapshot.
+    pub checklist: Option<ProgressProjection>,
+    pub current_activity: Option<String>,
+    pub prose_cells: Vec<SubagentProseCell>,
 }
+
+const MAX_SUBAGENT_PROSE_CELLS: usize = 24;
 
 /// Folds child-agent lifecycle records without inventing tasks from prose.
 ///
@@ -956,10 +1073,12 @@ pub struct SubagentProjection {
 pub fn project_subagents(events: &[ActivityEvent]) -> Vec<SubagentProjection> {
     let mut projected = Vec::<SubagentProjection>::new();
     let mut indices = BTreeMap::<String, usize>::new();
+    let aliases = project_subagent_aliases(events);
 
     for event in events {
         let ActivityKind::Subagent {
             id,
+            aliases: event_aliases,
             parent_id,
             label,
             status,
@@ -973,8 +1092,13 @@ pub fn project_subagents(events: &[ActivityEvent]) -> Vec<SubagentProjection> {
         if id.trim().is_empty() {
             continue;
         }
-        if let Some(index) = indices.get(id).copied() {
+        let canonical_id = resolve_subagent_alias(&aliases, id);
+        if let Some(index) = indices.get(&canonical_id).copied() {
             let existing = &mut projected[index];
+            merge_subagent_aliases(&mut existing.aliases, event_aliases, &canonical_id);
+            if id != &canonical_id && !existing.aliases.contains(id) {
+                existing.aliases.push(id.clone());
+            }
             if parent_id.is_some() {
                 existing.parent_id.clone_from(parent_id);
             }
@@ -991,11 +1115,21 @@ pub fn project_subagents(events: &[ActivityEvent]) -> Vec<SubagentProjection> {
             if tool_calls.is_some() {
                 existing.tool_calls = *tool_calls;
             }
-            existing.duration_ms = event.duration_ms.or(existing.duration_ms);
+            existing.duration_ms = event.duration_ms.or(existing.duration_ms).or_else(|| {
+                status
+                    .is_terminal()
+                    .then(|| event.at.elapsed_since(existing.at))
+            });
         } else {
-            indices.insert(id.clone(), projected.len());
+            indices.insert(canonical_id.clone(), projected.len());
+            let mut projection_aliases = Vec::new();
+            merge_subagent_aliases(&mut projection_aliases, event_aliases, &canonical_id);
+            if id != &canonical_id && !projection_aliases.contains(id) {
+                projection_aliases.push(id.clone());
+            }
             projected.push(SubagentProjection {
-                id: id.clone(),
+                id: canonical_id,
+                aliases: projection_aliases,
                 parent_id: parent_id.clone(),
                 label: label.clone(),
                 status: *status,
@@ -1004,10 +1138,188 @@ pub fn project_subagents(events: &[ActivityEvent]) -> Vec<SubagentProjection> {
                 tool_calls: *tool_calls,
                 at: event.at,
                 duration_ms: event.duration_ms,
+                checklist: None,
+                current_activity: None,
+                prose_cells: Vec::new(),
+            });
+        }
+    }
+
+    for agent in &mut projected {
+        if let Some(parent_id) = agent.parent_id.as_deref() {
+            agent.parent_id = Some(resolve_subagent_alias(&aliases, parent_id));
+        }
+        agent.aliases.sort();
+        agent.aliases.dedup();
+
+        let scope = AgentScope::Child {
+            id: agent.id.clone(),
+        };
+        let scoped_events = events
+            .iter()
+            .filter_map(|event| {
+                let raw_id = event.scope.child_id()?;
+                (resolve_subagent_alias(&aliases, raw_id) == agent.id).then(|| {
+                    let mut normalized = event.clone();
+                    normalized.scope = scope.clone();
+                    normalized
+                })
+            })
+            .collect::<Vec<_>>();
+        agent.checklist = newest_plan_for_scope(&scoped_events, &scope);
+        agent.prose_cells = scoped_events
+            .iter()
+            .filter_map(|event| {
+                let ActivityKind::AssistantText { text } = &event.kind else {
+                    return None;
+                };
+                (!text.trim().is_empty()).then(|| SubagentProseCell {
+                    event_id: event.id,
+                    at: event.at,
+                    text: text.clone(),
+                })
+            })
+            .collect();
+        if agent.prose_cells.len() > MAX_SUBAGENT_PROSE_CELLS {
+            let remove = agent.prose_cells.len() - MAX_SUBAGENT_PROSE_CELLS;
+            agent.prose_cells.drain(..remove);
+        }
+        if !agent.status.is_terminal() {
+            let progress = agent.checklist.clone().unwrap_or_default();
+            let label = current_work_label_for_scope(&progress, &scoped_events, &scope, "");
+            agent.current_activity = (!label.trim().is_empty()).then_some(label).or_else(|| {
+                agent
+                    .detail
+                    .clone()
+                    .filter(|detail| !detail.trim().is_empty())
             });
         }
     }
     projected
+}
+
+fn project_subagent_aliases(events: &[ActivityEvent]) -> BTreeMap<String, String> {
+    let mut resolved = BTreeMap::<String, String>::new();
+    for event in events {
+        let ActivityKind::Subagent { id, aliases, .. } = &event.kind else {
+            continue;
+        };
+        if id.trim().is_empty() {
+            continue;
+        }
+        let candidates = std::iter::once(id)
+            .chain(aliases.iter())
+            .filter(|candidate| !candidate.trim().is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        let established_roots = candidates
+            .iter()
+            .filter(|candidate| resolved.contains_key(*candidate))
+            .map(|candidate| resolve_subagent_alias(&resolved, candidate))
+            .collect::<Vec<_>>();
+        let canonical = established_roots
+            .first()
+            .cloned()
+            .unwrap_or_else(|| id.clone());
+        let roots_to_merge = established_roots.into_iter().collect::<BTreeSet<_>>();
+        if roots_to_merge.len() > 1 {
+            let known_ids = resolved.keys().cloned().collect::<Vec<_>>();
+            for known_id in known_ids {
+                let root = resolve_subagent_alias(&resolved, &known_id);
+                if roots_to_merge.contains(&root) {
+                    resolved.insert(known_id, canonical.clone());
+                }
+            }
+        }
+        resolved.insert(canonical.clone(), canonical.clone());
+        for candidate in candidates {
+            resolved.insert(candidate, canonical.clone());
+        }
+    }
+    let known_ids = resolved.keys().cloned().collect::<Vec<_>>();
+    for known_id in known_ids {
+        let canonical = resolve_subagent_alias(&resolved, &known_id);
+        resolved.insert(known_id, canonical);
+    }
+    resolved
+}
+
+fn resolve_subagent_alias(aliases: &BTreeMap<String, String>, id: &str) -> String {
+    let mut current = id.to_owned();
+    for _ in 0..16 {
+        let Some(next) = aliases.get(&current) else {
+            break;
+        };
+        if next == &current {
+            break;
+        }
+        current.clone_from(next);
+    }
+    current
+}
+
+fn merge_subagent_aliases(target: &mut Vec<String>, incoming: &[String], canonical_id: &str) {
+    for alias in incoming {
+        if !alias.trim().is_empty() && alias != canonical_id && !target.contains(alias) {
+            target.push(alias.clone());
+        }
+    }
+}
+
+/// Provider-neutral child-agent counts used by both compact and expanded UI.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SubagentAggregate {
+    pub total: usize,
+    pub pending: usize,
+    pub in_progress: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub cancelled: usize,
+    pub permission_blocked: usize,
+}
+
+impl SubagentAggregate {
+    pub fn working(&self) -> usize {
+        self.pending + self.in_progress
+    }
+
+    pub fn stopped(&self) -> usize {
+        self.failed + self.cancelled + self.permission_blocked
+    }
+
+    pub fn summary(&self) -> String {
+        let mut parts = vec![format!("{}/{} done", self.completed, self.total)];
+        if self.in_progress > 0 {
+            parts.push(format!("{} working", self.in_progress));
+        }
+        if self.pending > 0 {
+            parts.push(format!("{} queued", self.pending));
+        }
+        let stopped = self.stopped();
+        if stopped > 0 {
+            parts.push(format!("{stopped} stopped"));
+        }
+        parts.join(" · ")
+    }
+}
+
+pub fn project_subagent_aggregate(subagents: &[SubagentProjection]) -> SubagentAggregate {
+    let mut aggregate = SubagentAggregate {
+        total: subagents.len(),
+        ..SubagentAggregate::default()
+    };
+    for subagent in subagents {
+        match subagent.status {
+            SubagentStatus::Pending => aggregate.pending += 1,
+            SubagentStatus::InProgress => aggregate.in_progress += 1,
+            SubagentStatus::Completed => aggregate.completed += 1,
+            SubagentStatus::Failed => aggregate.failed += 1,
+            SubagentStatus::Cancelled => aggregate.cancelled += 1,
+            SubagentStatus::PermissionBlocked => aggregate.permission_blocked += 1,
+        }
+    }
+    aggregate
 }
 
 /// Last normalized provider-turn state in an event stream.
@@ -1024,6 +1336,9 @@ pub struct TurnStatusProjection {
 
 pub fn latest_turn_status(events: &[ActivityEvent]) -> Option<TurnStatusProjection> {
     events.iter().rev().find_map(|event| {
+        if !event.scope.is_main() {
+            return None;
+        }
         let ActivityKind::TurnStatus {
             status,
             message,
@@ -1052,9 +1367,20 @@ pub fn latest_turn_status(events: &[ActivityEvent]) -> Option<TurnStatusProjecti
 /// content within the mutation's origin; unknown named updates create a new
 /// task with that same origin.
 pub fn newest_plan(events: &[ActivityEvent]) -> Option<ProgressProjection> {
+    newest_plan_for_scope(events, &AgentScope::Main)
+}
+
+/// Folds only the task events owned by one exact provider actor.
+pub fn newest_plan_for_scope(
+    events: &[ActivityEvent],
+    scope: &AgentScope,
+) -> Option<ProgressProjection> {
     let mut folded: Option<(Uuid, UnixMillis, Vec<PlanItem>)> = None;
 
     for event in events {
+        if event.scope != *scope {
+            continue;
+        }
         match &event.kind {
             ActivityKind::PlanUpdate {
                 tasks,
@@ -1294,10 +1620,10 @@ pub fn project_progress(
     let persisted = newest_plan(persisted_events);
     let live_has_snapshot = live_events
         .iter()
-        .any(|event| event.kind.is_plan_snapshot());
-    let live_has_mutation = live_events
-        .iter()
-        .any(|event| matches!(event.kind, ActivityKind::TaskMutation { .. }));
+        .any(|event| event.scope.is_main() && event.kind.is_plan_snapshot());
+    let live_has_mutation = live_events.iter().any(|event| {
+        event.scope.is_main() && matches!(event.kind, ActivityKind::TaskMutation { .. })
+    });
 
     if live_has_snapshot || live_has_mutation {
         let mut combined = Vec::with_capacity(live_events.len() + usize::from(persisted.is_some()));
@@ -1342,6 +1668,15 @@ pub fn current_work_label(
     live_events: &[ActivityEvent],
     generic_label: &str,
 ) -> String {
+    current_work_label_for_scope(progress, live_events, &AgentScope::Main, generic_label)
+}
+
+pub fn current_work_label_for_scope(
+    progress: &ProgressProjection,
+    live_events: &[ActivityEvent],
+    scope: &AgentScope,
+    generic_label: &str,
+) -> String {
     if let Some(active_form) = progress
         .items
         .iter()
@@ -1357,6 +1692,9 @@ pub fn current_work_label(
 
     let mut resolved_tool_calls = BTreeSet::<String>::new();
     for event in live_events.iter().rev() {
+        if event.scope != *scope {
+            continue;
+        }
         match &event.kind {
             ActivityKind::ToolResult { id, .. } => {
                 if !id.is_empty() {
@@ -1920,11 +2258,22 @@ impl CliVersion {
 /// Unknown versions deliberately expose no tuning values. Provider default is
 /// always safe; new rows are added only alongside a fixture or equivalent
 /// provider proof.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum ChildEventChannel {
+    #[default]
+    Disabled,
+    CodexExecCollabV1,
+    ClaudeStreamJsonAgentV1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeTuningProfile {
     pub version: Option<CliVersion>,
     pub reasoning_efforts: &'static [&'static str],
-    pub supports_scoped_child_text: bool,
+    pub child_event_channel: ChildEventChannel,
 }
 
 impl RuntimeTuningProfile {
@@ -1934,6 +2283,10 @@ impl RuntimeTuningProfile {
             .iter()
             .copied()
             .find(|candidate| requested.eq_ignore_ascii_case(candidate))
+    }
+
+    pub fn supports_scoped_child_text(&self) -> bool {
+        self.child_event_channel != ChildEventChannel::Disabled
     }
 }
 
@@ -1952,7 +2305,7 @@ pub fn runtime_tuning_profile(
     version: Option<&CliVersion>,
     model: &str,
 ) -> RuntimeTuningProfile {
-    let (reasoning_efforts, supports_scoped_child_text) = match (family, version) {
+    let (reasoning_efforts, child_event_channel) = match (family, version) {
         (ProviderKind::Codex, Some(version)) if version.is(0, 144, 1) => {
             let efforts = if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") {
                 CODEX_ULTRA_REASONING
@@ -1961,31 +2314,35 @@ pub fn runtime_tuning_profile(
             } else {
                 CODEX_DEFAULT_REASONING
             };
-            (efforts, true)
+            (efforts, ChildEventChannel::CodexExecCollabV1)
         }
-        (ProviderKind::Claude, Some(version)) if version.is(2, 1, 128) => (CLAUDE_REASONING, true),
+        (ProviderKind::Claude, Some(version)) if version.is(2, 1, 128) => {
+            (CLAUDE_REASONING, ChildEventChannel::ClaudeStreamJsonAgentV1)
+        }
         (ProviderKind::Grok, Some(version)) if version.is(0, 2, 111) => {
             // The captured multiplex stream carries parent and child prose in
             // indistinguishable type=text envelopes. Subagents must stay off
             // until a scoped channel is available.
-            (GROK_REASONING_0_2_111, false)
+            (GROK_REASONING_0_2_111, ChildEventChannel::Disabled)
         }
         (ProviderKind::Grok, Some(version)) if version.is(0, 2, 114) => {
             // The installed 0.2.114 model metadata still advertises exactly
             // low/medium/high for grok-4.5. ACP makes task calls structured,
             // but scoped child prose remains a PR 3 capability.
-            (GROK_REASONING_0_2_111, false)
+            (GROK_REASONING_0_2_111, ChildEventChannel::Disabled)
         }
-        (ProviderKind::Kimi, Some(version)) if version.is(1, 49, 0) => (NO_REASONING, true),
+        (ProviderKind::Kimi, Some(version)) if version.is(1, 49, 0) => {
+            (NO_REASONING, ChildEventChannel::Disabled)
+        }
         (ProviderKind::Ollama, Some(version)) if version.is(0, 32, 1) => {
-            (OLLAMA_REASONING_0_32_1, true)
+            (OLLAMA_REASONING_0_32_1, ChildEventChannel::Disabled)
         }
-        _ => (NO_REASONING, false),
+        _ => (NO_REASONING, ChildEventChannel::Disabled),
     };
     RuntimeTuningProfile {
         version: version.cloned(),
         reasoning_efforts,
-        supports_scoped_child_text,
+        child_event_channel,
     }
 }
 
@@ -2004,7 +2361,7 @@ pub struct CapabilityProfile {
     pub executable_basename: String,
     pub runtime_version: Option<CliVersion>,
     pub supported_reasoning_efforts: Vec<String>,
-    pub supports_scoped_child_text: bool,
+    pub child_event_channel: ChildEventChannel,
     pub transport: TransportKind,
     pub stream_dialect: StreamDialect,
     pub plan_channel: PlanChannel,
@@ -2025,6 +2382,10 @@ impl CapabilityProfile {
 
     pub fn has_native_plan(&self) -> bool {
         self.plan_channel == PlanChannel::NativeStream
+    }
+
+    pub fn supports_scoped_child_text(&self) -> bool {
+        self.child_event_channel != ChildEventChannel::Disabled
     }
 
     pub fn supports_native_resume(&self) -> bool {
@@ -2146,7 +2507,7 @@ pub fn capability_profile_for_runtime(
             .iter()
             .map(|effort| (*effort).to_owned())
             .collect(),
-        supports_scoped_child_text: tuning.supports_scoped_child_text,
+        child_event_channel: tuning.child_event_channel,
         transport,
         stream_dialect,
         plan_channel,
@@ -2204,6 +2565,10 @@ mod tests {
 
     fn event(number: u128, at: i64, kind: ActivityKind) -> ActivityEvent {
         ActivityEvent::new(Uuid::from_u128(number), UnixMillis(at), kind)
+    }
+
+    fn child_event(number: u128, at: i64, child_id: &str, kind: ActivityKind) -> ActivityEvent {
+        ActivityEvent::child(Uuid::from_u128(number), UnixMillis(at), child_id, kind)
     }
 
     fn command(id: impl Into<String>, status: ActivityStatus) -> ActivityKind {
@@ -3759,6 +4124,7 @@ mod tests {
             100,
             ActivityKind::Subagent {
                 id: "child-1".into(),
+                aliases: Vec::new(),
                 parent_id: Some("parent-1".into()),
                 label: "Research current sources".into(),
                 status: SubagentStatus::InProgress,
@@ -3772,6 +4138,7 @@ mod tests {
             1_600,
             ActivityKind::Subagent {
                 id: "child-1".into(),
+                aliases: Vec::new(),
                 parent_id: None,
                 label: String::new(),
                 status: SubagentStatus::PermissionBlocked,
@@ -3799,6 +4166,484 @@ mod tests {
             newest_plan(&accumulator.events).is_none(),
             "child-agent lifecycle must not manufacture Progress checklist rows"
         );
+    }
+
+    #[test]
+    fn actor_scope_prevents_prose_lifecycle_and_task_cross_talk() {
+        let child_scope = AgentScope::Child {
+            id: "child-1".into(),
+        };
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest(ActivityEvent::assistant_text(
+            Uuid::from_u128(1),
+            UnixMillis(1),
+            "main-before",
+        ));
+        accumulator.ingest(child_event(
+            2,
+            2,
+            "child-1",
+            ActivityKind::AssistantText {
+                text: "child-only".into(),
+            },
+        ));
+        accumulator.ingest(ActivityEvent::assistant_text(
+            Uuid::from_u128(3),
+            UnixMillis(3),
+            "main-after",
+        ));
+        accumulator.ingest(event(
+            4,
+            4,
+            ActivityKind::Command {
+                id: "shared-call".into(),
+                command: "main".into(),
+                output_tail: None,
+                exit_code: None,
+                status: ActivityStatus::InProgress,
+            },
+        ));
+        accumulator.ingest(child_event(
+            5,
+            5,
+            "child-1",
+            ActivityKind::Command {
+                id: "shared-call".into(),
+                command: "child".into(),
+                output_tail: None,
+                exit_code: None,
+                status: ActivityStatus::InProgress,
+            },
+        ));
+        accumulator.ingest(child_event(
+            6,
+            6,
+            "child-1",
+            ActivityKind::Command {
+                id: "shared-call".into(),
+                command: "child".into(),
+                output_tail: Some("done".into()),
+                exit_code: Some(0),
+                status: ActivityStatus::Completed,
+            },
+        ));
+        accumulator.ingest(event(7, 7, plan("main task", PlanItemStatus::InProgress)));
+        accumulator.ingest(child_event(
+            8,
+            8,
+            "child-1",
+            plan("child task", PlanItemStatus::Pending),
+        ));
+
+        assert_eq!(
+            assistant_flat_text(&accumulator.events),
+            "main-beforemain-after"
+        );
+        assert_eq!(
+            assistant_flat_text_for_scope(&accumulator.events, &child_scope),
+            "child-only"
+        );
+        let commands = accumulator
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, ActivityKind::Command { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(commands.len(), 2);
+        assert!(matches!(
+            commands
+                .iter()
+                .find(|event| event.scope.is_main())
+                .map(|event| &event.kind),
+            Some(ActivityKind::Command {
+                status: ActivityStatus::InProgress,
+                ..
+            })
+        ));
+        assert!(matches!(
+            commands
+                .iter()
+                .find(|event| event.scope == child_scope)
+                .map(|event| &event.kind),
+            Some(ActivityKind::Command {
+                status: ActivityStatus::Completed,
+                ..
+            })
+        ));
+        assert_eq!(
+            newest_plan(&accumulator.events).unwrap().items[0].content,
+            "main task"
+        );
+        assert_eq!(
+            newest_plan_for_scope(&accumulator.events, &child_scope)
+                .unwrap()
+                .items[0]
+                .content,
+            "child task"
+        );
+    }
+
+    #[test]
+    fn child_projection_requires_lifecycle_and_preserves_real_empty_checklist() {
+        let lifecycle = event(
+            1,
+            1,
+            ActivityKind::Subagent {
+                id: "child-1".into(),
+                aliases: Vec::new(),
+                parent_id: Some("root".into()),
+                label: "Research".into(),
+                status: SubagentStatus::InProgress,
+                model: None,
+                detail: Some("Searching sources".into()),
+                tool_calls: None,
+            },
+        );
+        let child_plan = child_event(
+            2,
+            2,
+            "child-1",
+            ActivityKind::PlanUpdate {
+                tasks: Vec::new(),
+                authoritative: false,
+                compacted: false,
+                replaces_native: true,
+            },
+        );
+        let child_prose = child_event(
+            3,
+            3,
+            "child-1",
+            ActivityKind::AssistantText {
+                text: "A scoped finding".into(),
+            },
+        );
+
+        assert!(
+            project_subagents(&[child_plan.clone(), child_prose.clone()]).is_empty(),
+            "scoped detail without a lifecycle must not invent an agent row"
+        );
+        let projected = project_subagents(&[lifecycle, child_plan, child_prose]);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(
+            projected[0].checklist.as_ref().map(|plan| plan.items.len()),
+            Some(0)
+        );
+        assert_eq!(
+            projected[0].current_activity.as_deref(),
+            Some("Searching sources")
+        );
+        assert_eq!(projected[0].prose_cells.len(), 1);
+        assert_eq!(projected[0].prose_cells[0].text, "A scoped finding");
+    }
+
+    #[test]
+    fn child_aliases_survive_projection_and_normalize_nested_parents() {
+        let events = vec![
+            event(
+                1,
+                1,
+                ActivityKind::Subagent {
+                    id: "tool-call-parent".into(),
+                    aliases: vec!["durable-parent".into()],
+                    parent_id: Some("root".into()),
+                    label: "Parent".into(),
+                    status: SubagentStatus::InProgress,
+                    model: None,
+                    detail: None,
+                    tool_calls: None,
+                },
+            ),
+            event(
+                2,
+                2,
+                ActivityKind::Subagent {
+                    id: "durable-parent".into(),
+                    aliases: Vec::new(),
+                    parent_id: None,
+                    label: String::new(),
+                    status: SubagentStatus::Completed,
+                    model: None,
+                    detail: None,
+                    tool_calls: None,
+                },
+            ),
+            event(
+                3,
+                3,
+                ActivityKind::Subagent {
+                    id: "nested-child".into(),
+                    aliases: Vec::new(),
+                    parent_id: Some("durable-parent".into()),
+                    label: "Nested".into(),
+                    status: SubagentStatus::InProgress,
+                    model: None,
+                    detail: None,
+                    tool_calls: None,
+                },
+            ),
+            child_event(
+                4,
+                4,
+                "durable-parent",
+                ActivityKind::AssistantText {
+                    text: "Finished parent work".into(),
+                },
+            ),
+        ];
+
+        let projected = project_subagents(&events);
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0].id, "tool-call-parent");
+        assert_eq!(projected[0].status, SubagentStatus::Completed);
+        assert_eq!(projected[0].aliases, vec!["durable-parent"]);
+        assert_eq!(projected[0].prose_cells[0].text, "Finished parent work");
+        assert_eq!(projected[1].parent_id.as_deref(), Some("tool-call-parent"));
+    }
+
+    #[test]
+    fn late_alias_evidence_unites_existing_children_and_computes_duration() {
+        let events = vec![
+            event(
+                1,
+                100,
+                ActivityKind::Subagent {
+                    id: "tool-call-id".into(),
+                    aliases: Vec::new(),
+                    parent_id: Some("root".into()),
+                    label: "Research".into(),
+                    status: SubagentStatus::InProgress,
+                    model: None,
+                    detail: None,
+                    tool_calls: None,
+                },
+            ),
+            event(
+                2,
+                200,
+                ActivityKind::Subagent {
+                    id: "durable-agent-id".into(),
+                    aliases: Vec::new(),
+                    parent_id: None,
+                    label: String::new(),
+                    status: SubagentStatus::InProgress,
+                    model: None,
+                    detail: None,
+                    tool_calls: None,
+                },
+            ),
+            child_event(
+                3,
+                300,
+                "durable-agent-id",
+                ActivityKind::AssistantText {
+                    text: "Scoped result".into(),
+                },
+            ),
+            event(
+                4,
+                1_600,
+                ActivityKind::Subagent {
+                    id: "tool-call-id".into(),
+                    aliases: vec!["durable-agent-id".into()],
+                    parent_id: None,
+                    label: String::new(),
+                    status: SubagentStatus::Completed,
+                    model: None,
+                    detail: None,
+                    tool_calls: None,
+                },
+            ),
+        ];
+
+        let projected = project_subagents(&events);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].id, "tool-call-id");
+        assert_eq!(projected[0].aliases, vec!["durable-agent-id"]);
+        assert_eq!(projected[0].status, SubagentStatus::Completed);
+        assert_eq!(projected[0].duration_ms, Some(1_500));
+        assert_eq!(projected[0].prose_cells[0].text, "Scoped result");
+    }
+
+    #[test]
+    fn subagent_aggregate_exposes_exact_status_breakdown() {
+        let mut agents = Vec::new();
+        for status in [
+            SubagentStatus::Completed,
+            SubagentStatus::Completed,
+            SubagentStatus::Completed,
+            SubagentStatus::InProgress,
+            SubagentStatus::InProgress,
+        ] {
+            agents.push(SubagentProjection {
+                status,
+                ..SubagentProjection::default()
+            });
+        }
+        let aggregate = project_subagent_aggregate(&agents);
+        assert_eq!(aggregate.total, 5);
+        assert_eq!(aggregate.completed, 3);
+        assert_eq!(aggregate.working(), 2);
+        assert_eq!(aggregate.stopped(), 0);
+        assert_eq!(aggregate.summary(), "3/5 done · 2 working");
+
+        agents[4].status = SubagentStatus::PermissionBlocked;
+        let aggregate = project_subagent_aggregate(&agents);
+        assert_eq!(aggregate.permission_blocked, 1);
+        assert_eq!(aggregate.summary(), "3/5 done · 1 working · 1 stopped");
+    }
+
+    #[test]
+    fn cap_compaction_and_persistence_keep_a_trailing_plan_per_scope() {
+        let child_scope = AgentScope::Child {
+            id: "child-1".into(),
+        };
+        let mut accumulator = ActivityAccumulator::with_max_events(2);
+        accumulator.ingest(event(
+            1,
+            1,
+            ActivityKind::TaskMutation {
+                kind: TaskMutationKind::Create,
+                origin: PlanItemOrigin::Native,
+                content: "main task".into(),
+                task_id: Some("same-id".into()),
+                status: Some(PlanItemStatus::InProgress),
+                active_form: None,
+                result_summary: None,
+            },
+        ));
+        accumulator.ingest(child_event(
+            2,
+            2,
+            "child-1",
+            ActivityKind::TaskMutation {
+                kind: TaskMutationKind::Create,
+                origin: PlanItemOrigin::Native,
+                content: "child task".into(),
+                task_id: Some("same-id".into()),
+                status: Some(PlanItemStatus::Pending),
+                active_form: None,
+                result_summary: None,
+            },
+        ));
+        accumulator.ingest(event(
+            3,
+            3,
+            ActivityKind::ToolCall {
+                id: "ordinary".into(),
+                name: "Read".into(),
+                server: None,
+                input_summary: None,
+            },
+        ));
+
+        assert_eq!(
+            newest_plan(&accumulator.events).unwrap().items[0].content,
+            "main task"
+        );
+        assert_eq!(
+            newest_plan_for_scope(&accumulator.events, &child_scope)
+                .unwrap()
+                .items[0]
+                .content,
+            "child task"
+        );
+        let persisted = activity_events_for_persistence(&accumulator.events, 1);
+        assert_eq!(
+            persisted
+                .iter()
+                .filter(|event| event.kind.is_plan_snapshot())
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn live_cap_never_evicts_child_lifecycle_or_scoped_prose() {
+        let mut accumulator = ActivityAccumulator::with_max_events(2);
+        accumulator.ingest(event(
+            1,
+            1,
+            ActivityKind::Subagent {
+                id: "child-1".into(),
+                aliases: Vec::new(),
+                parent_id: Some("root".into()),
+                label: "Research".into(),
+                status: SubagentStatus::InProgress,
+                model: None,
+                detail: None,
+                tool_calls: None,
+            },
+        ));
+        accumulator.ingest(child_event(
+            2,
+            2,
+            "child-1",
+            ActivityKind::AssistantText {
+                text: "Durable child prose".into(),
+            },
+        ));
+        for number in 3..20 {
+            accumulator.ingest(event(
+                number,
+                number as i64,
+                ActivityKind::ToolCall {
+                    id: format!("ordinary-{number}"),
+                    name: "Read".into(),
+                    server: None,
+                    input_summary: None,
+                },
+            ));
+        }
+
+        assert_eq!(accumulator.events.len(), 2);
+        assert!(
+            accumulator
+                .events
+                .iter()
+                .any(|event| { matches!(event.kind, ActivityKind::Subagent { .. }) })
+        );
+        assert_eq!(
+            assistant_flat_text_for_scope(
+                &accumulator.events,
+                &AgentScope::Child {
+                    id: "child-1".into(),
+                },
+            ),
+            "Durable child prose"
+        );
+    }
+
+    #[test]
+    fn legacy_scope_defaults_main_and_malformed_explicit_scope_fails_closed() {
+        let legacy = serde_json::json!({
+            "id": Uuid::from_u128(1),
+            "at": 1,
+            "kind": {"type": "assistantText", "text": "legacy"}
+        });
+        let decoded: ActivityEvent = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.scope.is_main());
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        assert!(encoded.get("scope").is_none());
+
+        let child = child_event(
+            2,
+            2,
+            "child-1",
+            ActivityKind::AssistantText {
+                text: "child".into(),
+            },
+        );
+        let encoded_child = serde_json::to_value(child).unwrap();
+        assert_eq!(encoded_child["scope"]["kind"], "child");
+        assert_eq!(encoded_child["scope"]["id"], "child-1");
+
+        let malformed = serde_json::json!({
+            "id": Uuid::from_u128(3),
+            "at": 3,
+            "scope": {"kind": "futureActor", "id": "child-1"},
+            "kind": {"type": "assistantText", "text": "unsafe"}
+        });
+        assert!(serde_json::from_value::<ActivityEvent>(malformed).is_err());
     }
 
     #[test]
@@ -3891,6 +4736,7 @@ mod tests {
             },
             ActivityKind::Subagent {
                 id: "child-1".into(),
+                aliases: Vec::new(),
                 parent_id: Some("parent-1".into()),
                 label: "Research sources".into(),
                 status: SubagentStatus::PermissionBlocked,
@@ -4344,6 +5190,11 @@ mod tests {
             CODEX_ULTRA_REASONING
         );
         assert_eq!(
+            runtime_tuning_profile(ProviderKind::Codex, Some(&codex), "gpt-5.6-sol")
+                .child_event_channel,
+            ChildEventChannel::CodexExecCollabV1
+        );
+        assert_eq!(
             runtime_tuning_profile(ProviderKind::Codex, Some(&codex), "gpt-5.6-luna")
                 .reasoning_efforts,
             CODEX_MAX_REASONING
@@ -4358,11 +5209,16 @@ mod tests {
             runtime_tuning_profile(ProviderKind::Claude, Some(&claude), "sonnet").reasoning_efforts,
             CLAUDE_REASONING
         );
+        assert_eq!(
+            runtime_tuning_profile(ProviderKind::Claude, Some(&claude), "sonnet")
+                .child_event_channel,
+            ChildEventChannel::ClaudeStreamJsonAgentV1
+        );
 
         let grok = CliVersion::parse("grok 0.2.111 (94172f2aa4e5)").unwrap();
         let grok_tuning = runtime_tuning_profile(ProviderKind::Grok, Some(&grok), "grok-4.5");
         assert_eq!(grok_tuning.reasoning_efforts, GROK_REASONING_0_2_111);
-        assert!(!grok_tuning.supports_scoped_child_text);
+        assert!(!grok_tuning.supports_scoped_child_text());
         assert_eq!(
             grok_tuning.normalized_reasoning_effort(" HIGH "),
             Some("high")
@@ -4382,7 +5238,21 @@ mod tests {
             current_grok_tuning.reasoning_efforts,
             GROK_REASONING_0_2_111
         );
-        assert!(!current_grok_tuning.supports_scoped_child_text);
+        assert!(!current_grok_tuning.supports_scoped_child_text());
+
+        let installed_grok = CliVersion::parse("grok 0.2.117 (f1c06093089f)").unwrap();
+        let installed_grok_tuning =
+            runtime_tuning_profile(ProviderKind::Grok, Some(&installed_grok), "grok-4.5");
+        assert_eq!(
+            installed_grok_tuning.child_event_channel,
+            ChildEventChannel::Disabled
+        );
+
+        let kimi = CliVersion::parse("kimi, version 1.49.0").unwrap();
+        assert_eq!(
+            runtime_tuning_profile(ProviderKind::Kimi, Some(&kimi), "kimi").child_event_channel,
+            ChildEventChannel::Disabled
+        );
 
         let unknown = runtime_tuning_profile(
             ProviderKind::Grok,
@@ -4390,6 +5260,6 @@ mod tests {
             "grok-4.5",
         );
         assert!(unknown.reasoning_efforts.is_empty());
-        assert!(!unknown.supports_scoped_child_text);
+        assert!(!unknown.supports_scoped_child_text());
     }
 }

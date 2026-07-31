@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","model":"claude-sonnet","session_id":"claude-parent-session"}
+{"type":"assistant","session_id":"claude-parent-session","message":{"content":[{"type":"tool_use","id":"claude-agent-call","name":"Agent","input":{"description":"Return the fixture sentinel","prompt":"Return the fixture sentinel.","subagent_type":"Explore","model":"sonnet","run_in_background":true}}]}}
+{"type":"system","subtype":"task_started","task_id":"claude-background-task","tool_use_id":"claude-agent-call","description":"Return the fixture sentinel","subagent_type":"Explore","session_id":"claude-parent-session"}
+{"type":"user","session_id":"claude-parent-session","message":{"content":[{"type":"tool_result","tool_use_id":"claude-agent-call","content":"Agent completed"}]},"tool_use_result":{"agentId":"claude-durable-agent","content":[{"type":"text","text":"CHILD_FIXTURE_OK"}],"resolvedModel":"claude-sonnet","totalToolUseCount":1,"totalDurationMs":1000,"status":"completed"}}
+{"type":"assistant","session_id":"claude-parent-session","message":{"content":[{"type":"text","text":"PARENT_FIXTURE_OK"}]}}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":1200,"num_turns":2,"result":"PARENT_FIXTURE_OK","session_id":"claude-parent-session","total_cost_usd":0,"usage":{"input_tokens":100,"output_tokens":10}}

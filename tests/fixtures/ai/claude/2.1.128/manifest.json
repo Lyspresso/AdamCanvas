@@ -8,5 +8,5 @@
     "session and event ids replaced",
     "cwd, tools, commands, plugins, and memory paths omitted"
   ],
-  "note": "The local CLI was signed out, so this fixture intentionally pins its structured authentication-failure terminal shape."
+  "note": "auth-error.jsonl is the local signed-out capture. subagent.jsonl is a redacted schema-backed Agent/Task lifecycle contract for decoder coverage; only its explicitly identified tool result is treated as child prose."
 }
