@@ -3728,30 +3728,39 @@ fn kimi_delegation_terminal_detail(
 }
 
 fn kimi_delegation_kind(tool_call: &KimiAcpToolCall) -> Option<KimiDelegationKind> {
-    if let Some(input) = tool_call.raw_input.as_ref().and_then(Value::as_object)
-        && (input.contains_key("items")
-            || input.contains_key("resume_agent_ids")
-            || input.contains_key("prompt_template"))
-    {
+    match tool_call.kind.as_ref() {
+        Some(KimiAcpToolKind::Other(name)) => {
+            if let Some(kind) = kimi_exact_delegation_identity(name) {
+                return Some(kind);
+            }
+        }
+        None => {}
+        // A structured ACP kind is authoritative. Filenames such as
+        // AGENTS.md and search queries containing "agent" must retain their
+        // native Read/Search/Edit permission class.
+        Some(_) => return None,
+    }
+    tool_call
+        .title
+        .as_deref()
+        .and_then(kimi_exact_delegation_identity)
+}
+
+fn kimi_exact_delegation_identity(value: &str) -> Option<KimiDelegationKind> {
+    let value = value.trim().to_ascii_lowercase();
+    match normalized_token(&value).as_str() {
+        "agent" => return Some(KimiDelegationKind::Agent),
+        "agentswarm" => return Some(KimiDelegationKind::Swarm),
+        _ => {}
+    }
+    if value == "launching agent swarm" || value.starts_with("launching agent swarm:") {
         return Some(KimiDelegationKind::Swarm);
     }
-    let mut candidates = Vec::new();
-    if let Some(title) = tool_call.title.as_deref() {
-        candidates.push(title);
-    }
-    if let Some(KimiAcpToolKind::Other(name)) = tool_call.kind.as_ref() {
-        candidates.push(name);
-    }
-    for candidate in candidates {
-        let candidate = normalized_token(candidate);
-        if candidate.contains("agentswarm") {
-            return Some(KimiDelegationKind::Swarm);
-        }
-        if candidate.contains("agent") {
-            return Some(KimiDelegationKind::Agent);
-        }
-    }
-    None
+    let identity = value
+        .split_once(':')
+        .map_or(value.as_str(), |(identity, _)| identity.trim());
+    (identity.starts_with("launching ") && identity.ends_with(" agent"))
+        .then_some(KimiDelegationKind::Agent)
 }
 
 fn kimi_acp_tool_label(tool_call: &KimiAcpToolCall) -> String {
@@ -10123,6 +10132,8 @@ fn lock_unpoison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    static XAI_TRANSPORT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     fn request(provider_id: &str) -> AiRunRequest {
         AiRunRequest {
             turn_id: Uuid::from_u128(1),
@@ -15867,6 +15878,7 @@ send({
     fn xai_cancel_releases_the_run_before_bounded_cleanup_and_drops_late_events() {
         use std::net::TcpListener;
 
+        let _xai_test = lock_unpoison(&XAI_TRANSPORT_TEST_LOCK);
         let workers_before = XAI_HTTP_WORKERS.load(Ordering::Acquire);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -15983,6 +15995,7 @@ send({
     fn xai_completed_result_owns_terminal_before_group_completion_is_visible() {
         use std::net::TcpListener;
 
+        let _xai_test = lock_unpoison(&XAI_TRANSPORT_TEST_LOCK);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -15992,6 +16005,25 @@ send({
             while !request_bytes.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
                 let count = stream.read(&mut buffer).unwrap();
                 assert_ne!(count, 0, "client closed before sending HTTP headers");
+                request_bytes.extend_from_slice(&buffer[..count]);
+            }
+            let header_end = request_bytes
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = std::str::from_utf8(&request_bytes[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while request_bytes.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "client closed before sending the HTTP body");
                 request_bytes.extend_from_slice(&buffer[..count]);
             }
             let body = concat!(
@@ -16090,6 +16122,7 @@ send({
 
     #[test]
     fn xai_worker_disconnect_claims_one_failed_terminal_not_cancellation() {
+        let _xai_test = lock_unpoison(&XAI_TRANSPORT_TEST_LOCK);
         let mut run = request("xai_api");
         run.model.clear();
         let control = Arc::new(RunControl::default());
@@ -16265,7 +16298,7 @@ send({
         ));
 
         let explore = kimi_permission(
-            "Launching explore swarm",
+            "Launching agent swarm: Read-only research",
             KimiAcpToolKind::Other("other".into()),
             Some(json!({
                 "description": "Read-only research",
@@ -16305,7 +16338,7 @@ send({
             }),
         ] {
             let mutating = kimi_permission(
-                "Launching mutating swarm",
+                "Launching agent swarm: Mutating work",
                 KimiAcpToolKind::Other("other".into()),
                 Some(raw_input),
             );
@@ -16322,7 +16355,7 @@ send({
         }
 
         let coder = kimi_permission(
-            "Launching coder swarm",
+            "Launching agent swarm: Coder work",
             KimiAcpToolKind::Other("other".into()),
             Some(json!({
                 "description": "Coder swarm",
@@ -16379,6 +16412,65 @@ send({
     }
 
     #[test]
+    fn kimi_structured_tool_titles_do_not_alias_agent_delegations() {
+        for permission in [
+            kimi_permission("Read AGENTS.md", KimiAcpToolKind::Read, None),
+            kimi_permission("Search agent documentation", KimiAcpToolKind::Search, None),
+        ] {
+            assert_eq!(kimi_delegation_kind(&permission.tool_call), None);
+            assert!(matches!(
+                kimi_acp_permission_decision(
+                    &permission,
+                    PermissionMode::Sandbox,
+                    AiWorkspaceMode::Code,
+                    false,
+                    &RefCell::new(KimiPermissionBlockState::default()),
+                ),
+                KimiAcpPermissionDecision::Allow { .. }
+            ));
+        }
+
+        let edit = kimi_permission("Edit src/agent.rs", KimiAcpToolKind::Edit, None);
+        assert_eq!(kimi_delegation_kind(&edit.tool_call), None);
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &edit,
+                PermissionMode::Ask,
+                AiWorkspaceMode::Code,
+                false,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Reject { .. } | KimiAcpPermissionDecision::Cancel
+        ));
+
+        let agent = kimi_permission(
+            "Agent",
+            KimiAcpToolKind::Other("other".into()),
+            Some(json!({"subagent_type": "explore", "prompt": "Inspect"})),
+        );
+        assert_eq!(
+            kimi_delegation_kind(&agent.tool_call),
+            Some(KimiDelegationKind::Agent)
+        );
+
+        let mut swarm = kimi_permission(
+            "Unrelated display title",
+            KimiAcpToolKind::Other("AgentSwarm".into()),
+            Some(json!({"items": ["one"], "prompt_template": "Inspect {{item}}"})),
+        );
+        assert_eq!(
+            kimi_delegation_kind(&swarm.tool_call),
+            Some(KimiDelegationKind::Swarm)
+        );
+        swarm.tool_call.kind = None;
+        swarm.tool_call.title = Some("AgentSwarm".into());
+        assert_eq!(
+            kimi_delegation_kind(&swarm.tool_call),
+            Some(KimiDelegationKind::Swarm)
+        );
+    }
+
+    #[test]
     fn kimi_background_agent_result_stays_aggregate_and_terminal() {
         let tool_call = KimiAcpToolCall {
             id: "background-agent".into(),
@@ -16428,7 +16520,7 @@ send({
     fn kimi_adapter_return_finalizes_open_delegations_once_for_errors_and_cancellation() {
         let tool_call = KimiAcpToolCall {
             id: "pending-swarm".into(),
-            title: Some("Run AgentSwarm".into()),
+            title: Some("Launching agent swarm: Research in parallel".into()),
             kind: Some(KimiAcpToolKind::Other("other".into())),
             status: Some(KimiAcpToolStatus::InProgress),
             content: Vec::new(),
@@ -16518,7 +16610,7 @@ send({
     fn ambiguous_kimi_swarm_output_projects_an_aggregate_terminal_group() {
         let tool_call = KimiAcpToolCall {
             id: "ambiguous-swarm".into(),
-            title: Some("Run AgentSwarm".into()),
+            title: Some("Launching agent swarm: Research".into()),
             kind: Some(KimiAcpToolKind::Other("other".into())),
             status: Some(KimiAcpToolStatus::Completed),
             content: Vec::new(),
