@@ -48,6 +48,7 @@ use crate::{
     },
     platform,
     preview::PreviewCache,
+    sheet_edit::{self, EditableWorkbook},
     sheet_view::{self, SheetMetrics, SheetPalette, SheetViewState},
     spatial::{DEFAULT_CELL_SIZE, SpatialIndex},
     spreadsheet,
@@ -604,6 +605,17 @@ struct NoteDraft {
     moved: bool,
 }
 
+/// One open cell editor in a sheet lightbox.
+struct SheetCellEdit {
+    tile: Uuid,
+    row: usize,
+    column: usize,
+    draft: String,
+    focus_pending: bool,
+    /// A commit that failed, shown until the next attempt.
+    error: Option<String>,
+}
+
 #[derive(Default)]
 struct TileUiEvent {
     id: Option<Uuid>,
@@ -912,6 +924,12 @@ pub struct AdamApp {
     /// that failed, so a broken file is not retried every frame.
     sheets: HashMap<Uuid, Option<spreadsheet::Workbook>>,
     sheet_states: HashMap<Uuid, SheetViewState>,
+    /// Formula engines for workbooks being edited, created on the first
+    /// edit gesture. `Err` records why a workbook refused an engine (for
+    /// example a truncated load), so the refusal is shown, not retried.
+    sheet_engines: HashMap<Uuid, Result<EditableWorkbook, String>>,
+    /// The one cell editor a sheet can have open, if any.
+    sheet_cell_edit: Option<SheetCellEdit>,
     snap_to_grid: bool,
     preferences: AppPreferences,
     dots_available: bool,
@@ -1199,6 +1217,8 @@ impl AdamApp {
             grid_view: None,
             sheets: HashMap::new(),
             sheet_states: HashMap::new(),
+            sheet_engines: HashMap::new(),
+            sheet_cell_edit: None,
             snap_to_grid: false,
             preferences,
             dots_available,
@@ -2032,6 +2052,23 @@ impl AdamApp {
     }
 
     fn handle_shortcuts(&mut self, context: &Context) {
+        // The sheet cell editor only renders inside an edit-mode lightbox on
+        // its own tile. Any mouse path that tears that hosting down — Edit
+        // toggled off, the lightbox closed or stepped, the page switched —
+        // must drop the editor here, or its entry in text_is_active below
+        // silences every keyboard shortcut in the app indefinitely.
+        if let Some(edit) = &self.sheet_cell_edit {
+            let hosted = self.grid_view.is_some_and(|state| {
+                state.editing
+                    && state
+                        .lightbox
+                        .is_some_and(|lightbox| self.tile_id_at(lightbox.index) == Some(edit.tile))
+            });
+            if !hosted {
+                self.sheet_cell_edit = None;
+            }
+        }
+
         let text_is_active = self.editing_note.is_some()
             || self.renaming_page.is_some()
             || self.renaming_tile.is_some()
@@ -2044,6 +2081,7 @@ impl AdamApp {
             || self.pile_settings.is_some()
             || self.open_chat.is_some()
             || self.trash_open
+            || self.sheet_cell_edit.is_some()
             || self.agents.open;
 
         let undo = context.input(|input| {
@@ -2052,12 +2090,15 @@ impl AdamApp {
         let redo = context.input(|input| {
             input.modifiers.command && input.modifiers.shift && input.key_pressed(Key::Z)
         });
-        if undo && !text_is_active {
-            if let Some(workspace) = self.history.undo(&self.workspace) {
-                self.restore_workspace(workspace);
-            }
+        if undo
+            && !text_is_active
+            && !self.undo_open_sheet()
+            && let Some(workspace) = self.history.undo(&self.workspace)
+        {
+            self.restore_workspace(workspace);
         } else if redo
             && !text_is_active
+            && !self.redo_open_sheet()
             && let Some(workspace) = self.history.redo(&self.workspace)
         {
             self.restore_workspace(workspace);
@@ -3649,16 +3690,30 @@ impl AdamApp {
         rect: Rect,
         colors: Theme,
     ) {
+        // Mutating helpers cannot run while `sheet` is borrowed from the
+        // cache, so interactions are recorded here and applied afterwards.
+        enum SheetAction {
+            Begin { row: usize, column: usize },
+            Commit { advance: bool },
+        }
+        let mut action: Option<SheetAction> = None;
+
+        let mut state = self.sheet_states.get(&id).copied().unwrap_or_default();
+        let editing_here = self
+            .sheet_cell_edit
+            .as_ref()
+            .is_some_and(|edit| edit.tile == id);
+
         let Some(Some(workbook)) = self.sheets.get(&id) else {
             return;
         };
-        let mut state = self.sheet_states.get(&id).copied().unwrap_or_default();
         if state.sheet >= workbook.sheets.len() {
             state.sheet = 0;
         }
         let Some(sheet) = workbook.sheet(state.sheet) else {
             return;
         };
+        let (sheet_rows, sheet_columns) = (sheet.rows, sheet.columns);
 
         // One digit of the cell font, measured once per frame, is what the
         // metrics need to size columns without knowing about fonts.
@@ -3696,30 +3751,55 @@ impl AdamApp {
             && let Some((row, column)) =
                 metrics.cell_at((pointer - body.min + state.scroll).to_pos2())
         {
+            // Clicking a different cell while an editor is open commits it,
+            // as every spreadsheet does.
+            if editing_here {
+                action = Some(SheetAction::Commit { advance: false });
+            }
             state.selection = sheet_view::Selection { row, column };
         }
 
-        let (left, right, up, down) = context.input(|input| {
-            (
-                input.key_pressed(Key::ArrowLeft),
-                input.key_pressed(Key::ArrowRight),
-                input.key_pressed(Key::ArrowUp),
-                input.key_pressed(Key::ArrowDown),
-            )
-        });
-        if left || right || up || down {
-            state.selection.step(
-                isize::from(down) - isize::from(up),
-                isize::from(right) - isize::from(left),
-                sheet.rows,
-                sheet.columns,
-            );
-            state.scroll = metrics.scroll_to_reveal(
-                state.selection.row,
-                state.selection.column,
-                viewport,
-                state.scroll,
-            );
+        if response.double_clicked()
+            && let Some(pointer) = context.input(|input| input.pointer.interact_pos())
+            && body.contains(pointer)
+            && let Some((row, column)) =
+                metrics.cell_at((pointer - body.min + state.scroll).to_pos2())
+        {
+            state.selection = sheet_view::Selection { row, column };
+            action = Some(SheetAction::Begin { row, column });
+        }
+
+        // While an editor is open the keyboard belongs to it.
+        if !editing_here {
+            let (left, right, up, down, enter) = context.input(|input| {
+                (
+                    input.key_pressed(Key::ArrowLeft),
+                    input.key_pressed(Key::ArrowRight),
+                    input.key_pressed(Key::ArrowUp),
+                    input.key_pressed(Key::ArrowDown),
+                    input.key_pressed(Key::Enter),
+                )
+            });
+            if left || right || up || down {
+                state.selection.step(
+                    isize::from(down) - isize::from(up),
+                    isize::from(right) - isize::from(left),
+                    sheet_rows,
+                    sheet_columns,
+                );
+                state.scroll = metrics.scroll_to_reveal(
+                    state.selection.row,
+                    state.selection.column,
+                    viewport,
+                    state.scroll,
+                );
+            }
+            if enter {
+                action = Some(SheetAction::Begin {
+                    row: state.selection.row,
+                    column: state.selection.column,
+                });
+            }
         }
 
         sheet_view::draw(
@@ -3740,7 +3820,7 @@ impl AdamApp {
         );
 
         // A status line the sheet itself cannot show: which cell is selected,
-        // its formula if it has one, and whether the load was capped.
+        // its formula if it has one, and what state the editing is in.
         let cell = sheet.cell(state.selection.row, state.selection.column);
         let mut status = state.selection.reference();
         if let Some(formula) = cell.and_then(|cell| cell.formula.as_deref()) {
@@ -3754,7 +3834,23 @@ impl AdamApp {
                 sheet.rows, sheet.columns, sheet.source_rows, sheet.source_columns
             ));
         }
-        status.push_str("  ·  read-only for now");
+        status.push_str(match self.sheet_engines.get(&id) {
+            Some(Ok(engine)) if engine.is_dirty() => {
+                "  ·  edited — not saved to the file yet (saving arrives next)"
+            }
+            Some(Err(_)) => "  ·  read-only",
+            _ => "  ·  double-click or press Enter to edit a cell",
+        });
+        let status_error = self
+            .sheet_cell_edit
+            .as_ref()
+            .filter(|edit| edit.tile == id)
+            .and_then(|edit| edit.error.clone())
+            .or_else(|| {
+                self.sheet_engines
+                    .get(&id)
+                    .and_then(|engine| engine.as_ref().err().cloned())
+            });
         ui.painter().text(
             pos2(rect.left() + 8.0, rect.bottom() + 16.0),
             Align2::LEFT_CENTER,
@@ -3762,8 +3858,216 @@ impl AdamApp {
             FontId::proportional(11.5),
             colors.chrome_secondary_text,
         );
+        if let Some(error) = status_error {
+            ui.painter().text(
+                pos2(rect.left() + 8.0, rect.bottom() + 34.0),
+                Align2::LEFT_CENTER,
+                truncate(&error, 140),
+                FontId::proportional(11.5),
+                colors.danger,
+            );
+        }
+
+        // The cell editor floats over its own target cell — deliberately not
+        // over the selection, which a failed click-commit can leave on a
+        // different cell than the one the draft belongs to. Direct field
+        // access keeps this disjoint from the sheet borrow above.
+        if editing_here && let Some(edit) = &mut self.sheet_cell_edit {
+            // Escape and Enter must work even when panning has scrolled the
+            // edited cell out of view and the text field is not being drawn.
+            let escape = context.input(|input| input.key_pressed(Key::Escape));
+            let enter = context.input(|input| input.key_pressed(Key::Enter));
+
+            let cell_rect = metrics.cell_rect(edit.row, edit.column);
+            let editor_rect = Rect::from_min_size(
+                body.min + (cell_rect.min.to_vec2() - state.scroll),
+                cell_rect.size(),
+            )
+            .intersect(body);
+            let rendered = editor_rect.width() > 8.0 && editor_rect.height() > 8.0;
+
+            if rendered {
+                let focus_pending = edit.focus_pending;
+                edit.focus_pending = false;
+                let editor_response = ui.put(
+                    editor_rect,
+                    TextEdit::singleline(&mut edit.draft)
+                        .font(FontId::proportional(12.0))
+                        .text_color(colors.text),
+                );
+                if focus_pending {
+                    editor_response.request_focus();
+                }
+                if escape {
+                    self.sheet_cell_edit = None;
+                } else if editor_response.lost_focus() {
+                    // Enter and clicking away both commit; Excel's behaviour.
+                    action = Some(SheetAction::Commit { advance: enter });
+                }
+            } else if escape {
+                self.sheet_cell_edit = None;
+            } else if enter {
+                // Commit blind rather than leave the keyboard dead: the draft
+                // is whatever was typed before the cell scrolled away.
+                action = Some(SheetAction::Commit { advance: false });
+            }
+        }
+
+        match action {
+            Some(SheetAction::Begin { row, column }) => {
+                self.begin_sheet_cell_edit(id, state.sheet, row, column);
+            }
+            Some(SheetAction::Commit { advance }) => {
+                // Not folded into a match guard: the commit has side effects,
+                // and a guard that fails would fall through to another arm.
+                let committed = self.commit_sheet_cell_edit(id, state.sheet);
+                if committed && advance {
+                    state.selection.step(1, 0, sheet_rows, sheet_columns);
+                    state.scroll = metrics.scroll_to_reveal(
+                        state.selection.row,
+                        state.selection.column,
+                        viewport,
+                        state.scroll,
+                    );
+                }
+            }
+            None => {}
+        }
 
         self.sheet_states.insert(id, state);
+    }
+
+    /// Opens the cell editor, creating the workbook's engine on first use.
+    fn begin_sheet_cell_edit(&mut self, id: Uuid, sheet_index: usize, row: usize, column: usize) {
+        if !self.ensure_sheet_engine(id) {
+            return;
+        }
+        let draft = self
+            .sheets
+            .get(&id)
+            .and_then(|workbook| workbook.as_ref())
+            .and_then(|workbook| workbook.sheet(sheet_index))
+            .and_then(|sheet| sheet.cell(row, column));
+        self.sheet_cell_edit = Some(SheetCellEdit {
+            tile: id,
+            row,
+            column,
+            draft: sheet_edit::draft_for(draft),
+            focus_pending: true,
+            error: None,
+        });
+    }
+
+    /// Builds the formula engine for a workbook if it does not exist yet, and
+    /// opens editing headroom past the used range in the display cache.
+    /// Returns whether an engine is available.
+    fn ensure_sheet_engine(&mut self, id: Uuid) -> bool {
+        if let Some(result) = self.sheet_engines.get(&id) {
+            return result.is_ok();
+        }
+        let Some(Some(workbook)) = self.sheets.get_mut(&id) else {
+            return false;
+        };
+        let engine = EditableWorkbook::from_loaded(workbook);
+        if engine.is_ok() {
+            for sheet in &mut workbook.sheets {
+                sheet_edit::grow_for_editing(sheet);
+            }
+        }
+        let available = engine.is_ok();
+        self.sheet_engines.insert(id, engine);
+        available
+    }
+
+    /// Commits the open editor into the engine. Returns whether the commit
+    /// succeeded; on failure the editor stays open with the reason shown.
+    fn commit_sheet_cell_edit(&mut self, id: Uuid, sheet_index: usize) -> bool {
+        let Some(edit) = &self.sheet_cell_edit else {
+            return false;
+        };
+        if edit.tile != id {
+            return false;
+        }
+        let (row, column, draft) = (edit.row, edit.column, edit.draft.clone());
+        let Some(Ok(engine)) = self.sheet_engines.get_mut(&id) else {
+            self.sheet_cell_edit = None;
+            return false;
+        };
+        match engine.set_input(sheet_index, row, column, &draft) {
+            Ok(()) => {
+                if let Some(Some(workbook)) = self.sheets.get_mut(&id)
+                    && let Some(sheet) = workbook.sheets.get_mut(sheet_index)
+                {
+                    // An edit near the frontier opens more headroom, so the
+                    // grid never becomes a silent wall 64 rows in.
+                    if row + 8 >= sheet.rows || column + 4 >= sheet.columns {
+                        sheet_edit::grow_for_editing(sheet);
+                    }
+                    engine.resync(sheet_index, sheet);
+                }
+                self.sheet_cell_edit = None;
+                true
+            }
+            Err(error) => {
+                if let Some(edit) = &mut self.sheet_cell_edit {
+                    edit.error = Some(error);
+                    edit.focus_pending = true;
+                }
+                false
+            }
+        }
+    }
+
+    /// Routes Command-Z to the sheet in the open lightbox, when there is one.
+    /// Returns whether the shortcut was taken.
+    fn undo_open_sheet(&mut self) -> bool {
+        self.step_open_sheet_history(true)
+    }
+
+    fn redo_open_sheet(&mut self) -> bool {
+        self.step_open_sheet_history(false)
+    }
+
+    fn step_open_sheet_history(&mut self, undo: bool) -> bool {
+        let Some(id) = self.open_inline_sheet_tile() else {
+            return false;
+        };
+        // While a sheet is fullscreen, Command-Z belongs to it even when
+        // there is nothing to undo — falling through to the workspace would
+        // silently rearrange tiles the user cannot see.
+        if let Some(Ok(engine)) = self.sheet_engines.get_mut(&id) {
+            let stepped = if undo { engine.undo() } else { engine.redo() };
+            if stepped && let Some(Some(workbook)) = self.sheets.get_mut(&id) {
+                let sheet_index = self
+                    .sheet_states
+                    .get(&id)
+                    .map(|state| state.sheet)
+                    .unwrap_or(0);
+                if let Some(sheet) = workbook.sheets.get_mut(sheet_index)
+                    && let Some(Ok(engine)) = self.sheet_engines.get(&id)
+                {
+                    engine.resync(sheet_index, sheet);
+                }
+            }
+        }
+        true
+    }
+
+    /// The tile whose sheet is currently expanded in the grid lightbox, if
+    /// the lightbox is showing an inline sheet at all. Edit mode is part of
+    /// the definition: in browse mode the lightbox draws a static preview,
+    /// and keys routed to an invisible sheet would act with no feedback.
+    fn open_inline_sheet_tile(&self) -> Option<Uuid> {
+        let state = self.grid_view?;
+        if !state.editing {
+            return None;
+        }
+        let lightbox = state.lightbox?;
+        let id = self.tile_id_at(lightbox.index)?;
+        self.sheets
+            .get(&id)
+            .is_some_and(Option::is_some)
+            .then_some(id)
     }
 
     /// The note text field that Edit mode opens inside the expanded cell.
@@ -3911,8 +4215,14 @@ impl AdamApp {
             (_, _, false, true) => Some(metrics.columns as isize),
             _ => None,
         };
+        let sheet_owns_keys = state.editing
+            && state
+                .lightbox
+                .and_then(|lightbox| self.tile_id_at(lightbox.index))
+                .is_some_and(|id| self.sheets.get(&id).is_some_and(Option::is_some));
         if let Some(step) = step
             && count > 0
+            && !sheet_owns_keys
         {
             let visible = state.camera.visible_size(view);
             match &mut state.lightbox {

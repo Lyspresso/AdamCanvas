@@ -70,7 +70,7 @@ impl CellValue {
 /// Trailing zeros make a column of figures hard to scan, so a whole number
 /// prints without a decimal point and everything else keeps a bounded number
 /// of places.
-fn format_number(number: f64) -> String {
+pub fn format_number(number: f64) -> String {
     if !number.is_finite() {
         return String::from("#NUM!");
     }
@@ -120,6 +120,43 @@ impl Sheet {
 
     pub fn is_empty(&self) -> bool {
         self.rows == 0 || self.columns == 0
+    }
+
+    /// Grows the grid to at least `rows` × `columns`, padding with blanks.
+    ///
+    /// Editing needs room past the file's used range — adding a row of data
+    /// is the most ordinary spreadsheet edit there is. Growth is re-strided
+    /// because cells are row-major: appending columns moves every row's slice.
+    /// `source_rows`/`source_columns` keep describing the file itself.
+    pub fn grow(&mut self, rows: usize, columns: usize) {
+        let rows = rows.max(self.rows);
+        let columns = columns.max(self.columns);
+        if rows == self.rows && columns == self.columns {
+            return;
+        }
+        let mut cells = vec![Cell::default(); rows * columns];
+        for row in 0..self.rows {
+            for column in 0..self.columns {
+                cells[row * columns + column] = self.cells[row * self.columns + column].clone();
+            }
+        }
+        self.cells = cells;
+        self.rows = rows;
+        self.columns = columns;
+    }
+
+    /// Replaces one cell in the display cache. Out-of-bounds writes are
+    /// ignored rather than growing the sheet: the grid's shape is fixed by
+    /// load and [`Sheet::grow`], and the editor's selection is clamped inside
+    /// it.
+    pub fn set_cell(&mut self, row: usize, column: usize, cell: Cell) {
+        if row >= self.rows || column >= self.columns {
+            return;
+        }
+        let columns = self.columns;
+        if let Some(slot) = self.cells.get_mut(row * columns + column) {
+            *slot = cell;
+        }
     }
 }
 
