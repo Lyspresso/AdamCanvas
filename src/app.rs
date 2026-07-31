@@ -7764,6 +7764,7 @@ impl AdamApp {
                         .as_deref()
                         .map(Path::new),
                     &conversation.settings.api_endpoint,
+                    matches!(continuity, PromptContinuity::Resume),
                 )
                 .then(|| {
                         "Keep Adam's Progress checklist current with task_create, task_update, and task_list when those tools are offered. Create concrete main-agent steps before substantial work, move only the active step to in_progress, and finish each step as it completes. Checklist bookkeeping is allowed in every access stance and does not modify files or canvas data. Do not use prose, command activity, or child-agent counts as a substitute for the checklist."
