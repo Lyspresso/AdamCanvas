@@ -257,6 +257,11 @@ The visible choices map to real provider controls:
   4 server agents and High or XHigh to 16. Adam sends the hosted
   `web_search` tool only when explicitly enabled, sends no client function
   tools, and reads its key from the temporary setting or `XAI_API_KEY`.
+  If xAI nevertheless reports an unrequested or unknown server-side hosted
+  call, Adam quarantines that item without executing or projecting it as a
+  local tool, preserves the leader response, and attaches one bounded provider
+  notice to the completed group. An unsolicited client `function_call` or
+  `custom_tool_call` still fails closed because Adam exposed no such executor.
   The API exposes leader tool calls and the leader’s answer, so the only
   honest lifecycle is one aggregate 4- or 16-agent group. Stop wins a
   serialized terminal race and releases the Adam run slot immediately; a
@@ -525,8 +530,15 @@ fine-grained thought and intermediate update chatter, coalesces the latest
 tool/progress/plan state, and continues reading the provider. Session identity,
 permission decisions, final plans and tools, root completion, real child
 spawn/finish state, final child prose, and terminal outcomes remain observable.
-Line, byte, text, identity, and registry bounds remain hard failures because
-those protect memory and protocol integrity rather than presentation density.
+If either ACP transport then fails, it first flushes already-accepted partial
+root text plus the latest root tool and plan snapshots, returns the original
+error, and does not invent a successful terminal. Line, protocol-byte, text,
+and identity bounds remain hard failures because those protect memory and
+protocol integrity rather than presentation density. Grok's cumulative child
+projection registry is different: after 256 tracked children it stops
+projecting newly discovered children, keeps the root turn alive, and denies
+permissions whose ownership can no longer be proven. Kimi's bounded root-tool
+registry remains a hard identity and permission boundary.
 
 ## Inspector, artifacts, files, and context
 
