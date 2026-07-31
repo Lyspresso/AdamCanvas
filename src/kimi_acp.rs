@@ -237,6 +237,32 @@ impl KimiAcpPermissionRequest {
             .iter()
             .find(|option| option.kind == KimiAcpPermissionOptionKind::RejectOnce)
     }
+
+    /// Kimi Code 0.31 bridges `AskUserQuestion` through ACP's permission
+    /// method because ACP has no dedicated question request. Recognize only
+    /// that pinned, source-backed wire shape so a normal tool approval cannot
+    /// gain question semantics merely by borrowing the display title.
+    pub fn ask_user_question_skip_option(&self) -> Option<&KimiAcpPermissionOption> {
+        if self.tool_call.title.as_deref() != Some("AskUserQuestion") {
+            return None;
+        }
+        let (skip, choices) = self.options.split_last()?;
+        if choices.is_empty()
+            || skip.id != "q0_skip"
+            || skip.name != "Skip"
+            || skip.kind != KimiAcpPermissionOptionKind::RejectOnce
+        {
+            return None;
+        }
+        choices
+            .iter()
+            .enumerate()
+            .all(|(index, option)| {
+                option.id == format!("q0_opt_{index}")
+                    && option.kind == KimiAcpPermissionOptionKind::AllowOnce
+            })
+            .then_some(skip)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2903,6 +2929,63 @@ mod tests {
                 KimiAcpPermissionOptionKind::RejectOnce,
             ]
         );
+    }
+
+    #[test]
+    fn pinned_ask_user_question_fixture_selects_only_the_explicit_skip_contract() {
+        let fixture = include_str!("../tests/fixtures/ai/kimi/0.31.0/acp-ask-user-question.jsonl")
+            .replace("<ROOT_SESSION>", "session-1");
+        let message: Value = serde_json::from_str(fixture.trim()).unwrap();
+        let state = initialized_state();
+        let request = state
+            .parse_permission_request(message.get("params").unwrap())
+            .unwrap();
+
+        let skip = request.ask_user_question_skip_option().unwrap();
+        assert_eq!(skip.id, "q0_skip");
+        let (response, resolution, disposition) = permission_response(
+            &request,
+            KimiAcpPermissionDecision::Reject {
+                option_id: skip.id.clone(),
+            },
+        )
+        .unwrap();
+        assert_eq!(response["outcome"]["outcome"], "selected");
+        assert_eq!(response["outcome"]["optionId"], "q0_skip");
+        assert_eq!(
+            resolution,
+            KimiAcpPermissionResolution::Rejected {
+                option_id: "q0_skip".into()
+            }
+        );
+        assert_eq!(disposition, AgentMessageDisposition::Continue);
+    }
+
+    #[test]
+    fn ask_user_question_detection_rejects_permission_lookalikes() {
+        let fixture = include_str!("../tests/fixtures/ai/kimi/0.31.0/acp-ask-user-question.jsonl")
+            .replace("<ROOT_SESSION>", "session-1");
+        let message: Value = serde_json::from_str(fixture.trim()).unwrap();
+        let state = initialized_state();
+        let request = state
+            .parse_permission_request(message.get("params").unwrap())
+            .unwrap();
+
+        let mut wrong_title = request.clone();
+        wrong_title.tool_call.title = Some("Ask user question".into());
+        assert!(wrong_title.ask_user_question_skip_option().is_none());
+
+        let mut wrong_namespace = request.clone();
+        wrong_namespace.options[0].id = "approve_once".into();
+        assert!(wrong_namespace.ask_user_question_skip_option().is_none());
+
+        let mut persistent_choice = request.clone();
+        persistent_choice.options[0].kind = KimiAcpPermissionOptionKind::AllowAlways;
+        assert!(persistent_choice.ask_user_question_skip_option().is_none());
+
+        let mut wrong_skip = request;
+        wrong_skip.options.last_mut().unwrap().id = "reject".into();
+        assert!(wrong_skip.ask_user_question_skip_option().is_none());
     }
 
     #[test]

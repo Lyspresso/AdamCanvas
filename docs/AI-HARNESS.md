@@ -248,7 +248,13 @@ The visible choices map to real provider controls:
   caller identity, so attaching Adam task tools would break the
   native-XOR-tools safety boundary. Kimi’s root ACP permission requests still
   pass through Adam’s normal stance mapping and fail closed when the request
-  cannot be answered safely. Background `Agent` jobs are refused: Adam’s
+  cannot be answered safely. Kimi 0.31 also bridges `AskUserQuestion` through
+  that same ACP method with a distinct `q0_opt_*` / `q0_skip` option contract.
+  Until Adam has an interactive question surface, it recognizes only that exact
+  shape and selects Kimi’s explicit Skip response in every permission stance;
+  it never fabricates the first answer in Bypass or marks the turn permission-
+  blocked solely for dismissing the unsupported question. Background `Agent`
+  jobs are refused: Adam’s
   per-turn ACP host cannot truthfully keep such a job alive or receive its
   later notification after the root turn exits.
 - xAI Grok Heavy is a dedicated Responses API adapter, not the generic

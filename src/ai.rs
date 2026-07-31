@@ -3154,6 +3154,18 @@ fn kimi_acp_permission_decision(
     swarm_enabled: bool,
     blocked: &RefCell<KimiPermissionBlockState>,
 ) -> KimiAcpPermissionDecision {
+    // Kimi 0.31 reuses session/request_permission for AskUserQuestion because
+    // ACP has no question RPC. Adam does not yet have an interactive question
+    // surface, so choose Kimi's explicit Skip option in every stance. In
+    // particular, Bypass must never turn the first allow_once choice into an
+    // answer the user did not provide. This is a graceful tool dismissal, not
+    // a blocked capability, so do not set the permission terminal cause.
+    if let Some(skip) = permission.ask_user_question_skip_option() {
+        return KimiAcpPermissionDecision::Reject {
+            option_id: skip.id.clone(),
+        };
+    }
+
     let tool = kimi_acp_tool_label(&permission.tool_call);
     let tool_call_id = permission.tool_call.id.clone();
     let delegation = kimi_delegation_kind(&permission.tool_call);
@@ -10237,6 +10249,42 @@ mod tests {
         }
     }
 
+    fn kimi_question_permission() -> KimiAcpPermissionRequest {
+        KimiAcpPermissionRequest {
+            session_id: "kimi-session".into(),
+            tool_call: KimiAcpToolCall {
+                id: "1:ask-user".into(),
+                title: Some("AskUserQuestion".into()),
+                kind: None,
+                status: None,
+                content: vec![json!({
+                    "type": "content",
+                    "content": {"type": "text", "text": "Which option?"}
+                })],
+                locations: Vec::new(),
+                raw_input: None,
+                raw_output: None,
+            },
+            options: vec![
+                crate::kimi_acp::KimiAcpPermissionOption {
+                    id: "q0_opt_0".into(),
+                    name: "First".into(),
+                    kind: crate::kimi_acp::KimiAcpPermissionOptionKind::AllowOnce,
+                },
+                crate::kimi_acp::KimiAcpPermissionOption {
+                    id: "q0_opt_1".into(),
+                    name: "Second".into(),
+                    kind: crate::kimi_acp::KimiAcpPermissionOptionKind::AllowOnce,
+                },
+                crate::kimi_acp::KimiAcpPermissionOption {
+                    id: "q0_skip".into(),
+                    name: "Skip".into(),
+                    kind: crate::kimi_acp::KimiAcpPermissionOptionKind::RejectOnce,
+                },
+            ],
+        }
+    }
+
     #[test]
     fn grok_acp_task_bridge_is_version_pinned() {
         let task_only = CliVersion::parse("grok 0.2.114").unwrap();
@@ -16408,6 +16456,62 @@ send({
                 &RefCell::new(KimiPermissionBlockState::default()),
             ),
             KimiAcpPermissionDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn kimi_questions_are_skipped_without_fabricating_answers_or_blocking_the_turn() {
+        let question = kimi_question_permission();
+        for permission_mode in [
+            PermissionMode::Sandbox,
+            PermissionMode::Ask,
+            PermissionMode::Plan,
+            PermissionMode::Auto,
+            PermissionMode::Bypass,
+        ] {
+            for workspace_mode in [
+                AiWorkspaceMode::Chat,
+                AiWorkspaceMode::Cowork,
+                AiWorkspaceMode::Code,
+            ] {
+                let blocked = RefCell::new(KimiPermissionBlockState::default());
+                assert_eq!(
+                    kimi_acp_permission_decision(
+                        &question,
+                        permission_mode,
+                        workspace_mode,
+                        true,
+                        &blocked,
+                    ),
+                    KimiAcpPermissionDecision::Reject {
+                        option_id: "q0_skip".into()
+                    }
+                );
+                assert!(
+                    blocked.borrow().pending.is_none(),
+                    "skipping a question is not a permission-block terminal cause"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_question_title_alone_cannot_change_permission_policy() {
+        let lookalike = kimi_permission(
+            "AskUserQuestion",
+            KimiAcpToolKind::Other("other".into()),
+            None,
+        );
+        assert!(lookalike.ask_user_question_skip_option().is_none());
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &lookalike,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Code,
+                true,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Allow { ref option_id } if option_id == "allow-once"
         ));
     }
 
