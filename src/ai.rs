@@ -3412,6 +3412,9 @@ impl OutputDecoder {
         let metadata = self.subagents.entry(canonical_id.to_owned()).or_default();
         let resumed =
             metadata.status.is_some_and(SubagentStatus::is_terminal) && !status.is_terminal();
+        if resumed {
+            self.subagent_messages.remove(canonical_id);
+        }
         if incoming.detail.is_none() && (resumed || status.is_terminal()) {
             metadata.detail = None;
         }
@@ -4031,6 +4034,7 @@ impl OutputDecoder {
         }
         if status.is_terminal()
             && let Some(text) = tagged_text(content, "result")
+                .map(|text| unescape_claude_notification_entities(&text))
             && let Some(text) = self.remember_subagent_message(&canonical_id, text)
         {
             decoded.kinds.push_scoped(
@@ -6037,6 +6041,35 @@ fn tagged_text(value: &str, tag: &str) -> Option<String> {
     let end = start.saturating_add(relative_end);
     let text = value.get(start..end)?.trim();
     (!text.is_empty()).then(|| text.to_owned())
+}
+
+fn unescape_claude_notification_entities(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut cursor = 0;
+    while cursor < value.len() {
+        let remaining = &value[cursor..];
+        let (replacement, consumed) = if remaining.starts_with("&amp;") {
+            (Some('&'), 5)
+        } else if remaining.starts_with("&lt;") {
+            (Some('<'), 4)
+        } else if remaining.starts_with("&gt;") {
+            (Some('>'), 4)
+        } else {
+            (None, 0)
+        };
+        if let Some(replacement) = replacement {
+            output.push(replacement);
+            cursor += consumed;
+        } else {
+            let character = remaining
+                .chars()
+                .next()
+                .expect("cursor remains on a character boundary");
+            output.push(character);
+            cursor += character.len_utf8();
+        }
+    }
+    output
 }
 
 fn is_claude_agent_output(payload: &Value) -> bool {
@@ -10005,7 +10038,12 @@ send({
                 assert_eq!(children.len(), 1);
                 assert_eq!(children[0].status, SubagentStatus::Completed);
                 assert_eq!(children[0].prose_cells.len(), 1);
-                assert_eq!(children[0].prose_cells[0].text, "CHILD_FIXTURE_OK");
+                let expected_child = if provider == "claude_cli" {
+                    "CHILD_FIXTURE_OK & A < B > C"
+                } else {
+                    "CHILD_FIXTURE_OK"
+                };
+                assert_eq!(children[0].prose_cells[0].text, expected_child);
                 assert!(children[0].checklist.is_none());
                 if provider == "claude_cli" {
                     assert_eq!(children[0].id, "claude-agent-call");
@@ -10041,6 +10079,34 @@ send({
         let detail = compact_subagent_detail("é".repeat(MAX_SUBAGENT_DETAIL_BYTES));
         assert!(detail.len() <= MAX_SUBAGENT_DETAIL_BYTES);
         assert!(detail.ends_with('…'));
+    }
+
+    #[test]
+    fn resumed_child_can_repeat_a_legitimate_terminal_message() {
+        let mut decoder = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
+        let child = KnownSubagent {
+            label: "Research child".into(),
+            ..KnownSubagent::default()
+        };
+        decoder.remember_subagent("child-1", child.clone(), SubagentStatus::Completed);
+        assert_eq!(
+            decoder.remember_subagent_message("child-1", "No findings".into()),
+            Some("No findings".into())
+        );
+        assert!(
+            decoder
+                .remember_subagent_message("child-1", "No findings".into())
+                .is_none(),
+            "duplicate output in one lifecycle stays coalesced"
+        );
+
+        decoder.remember_subagent("child-1", child.clone(), SubagentStatus::InProgress);
+        decoder.remember_subagent("child-1", child, SubagentStatus::Completed);
+        assert_eq!(
+            decoder.remember_subagent_message("child-1", "No findings".into()),
+            Some("No findings".into()),
+            "a resumed lifecycle may legitimately produce the same final prose"
+        );
     }
 
     #[test]
