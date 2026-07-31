@@ -25,6 +25,7 @@ pub mod photo_details;
 pub mod platform;
 pub mod preview;
 pub mod progress_stepper;
+pub mod sheet_view;
 pub mod spatial;
 pub mod spreadsheet;
 pub mod structured_preview;

@@ -48,7 +48,9 @@ use crate::{
     },
     platform,
     preview::PreviewCache,
+    sheet_view::{self, SheetMetrics, SheetPalette, SheetViewState},
     spatial::{DEFAULT_CELL_SIZE, SpatialIndex},
+    spreadsheet,
     structured_preview::{StructuredPreview, StructuredPreviewCache},
 };
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -906,6 +908,10 @@ pub struct AdamApp {
     /// Contact-sheet lens over the active page. `None` is the ordinary spatial
     /// canvas; the grid never writes tile geometry, so toggling is free.
     grid_view: Option<GridViewState>,
+    /// Workbooks opened in the grid, keyed by tile. `None` records a load
+    /// that failed, so a broken file is not retried every frame.
+    sheets: HashMap<Uuid, Option<spreadsheet::Workbook>>,
+    sheet_states: HashMap<Uuid, SheetViewState>,
     snap_to_grid: bool,
     preferences: AppPreferences,
     dots_available: bool,
@@ -1191,6 +1197,8 @@ impl AdamApp {
             semantic_reconcile_needed: true,
             show_grid: false,
             grid_view: None,
+            sheets: HashMap::new(),
+            sheet_states: HashMap::new(),
             snap_to_grid: false,
             preferences,
             dots_available,
@@ -3557,6 +3565,8 @@ impl AdamApp {
                         self.checkpoint();
                         self.editing_note = Some(id);
                         self.editing_focus_pending = Some(id);
+                    } else if self.open_sheet_for(id) {
+                        // Shown inline; nothing to hand off.
                     } else {
                         self.activate_tile(id);
                         // The file may come back changed, so the cached
@@ -3566,18 +3576,194 @@ impl AdamApp {
                     }
                 }
 
+                let settled = state
+                    .lightbox
+                    .is_some_and(|lightbox| lightbox.progress >= 1.0);
                 if state.editing
-                    && let Some(id) = self.editing_note
+                    && settled
                     && let Some(photo) = expanded_photo
-                    && state
-                        .lightbox
-                        .is_some_and(|lightbox| lightbox.progress >= 1.0)
                 {
-                    self.show_grid_note_editor(ui, &context, id, photo, colors);
+                    if let Some(id) = self.editing_note {
+                        self.show_grid_note_editor(ui, &context, id, photo, colors);
+                    } else if let Some(id) = state
+                        .lightbox
+                        .and_then(|lightbox| self.tile_id_at(lightbox.index))
+                    {
+                        self.show_grid_sheet(ui, &context, id, photo, colors);
+                    }
                 }
 
                 self.grid_view = Some(state);
             });
+    }
+
+    fn tile_id_at(&self, index: usize) -> Option<Uuid> {
+        self.workspace
+            .active_page()
+            .tiles
+            .get(index)
+            .map(|tile| tile.id)
+    }
+
+    /// Loads a spreadsheet tile into the cache, returning whether the tile is
+    /// one Adam can show inline rather than hand to another application.
+    ///
+    /// A failed load is cached as `None` so a corrupt file is not re-parsed on
+    /// every frame; it falls through to the hand-off, where the app that owns
+    /// the format may well manage what Adam could not.
+    fn open_sheet_for(&mut self, id: Uuid) -> bool {
+        let Some(path) =
+            self.workspace
+                .active_page()
+                .tile(id)
+                .and_then(|tile| match &tile.content {
+                    TileContent::File { path, .. } => Some(path.clone()),
+                    _ => None,
+                })
+        else {
+            return false;
+        };
+        if !spreadsheet::is_spreadsheet(&path) {
+            return false;
+        }
+        self.sheets
+            .entry(id)
+            .or_insert_with(|| match spreadsheet::load(&path) {
+                Ok(workbook) => Some(workbook),
+                Err(error) => {
+                    log::warn!("could not read {} as a sheet: {error:#}", path.display());
+                    None
+                }
+            })
+            .is_some()
+    }
+
+    /// Draws a loaded workbook in the expanded cell, with its own scroll and
+    /// cell selection. Read-only for now — writing back arrives with the
+    /// formula engine.
+    fn show_grid_sheet(
+        &mut self,
+        ui: &mut Ui,
+        context: &Context,
+        id: Uuid,
+        rect: Rect,
+        colors: Theme,
+    ) {
+        let Some(Some(workbook)) = self.sheets.get(&id) else {
+            return;
+        };
+        let mut state = self.sheet_states.get(&id).copied().unwrap_or_default();
+        if state.sheet >= workbook.sheets.len() {
+            state.sheet = 0;
+        }
+        let Some(sheet) = workbook.sheet(state.sheet) else {
+            return;
+        };
+
+        // One digit of the cell font, measured once per frame, is what the
+        // metrics need to size columns without knowing about fonts.
+        let character_width = ui
+            .painter()
+            .layout_no_wrap("0".into(), FontId::proportional(12.0), Color32::WHITE)
+            .size()
+            .x;
+        let metrics = SheetMetrics::measure(sheet, character_width);
+
+        let response = ui.allocate_rect(rect, Sense::click_and_drag());
+        let body = Rect::from_min_max(
+            pos2(
+                rect.left() + metrics.row_header_width,
+                rect.top() + metrics.column_header_height,
+            ),
+            rect.max,
+        );
+        let viewport = body.size();
+
+        if response.contains_pointer() {
+            let scroll = context.input(|input| input.smooth_scroll_delta);
+            if scroll != Vec2::ZERO {
+                state.scroll -= scroll;
+            }
+        }
+        if response.dragged_by(PointerButton::Primary) {
+            state.scroll -= response.drag_delta();
+        }
+        state.scroll = metrics.clamp_scroll(state.scroll, viewport);
+
+        if response.clicked()
+            && let Some(pointer) = context.input(|input| input.pointer.interact_pos())
+            && body.contains(pointer)
+            && let Some((row, column)) =
+                metrics.cell_at((pointer - body.min + state.scroll).to_pos2())
+        {
+            state.selection = sheet_view::Selection { row, column };
+        }
+
+        let (left, right, up, down) = context.input(|input| {
+            (
+                input.key_pressed(Key::ArrowLeft),
+                input.key_pressed(Key::ArrowRight),
+                input.key_pressed(Key::ArrowUp),
+                input.key_pressed(Key::ArrowDown),
+            )
+        });
+        if left || right || up || down {
+            state.selection.step(
+                isize::from(down) - isize::from(up),
+                isize::from(right) - isize::from(left),
+                sheet.rows,
+                sheet.columns,
+            );
+            state.scroll = metrics.scroll_to_reveal(
+                state.selection.row,
+                state.selection.column,
+                viewport,
+                state.scroll,
+            );
+        }
+
+        sheet_view::draw(
+            ui.painter(),
+            rect,
+            sheet,
+            &metrics,
+            &state,
+            SheetPalette {
+                surface: colors.tile,
+                header: colors.tile_footer,
+                grid_line: color_with_alpha(colors.tertiary_text, 60),
+                text: colors.text,
+                secondary_text: colors.secondary_text,
+                selection: color_with_alpha(colors.accent, 60),
+                accent: colors.accent,
+            },
+        );
+
+        // A status line the sheet itself cannot show: which cell is selected,
+        // its formula if it has one, and whether the load was capped.
+        let cell = sheet.cell(state.selection.row, state.selection.column);
+        let mut status = state.selection.reference();
+        if let Some(formula) = cell.and_then(|cell| cell.formula.as_deref()) {
+            status.push_str(&format!("  ={formula}"));
+        } else if let Some(cell) = cell.filter(|cell| !cell.value.is_empty()) {
+            status.push_str(&format!("  {}", truncate(&cell.value.display(), 60)));
+        }
+        if sheet.truncated {
+            status.push_str(&format!(
+                "  ·  showing {}×{} of {}×{}",
+                sheet.rows, sheet.columns, sheet.source_rows, sheet.source_columns
+            ));
+        }
+        status.push_str("  ·  read-only for now");
+        ui.painter().text(
+            pos2(rect.left() + 8.0, rect.bottom() + 16.0),
+            Align2::LEFT_CENTER,
+            status,
+            FontId::proportional(11.5),
+            colors.chrome_secondary_text,
+        );
+
+        self.sheet_states.insert(id, state);
     }
 
     /// The note text field that Edit mode opens inside the expanded cell.
