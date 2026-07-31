@@ -1,15 +1,17 @@
 //! Agents panel: read-only detection of installed AI provider CLIs.
 //!
-//! Scope guard (docs/ai/multi-harness-orchestration.md §5): this module only
-//! detects providers and describes how to install them. It never installs,
-//! launches, or manages agents, and none of the orchestration safety gates
+//! Scope guard (docs/ai/multi-harness-orchestration.md §5): this module
+//! detects providers, runs compiled-in vendor install commands only on an
+//! explicit user click, and probes sign-in status read-only. It never
+//! launches or manages agents, and none of the orchestration safety gates
 //! are touched. Status grammar borrowed from Buzz (github.com/block/buzz,
-//! Apache-2.0): presence and verification are one axis, sign-in is a future
-//! orthogonal axis, and only compiled-in table entries may ever carry
-//! runnable install commands.
+//! Apache-2.0): presence/verification and sign-in are two orthogonal axes,
+//! and only compiled-in table entries may ever carry runnable install
+//! commands or auth probes.
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use egui::{Align, Color32, Frame, Layout, Margin, RichText, Stroke, Ui, vec2};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -18,8 +20,8 @@ use std::time::{Duration, Instant};
 use crate::ai::{ProviderProbe, probe_installed_provider};
 use crate::chat_core::{CliVersion, capability_profile, runtime_tuning_profile};
 
-/// Availability axis. Sign-in is a deliberately separate future axis so a
-/// v1.5 auth probe extends this model instead of reshaping it.
+/// Availability axis. Sign-in is the deliberately separate second axis
+/// below (Buzz keeps them orthogonal; so do we).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AgentAvailability {
     NotDetected,
@@ -31,6 +33,21 @@ pub enum AgentAvailability {
     DetectedVerified {
         version: CliVersion,
     },
+}
+
+/// Sign-in axis, filled only for providers whose CLI has a vendor status
+/// command (claude `auth status`, codex `login status`). Everything else is
+/// `NotApplicable` — sign-in happens at launch — and undetected binaries
+/// stay `Unknown`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AgentAuth {
+    #[default]
+    Unknown,
+    NotApplicable,
+    SignedIn,
+    SignedOut,
+    /// The status command failed to run or timed out; never guess.
+    ProbeFailed,
 }
 
 /// One compiled-in provider entry. Only this table may carry install
@@ -48,6 +65,11 @@ pub struct AgentProviderMeta {
     pub hover_note: Option<&'static str>,
     /// Set for rows that are informational instead of probed.
     pub info_note: Option<&'static str>,
+    /// Vendor status-command arguments (run against the resolved binary)
+    /// used to fill the sign-in axis; None ⇒ NotApplicable.
+    pub auth_probe: Option<&'static [&'static str]>,
+    /// Copyable command that starts the vendor's interactive sign-in.
+    pub sign_in_command: Option<&'static str>,
 }
 
 /// Mirrors `AI_PROVIDER_OPTIONS` in app.rs (asserted by test there); probed
@@ -70,6 +92,10 @@ pub const AGENT_PROVIDERS: &[AgentProviderMeta] = &[
         docs_url: Some("https://code.claude.com/docs/en/setup"),
         hover_note: None,
         info_note: None,
+        // Output shapes verified live 2026-07-30: JSON with "loggedIn":
+        // true/false, exit 0 when signed in, 1 when not.
+        auth_probe: Some(&["auth", "status"]),
+        sign_in_command: Some("claude auth login"),
     },
     AgentProviderMeta {
         provider_id: "codex_cli",
@@ -80,6 +106,9 @@ pub const AGENT_PROVIDERS: &[AgentProviderMeta] = &[
         docs_url: Some("https://developers.openai.com/codex/cli"),
         hover_note: None,
         info_note: None,
+        // Verified live 2026-07-30: "Logged in using ChatGPT", exit 0.
+        auth_probe: Some(&["login", "status"]),
+        sign_in_command: Some("codex login"),
     },
     AgentProviderMeta {
         provider_id: "grok_cli",
@@ -90,6 +119,8 @@ pub const AGENT_PROVIDERS: &[AgentProviderMeta] = &[
         docs_url: Some("https://docs.x.ai/build/overview"),
         hover_note: None,
         info_note: None,
+        auth_probe: None,
+        sign_in_command: None,
     },
     AgentProviderMeta {
         provider_id: "kimi_cli",
@@ -102,6 +133,8 @@ pub const AGENT_PROVIDERS: &[AgentProviderMeta] = &[
         ),
         hover_note: None,
         info_note: None,
+        auth_probe: None,
+        sign_in_command: None,
     },
     AgentProviderMeta {
         provider_id: "lm_studio",
@@ -114,6 +147,8 @@ pub const AGENT_PROVIDERS: &[AgentProviderMeta] = &[
             "With an endpoint configured, Adam talks to LM Studio's local server directly — the CLI is optional.",
         ),
         info_note: None,
+        auth_probe: None,
+        sign_in_command: None,
     },
     AgentProviderMeta {
         provider_id: "ollama",
@@ -124,6 +159,8 @@ pub const AGENT_PROVIDERS: &[AgentProviderMeta] = &[
         docs_url: Some("https://ollama.com/download"),
         hover_note: Some("The binary being present does not mean the Ollama daemon is running."),
         info_note: None,
+        auth_probe: None,
+        sign_in_command: None,
     },
     AgentProviderMeta {
         provider_id: "auto",
@@ -134,6 +171,8 @@ pub const AGENT_PROVIDERS: &[AgentProviderMeta] = &[
         docs_url: None,
         hover_note: None,
         info_note: None,
+        auth_probe: None,
+        sign_in_command: None,
     },
     AgentProviderMeta {
         provider_id: "openai_compatible",
@@ -144,6 +183,8 @@ pub const AGENT_PROVIDERS: &[AgentProviderMeta] = &[
         docs_url: None,
         hover_note: None,
         info_note: Some("No local install — uses the endpoint configured per conversation."),
+        auth_probe: None,
+        sign_in_command: None,
     },
     AgentProviderMeta {
         provider_id: "custom_cli",
@@ -154,6 +195,8 @@ pub const AGENT_PROVIDERS: &[AgentProviderMeta] = &[
         docs_url: None,
         hover_note: None,
         info_note: Some("Runs your custom command; deliberately not probed."),
+        auth_probe: None,
+        sign_in_command: None,
     },
 ];
 
@@ -183,20 +226,30 @@ pub enum AgentsWorkerJob {
 
 #[derive(Clone, Debug, Default)]
 pub struct AgentsScanSnapshot {
-    pub probes: Vec<(&'static str, ProviderProbe)>,
+    pub probes: Vec<(&'static str, ProviderProbe, AgentAuth)>,
 }
 
 impl AgentsScanSnapshot {
     pub fn probe(&self, provider_id: &str) -> Option<&ProviderProbe> {
         self.probes
             .iter()
-            .find(|(id, _)| *id == provider_id)
-            .map(|(_, probe)| probe)
+            .find(|(id, _, _)| *id == provider_id)
+            .map(|(_, probe, _)| probe)
+    }
+
+    pub fn auth(&self, provider_id: &str) -> AgentAuth {
+        self.probes
+            .iter()
+            .find(|(id, _, _)| *id == provider_id)
+            .map(|(_, _, auth)| *auth)
+            .unwrap_or_default()
     }
 }
 
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const INSTALL_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const AUTH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTH_DRAIN_GRACE: Duration = Duration::from_secs(1);
 const OUTPUT_TAIL_BYTES: usize = 8 * 1024;
 
 /// One executed install command with enough output retained to diagnose a
@@ -365,6 +418,118 @@ fn run_install_command(command: &str, timeout: Duration, drain_grace: Duration) 
     }
 }
 
+/// Runs a vendor status command directly (no shell) with the same
+/// wedge-proofing as installs: own process group, deadline group-kill, and
+/// a bounded output drain. Returns (exit success, combined output tail).
+fn run_probe_command(
+    program: &std::path::Path,
+    args: &[&str],
+    timeout: Duration,
+    drain_grace: Duration,
+) -> (Option<bool>, String) {
+    let mut probe = Command::new(program);
+    probe
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        probe.process_group(0);
+    }
+    let mut child = match probe.spawn() {
+        Ok(child) => child,
+        Err(error) => return (None, format!("could not run the status command: {error}")),
+    };
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (tail_sender, tail_receiver) = bounded::<(&'static str, String)>(2);
+    let stdout_sender = tail_sender.clone();
+    thread::spawn(move || {
+        let _ = stdout_sender.send(("stdout", drain_tail(stdout)));
+    });
+    thread::spawn(move || {
+        let _ = tail_sender.send(("stderr", drain_tail(stderr)));
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
+            Ok(None) | Err(_) => {
+                kill_install_process_group(&mut child);
+                break None;
+            }
+        }
+    };
+    let drain_deadline = Instant::now() + drain_grace;
+    let mut pieces: Vec<String> = Vec::new();
+    for _ in 0..2 {
+        let Some(remaining) = drain_deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match tail_receiver.recv_timeout(remaining) {
+            Ok((_, tail)) => pieces.push(tail),
+            Err(_) => break,
+        }
+    }
+    (
+        status.map(|status| status.success()),
+        pieces.join("\n").trim().to_owned(),
+    )
+}
+
+/// Pure classifier for vendor status-command output. Signed-out markers win
+/// over exit codes ("not logged in" contains "logged in", and some CLIs
+/// exit 0 while logged out). Both real CLIs always print an explicit marker
+/// when genuinely signed out, so a non-zero exit WITHOUT a marker is some
+/// other failure (missing subcommand, crash, config error) and classifies
+/// as ProbeFailed — the review-confirmed rule: never assert an auth state
+/// the CLI didn't state.
+fn classify_auth_output(exit_success: Option<bool>, combined: &str) -> AgentAuth {
+    let Some(exit_success) = exit_success else {
+        return AgentAuth::ProbeFailed;
+    };
+    let lowered = combined.to_lowercase();
+    let signed_out = [
+        "\"loggedin\": false",
+        "\"loggedin\":false",
+        "not logged in",
+        "logged out",
+        "not authenticated",
+        "no credentials",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker));
+    if signed_out {
+        return AgentAuth::SignedOut;
+    }
+    if exit_success {
+        AgentAuth::SignedIn
+    } else {
+        AgentAuth::ProbeFailed
+    }
+}
+
+/// Sign-in status for one provider, derived from the resolved binary and
+/// the compiled-in probe spec; providers without a spec are NotApplicable.
+fn auth_status_for(provider_id: &str, probe: &ProviderProbe) -> AgentAuth {
+    let Some(program) = probe.program.as_deref() else {
+        return AgentAuth::Unknown;
+    };
+    let Some(args) = AGENT_PROVIDERS
+        .iter()
+        .find(|meta| meta.provider_id == provider_id)
+        .and_then(|meta| meta.auth_probe)
+    else {
+        return AgentAuth::NotApplicable;
+    };
+    let (exit_success, combined) =
+        run_probe_command(program, args, AUTH_PROBE_TIMEOUT, AUTH_DRAIN_GRACE);
+    classify_auth_output(exit_success, &combined)
+}
+
 /// Builds the user-facing outcome from the executed step and the
 /// post-install re-probe. Pure, so the honest-message wording is testable.
 fn install_outcome(
@@ -415,11 +580,31 @@ pub fn start_agents_scan_worker(
     thread::Builder::new()
         .name("adam-agents-scan".into())
         .spawn(move || {
-            let scan = |refresh: bool| AgentsScanSnapshot {
+            // Auth results are cached per (provider, resolved path) so
+            // ordinary rescans don't re-spawn vendor CLIs; Refresh and the
+            // post-install rescan (refresh: true) re-probe. Review finding:
+            // uncached probes made every scan pay the full auth cost.
+            let mut auth_cache: HashMap<(&'static str, PathBuf), AgentAuth> = HashMap::new();
+            let mut scan = |refresh: bool| AgentsScanSnapshot {
                 probes: PROBED_PROVIDER_IDS
                     .iter()
                     .map(|provider_id| {
-                        (*provider_id, probe_installed_provider(provider_id, refresh))
+                        let probe = probe_installed_provider(provider_id, refresh);
+                        let auth = match probe.program.clone() {
+                            Some(program) => {
+                                let key = (*provider_id, program);
+                                match auth_cache.get(&key) {
+                                    Some(cached) if !refresh => *cached,
+                                    _ => {
+                                        let auth = auth_status_for(provider_id, &probe);
+                                        auth_cache.insert(key, auth);
+                                        auth
+                                    }
+                                }
+                            }
+                            None => AgentAuth::Unknown,
+                        };
+                        (*provider_id, probe, auth)
                     })
                     .collect(),
             };
@@ -453,9 +638,15 @@ pub fn start_agents_scan_worker(
                             step,
                             &probe_after,
                         );
-                        let install_send = result_sender.send(AgentsWorkerResult::Install(outcome));
+                        // Snapshot goes FIRST so poll() applies the fresh
+                        // row state in the same drain that clears the
+                        // Installing spinner — otherwise the success toast
+                        // fires while the row still says "Not detected"
+                        // with a live Install button (review finding:
+                        // double-install window).
                         let snapshot_send =
                             result_sender.send(AgentsWorkerResult::Snapshot(scan(true)));
+                        let install_send = result_sender.send(AgentsWorkerResult::Install(outcome));
                         if install_send.is_err() || snapshot_send.is_err() {
                             break;
                         }
@@ -625,6 +816,7 @@ pub struct AgentRow {
     pub meta: &'static AgentProviderMeta,
     pub kind: AgentRowKind,
     pub program: Option<PathBuf>,
+    pub auth: AgentAuth,
     pub selected: bool,
 }
 
@@ -653,6 +845,7 @@ pub fn agent_rows(snapshot: &AgentsScanSnapshot, selected_provider: Option<&str>
                 program: snapshot
                     .probe(meta.provider_id)
                     .and_then(|probe| probe.program.clone()),
+                auth: snapshot.auth(meta.provider_id),
                 selected: selected_provider.is_some_and(|selected| selected == meta.provider_id),
             }
         })
@@ -800,6 +993,7 @@ pub struct AgentsPanelAction {
     pub refresh: bool,
     pub install: Option<&'static str>,
     pub copy_install: Option<&'static str>,
+    pub copy_sign_in: Option<&'static str>,
     pub open_docs: Option<&'static str>,
     pub clear_install_log: bool,
     pub dismiss_setup: bool,
@@ -841,7 +1035,7 @@ pub fn agents_panel_ui(
     for row in rows {
         match &row.kind {
             AgentRowKind::Probed { availability } => {
-                probed_row_ui(ui, row, availability, installing, palette, action);
+                probed_row_ui(ui, row, availability, scanning, installing, palette, action);
                 if let Some(outcome) = last_install
                     && outcome.provider_id == row.meta.provider_id
                 {
@@ -879,6 +1073,7 @@ fn probed_row_ui(
     ui: &mut Ui,
     row: &AgentRow,
     availability: &AgentAvailability,
+    scanning: bool,
     installing: Option<&'static str>,
     palette: &AgentsPalette,
     action: &mut AgentsPanelAction,
@@ -913,7 +1108,24 @@ fn probed_row_ui(
                         .color(palette.text),
                 );
                 status_chip(ui, &availability_label(availability), tone);
+                match row.auth {
+                    AgentAuth::SignedIn => status_chip(ui, "Signed in", palette.secondary_text),
+                    AgentAuth::SignedOut => status_chip(ui, "Signed out", palette.danger),
+                    AgentAuth::ProbeFailed => {
+                        status_chip(ui, "Sign-in unknown", palette.tertiary_text);
+                    }
+                    AgentAuth::Unknown | AgentAuth::NotApplicable => {}
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if row.auth == AgentAuth::SignedOut
+                        && let Some(command) = row.meta.sign_in_command
+                        && ui
+                            .small_button("Copy sign-in command")
+                            .on_hover_text(format!("Run in Terminal: {command}"))
+                            .clicked()
+                    {
+                        action.copy_sign_in = Some(command);
+                    }
                     if this_installing {
                         ui.spinner();
                         ui.label(
@@ -924,7 +1136,11 @@ fn probed_row_ui(
                     } else if missing {
                         match install_plan(row.meta) {
                             InstallPlan::RunCommand(command) => {
-                                let install_enabled = installing.is_none();
+                                // Also disabled while a scan runs: the serial
+                                // worker would queue the install behind it and
+                                // the spinner would lie about what is
+                                // happening (review finding).
+                                let install_enabled = installing.is_none() && !scanning;
                                 let install = ui
                                     .add_enabled(
                                         install_enabled,
@@ -933,7 +1149,9 @@ fn probed_row_ui(
                                             .min_size(vec2(64.0, 22.0)),
                                     )
                                     .on_hover_text(format!("Runs: {command}"))
-                                    .on_disabled_hover_text("Another install is already running");
+                                    .on_disabled_hover_text(
+                                        "Busy — wait for the current scan or install to finish",
+                                    );
                                 if install.clicked() {
                                     action.install = Some(row.meta.provider_id);
                                 }
@@ -1124,7 +1342,7 @@ pub fn agents_setup_ui(
             ui.set_max_width(560.0);
             for row in rows {
                 if let AgentRowKind::Probed { availability } = &row.kind {
-                    probed_row_ui(ui, row, availability, installing, palette, action);
+                    probed_row_ui(ui, row, availability, scanning, installing, palette, action);
                     if let Some(outcome) = last_install
                         && outcome.provider_id == row.meta.provider_id
                     {
@@ -1174,7 +1392,7 @@ mod tests {
         AgentsScanSnapshot {
             probes: entries
                 .iter()
-                .map(|(id, program, version)| (*id, probe(*program, *version)))
+                .map(|(id, program, version)| (*id, probe(*program, *version), AgentAuth::Unknown))
                 .collect(),
         }
     }
@@ -1505,5 +1723,127 @@ mod tests {
         let mut one_present = all_missing_snapshot();
         one_present.probes[5].1.program = Some(PathBuf::from("/usr/local/bin/ollama"));
         assert!(!needs_setup(&one_present));
+    }
+
+    #[test]
+    fn auth_output_shapes_from_real_clis_classify_correctly() {
+        // Captured live 2026-07-30 from claude 2.1.128 and codex 0.144.1.
+        let claude_signed_out = "{\n  \"loggedIn\": false,\n  \"authMethod\": \"none\",\n  \"apiProvider\": \"firstParty\"\n}";
+        assert_eq!(
+            classify_auth_output(Some(false), claude_signed_out),
+            AgentAuth::SignedOut
+        );
+        assert_eq!(
+            classify_auth_output(Some(true), "{ \"loggedIn\": true }"),
+            AgentAuth::SignedIn
+        );
+        assert_eq!(
+            classify_auth_output(Some(true), "Logged in using ChatGPT"),
+            AgentAuth::SignedIn
+        );
+    }
+
+    #[test]
+    fn signed_out_markers_win_over_a_successful_exit_code() {
+        // "not logged in" contains "logged in"; and some CLIs exit 0 while
+        // logged out — the marker must dominate.
+        assert_eq!(
+            classify_auth_output(Some(true), "Not logged in"),
+            AgentAuth::SignedOut
+        );
+    }
+
+    #[test]
+    fn a_probe_that_never_ran_is_probe_failed_not_an_auth_state() {
+        assert_eq!(classify_auth_output(None, ""), AgentAuth::ProbeFailed);
+    }
+
+    #[test]
+    fn bare_success_without_markers_reads_as_signed_in() {
+        assert_eq!(classify_auth_output(Some(true), "ok"), AgentAuth::SignedIn);
+    }
+
+    #[test]
+    fn ran_but_errored_probe_is_probe_failed_never_signed_out() {
+        // An older CLI without the status subcommand, a crash, or a config
+        // error must not brand a possibly-signed-in user as signed out
+        // (review-confirmed rule).
+        for output in [
+            "error: unknown command 'auth'",
+            "error: unrecognized subcommand 'login'",
+            "some stack trace",
+        ] {
+            assert_eq!(
+                classify_auth_output(Some(false), output),
+                AgentAuth::ProbeFailed,
+                "{output}"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_json_signed_out_marker_is_recognized() {
+        assert_eq!(
+            classify_auth_output(Some(false), "{\"loggedIn\":false}"),
+            AgentAuth::SignedOut
+        );
+    }
+
+    #[test]
+    fn auth_probes_exist_only_for_claude_and_codex_and_carry_sign_in_commands() {
+        for meta in AGENT_PROVIDERS {
+            let expect_probe = matches!(meta.provider_id, "claude_cli" | "codex_cli");
+            assert_eq!(
+                meta.auth_probe.is_some(),
+                expect_probe,
+                "{} auth probe presence",
+                meta.provider_id
+            );
+            assert_eq!(
+                meta.sign_in_command.is_some(),
+                expect_probe,
+                "{} sign-in command presence",
+                meta.provider_id
+            );
+        }
+    }
+
+    #[test]
+    fn undetected_binary_never_runs_an_auth_probe() {
+        assert_eq!(
+            auth_status_for("claude_cli", &probe(None, None)),
+            AgentAuth::Unknown
+        );
+        assert_eq!(
+            auth_status_for("ollama", &probe(Some("/usr/local/bin/ollama"), None)),
+            AgentAuth::NotApplicable
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_status_command_is_stopped_and_reports_probe_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("hung-status-stub");
+        std::fs::write(&stub, "#!/bin/sh\nsleep 30\n").expect("write stub");
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stub");
+        let started = Instant::now();
+        let (exit_success, _) = run_probe_command(
+            &stub,
+            &[],
+            Duration::from_millis(300),
+            Duration::from_secs(2),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "probe kill must be bounded; elapsed {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            classify_auth_output(exit_success, ""),
+            AgentAuth::ProbeFailed
+        );
     }
 }

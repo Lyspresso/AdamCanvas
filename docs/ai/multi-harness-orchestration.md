@@ -69,9 +69,10 @@ local endpoints — see §5).
 > (`src/agents_panel.rs`, branches `work/claude-agents` + `-install`) —
 > provider detection, a chat setup screen, and one-click installs bounded
 > by a compiled-in allowlist of vendor-verified commands (user-initiated,
-> logged, post-verified; no agent may trigger one). None of the seven gates
-> below are touched; sign-in probes remain future work, and seat
-> eligibility surfacing can later build on its verified-version statuses.
+> logged, post-verified; no agent may trigger one), plus read-only sign-in
+> status probes for Claude/Codex via their own status commands. None of the
+> seven gates below are touched, and seat eligibility surfacing can later
+> build on its verified-version and sign-in statuses.
 
 Goal stated by Lydia 2026-07-30: eventually either (a) a standing PM arrangement where
 one agent leads another (as Claude leads Codex on this repo today), and/or (b) **Adam
