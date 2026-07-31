@@ -3902,15 +3902,12 @@ impl OutputDecoder {
                         && let Some(kind) = self.decode_tool_result(block, Some(value))
                     {
                         let child_message = match &kind {
-                            ActivityKind::Subagent { id, status, .. }
-                                if matches!(
-                                    status,
-                                    SubagentStatus::Completed | SubagentStatus::Failed
-                                ) =>
-                            {
-                                claude_subagent_result_text(block, Some(value))
-                                    .map(|text| (id.clone(), text))
-                            }
+                            ActivityKind::Subagent {
+                                id,
+                                status: SubagentStatus::Completed | SubagentStatus::Failed,
+                                ..
+                            } => claude_subagent_result_text(block, Some(value))
+                                .map(|text| (id.clone(), text)),
                             _ => None,
                         };
                         if let ActivityKind::Subagent { id, .. } = &kind

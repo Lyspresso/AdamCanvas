@@ -2283,7 +2283,12 @@ pub enum ChildEventChannel {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeTuningProfile {
     pub version: Option<CliVersion>,
+    /// True only when this exact family/version pair has a captured or
+    /// otherwise provider-proven contract row.
+    pub verified_runtime: bool,
     pub reasoning_efforts: &'static [&'static str],
+    /// Compatibility summary for callers that only need an on/off gate.
+    pub supports_scoped_child_text: bool,
     pub child_event_channel: ChildEventChannel,
 }
 
@@ -2297,7 +2302,7 @@ impl RuntimeTuningProfile {
     }
 
     pub fn supports_scoped_child_text(&self) -> bool {
-        self.child_event_channel != ChildEventChannel::Disabled
+        self.supports_scoped_child_text
     }
 }
 
@@ -2316,7 +2321,7 @@ pub fn runtime_tuning_profile(
     version: Option<&CliVersion>,
     model: &str,
 ) -> RuntimeTuningProfile {
-    let (reasoning_efforts, child_event_channel) = match (family, version) {
+    let (reasoning_efforts, child_event_channel, verified_runtime) = match (family, version) {
         (ProviderKind::Codex, Some(version)) if version.is(0, 144, 1) => {
             let efforts = if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") {
                 CODEX_ULTRA_REASONING
@@ -2325,34 +2330,38 @@ pub fn runtime_tuning_profile(
             } else {
                 CODEX_DEFAULT_REASONING
             };
-            (efforts, ChildEventChannel::CodexExecCollabV1)
+            (efforts, ChildEventChannel::CodexExecCollabV1, true)
         }
-        (ProviderKind::Claude, Some(version)) if version.is(2, 1, 128) => {
-            (CLAUDE_REASONING, ChildEventChannel::ClaudeStreamJsonAgentV1)
-        }
+        (ProviderKind::Claude, Some(version)) if version.is(2, 1, 128) => (
+            CLAUDE_REASONING,
+            ChildEventChannel::ClaudeStreamJsonAgentV1,
+            true,
+        ),
         (ProviderKind::Grok, Some(version)) if version.is(0, 2, 111) => {
             // The captured multiplex stream carries parent and child prose in
             // indistinguishable type=text envelopes. Subagents must stay off
             // until a scoped channel is available.
-            (GROK_REASONING_0_2_111, ChildEventChannel::Disabled)
+            (GROK_REASONING_0_2_111, ChildEventChannel::Disabled, true)
         }
         (ProviderKind::Grok, Some(version)) if version.is(0, 2, 114) => {
             // The installed 0.2.114 model metadata still advertises exactly
             // low/medium/high for grok-4.5. ACP makes task calls structured,
             // but scoped child prose remains a PR 3 capability.
-            (GROK_REASONING_0_2_111, ChildEventChannel::Disabled)
+            (GROK_REASONING_0_2_111, ChildEventChannel::Disabled, true)
         }
         (ProviderKind::Kimi, Some(version)) if version.is(1, 49, 0) => {
-            (NO_REASONING, ChildEventChannel::Disabled)
+            (NO_REASONING, ChildEventChannel::Disabled, true)
         }
         (ProviderKind::Ollama, Some(version)) if version.is(0, 32, 1) => {
-            (OLLAMA_REASONING_0_32_1, ChildEventChannel::Disabled)
+            (OLLAMA_REASONING_0_32_1, ChildEventChannel::Disabled, true)
         }
-        _ => (NO_REASONING, ChildEventChannel::Disabled),
+        _ => (NO_REASONING, ChildEventChannel::Disabled, false),
     };
     RuntimeTuningProfile {
         version: version.cloned(),
+        verified_runtime,
         reasoning_efforts,
+        supports_scoped_child_text: child_event_channel != ChildEventChannel::Disabled,
         child_event_channel,
     }
 }
@@ -5305,16 +5314,16 @@ mod tests {
         );
 
         let kimi = CliVersion::parse("kimi, version 1.49.0").unwrap();
-        assert_eq!(
-            runtime_tuning_profile(ProviderKind::Kimi, Some(&kimi), "kimi").child_event_channel,
-            ChildEventChannel::Disabled
-        );
+        let kimi_tuning = runtime_tuning_profile(ProviderKind::Kimi, Some(&kimi), "kimi");
+        assert!(kimi_tuning.verified_runtime);
+        assert_eq!(kimi_tuning.child_event_channel, ChildEventChannel::Disabled);
 
         let unknown = runtime_tuning_profile(
             ProviderKind::Grok,
             CliVersion::parse("grok 9.9.9").as_ref(),
             "grok-4.5",
         );
+        assert!(!unknown.verified_runtime);
         assert!(unknown.reasoning_efforts.is_empty());
         assert!(!unknown.supports_scoped_child_text());
     }

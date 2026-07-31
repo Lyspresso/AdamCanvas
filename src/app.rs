@@ -6181,7 +6181,7 @@ impl AdamApp {
                             colors,
                         );
                     } else if runtime.show_subagents_detail {
-                        let events = projected_ai_activity(&conversation, &runtime);
+                        let events = projected_ai_subagent_activity(&conversation, &runtime);
                         render_ai_subagents_detail(
                             ui,
                             conversation_id,
@@ -12738,6 +12738,17 @@ fn projected_ai_activity(
     events
 }
 
+fn projected_ai_subagent_activity(
+    conversation: &AiConversation,
+    runtime: &AiChatRuntime,
+) -> Vec<HarnessActivityEvent> {
+    if runtime.active_turn.is_some() {
+        runtime.activity_trace.events.clone()
+    } else {
+        conversation.latest_assistant_turn_activity().to_vec()
+    }
+}
+
 fn persisted_ai_activity(conversation: &AiConversation) -> Vec<HarnessActivityEvent> {
     conversation
         .messages()
@@ -12789,7 +12800,7 @@ fn render_ai_inspector(
     let projected_events = projected_ai_activity(conversation, runtime);
     let progress = project_progress(&persisted_events, live_events);
     let live_progress = project_progress(&[], live_events);
-    let subagents = project_subagents(&projected_events);
+    let subagents = project_subagents(&projected_ai_subagent_activity(conversation, runtime));
     let terminal = if runtime.active_turn.is_some() {
         latest_turn_status(live_events)
     } else {
@@ -17791,6 +17802,60 @@ mod tests {
             .items;
 
         assert_eq!(relaunched_seed, task_snapshot);
+    }
+
+    #[test]
+    fn subagent_projection_is_latest_turn_when_idle_and_live_turn_when_running() {
+        let lifecycle = |label: &str| {
+            HarnessActivityEvent::new(
+                Uuid::new_v4(),
+                UnixMillis(2),
+                ActivityKind::Subagent {
+                    id: "reused-child".into(),
+                    aliases: Vec::new(),
+                    parent_id: Some("root".into()),
+                    label: label.into(),
+                    status: SubagentStatus::InProgress,
+                    model: None,
+                    detail: None,
+                    tool_calls: None,
+                },
+            )
+        };
+        let mut conversation = AiConversation::new(
+            Uuid::new_v4(),
+            "Turn-local agents",
+            PermissionMode::Ask,
+            UnixMillis(1),
+        );
+        for label in ["Old child", "Latest child"] {
+            conversation
+                .append_message_with_activity(
+                    Uuid::new_v4(),
+                    MessageRole::Assistant,
+                    label,
+                    UnixMillis(2),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![lifecycle(label)],
+                    Some(Uuid::new_v4()),
+                )
+                .unwrap();
+        }
+
+        let runtime = AiChatRuntime::default();
+        let idle = project_subagents(&projected_ai_subagent_activity(&conversation, &runtime));
+        assert_eq!(idle.len(), 1);
+        assert_eq!(idle[0].label, "Latest child");
+
+        let mut runtime = AiChatRuntime {
+            active_turn: Some(Uuid::new_v4()),
+            ..AiChatRuntime::default()
+        };
+        runtime.activity_trace.ingest(lifecycle("Live child"));
+        let live = project_subagents(&projected_ai_subagent_activity(&conversation, &runtime));
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].label, "Live child");
     }
 
     #[test]
