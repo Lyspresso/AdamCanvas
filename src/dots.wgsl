@@ -313,7 +313,18 @@ fn dotsField(uv01: vec2<f32>) -> vec4<f32> {
 
   if (styleI <= 3) {
     let accum = renderDots3D(styleI, position);
-    let col   = mix(bg, fg, accum);
+    // Brightness scales ink — how far a dot departs from the background.
+    // Multiplying it into the tint only achieves that for a tint lighter
+    // than the background; against a dark tint (black on white) it is a
+    // no-op, so light palettes silently lost the boost dark ones received.
+    // Scale coverage instead in that case, matching the flat styles below.
+    let luma     = vec3<f32>(0.2126, 0.7152, 0.0722);
+    let tintDark = dot(u.tint.rgb, luma) < dot(bg, luma);
+    if (tintDark) {
+      let amount = clamp(accum * u.brightness, vec3<f32>(0.0), vec3<f32>(1.0));
+      return vec4<f32>(mix(bg, u.tint.rgb, amount), 1.0);
+    }
+    let col = mix(bg, fg, accum);
     return vec4<f32>(col, 1.0);
   }
 

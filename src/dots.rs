@@ -22,16 +22,32 @@ pub struct DotsParams {
     pub depth_fade: f32,
 }
 
+/// Rec. 709 luma of a `0xRRGGBB` colour, kept integer so this stays usable
+/// from `const fn`.
+const fn luma8(color: u32) -> u32 {
+    let r = (color >> 16) & 0xFF;
+    let g = (color >> 8) & 0xFF;
+    let b = color & 0xFF;
+    (r * 54 + g * 183 + b * 19) >> 8
+}
+
 impl DotsParams {
     /// The Flow preset captured in the selected MetalForge Dots reference.
+    ///
+    /// Coverage is lifted for dark-ink-on-light-field palettes. The shader's
+    /// blend is a mathematical inverse between the two polarities, but vision
+    /// is not: at equal coverage, dark dots on a light field read far fainter
+    /// than light dots on a dark one, to the point of vanishing. These are
+    /// deliberately not the same numbers for both polarities.
     pub const fn chrome_flow(tint: u32, background: u32) -> Self {
+        let dark_ink = luma8(tint) < luma8(background);
         Self {
             style: 4,
             speed: 0.65,
-            brightness: 1.80,
+            brightness: if dark_ink { 2.80 } else { 1.80 },
             tint,
             background,
-            dot_size: 0.70,
+            dot_size: if dark_ink { 0.95 } else { 0.70 },
             grid_density: 1.57,
             pattern_scale: 0.75,
             vignette: 1.00,
@@ -370,10 +386,37 @@ mod tests {
             DotsParams {
                 tint: dark.tint,
                 background: dark.background,
+                brightness: dark.brightness,
+                dot_size: dark.dot_size,
                 ..light
             },
             dark
         );
+        // Dark ink on a light field needs more coverage to read as the same
+        // texture; equal numbers made the light palette nearly invisible.
+        assert!(light.brightness > dark.brightness);
+        assert!(light.dot_size > dark.dot_size);
+    }
+
+    /// The shader is otherwise only compiled when a GPU surface is created,
+    /// so a malformed edit ships as a blank canvas at runtime rather than a
+    /// build failure. naga comes in through wgpu; no extra dependency.
+    #[test]
+    fn dots_shader_parses_and_validates() {
+        let source = include_str!("dots.wgsl");
+        let module = match wgpu::naga::front::wgsl::parse_str(source) {
+            Ok(module) => module,
+            Err(error) => panic!(
+                "dots.wgsl failed to parse:\n{}",
+                error.emit_to_string(source)
+            ),
+        };
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("dots.wgsl failed validation");
     }
 
     #[test]
@@ -396,16 +439,28 @@ mod tests {
         assert_eq!(dark.background, rgbaf(0x000000));
         assert_eq!(light.tint, rgbaf(0x000000));
         assert_eq!(light.background, rgbaf(0xFFFFFF));
+        // Everything except the palette and its coverage compensation is
+        // shared; see `chrome_flow` for why the two polarities cannot use the
+        // same coverage and still look alike.
         assert_eq!(
             DotsUniform {
                 tint: dark.tint,
                 background: dark.background,
+                brightness: dark.brightness,
+                dot_size: dark.dot_size,
                 ..light
             },
             dark
         );
+        assert!(light.brightness > dark.brightness);
+        assert!(light.dot_size > dark.dot_size);
+
         assert_eq!(beach.tint, rgbaf(0x1B2A25));
         assert_eq!(beach.background, rgbaf(0xFFEEAD));
+        // Beach is dark ink on a light field, so it takes the lifted coverage
+        // rather than the dark-theme numbers.
+        assert_eq!(beach.brightness, light.brightness);
+        assert_eq!(beach.dot_size, light.dot_size);
     }
 
     #[test]
