@@ -9,10 +9,12 @@
 //! what makes an image look like it un-crops rather than merely growing.
 //!
 //! Positions here live in **layout space**: an origin-at-zero coordinate system
-//! whose width is fixed by the viewport, independent of zoom. [`GridCamera`]
-//! maps layout space onto the screen, which is what lets the wall be panned in
-//! both axes once it is zoomed past the viewport — the same feel as the canvas
-//! rather than a document that only scrolls vertically.
+//! whose width [`ZoomMode`] decides and whose relationship to the screen
+//! [`GridCamera`] owns. That separation is what lets the wall be panned in both
+//! axes whenever it is wider than the viewport — the same feel as the canvas
+//! rather than a document that only scrolls vertically — and what lets a mode
+//! re-flow the wall without any of the culling, hit-testing or lightbox code
+//! knowing that it did.
 //!
 //! Everything here is pure geometry so the interaction can be tested without a
 //! render surface. The painting side lives in `app.rs`, which owns the theme,
@@ -25,6 +27,18 @@ use egui::{Pos2, Rect, Vec2, pos2, vec2};
 pub const TARGET_CELL: f32 = 168.0;
 pub const GAP: f32 = 12.0;
 pub const PADDING: f32 = 20.0;
+
+/// Columns the [`ZoomMode::Wall`] lays out, whatever the window size.
+pub const WALL_COLUMNS: usize = 20;
+/// How many of those fill the viewport when the Wall is first entered — so it
+/// opens at a familiar size and the other twelve are out there to be found.
+pub const WALL_VISIBLE_COLUMNS: usize = 8;
+
+/// Layout width that yields exactly `columns` columns at the target cell size.
+pub fn width_for_columns(columns: usize) -> f32 {
+    let columns = columns.max(1) as f32;
+    PADDING * 2.0 + columns * TARGET_CELL + (columns - 1.0) * GAP
+}
 
 /// Lightbox open/close duration. Short on purpose — the point is to land on
 /// the photo, not to watch a transition.
@@ -64,8 +78,8 @@ impl CellShape {
 
 /// What zooming does to the wall.
 ///
-/// The two modes differ only in the width the wall is laid out at, which is
-/// enough to change the whole character of the gesture.
+/// The modes differ only in the width the wall is laid out at, which is enough
+/// to change the whole character of the gesture.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum ZoomMode {
     /// The wall keeps its column count and is magnified. Zooming past 100%
@@ -78,6 +92,11 @@ pub enum ZoomMode {
     /// pulled up into the space at the sides instead of leaving empty margins.
     /// Nothing ever overflows horizontally, so there is nothing to pan to.
     Reflow,
+    /// A fixed [`WALL_COLUMNS`]-wide wall, laid out independently of the
+    /// window and entered at a zoom that shows [`WALL_VISIBLE_COLUMNS`] of it.
+    /// The rest is off to the sides, so the wall is roamed in both axes like
+    /// the canvas, and zooming out pulls back to take in the whole thing.
+    Wall,
 }
 
 impl ZoomMode {
@@ -98,13 +117,41 @@ impl ZoomMode {
                 };
                 (view_width / zoom).max(1.0)
             }
+            // Fixed: neither the window nor the zoom changes how wide the
+            // wall is, which is what leaves something off-screen to roam to.
+            Self::Wall => width_for_columns(WALL_COLUMNS),
         }
+    }
+
+    /// Zoom to adopt when this mode is entered, if it wants a particular one.
+    pub fn entry_zoom(self, view_width: f32) -> Option<f32> {
+        match self {
+            Self::Magnify | Self::Reflow => None,
+            Self::Wall => {
+                let view_width = if view_width.is_finite() && view_width > 0.0 {
+                    view_width
+                } else {
+                    return Some(1.0);
+                };
+                Some(
+                    (view_width / width_for_columns(WALL_VISIBLE_COLUMNS))
+                        .clamp(GridCamera::MIN_ZOOM, GridCamera::MAX_ZOOM),
+                )
+            }
+        }
+    }
+
+    /// Whether zooming re-flows the wall, in which case the pointer cannot be
+    /// the anchor because every tile changes row.
+    fn reflows_on_zoom(self) -> bool {
+        matches!(self, Self::Reflow)
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Magnify => "Magnify",
             Self::Reflow => "Reflow",
+            Self::Wall => "Wall",
         }
     }
 }
@@ -332,7 +379,8 @@ impl Default for GridCamera {
 }
 
 impl GridCamera {
-    pub const MIN_ZOOM: f32 = 0.35;
+    /// Low enough that a whole [`ZoomMode::Wall`] fits in an ordinary window.
+    pub const MIN_ZOOM: f32 = 0.2;
     pub const MAX_ZOOM: f32 = 5.0;
 
     fn sanitized(self) -> Self {
@@ -604,14 +652,17 @@ impl GridViewState {
         if !factor.is_finite() || factor <= 0.0 {
             return;
         }
-        match self.mode {
-            ZoomMode::Magnify => self.camera.zoom_by(factor, pointer, view),
-            ZoomMode::Reflow => self.reanchored(view, count, |state| {
+        if self.mode.reflows_on_zoom() {
+            self.reanchored(view, count, |state| {
                 state.camera.zoom =
                     (state.camera.zoom * factor).clamp(GridCamera::MIN_ZOOM, GridCamera::MAX_ZOOM);
                 // A reflowed wall never overflows sideways.
                 state.camera.offset.x = 0.0;
-            }),
+            });
+        } else {
+            // Magnify and Wall both have a layout that zoom does not disturb,
+            // so the point under the cursor can stay put.
+            self.camera.zoom_by(factor, pointer, view);
         }
     }
 
@@ -622,9 +673,20 @@ impl GridViewState {
     }
 
     pub fn set_mode(&mut self, mode: ZoomMode, view: Rect, count: usize) {
-        if self.mode != mode {
-            self.reanchored(view, count, |state| state.mode = mode);
+        if self.mode == mode {
+            return;
         }
+        // Leaving the Wall drops its entry zoom, which would otherwise strand
+        // the other modes at an arbitrary percentage.
+        let leaving_wall = self.mode == ZoomMode::Wall;
+        self.reanchored(view, count, |state| {
+            state.mode = mode;
+            if let Some(zoom) = mode.entry_zoom(view.width()) {
+                state.camera.zoom = zoom;
+            } else if leaving_wall {
+                state.camera.zoom = 1.0;
+            }
+        });
     }
 }
 
@@ -1018,6 +1080,108 @@ mod tests {
             );
             assert!(state.camera.offset.y.is_finite());
         }
+    }
+
+    #[test]
+    fn the_wall_is_a_fixed_twenty_columns_whatever_the_window() {
+        for view_width in [700.0, 1000.0, 1600.0, 2400.0] {
+            for zoom in [0.2, 0.5, 1.0, 3.0] {
+                let metrics = GridMetrics::compute(
+                    ZoomMode::Wall.layout_width(view_width, zoom),
+                    500,
+                    TARGET_CELL,
+                    GAP,
+                    PADDING,
+                    CellShape::Square,
+                );
+                assert_eq!(
+                    metrics.columns, WALL_COLUMNS,
+                    "wall at width {view_width} zoom {zoom} gave {} columns",
+                    metrics.columns
+                );
+                // Cells stay at the target size — the wall does not stretch.
+                assert!((metrics.cell.x - TARGET_CELL).abs() < 0.01);
+            }
+        }
+    }
+
+    #[test]
+    fn entering_the_wall_starts_at_eight_across_with_the_rest_off_to_the_sides() {
+        let view = Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 800.0));
+        let count = 500;
+        let mut state = GridViewState::default();
+        state.set_mode(ZoomMode::Wall, view, count);
+
+        let metrics = state.metrics(view.width(), count);
+        assert_eq!(metrics.columns, WALL_COLUMNS);
+
+        // Exactly the intended number of columns spans the viewport.
+        let visible_layout = state.camera.visible_size(view).x;
+        let expected = width_for_columns(WALL_VISIBLE_COLUMNS);
+        assert!(
+            (visible_layout - expected).abs() < 1.0,
+            "viewport spans {visible_layout} layout points, wanted {expected}"
+        );
+
+        // Which leaves the rest of the wall off-screen, to be panned to.
+        assert!(
+            metrics.content.x > visible_layout * 1.5,
+            "wall should extend well past the viewport"
+        );
+        let panned = GridCamera {
+            offset: vec2(99_999.0, 0.0),
+            ..state.camera
+        }
+        .clamped(metrics.content, view);
+        assert!(
+            panned.offset.x > 0.0,
+            "the wall must pan sideways at its entry zoom"
+        );
+    }
+
+    #[test]
+    fn zooming_the_wall_out_can_take_in_every_column() {
+        let view = Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 800.0));
+        let mut state = GridViewState::default();
+        state.set_mode(ZoomMode::Wall, view, 500);
+        for _ in 0..40 {
+            state.apply_zoom(0.5, view.center(), view, 500);
+        }
+        assert_eq!(state.camera.zoom, GridCamera::MIN_ZOOM);
+        let metrics = state.metrics(view.width(), 500);
+        assert!(
+            metrics.content.x * state.camera.zoom <= view.width() + 1.0,
+            "the whole wall ({} wide at {}x) should fit in {}",
+            metrics.content.x,
+            state.camera.zoom,
+            view.width()
+        );
+    }
+
+    #[test]
+    fn leaving_the_wall_gives_the_other_modes_an_ordinary_zoom_back() {
+        let view = Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 800.0));
+        let mut state = GridViewState::default();
+        state.set_mode(ZoomMode::Wall, view, 200);
+        assert!(
+            (state.camera.zoom - 1.0).abs() > 0.01,
+            "wall sets its own zoom"
+        );
+        state.set_mode(ZoomMode::Magnify, view, 200);
+        assert_eq!(state.camera.zoom, 1.0);
+    }
+
+    #[test]
+    fn wall_zoom_anchors_on_the_pointer_because_its_layout_does_not_move() {
+        let view = view();
+        let mut state = GridViewState::default();
+        state.set_mode(ZoomMode::Wall, view, 300);
+        let pointer = pos2(700.0, 450.0);
+        let before = state.camera.to_layout(pointer, view);
+        state.apply_zoom(1.7, pointer, view, 300);
+        let after = state.camera.to_layout(pointer, view);
+        assert!((after.x - before.x).abs() < 0.01 && (after.y - before.y).abs() < 0.01);
+        assert_eq!(state.metrics(view.width(), 300).columns, WALL_COLUMNS);
     }
 
     #[test]

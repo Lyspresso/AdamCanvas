@@ -2239,23 +2239,29 @@ impl AdamApp {
                             }
                         }
                         ui.separator();
-                        let reflowing = grid.mode == ZoomMode::Reflow;
-                        if ui
-                            .add(Button::new("Reflow").selected(reflowing))
-                            .on_hover_text(if reflowing {
-                                "On: zooming out packs more columns in. \
-                                 Click to magnify the wall instead."
-                            } else {
-                                "Off: zooming magnifies the wall. Click to make \
-                                 zooming out pack more columns in instead."
-                            })
-                            .clicked()
-                        {
-                            grid_mode_clicked = Some(if reflowing {
-                                ZoomMode::Magnify
-                            } else {
-                                ZoomMode::Reflow
-                            });
+                        // Two opt-in modes; clicking the active one returns to
+                        // the plain magnifying wall.
+                        for (mode, hover) in [
+                            (
+                                ZoomMode::Reflow,
+                                "Zooming out packs more columns in rather than \
+                                 shrinking the wall",
+                            ),
+                            (
+                                ZoomMode::Wall,
+                                "A fixed 20-wide wall, opening 8 across — roam it \
+                                 in any direction, or zoom out to take it all in",
+                            ),
+                        ] {
+                            let active = grid.mode == mode;
+                            if ui
+                                .add(Button::new(mode.label()).selected(active))
+                                .on_hover_text(hover)
+                                .clicked()
+                            {
+                                grid_mode_clicked =
+                                    Some(if active { ZoomMode::Magnify } else { mode });
+                            }
                         }
                         reset_zoom_clicked = ui
                             .add(Button::new(format!("{:.0}%", grid.camera.zoom * 100.0)))
@@ -11512,6 +11518,7 @@ fn draw_grid_view_hint(
             match mode {
                 ZoomMode::Magnify => "drag to pan, pinch to zoom",
                 ZoomMode::Reflow => "pinch to change how many fit",
+                ZoomMode::Wall => "drag to roam, pinch to pull back",
             },
             zoom * 100.0
         )
