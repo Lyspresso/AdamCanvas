@@ -21,8 +21,9 @@ use crate::{
     },
     grok_acp::{
         GrokAcpError, GrokAcpEvent, GrokAcpHttpMcpServer, GrokAcpLimits, GrokAcpPermissionDecision,
-        GrokAcpPermissionRequest, GrokAcpPermissionResolution, GrokAcpRequest, GrokAcpStopReason,
-        GrokAcpToolCall, GrokAcpToolKind, GrokAcpToolStatus, run_grok_acp,
+        GrokAcpPermissionRequest, GrokAcpPermissionResolution, GrokAcpPlanStatus,
+        GrokAcpProgressRoute, GrokAcpRequest, GrokAcpSessionScope, GrokAcpStopReason,
+        GrokAcpSubagentStatus, GrokAcpToolCall, GrokAcpToolKind, GrokAcpToolStatus, run_grok_acp,
     },
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
@@ -589,7 +590,8 @@ impl PreparedRun {
                 )
                 .plan_channel
             }
-            Self::GrokAcp(_) | Self::Http { .. } => PlanChannel::AppTaskTools,
+            Self::GrokAcp(specification) => specification.plan_channel,
+            Self::Http { .. } => PlanChannel::AppTaskTools,
         }
     }
 }
@@ -622,6 +624,9 @@ struct ProcessSpec {
 struct GrokAcpSpec {
     program: PathBuf,
     cwd: PathBuf,
+    runtime_version: CliVersion,
+    plan_channel: PlanChannel,
+    subagents_enabled: bool,
 }
 
 fn built_in_cli_executable(provider_id: &str) -> Option<&'static str> {
@@ -734,6 +739,15 @@ fn runtime_tuning_for_program(
         profile.runtime_version.as_ref(),
         model,
     )
+}
+
+fn fresh_runtime_tuning_for_program(
+    provider_id: &str,
+    program: &Path,
+    model: &str,
+) -> RuntimeTuningProfile {
+    invalidate_cached_cli_version(program);
+    runtime_tuning_for_program(provider_id, program, model)
 }
 
 fn cached_cli_version(program: &Path) -> Option<CliVersion> {
@@ -868,6 +882,7 @@ pub fn provider_exposes_app_task_tools(
     provider_id: &str,
     cwd: Option<&Path>,
     endpoint: &str,
+    resuming: bool,
 ) -> bool {
     let Some(provider_id) = resolve_effective_provider_id(provider_id, cwd, endpoint) else {
         return false;
@@ -877,8 +892,11 @@ pub fn provider_exposes_app_task_tools(
         "lm_studio" => !endpoint.trim().is_empty(),
         "custom_cli" => true,
         "grok_cli" => resolve_executable("grok", cwd)
-            .map(|program| runtime_tuning_for_program("grok_cli", &program, ""))
-            .is_some_and(|tuning| supports_grok_acp_task_bridge(tuning.version.as_ref())),
+            .map(|program| fresh_runtime_tuning_for_program("grok_cli", &program, ""))
+            .is_some_and(|tuning| {
+                supports_grok_acp_task_bridge(tuning.version.as_ref())
+                    && grok_acp_plan_channel(&tuning, resuming) == PlanChannel::AppTaskTools
+            }),
         _ => false,
     }
 }
@@ -911,8 +929,19 @@ fn prepare_resolved_cli(
     request: &AiRunRequest,
 ) -> Result<PreparedRun, AiEngineError> {
     if provider_id == "grok_cli" {
-        let tuning = runtime_tuning_for_program(provider_id, &program, effective_model(request));
+        // Re-probe every launch. A same-path provider upgrade or downgrade
+        // must not inherit a cached capability contract from an earlier turn.
+        let tuning =
+            fresh_runtime_tuning_for_program(provider_id, &program, effective_model(request));
         if supports_grok_acp_task_bridge(tuning.version.as_ref()) {
+            let runtime_version = tuning
+                .version
+                .clone()
+                .expect("a supported Grok ACP contract always has a parsed version");
+            let subagents_requested =
+                request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) != Some(false);
+            let plan_channel = grok_acp_plan_channel(&tuning, request.resume_session_id.is_some());
+            let subagents_enabled = tuning.supports_scoped_child_text() && subagents_requested;
             let cwd = match canonical_working_directory(request.cwd.as_deref())? {
                 Some(cwd) => cwd,
                 None => env::current_dir()
@@ -923,7 +952,13 @@ fn prepare_resolved_cli(
                         ))
                     })?,
             };
-            return Ok(PreparedRun::GrokAcp(GrokAcpSpec { program, cwd }));
+            return Ok(PreparedRun::GrokAcp(GrokAcpSpec {
+                program,
+                cwd,
+                runtime_version,
+                plan_channel,
+                subagents_enabled,
+            }));
         }
     }
     Ok(PreparedRun::Process(preset_process_spec(
@@ -933,8 +968,25 @@ fn prepare_resolved_cli(
     )?))
 }
 
+fn grok_acp_plan_channel(tuning: &RuntimeTuningProfile, resuming: bool) -> PlanChannel {
+    if tuning.supports_scoped_child_text() || resuming {
+        // Grok children inherit connected MCP servers and its resume record
+        // does not preserve the session's original child capability. Exact
+        // 0.2.117 and every resumed ACP session therefore withhold Adam's task
+        // server and use the root ACP plan as Main Progress.
+        PlanChannel::NativeStream
+    } else {
+        PlanChannel::AppTaskTools
+    }
+}
+
 fn supports_grok_acp_task_bridge(version: Option<&CliVersion>) -> bool {
-    version.is_some_and(|version| (version.major, version.minor, version.patch) == (0, 2, 114))
+    version.is_some_and(|version| {
+        matches!(
+            (version.major, version.minor, version.patch),
+            (0, 2, 114) | (0, 2, 117)
+        )
+    })
 }
 
 fn effective_model(request: &AiRunRequest) -> &str {
@@ -1661,7 +1713,7 @@ struct GrokPermissionBlockState {
 }
 
 impl GrokPermissionBlockState {
-    fn observe_event(&mut self, event: &GrokAcpEvent) {
+    fn observe_event(&mut self, event: &GrokAcpEvent, scope: Option<&GrokAcpSessionScope>) {
         match event {
             // These events are part of the permission exchange itself. A
             // terminal refusal/cancellation immediately after them can still
@@ -1671,9 +1723,21 @@ impl GrokPermissionBlockState {
             | GrokAcpEvent::Terminal { .. }
             | GrokAcpEvent::SessionStarted { .. }
             | GrokAcpEvent::AgentMessageChunk { .. }
-            | GrokAcpEvent::AgentThoughtChunk { .. } => {}
+            | GrokAcpEvent::ChildMessage { .. }
+            | GrokAcpEvent::AgentThoughtChunk { .. }
+            | GrokAcpEvent::SubagentSpawned { .. }
+            | GrokAcpEvent::SessionScopeRegistered { .. }
+            | GrokAcpEvent::SubagentProgress { .. }
+            | GrokAcpEvent::SubagentFinished { .. } => {}
+            // Concurrent child activity says nothing about whether the root
+            // recovered from its own denied request.
+            GrokAcpEvent::ToolCall { .. }
+            | GrokAcpEvent::ToolCallUpdate { .. }
+            | GrokAcpEvent::PlanSnapshot { .. }
+                if !matches!(scope, Some(GrokAcpSessionScope::Root)) => {}
             // Once the provider continues doing substantive work, an older
-            // denial is no longer evidence for a later terminal outcome.
+            // root denial is no longer evidence for a later root terminal
+            // outcome.
             GrokAcpEvent::ToolCall { tool_call, .. }
             | GrokAcpEvent::ToolCallUpdate { tool_call, .. }
                 if self
@@ -1690,6 +1754,65 @@ impl GrokPermissionBlockState {
     }
 }
 
+#[derive(Debug, Default)]
+struct GrokAcpProjectionState {
+    root_plan_channel: PlanChannel,
+    root_session_id: Option<String>,
+    child_scope_by_session: HashMap<String, GrokAcpSessionScope>,
+    emitted_tool_calls: HashSet<(String, String)>,
+    permission_tools: HashMap<(String, String), String>,
+    child_permission_blocks: HashMap<String, GrokPermissionBlock>,
+}
+
+impl GrokAcpProjectionState {
+    fn remember_root(&mut self, session_id: &str) {
+        self.root_session_id = Some(session_id.to_owned());
+    }
+
+    fn remember_child(&mut self, session_id: &str, scope: GrokAcpSessionScope) {
+        self.child_scope_by_session
+            .insert(session_id.to_owned(), scope);
+    }
+
+    fn scope_for_session(&self, session_id: &str) -> Option<GrokAcpSessionScope> {
+        if self.root_session_id.as_deref() == Some(session_id) {
+            Some(GrokAcpSessionScope::Root)
+        } else {
+            self.child_scope_by_session.get(session_id).cloned()
+        }
+    }
+
+    fn scope_for_event(&self, event: &GrokAcpEvent) -> Option<GrokAcpSessionScope> {
+        match event {
+            GrokAcpEvent::SessionStarted { .. }
+            | GrokAcpEvent::AgentMessageChunk { .. }
+            | GrokAcpEvent::SubagentSpawned { .. }
+            | GrokAcpEvent::SubagentProgress { .. }
+            | GrokAcpEvent::SubagentFinished { .. }
+            | GrokAcpEvent::Terminal { .. } => Some(GrokAcpSessionScope::Root),
+            GrokAcpEvent::ChildMessage { scope, .. } => Some(scope.clone()),
+            GrokAcpEvent::SessionScopeRegistered { scope, .. } => Some(scope.clone()),
+            GrokAcpEvent::AgentThoughtChunk { session_id, .. }
+            | GrokAcpEvent::ToolCall { session_id, .. }
+            | GrokAcpEvent::ToolCallUpdate { session_id, .. }
+            | GrokAcpEvent::PlanSnapshot { session_id, .. }
+            | GrokAcpEvent::PermissionResolved { session_id, .. } => {
+                self.scope_for_session(session_id)
+            }
+            GrokAcpEvent::PermissionRequested { request } => Some(request.scope.clone()),
+        }
+    }
+
+    fn adam_scope_for_session(&self, session_id: &str) -> Option<AgentScope> {
+        match self.scope_for_session(session_id)? {
+            GrokAcpSessionScope::Root => Some(AgentScope::Main),
+            GrokAcpSessionScope::Child { .. } => Some(AgentScope::Child {
+                id: session_id.to_owned(),
+            }),
+        }
+    }
+}
+
 fn run_grok_acp_transport(
     request: &AiRunRequest,
     specification: GrokAcpSpec,
@@ -1697,45 +1820,85 @@ fn run_grok_acp_transport(
     event_sender: &Sender<AiEvent>,
     task_tools: &Arc<Mutex<TaskToolRegistry>>,
 ) -> RunOutcome {
-    let bridge_events = event_sender.clone();
-    let turn_id = request.turn_id;
-    let conversation_id = request.conversation_id;
-    let mut bridge = match TaskToolBridge::start(
-        turn_id,
-        Arc::clone(task_tools),
-        Arc::new(move |events| {
-            bridge_events
-                .send(AiEvent::ActivityBatch {
-                    turn_id,
-                    conversation_id,
-                    events,
-                })
-                .expect("AI event receiver must remain available while task bridge is active");
-        }),
-    ) {
-        Ok(bridge) => bridge,
-        Err(error) => {
-            return RunOutcome::provider_error(format!(
-                "could not start Adam's task-tool bridge: {error}"
-            ));
+    // Prepared runs can wait in Adam's queue while a CLI updates in place.
+    // Re-probe at the process boundary and fail closed instead of launching a
+    // binary under a different child/tool contract than the registered run.
+    let tuning = fresh_runtime_tuning_for_program(
+        "grok_cli",
+        &specification.program,
+        effective_model(request),
+    );
+    let subagents_requested =
+        request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) != Some(false);
+    let current_plan_channel = grok_acp_plan_channel(&tuning, request.resume_session_id.is_some());
+    let current_subagents_enabled = tuning.supports_scoped_child_text() && subagents_requested;
+    if tuning.version.as_ref() != Some(&specification.runtime_version)
+        || !supports_grok_acp_task_bridge(tuning.version.as_ref())
+        || current_plan_channel != specification.plan_channel
+        || current_subagents_enabled != specification.subagents_enabled
+    {
+        return RunOutcome::provider_error(
+            "the installed Grok runtime changed after this turn was prepared; retry the turn so Adam can apply the current capability contract",
+        );
+    }
+    let progress_route = match specification.plan_channel {
+        PlanChannel::NativeStream => GrokAcpProgressRoute::NativeStream,
+        PlanChannel::AppTaskTools => GrokAcpProgressRoute::AdamTaskTools,
+        PlanChannel::None => {
+            return RunOutcome::provider_error(
+                "the prepared Grok ACP run did not select a Progress authority",
+            );
         }
     };
 
-    let tuning =
-        runtime_tuning_for_program("grok_cli", &specification.program, effective_model(request));
+    let bridge_events = event_sender.clone();
+    let turn_id = request.turn_id;
+    let conversation_id = request.conversation_id;
+    let mut bridge = if specification.plan_channel == PlanChannel::AppTaskTools {
+        match TaskToolBridge::start(
+            turn_id,
+            Arc::clone(task_tools),
+            Arc::new(move |events| {
+                bridge_events
+                    .send(AiEvent::ActivityBatch {
+                        turn_id,
+                        conversation_id,
+                        events,
+                    })
+                    .expect("AI event receiver must remain available while task bridge is active");
+            }),
+        ) {
+            Ok(bridge) => Some(bridge),
+            Err(error) => {
+                return RunOutcome::provider_error(format!(
+                    "could not start Adam's task-tool bridge: {error}"
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
     let model = (!effective_model(request).is_empty()).then(|| effective_model(request).to_owned());
     let reasoning_effort = tuning
         .normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
         .map(str::to_owned);
+    let subagents_enabled = specification.subagents_enabled;
     let mut rules = request.system_prompt.clone().unwrap_or_default();
-    if !tuning.supports_scoped_child_text()
-        || request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) == Some(false)
-    {
+    if !subagents_enabled {
         if !rules.is_empty() {
             rules.push_str("\n\n");
         }
         rules.push_str(
             "Do not spawn child agents in this run. Adam will enable them only through a provider channel that scopes every child's prose and task events.",
+        );
+    }
+    if specification.plan_channel == PlanChannel::NativeStream {
+        if !rules.is_empty() {
+            rules.push_str("\n\n");
+        }
+        rules.push_str(
+            "Keep the foreground session's provider-native plan current as the main task checklist. Child plans belong only to their child sessions. Adam's task-tool MCP server is intentionally not attached to this run because Grok resume records do not preserve the session's original child capability.",
         );
     }
     let acp_request = GrokAcpRequest {
@@ -1758,19 +1921,19 @@ fn run_grok_acp_transport(
             .provider_preferences
             .max_turns
             .map(|turns| turns.clamp(1, 100)),
-        // This run exposes Adam's task tools as its one planning channel.
-        // Grok's native planner must therefore stay off even when the general
-        // provider preference is enabled.
-        planning_enabled: false,
+        // Exact native-XOR-tools contract: child-safe runs use only Grok's
+        // native root plan; root-only runs expose only Adam task tools.
+        planning_enabled: specification.plan_channel == PlanChannel::NativeStream
+            && request.provider_preferences.feature(AI_FEATURE_PLANNING) != Some(false),
         memory_enabled: request.provider_preferences.feature(AI_FEATURE_MEMORY),
+        subagents_enabled,
         model,
         reasoning_effort,
         resume_session_id: request.resume_session_id.clone(),
-        http_mcp_server: GrokAcpHttpMcpServer::bearer(
-            "adam_tasks",
-            bridge.endpoint(),
-            bridge.bearer_token(),
-        ),
+        progress_route,
+        http_mcp_server: bridge.as_ref().map(|bridge| {
+            GrokAcpHttpMcpServer::bearer("adam_tasks", bridge.endpoint(), bridge.bearer_token())
+        }),
         limits: GrokAcpLimits {
             wall_timeout: run_timeout(request.workspace_mode),
             ..GrokAcpLimits::default()
@@ -1778,24 +1941,32 @@ fn run_grok_acp_transport(
     };
 
     let permission_block = RefCell::new(GrokPermissionBlockState::default());
-    let emitted_tool_calls = RefCell::new(HashSet::<String>::new());
+    let projection = RefCell::new(GrokAcpProjectionState {
+        root_plan_channel: specification.plan_channel,
+        ..GrokAcpProjectionState::default()
+    });
+    let root_task_tools_enabled = specification.plan_channel == PlanChannel::AppTaskTools;
     let result = run_grok_acp(
         &acp_request,
         &control.cancelled,
         |permission| {
-            grok_acp_permission_decision(
+            grok_acp_permission_decision_with_subagents(
                 permission,
                 request.permission_mode,
                 request.workspace_mode,
+                root_task_tools_enabled,
                 &permission_block,
             )
         },
         |event| {
-            permission_block.borrow_mut().observe_event(&event);
-            emit_grok_acp_event(request, event_sender, event, &emitted_tool_calls);
+            let scope = projection.borrow().scope_for_event(&event);
+            permission_block
+                .borrow_mut()
+                .observe_event(&event, scope.as_ref());
+            emit_grok_acp_event(request, event_sender, event, &projection);
         },
     );
-    let bridge_stop = bridge.stop();
+    let bridge_stop = bridge.as_mut().map(TaskToolBridge::stop).transpose();
 
     if control.cancelled.load(Ordering::Acquire) {
         return RunOutcome::Cancelled;
@@ -1871,29 +2042,49 @@ fn grok_permission_blocked_outcome(tool: String) -> RunOutcome {
     }
 }
 
+#[cfg(test)]
 fn grok_acp_permission_decision(
     permission: &GrokAcpPermissionRequest,
     mode: PermissionMode,
     workspace_mode: AiWorkspaceMode,
     blocked: &RefCell<GrokPermissionBlockState>,
 ) -> GrokAcpPermissionDecision {
+    grok_acp_permission_decision_with_subagents(permission, mode, workspace_mode, false, blocked)
+}
+
+fn grok_acp_permission_decision_with_subagents(
+    permission: &GrokAcpPermissionRequest,
+    mode: PermissionMode,
+    workspace_mode: AiWorkspaceMode,
+    root_task_tools_enabled: bool,
+    blocked: &RefCell<GrokPermissionBlockState>,
+) -> GrokAcpPermissionDecision {
     let tool = grok_acp_tool_label(&permission.tool_call);
     let tool_call_id = permission.tool_call.id.clone();
-    let normalized = tool
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    let canonical_normalized = permission
+    let canonical = permission
         .tool_call
         .canonical_mcp_tool_name
+        .as_deref()
+        .unwrap_or_default();
+    let normalized_title = permission
+        .tool_call
+        .title
         .as_deref()
         .unwrap_or_default()
         .chars()
         .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect::<String>();
-    let is_residual_task_prompt = [&normalized, &canonical_normalized]
+    let normalized_canonical = canonical
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    let is_exact_task_tool = matches!(
+        canonical,
+        "adam_tasks__task_create" | "adam_tasks__task_update" | "adam_tasks__task_list"
+    );
+    let is_task_lookalike = [&normalized_title, &normalized_canonical]
         .into_iter()
         .any(|name| {
             matches!(
@@ -1906,13 +2097,14 @@ fn grok_acp_permission_decision(
                     | "adamtaskstasklist"
             )
         });
-    let asks_for_child = [&normalized, &canonical_normalized]
+    let asks_for_child = [&normalized_title, &normalized_canonical]
         .into_iter()
         .any(|name| {
             name.contains("subagent")
                 || name.contains("spawnagent")
                 || name.contains("delegateagent")
         });
+    let is_root = permission.scope == GrokAcpSessionScope::Root;
 
     let class = match permission.tool_call.kind {
         Some(
@@ -1925,14 +2117,22 @@ fn grok_acp_permission_decision(
         | None => AiPermissionClass::Destructive,
         _ => AiPermissionClass::Mutate,
     };
-    // Exact task calls are pre-authorized by Grok's process-level MCPTool
-    // rules. Seeing one again on this callback means that boundary did not
-    // behave as negotiated; fail closed instead of trusting provider metadata
-    // as an authorization fact.
-    let verdict = if is_residual_task_prompt
-        || asks_for_child
-        || (workspace_mode == AiWorkspaceMode::Chat && class != AiPermissionClass::Read)
-    {
+    // Exact task tools are available only in a root-only AppTaskTools run.
+    // Scoped-child runs use NativeStream and the inherited MCP endpoint stays
+    // inert at list and call time. Title lookalikes and child calls never
+    // establish authority.
+    let verdict = if asks_for_child || (is_task_lookalike && !is_exact_task_tool) {
+        // The verified 0.2.117 child path is a lifecycle notification, not a
+        // permission-gated tool call. Treat provider-controlled spellings
+        // only as a reason to deny; they never establish authority.
+        AiPermissionVerdict::Deny
+    } else if is_exact_task_tool {
+        if is_root && root_task_tools_enabled {
+            AiPermissionVerdict::Allow
+        } else {
+            AiPermissionVerdict::Deny
+        }
+    } else if workspace_mode == AiWorkspaceMode::Chat && class != AiPermissionClass::Read {
         AiPermissionVerdict::Deny
     } else {
         ai_permission_verdict(mode, class)
@@ -1943,17 +2143,23 @@ fn grok_acp_permission_decision(
             if let Some(option) = permission.first_allow_once_option() {
                 // A successful later approval is proof that an older denial
                 // no longer explains this turn's eventual terminal state.
-                blocked.borrow_mut().pending = None;
+                if is_root {
+                    blocked.borrow_mut().pending = None;
+                }
                 GrokAcpPermissionDecision::Allow {
                     option_id: option.id.clone(),
                 }
             } else {
-                blocked.borrow_mut().pending = Some(GrokPermissionBlock { tool, tool_call_id });
+                if is_root {
+                    blocked.borrow_mut().pending = Some(GrokPermissionBlock { tool, tool_call_id });
+                }
                 GrokAcpPermissionDecision::Cancel
             }
         }
         AiPermissionVerdict::Prompt | AiPermissionVerdict::Deny => {
-            blocked.borrow_mut().pending = Some(GrokPermissionBlock { tool, tool_call_id });
+            if is_root {
+                blocked.borrow_mut().pending = Some(GrokPermissionBlock { tool, tool_call_id });
+            }
             permission
                 .first_reject_once_option()
                 .map(|option| GrokAcpPermissionDecision::Reject {
@@ -1968,97 +2174,379 @@ fn emit_grok_acp_event(
     request: &AiRunRequest,
     event_sender: &Sender<AiEvent>,
     event: GrokAcpEvent,
-    emitted_tool_calls: &RefCell<HashSet<String>>,
+    projection: &RefCell<GrokAcpProjectionState>,
 ) {
-    let send_activity = |kind| {
-        let _ = event_sender.send(AiEvent::Activity {
-            turn_id: request.turn_id,
-            conversation_id: request.conversation_id,
-            event: activity_event(kind),
-        });
-    };
-
     match event {
         GrokAcpEvent::SessionStarted { session_id, .. } => {
-            send_activity(ActivityKind::SessionInfo {
-                model: (!effective_model(request).is_empty())
-                    .then(|| effective_model(request).to_owned()),
-                session_id: Some(session_id),
-            });
+            projection.borrow_mut().remember_root(&session_id);
+            send_grok_acp_activity(
+                request,
+                event_sender,
+                AgentScope::Main,
+                ActivityKind::SessionInfo {
+                    model: (!effective_model(request).is_empty())
+                        .then(|| effective_model(request).to_owned()),
+                    session_id: Some(session_id),
+                },
+                None,
+            );
         }
         GrokAcpEvent::AgentMessageChunk { text, .. } => {
-            send_activity(ActivityKind::AssistantText { text: text.clone() });
+            send_grok_acp_activity(
+                request,
+                event_sender,
+                AgentScope::Main,
+                ActivityKind::AssistantText { text: text.clone() },
+                None,
+            );
             let _ = event_sender.send(AiEvent::Delta {
                 turn_id: request.turn_id,
                 conversation_id: request.conversation_id,
                 text,
             });
         }
-        GrokAcpEvent::AgentThoughtChunk { text, .. } => {
-            send_activity(ActivityKind::Thinking { text });
+        GrokAcpEvent::ChildMessage {
+            scope,
+            session_id,
+            text,
+            ..
+        } => {
+            if !matches!(scope, GrokAcpSessionScope::Child { .. }) {
+                return;
+            }
+            send_grok_acp_activity(
+                request,
+                event_sender,
+                AgentScope::Child { id: session_id },
+                ActivityKind::AssistantText { text },
+                None,
+            );
         }
-        GrokAcpEvent::ToolCall { tool_call, .. } => {
-            emit_grok_acp_tool_call(&send_activity, &tool_call, emitted_tool_calls, false);
+        GrokAcpEvent::AgentThoughtChunk {
+            session_id, text, ..
+        } => {
+            let Some(scope) = projection.borrow().adam_scope_for_session(&session_id) else {
+                return;
+            };
+            send_grok_acp_activity(
+                request,
+                event_sender,
+                scope,
+                ActivityKind::Thinking { text },
+                None,
+            );
         }
-        GrokAcpEvent::ToolCallUpdate { tool_call, .. } => {
-            emit_grok_acp_tool_call(&send_activity, &tool_call, emitted_tool_calls, true);
+        GrokAcpEvent::ToolCall {
+            session_id,
+            tool_call,
+        } => {
+            emit_grok_acp_tool_call(
+                request,
+                event_sender,
+                &session_id,
+                &tool_call,
+                projection,
+                false,
+            );
         }
-        GrokAcpEvent::PlanSnapshot { .. } => {
-            // Exact native-XOR-tools contract: the ACP run exposes Adam's
-            // app-owned task tools, so a provider-native plan cannot also
-            // become the main Progress projection.
+        GrokAcpEvent::ToolCallUpdate {
+            session_id,
+            tool_call,
+        } => {
+            emit_grok_acp_tool_call(
+                request,
+                event_sender,
+                &session_id,
+                &tool_call,
+                projection,
+                true,
+            );
+        }
+        GrokAcpEvent::PlanSnapshot {
+            session_id,
+            entries,
+        } => {
+            let Some(scope) = projection.borrow().adam_scope_for_session(&session_id) else {
+                return;
+            };
+            if scope.is_main() && projection.borrow().root_plan_channel != PlanChannel::NativeStream
+            {
+                // Exact native-XOR-tools contract: a root-only ACP session
+                // exposes Adam's app-owned task tools, so its provider-native
+                // plan cannot also become Main Progress.
+                return;
+            }
+            projection
+                .borrow_mut()
+                .child_permission_blocks
+                .remove(&session_id);
+            let tasks = entries
+                .into_iter()
+                .map(|entry| PlanItem {
+                    content: entry.content,
+                    active_form: None,
+                    status: grok_acp_plan_status(entry.status),
+                    task_id: (!entry.id.trim().is_empty()).then_some(entry.id),
+                    origin: PlanItemOrigin::Native,
+                })
+                .collect();
+            send_grok_acp_activity(
+                request,
+                event_sender,
+                scope,
+                ActivityKind::PlanUpdate {
+                    tasks,
+                    authoritative: false,
+                    compacted: false,
+                    replaces_native: true,
+                },
+                None,
+            );
         }
         GrokAcpEvent::PermissionRequested {
             request: permission,
         } => {
-            send_activity(ActivityKind::PermissionPrompt {
-                id: permission.tool_call.id.clone(),
-                tool: grok_acp_tool_label(&permission.tool_call),
-                summary: format!(
-                    "Grok requested permission to use {}.",
-                    grok_acp_tool_label(&permission.tool_call)
+            let Some(scope) = projection
+                .borrow()
+                .adam_scope_for_session(&permission.session_id)
+            else {
+                return;
+            };
+            let tool = grok_acp_tool_label(&permission.tool_call);
+            projection.borrow_mut().permission_tools.insert(
+                (
+                    permission.session_id.clone(),
+                    permission.tool_call.id.clone(),
                 ),
-                resolution: None,
-            });
+                tool.clone(),
+            );
+            send_grok_acp_activity(
+                request,
+                event_sender,
+                scope,
+                ActivityKind::PermissionPrompt {
+                    id: permission.tool_call.id,
+                    tool: tool.clone(),
+                    summary: format!("Grok requested permission to use {tool}."),
+                    resolution: None,
+                },
+                None,
+            );
         }
         GrokAcpEvent::PermissionResolved {
+            session_id,
             tool_call_id,
             resolution,
-            ..
         } => {
+            let Some(scope) = projection.borrow().adam_scope_for_session(&session_id) else {
+                return;
+            };
             let resolution = match resolution {
                 GrokAcpPermissionResolution::Allowed { .. } => PermissionResolution::Allowed,
                 GrokAcpPermissionResolution::Rejected { .. }
                 | GrokAcpPermissionResolution::Cancelled => PermissionResolution::Denied,
             };
-            send_activity(ActivityKind::PermissionPrompt {
-                id: tool_call_id,
-                tool: "Grok tool".into(),
-                summary: "Grok permission request resolved.".into(),
-                resolution: Some(resolution),
+            let tool = {
+                let mut projection = projection.borrow_mut();
+                let tool = projection
+                    .permission_tools
+                    .remove(&(session_id.clone(), tool_call_id.clone()))
+                    .unwrap_or_else(|| "Grok tool".into());
+                if !scope.is_main() {
+                    if resolution == PermissionResolution::Denied {
+                        projection.child_permission_blocks.insert(
+                            session_id.clone(),
+                            GrokPermissionBlock {
+                                tool: tool.clone(),
+                                tool_call_id: tool_call_id.clone(),
+                            },
+                        );
+                    } else {
+                        projection.child_permission_blocks.remove(&session_id);
+                    }
+                }
+                tool
+            };
+            send_grok_acp_activity(
+                request,
+                event_sender,
+                scope,
+                ActivityKind::PermissionPrompt {
+                    id: tool_call_id,
+                    tool: tool.clone(),
+                    summary: format!("Grok permission request for {tool} resolved."),
+                    resolution: Some(resolution),
+                },
+                None,
+            );
+        }
+        GrokAcpEvent::SubagentSpawned { subagent } => {
+            let child_scope = GrokAcpSessionScope::Child {
+                subagent_id: subagent.subagent_id.clone(),
+                parent_session_id: subagent.parent_session_id.clone(),
+            };
+            projection
+                .borrow_mut()
+                .remember_child(&subagent.child_session_id, child_scope);
+            send_grok_acp_activity(
+                request,
+                event_sender,
+                AgentScope::Main,
+                ActivityKind::Subagent {
+                    id: subagent.child_session_id.clone(),
+                    aliases: grok_subagent_aliases(
+                        &subagent.child_session_id,
+                        &subagent.subagent_id,
+                    ),
+                    parent_id: Some(subagent.parent_session_id),
+                    label: if subagent.description.trim().is_empty() {
+                        subagent.subagent_type
+                    } else {
+                        subagent.description
+                    },
+                    status: SubagentStatus::InProgress,
+                    model: subagent.model,
+                    detail: subagent.capability_mode.or(subagent.role),
+                    tool_calls: None,
+                },
+                None,
+            );
+        }
+        GrokAcpEvent::SessionScopeRegistered { session_id, scope } => {
+            if matches!(scope, GrokAcpSessionScope::Child { .. }) {
+                projection.borrow_mut().remember_child(&session_id, scope);
+            }
+        }
+        GrokAcpEvent::SubagentProgress { progress } => {
+            let detail = progress
+                .tools_used
+                .last()
+                .map(|tool| format!("Using {}", activity_tool_name(tool)))
+                .or_else(|| {
+                    (progress.turn_count > 0).then(|| {
+                        format!(
+                            "{} turn{}",
+                            progress.turn_count,
+                            if progress.turn_count == 1 { "" } else { "s" }
+                        )
+                    })
+                });
+            send_grok_acp_activity(
+                request,
+                event_sender,
+                AgentScope::Main,
+                ActivityKind::Subagent {
+                    id: progress.child_session_id.clone(),
+                    aliases: grok_subagent_aliases(
+                        &progress.child_session_id,
+                        &progress.subagent_id,
+                    ),
+                    parent_id: Some(progress.parent_session_id),
+                    label: String::new(),
+                    status: SubagentStatus::InProgress,
+                    model: None,
+                    detail,
+                    tool_calls: Some(u64::from(progress.tool_call_count)),
+                },
+                Some(grok_duration_ms(progress.duration_ms)),
+            );
+        }
+        GrokAcpEvent::SubagentFinished { result } => {
+            let permission_block = projection
+                .borrow_mut()
+                .child_permission_blocks
+                .remove(&result.child_session_id);
+            let mut status = grok_subagent_status(&result.status, result.error.as_deref());
+            if status == SubagentStatus::Cancelled && permission_block.is_some() {
+                status = SubagentStatus::PermissionBlocked;
+            }
+            let detail = result.error.or_else(|| {
+                permission_block.map(|block| format!("Permission unavailable for {}", block.tool))
             });
+            send_grok_acp_activity(
+                request,
+                event_sender,
+                AgentScope::Main,
+                ActivityKind::Subagent {
+                    id: result.child_session_id.clone(),
+                    aliases: grok_subagent_aliases(&result.child_session_id, &result.subagent_id),
+                    parent_id: Some(result.parent_session_id),
+                    label: String::new(),
+                    status,
+                    model: None,
+                    detail,
+                    tool_calls: Some(u64::from(result.tool_calls)),
+                },
+                Some(grok_duration_ms(result.duration_ms)),
+            );
         }
         GrokAcpEvent::Terminal { .. } => {}
     }
 }
 
+fn send_grok_acp_activity(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    scope: AgentScope,
+    kind: ActivityKind,
+    duration_ms: Option<i64>,
+) {
+    let mut event = scoped_activity_event(scope, kind);
+    event.duration_ms = duration_ms;
+    let _ = event_sender.send(AiEvent::Activity {
+        turn_id: request.turn_id,
+        conversation_id: request.conversation_id,
+        event,
+    });
+}
+
 fn emit_grok_acp_tool_call(
-    send_activity: &impl Fn(ActivityKind),
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    session_id: &str,
     tool_call: &GrokAcpToolCall,
-    emitted_tool_calls: &RefCell<HashSet<String>>,
+    projection: &RefCell<GrokAcpProjectionState>,
     is_update: bool,
 ) {
-    let first = emitted_tool_calls.borrow_mut().insert(tool_call.id.clone());
+    let Some(scope) = projection.borrow().adam_scope_for_session(session_id) else {
+        return;
+    };
+    if !scope.is_main() {
+        let clears_denial = projection
+            .borrow()
+            .child_permission_blocks
+            .get(session_id)
+            .is_some_and(|block| {
+                block.tool_call_id != tool_call.id
+                    || tool_call.status == Some(GrokAcpToolStatus::Completed)
+            });
+        if clears_denial {
+            projection
+                .borrow_mut()
+                .child_permission_blocks
+                .remove(session_id);
+        }
+    }
+    let first = projection
+        .borrow_mut()
+        .emitted_tool_calls
+        .insert((session_id.to_owned(), tool_call.id.clone()));
     if first {
-        send_activity(ActivityKind::ToolCall {
-            id: tool_call.id.clone(),
-            name: grok_acp_tool_label(tool_call),
-            server: Some("grok".into()),
-            input_summary: tool_call
-                .locations
-                .first()
-                .map(|location| location.path.clone()),
-        });
+        send_grok_acp_activity(
+            request,
+            event_sender,
+            scope.clone(),
+            ActivityKind::ToolCall {
+                id: tool_call.id.clone(),
+                name: grok_acp_tool_label(tool_call),
+                server: Some("grok".into()),
+                input_summary: tool_call
+                    .locations
+                    .first()
+                    .map(|location| location.path.clone()),
+            },
+            None,
+        );
     }
     if is_update
         && matches!(
@@ -2066,12 +2554,56 @@ fn emit_grok_acp_tool_call(
             Some(GrokAcpToolStatus::Completed | GrokAcpToolStatus::Failed)
         )
     {
-        send_activity(ActivityKind::ToolResult {
-            id: tool_call.id.clone(),
-            output: grok_acp_tool_output(tool_call),
-            is_error: tool_call.status == Some(GrokAcpToolStatus::Failed),
-        });
+        send_grok_acp_activity(
+            request,
+            event_sender,
+            scope,
+            ActivityKind::ToolResult {
+                id: tool_call.id.clone(),
+                output: grok_acp_tool_output(tool_call),
+                is_error: tool_call.status == Some(GrokAcpToolStatus::Failed),
+            },
+            None,
+        );
     }
+}
+
+fn grok_acp_plan_status(status: GrokAcpPlanStatus) -> PlanItemStatus {
+    match status {
+        GrokAcpPlanStatus::Pending => PlanItemStatus::Pending,
+        GrokAcpPlanStatus::InProgress => PlanItemStatus::InProgress,
+        GrokAcpPlanStatus::Completed => PlanItemStatus::Completed,
+        GrokAcpPlanStatus::Other(status) if normalized_token(&status).as_str() == "cancelled" => {
+            PlanItemStatus::Cancelled
+        }
+        GrokAcpPlanStatus::Other(_) => PlanItemStatus::Pending,
+    }
+}
+
+fn grok_subagent_aliases(child_session_id: &str, subagent_id: &str) -> Vec<String> {
+    (child_session_id != subagent_id)
+        .then(|| subagent_id.to_owned())
+        .into_iter()
+        .collect()
+}
+
+fn grok_subagent_status(status: &GrokAcpSubagentStatus, error: Option<&str>) -> SubagentStatus {
+    if error.is_some_and(|error| {
+        let error = error.to_ascii_lowercase();
+        error.contains("permission") && (error.contains("denied") || error.contains("cancel"))
+    }) {
+        return SubagentStatus::PermissionBlocked;
+    }
+    match status {
+        GrokAcpSubagentStatus::Completed => SubagentStatus::Completed,
+        GrokAcpSubagentStatus::Failed => SubagentStatus::Failed,
+        GrokAcpSubagentStatus::Cancelled => SubagentStatus::Cancelled,
+        GrokAcpSubagentStatus::Other(_) => SubagentStatus::Failed,
+    }
+}
+
+fn grok_duration_ms(duration_ms: u64) -> i64 {
+    i64::try_from(duration_ms).unwrap_or(i64::MAX)
 }
 
 fn grok_acp_tool_label(tool_call: &GrokAcpToolCall) -> String {
@@ -2079,6 +2611,12 @@ fn grok_acp_tool_label(tool_call: &GrokAcpToolCall) -> String {
         .title
         .clone()
         .filter(|title| !title.trim().is_empty())
+        .or_else(|| {
+            tool_call
+                .canonical_mcp_tool_name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+        })
         .unwrap_or_else(|| match &tool_call.kind {
             Some(kind) => format!("{kind:?}"),
             None => "Grok tool".into(),
@@ -7835,6 +8373,7 @@ mod tests {
     fn acp_permission(title: &str, kind: GrokAcpToolKind) -> GrokAcpPermissionRequest {
         GrokAcpPermissionRequest {
             session_id: "session".into(),
+            scope: GrokAcpSessionScope::Root,
             tool_call: GrokAcpToolCall {
                 id: format!("tool-{title}"),
                 title: Some(title.into()),
@@ -7861,11 +8400,15 @@ mod tests {
 
     #[test]
     fn grok_acp_task_bridge_is_version_pinned() {
-        let supported = CliVersion::parse("grok 0.2.114").unwrap();
+        let task_only = CliVersion::parse("grok 0.2.114").unwrap();
+        let scoped_subagents = CliVersion::parse("grok 0.2.117").unwrap();
         let old = CliVersion::parse("grok 0.2.111").unwrap();
+        let unverified_patch = CliVersion::parse("grok 0.2.118").unwrap();
         let future = CliVersion::parse("grok 0.3.0").unwrap();
-        assert!(supports_grok_acp_task_bridge(Some(&supported)));
+        assert!(supports_grok_acp_task_bridge(Some(&task_only)));
+        assert!(supports_grok_acp_task_bridge(Some(&scoped_subagents)));
         assert!(!supports_grok_acp_task_bridge(Some(&old)));
+        assert!(!supports_grok_acp_task_bridge(Some(&unverified_patch)));
         assert!(!supports_grok_acp_task_bridge(Some(&future)));
         assert!(!supports_grok_acp_task_bridge(None));
     }
@@ -7876,19 +8419,53 @@ mod tests {
             "openai_compatible",
             None,
             "https://example.com/v1",
+            true,
         ));
         assert!(provider_exposes_app_task_tools(
             "lm_studio",
             None,
             "http://127.0.0.1:1234/v1",
+            true,
         ));
-        assert!(provider_exposes_app_task_tools("custom_cli", None, ""));
+        assert!(provider_exposes_app_task_tools(
+            "custom_cli",
+            None,
+            "",
+            true,
+        ));
         for provider in ["claude_cli", "codex_cli", "kimi_cli", "ollama"] {
             assert!(
-                !provider_exposes_app_task_tools(provider, None, ""),
+                !provider_exposes_app_task_tools(provider, None, "", true),
                 "{provider}"
             );
         }
+    }
+
+    #[test]
+    fn grok_acp_version_and_resume_contract_select_progress() {
+        let task_only = CliVersion::parse("grok 0.2.114").unwrap();
+        let scoped_subagents = CliVersion::parse("grok 0.2.117").unwrap();
+        let task_only_tuning =
+            runtime_tuning_profile(ProviderKind::Grok, Some(&task_only), "grok-4.5");
+        let scoped_tuning =
+            runtime_tuning_profile(ProviderKind::Grok, Some(&scoped_subagents), "grok-4.5");
+
+        assert_eq!(
+            grok_acp_plan_channel(&task_only_tuning, false),
+            PlanChannel::AppTaskTools
+        );
+        assert_eq!(
+            grok_acp_plan_channel(&task_only_tuning, true),
+            PlanChannel::NativeStream
+        );
+        assert_eq!(
+            grok_acp_plan_channel(&scoped_tuning, false),
+            PlanChannel::NativeStream
+        );
+        assert_eq!(
+            grok_acp_plan_channel(&scoped_tuning, true),
+            PlanChannel::NativeStream
+        );
     }
 
     #[test]
@@ -8088,6 +8665,82 @@ mod tests {
     }
 
     #[test]
+    fn grok_acp_scoped_permissions_keep_main_tasks_root_owned() {
+        let blocked = RefCell::new(GrokPermissionBlockState::default());
+        let mut root_task = acp_permission(
+            "provider-controlled title",
+            GrokAcpToolKind::Other("mcp".into()),
+        );
+        root_task.tool_call.canonical_mcp_tool_name = Some("adam_tasks__task_update".into());
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &root_task,
+                PermissionMode::Ask,
+                AiWorkspaceMode::Cowork,
+                true,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Allow { .. }
+        ));
+
+        let mut child_task = root_task.clone();
+        child_task.session_id = "child-session".into();
+        child_task.scope = GrokAcpSessionScope::Child {
+            subagent_id: "provider-child".into(),
+            parent_session_id: "session".into(),
+        };
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &child_task,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Cowork,
+                true,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+        assert!(
+            blocked.borrow().pending.is_none(),
+            "a child denial must not become the root turn's terminal cause"
+        );
+
+        let spawn = acp_permission("spawn_subagent", GrokAcpToolKind::Execute);
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &spawn,
+                PermissionMode::Ask,
+                AiWorkspaceMode::Cowork,
+                true,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &spawn,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Cowork,
+                false,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+
+        let mut title_lookalike = acp_permission("Spawn subagent", GrokAcpToolKind::Execute);
+        title_lookalike.tool_call.kind = None;
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &title_lookalike,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Cowork,
+                true,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
     fn grok_acp_permission_errors_keep_terminal_truth() {
         let outcome =
             grok_acp_error_outcome(GrokAcpError::WebAccessDisabled { tool: "WebSearch" }, None);
@@ -8158,24 +8811,40 @@ mod tests {
             AiWorkspaceMode::Cowork,
             &blocked,
         );
-        blocked
-            .borrow_mut()
-            .observe_event(&GrokAcpEvent::ToolCallUpdate {
+        blocked.borrow_mut().observe_event(
+            &GrokAcpEvent::ToolCallUpdate {
                 session_id: "session".into(),
                 tool_call: denied.tool_call.clone(),
-            });
+            },
+            Some(&GrokAcpSessionScope::Root),
+        );
         assert!(
             blocked.borrow().pending.is_some(),
             "the denied tool's own terminal update must retain attribution"
         );
+        blocked.borrow_mut().observe_event(
+            &GrokAcpEvent::ToolCall {
+                session_id: "child-session".into(),
+                tool_call: acp_permission("Child read", GrokAcpToolKind::Read).tool_call,
+            },
+            Some(&GrokAcpSessionScope::Child {
+                subagent_id: "provider-child".into(),
+                parent_session_id: "session".into(),
+            }),
+        );
+        assert!(
+            blocked.borrow().pending.is_some(),
+            "concurrent child work must not erase a root permission failure"
+        );
         let mut completed_denied_tool = denied.tool_call.clone();
         completed_denied_tool.status = Some(GrokAcpToolStatus::Completed);
-        blocked
-            .borrow_mut()
-            .observe_event(&GrokAcpEvent::ToolCallUpdate {
+        blocked.borrow_mut().observe_event(
+            &GrokAcpEvent::ToolCallUpdate {
                 session_id: "session".into(),
                 tool_call: completed_denied_tool,
-            });
+            },
+            Some(&GrokAcpSessionScope::Root),
+        );
         assert!(
             blocked.borrow().pending.is_none(),
             "completion proves the denied operation continued"
@@ -8187,10 +8856,13 @@ mod tests {
             AiWorkspaceMode::Cowork,
             &blocked,
         );
-        blocked.borrow_mut().observe_event(&GrokAcpEvent::ToolCall {
-            session_id: "session".into(),
-            tool_call: acp_permission("Different tool", GrokAcpToolKind::Read).tool_call,
-        });
+        blocked.borrow_mut().observe_event(
+            &GrokAcpEvent::ToolCall {
+                session_id: "session".into(),
+                tool_call: acp_permission("Different tool", GrokAcpToolKind::Read).tool_call,
+            },
+            Some(&GrokAcpSessionScope::Root),
+        );
         assert!(
             blocked.borrow().pending.is_none(),
             "a different tool call proves the provider continued beyond the denial"
@@ -8202,13 +8874,14 @@ mod tests {
             AiWorkspaceMode::Cowork,
             &blocked,
         );
-        blocked
-            .borrow_mut()
-            .observe_event(&GrokAcpEvent::AgentThoughtChunk {
+        blocked.borrow_mut().observe_event(
+            &GrokAcpEvent::AgentThoughtChunk {
                 session_id: "session".into(),
                 message_id: "thought-after-denial".into(),
                 text: "Explaining why permission was unavailable".into(),
-            });
+            },
+            Some(&GrokAcpSessionScope::Root),
+        );
         assert!(
             blocked.borrow().pending.is_some(),
             "prose can explain a denial and must not erase its attribution"
@@ -8237,9 +8910,754 @@ mod tests {
                 session_id: "session".into(),
                 entries: Vec::new(),
             },
-            &RefCell::new(HashSet::new()),
+            &RefCell::new(GrokAcpProjectionState {
+                root_plan_channel: PlanChannel::AppTaskTools,
+                root_session_id: Some("session".into()),
+                ..GrokAcpProjectionState::default()
+            }),
         );
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn grok_acp_native_channel_projects_the_root_plan() {
+        let run = request("grok_cli");
+        let (sender, receiver) = unbounded();
+        emit_grok_acp_event(
+            &run,
+            &sender,
+            GrokAcpEvent::PlanSnapshot {
+                session_id: "session".into(),
+                entries: vec![crate::grok_acp::GrokAcpPlanEntry {
+                    id: "main-step".into(),
+                    content: "Synthesize the findings".into(),
+                    priority: crate::grok_acp::GrokAcpPlanPriority::Medium,
+                    status: GrokAcpPlanStatus::InProgress,
+                }],
+            },
+            &RefCell::new(GrokAcpProjectionState {
+                root_plan_channel: PlanChannel::NativeStream,
+                root_session_id: Some("session".into()),
+                ..GrokAcpProjectionState::default()
+            }),
+        );
+
+        assert!(receiver.try_iter().any(|event| {
+            matches!(
+                event,
+                AiEvent::Activity {
+                    event:
+                        ActivityEvent {
+                            scope: AgentScope::Main,
+                            kind:
+                                ActivityKind::PlanUpdate {
+                                    tasks,
+                                    replaces_native: true,
+                                    ..
+                                },
+                            ..
+                        },
+                    ..
+                } if tasks.len() == 1
+                    && tasks[0].content == "Synthesize the findings"
+                    && tasks[0].status == PlanItemStatus::InProgress
+                    && tasks[0].origin == PlanItemOrigin::Native
+            )
+        }));
+    }
+
+    #[test]
+    fn grok_acp_projection_keeps_parent_and_child_activity_separate() {
+        let run = request("grok_cli");
+        let (sender, receiver) = unbounded();
+        let projection = RefCell::new(GrokAcpProjectionState::default());
+        let emit = |event| emit_grok_acp_event(&run, &sender, event, &projection);
+
+        emit(GrokAcpEvent::SessionStarted {
+            session_id: "root-session".into(),
+            resumed: false,
+        });
+        emit(GrokAcpEvent::SubagentSpawned {
+            subagent: crate::grok_acp::GrokAcpSubagentSpawned {
+                subagent_id: "provider-child".into(),
+                parent_session_id: "root-session".into(),
+                parent_prompt_id: Some("prompt-1".into()),
+                child_session_id: "child-session".into(),
+                subagent_type: "explore".into(),
+                description: "Research sources".into(),
+                effective_context_source: Some("new".into()),
+                context_normalized: false,
+                capability_mode: Some("read-only".into()),
+                persona: None,
+                role: Some("researcher".into()),
+                model: Some("grok-4.5".into()),
+                resumed_from: None,
+                workflow_run_id: None,
+            },
+        });
+        emit(GrokAcpEvent::AgentMessageChunk {
+            session_id: "root-session".into(),
+            message_id: "shared-message".into(),
+            text: "PARENT_ONLY".into(),
+        });
+        emit(GrokAcpEvent::ChildMessage {
+            scope: GrokAcpSessionScope::Child {
+                subagent_id: "provider-child".into(),
+                parent_session_id: "root-session".into(),
+            },
+            session_id: "child-session".into(),
+            message_id: "shared-message".into(),
+            text: "CHILD_ONLY".into(),
+        });
+        emit(GrokAcpEvent::AgentThoughtChunk {
+            session_id: "child-session".into(),
+            message_id: "thought-1".into(),
+            text: "Checking sources".into(),
+        });
+        for session_id in ["root-session", "child-session"] {
+            emit(GrokAcpEvent::ToolCall {
+                session_id: session_id.into(),
+                tool_call: GrokAcpToolCall {
+                    id: "shared-tool-id".into(),
+                    title: Some("Read file".into()),
+                    canonical_mcp_tool_name: None,
+                    kind: Some(GrokAcpToolKind::Read),
+                    status: Some(GrokAcpToolStatus::Pending),
+                    content: Vec::new(),
+                    locations: Vec::new(),
+                },
+            });
+        }
+        emit(GrokAcpEvent::PlanSnapshot {
+            session_id: "child-session".into(),
+            entries: vec![crate::grok_acp::GrokAcpPlanEntry {
+                id: "child-task".into(),
+                content: "Inspect the source".into(),
+                priority: crate::grok_acp::GrokAcpPlanPriority::High,
+                status: GrokAcpPlanStatus::InProgress,
+            }],
+        });
+        let mut child_permission = acp_permission("WebFetch", GrokAcpToolKind::Fetch);
+        child_permission.session_id = "child-session".into();
+        child_permission.scope = GrokAcpSessionScope::Child {
+            subagent_id: "provider-child".into(),
+            parent_session_id: "root-session".into(),
+        };
+        emit(GrokAcpEvent::PermissionRequested {
+            request: child_permission,
+        });
+        emit(GrokAcpEvent::PermissionResolved {
+            session_id: "child-session".into(),
+            tool_call_id: "tool-WebFetch".into(),
+            resolution: GrokAcpPermissionResolution::Allowed {
+                option_id: "allow-once".into(),
+            },
+        });
+        emit(GrokAcpEvent::SubagentProgress {
+            progress: crate::grok_acp::GrokAcpSubagentProgress {
+                subagent_id: "provider-child".into(),
+                parent_session_id: "root-session".into(),
+                child_session_id: "child-session".into(),
+                duration_ms: 250,
+                turn_count: 1,
+                tool_call_count: 1,
+                tokens_used: 100,
+                context_window_tokens: 1_000,
+                context_usage_pct: 10,
+                tools_used: vec!["read_file".into()],
+                error_count: 0,
+            },
+        });
+        emit(GrokAcpEvent::SubagentFinished {
+            result: crate::grok_acp::GrokAcpSubagentFinished {
+                subagent_id: "provider-child".into(),
+                parent_session_id: "root-session".into(),
+                child_session_id: "child-session".into(),
+                status: GrokAcpSubagentStatus::Completed,
+                error: None,
+                tool_calls: 1,
+                turns: 1,
+                duration_ms: 500,
+                tokens_used: 150,
+                output: Some("CHILD_ONLY".into()),
+                will_wake: false,
+                synthetic: false,
+            },
+        });
+
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        let deltas = events
+            .iter()
+            .filter_map(|event| match event {
+                AiEvent::Delta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deltas, ["PARENT_ONLY"]);
+
+        let activities = events
+            .into_iter()
+            .filter_map(|event| match event {
+                AiEvent::Activity { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(activities.iter().any(|event| {
+            event.scope.is_main()
+                && matches!(
+                    &event.kind,
+                    ActivityKind::AssistantText { text } if text == "PARENT_ONLY"
+                )
+        }));
+        assert!(!activities.iter().any(|event| {
+            event.scope.is_main()
+                && matches!(
+                    &event.kind,
+                    ActivityKind::AssistantText { text } if text.contains("CHILD_ONLY")
+                )
+        }));
+        assert!(activities.iter().any(|event| {
+            event.scope
+                == (AgentScope::Child {
+                    id: "child-session".into(),
+                })
+                && matches!(
+                    &event.kind,
+                    ActivityKind::AssistantText { text } if text == "CHILD_ONLY"
+                )
+        }));
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        &event.kind,
+                        ActivityKind::ToolCall { id, .. } if id == "shared-tool-id"
+                    )
+                })
+                .count(),
+            2,
+            "tool-call IDs are scoped by provider session"
+        );
+        assert!(activities.iter().any(|event| {
+            event.scope
+                == (AgentScope::Child {
+                    id: "child-session".into(),
+                })
+                && matches!(
+                    &event.kind,
+                    ActivityKind::PlanUpdate { tasks, .. }
+                        if tasks.len() == 1
+                            && tasks[0].content == "Inspect the source"
+                            && tasks[0].origin == PlanItemOrigin::Native
+                )
+        }));
+        assert!(activities.iter().any(|event| {
+            event.scope
+                == (AgentScope::Child {
+                    id: "child-session".into(),
+                })
+                && matches!(
+                    &event.kind,
+                    ActivityKind::PermissionPrompt {
+                        tool,
+                        resolution: Some(PermissionResolution::Allowed),
+                        ..
+                    } if tool == "WebFetch"
+                )
+        }));
+        assert!(activities.iter().any(|event| {
+            matches!(
+                &event.kind,
+                ActivityKind::Subagent {
+                    id,
+                    aliases,
+                    status: SubagentStatus::Completed,
+                    ..
+                } if id == "child-session" && aliases == &["provider-child".to_owned()]
+            ) && event.duration_ms == Some(500)
+        }));
+    }
+
+    #[test]
+    fn grok_acp_replayed_child_scope_routes_later_live_activity_without_replaying_ui() {
+        let run = request("grok_cli");
+        let (sender, receiver) = unbounded();
+        let projection = RefCell::new(GrokAcpProjectionState::default());
+        let emit = |event| emit_grok_acp_event(&run, &sender, event, &projection);
+
+        emit(GrokAcpEvent::SessionScopeRegistered {
+            session_id: "resumed-child".into(),
+            scope: GrokAcpSessionScope::Child {
+                subagent_id: "provider-child".into(),
+                parent_session_id: "root-session".into(),
+            },
+        });
+        assert!(
+            receiver.try_recv().is_err(),
+            "replay route registration must not create a visible lifecycle row"
+        );
+
+        emit(GrokAcpEvent::SessionStarted {
+            session_id: "root-session".into(),
+            resumed: true,
+        });
+        emit(GrokAcpEvent::AgentThoughtChunk {
+            session_id: "resumed-child".into(),
+            message_id: "live-thought".into(),
+            text: "Continuing the resumed child".into(),
+        });
+
+        let activities = receiver
+            .try_iter()
+            .filter_map(|event| match event {
+                AiEvent::Activity { event, .. } => Some(event),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(activities.iter().any(|event| {
+            event.scope
+                == (AgentScope::Child {
+                    id: "resumed-child".into(),
+                })
+                && matches!(
+                    &event.kind,
+                    ActivityKind::Thinking { text }
+                        if text == "Continuing the resumed child"
+                )
+        }));
+        assert!(
+            !activities
+                .iter()
+                .any(|event| matches!(&event.kind, ActivityKind::Subagent { .. }))
+        );
+    }
+
+    #[test]
+    fn grok_child_permission_denial_without_provider_error_is_permission_blocked() {
+        let run = request("grok_cli");
+        let (sender, receiver) = unbounded();
+        let projection = RefCell::new(GrokAcpProjectionState::default());
+        let emit = |event| emit_grok_acp_event(&run, &sender, event, &projection);
+
+        emit(GrokAcpEvent::SessionStarted {
+            session_id: "root-session".into(),
+            resumed: false,
+        });
+        emit(GrokAcpEvent::SubagentSpawned {
+            subagent: crate::grok_acp::GrokAcpSubagentSpawned {
+                subagent_id: "provider-child".into(),
+                parent_session_id: "root-session".into(),
+                parent_prompt_id: None,
+                child_session_id: "child-session".into(),
+                subagent_type: "explore".into(),
+                description: "Research".into(),
+                effective_context_source: None,
+                context_normalized: false,
+                capability_mode: Some("read-only".into()),
+                persona: None,
+                role: None,
+                model: None,
+                resumed_from: None,
+                workflow_run_id: None,
+            },
+        });
+        let mut permission = acp_permission("WebFetch", GrokAcpToolKind::Fetch);
+        permission.session_id = "child-session".into();
+        permission.scope = GrokAcpSessionScope::Child {
+            subagent_id: "provider-child".into(),
+            parent_session_id: "root-session".into(),
+        };
+        emit(GrokAcpEvent::PermissionRequested {
+            request: permission,
+        });
+        emit(GrokAcpEvent::PermissionResolved {
+            session_id: "child-session".into(),
+            tool_call_id: "tool-WebFetch".into(),
+            resolution: GrokAcpPermissionResolution::Cancelled,
+        });
+        emit(GrokAcpEvent::ToolCallUpdate {
+            session_id: "child-session".into(),
+            tool_call: GrokAcpToolCall {
+                id: "tool-WebFetch".into(),
+                title: Some("WebFetch".into()),
+                canonical_mcp_tool_name: None,
+                kind: Some(GrokAcpToolKind::Fetch),
+                status: Some(GrokAcpToolStatus::Failed),
+                content: Vec::new(),
+                locations: Vec::new(),
+            },
+        });
+        emit(GrokAcpEvent::SubagentFinished {
+            result: crate::grok_acp::GrokAcpSubagentFinished {
+                subagent_id: "provider-child".into(),
+                parent_session_id: "root-session".into(),
+                child_session_id: "child-session".into(),
+                status: GrokAcpSubagentStatus::Cancelled,
+                error: None,
+                tool_calls: 0,
+                turns: 1,
+                duration_ms: 100,
+                tokens_used: 10,
+                output: None,
+                will_wake: false,
+                synthetic: false,
+            },
+        });
+
+        assert!(receiver.try_iter().any(|event| {
+            matches!(
+                event,
+                AiEvent::Activity {
+                    event:
+                        ActivityEvent {
+                            kind:
+                                ActivityKind::Subagent {
+                                    id,
+                                    status: SubagentStatus::PermissionBlocked,
+                                    detail: Some(detail),
+                                    ..
+                                },
+                            ..
+                        },
+                    ..
+                } if id == "child-session" && detail.contains("WebFetch")
+            )
+        }));
+    }
+
+    #[test]
+    fn grok_child_permission_cancellation_is_not_generic_cancellation() {
+        assert_eq!(
+            grok_subagent_status(
+                &GrokAcpSubagentStatus::Cancelled,
+                Some("Subagent turn was cancelled: user cancelled a permission prompt"),
+            ),
+            SubagentStatus::PermissionBlocked
+        );
+        assert_eq!(
+            grok_subagent_status(&GrokAcpSubagentStatus::Cancelled, Some("user stopped run")),
+            SubagentStatus::Cancelled
+        );
+    }
+
+    #[test]
+    #[ignore = "requires installed Grok 0.2.117 and a live provider turn"]
+    fn installed_grok_subagent_run_omits_main_task_bridge_and_scopes_permissions() {
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = env::var_os("GROK_BIN")
+            .map(PathBuf::from)
+            .or_else(|| resolve_executable("grok", Some(temporary.path())))
+            .expect("installed Grok CLI");
+        assert!(
+            probe_cli_version(&executable).is_some_and(|version| {
+                (version.major, version.minor, version.patch) == (0, 2, 117)
+            }),
+            "this evidence test is pinned to installed Grok 0.2.117"
+        );
+        let run_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let registry = Arc::new(Mutex::new(TaskToolRegistry::new()));
+        lock_unpoison(&registry)
+            .register_run(run_id, conversation_id, PlanChannel::NativeStream, &[])
+            .unwrap();
+        let request = GrokAcpRequest {
+            executable,
+            cwd: temporary.path().to_path_buf(),
+            prompt: concat!(
+                "Use spawn_subagent exactly once. Spawn one foreground general-purpose subagent ",
+                "with all capability. Tell the child to invoke its built-in file write or edit ",
+                "tool exactly once to create child-permission-probe.txt in ",
+                "the working folder with content CHILD_PERMISSION_PROBE. The child must make ",
+                "that tool call even though it requires permission and must not merely describe ",
+                "it. The parent must never call a file tool. Wait for the child, ",
+                "then reply only PARENT_PERMISSION_TEST_DONE."
+            )
+            .into(),
+            rules: concat!(
+                "This is a permission-boundary test. Adam has attached no MCP servers. ",
+                "The child must attempt the requested built-in write or edit tool. ",
+                "Do not merely describe the tool call."
+            )
+            .into(),
+            sandbox: "read-only".into(),
+            permission_mode: "default".into(),
+            web_enabled: false,
+            max_turns: Some(8),
+            planning_enabled: false,
+            memory_enabled: Some(false),
+            subagents_enabled: true,
+            model: Some("grok-4.5".into()),
+            reasoning_effort: Some("low".into()),
+            resume_session_id: None,
+            progress_route: GrokAcpProgressRoute::NativeStream,
+            http_mcp_server: None,
+            limits: GrokAcpLimits {
+                wall_timeout: Duration::from_secs(120),
+                ..GrokAcpLimits::default()
+            },
+        };
+        let permissions = RefCell::new(Vec::<GrokAcpPermissionRequest>::new());
+        let events = RefCell::new(Vec::<GrokAcpEvent>::new());
+        let cancelled = AtomicBool::new(false);
+        let outcome = run_grok_acp(
+            &request,
+            &cancelled,
+            |permission| {
+                permissions.borrow_mut().push(permission.clone());
+                permission
+                    .first_reject_once_option()
+                    .map(|option| GrokAcpPermissionDecision::Reject {
+                        option_id: option.id.clone(),
+                    })
+                    .unwrap_or(GrokAcpPermissionDecision::Cancel)
+            },
+            |event| events.borrow_mut().push(event),
+        )
+        .unwrap();
+
+        let permission_snapshot = permissions.borrow().clone();
+        let event_snapshot = events.borrow().clone();
+        let task_snapshot = lock_unpoison(&registry)
+            .tasks_for_conversation(conversation_id)
+            .unwrap_or_default()
+            .to_vec();
+        let child_session_ids = event_snapshot
+            .iter()
+            .filter_map(|event| match event {
+                GrokAcpEvent::SubagentSpawned { subagent } => {
+                    Some(subagent.child_session_id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let child_tool_ids = event_snapshot
+            .iter()
+            .filter_map(|event| match event {
+                GrokAcpEvent::ToolCall {
+                    session_id,
+                    tool_call,
+                }
+                | GrokAcpEvent::ToolCallUpdate {
+                    session_id,
+                    tool_call,
+                } if child_session_ids.contains(session_id.as_str()) => Some(tool_call.id.as_str()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let child_owned_permission = permission_snapshot.iter().any(|permission| {
+            matches!(permission.scope, GrokAcpSessionScope::Child { .. })
+                && child_tool_ids.contains(permission.tool_call.id.as_str())
+        });
+        let task_tool_was_exposed = event_snapshot.iter().any(|event| {
+            matches!(
+                event,
+                GrokAcpEvent::ToolCall { tool_call, .. }
+                    | GrokAcpEvent::ToolCallUpdate { tool_call, .. }
+                    if tool_call
+                        .canonical_mcp_tool_name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with("adam_tasks__"))
+            )
+        }) || permission_snapshot.iter().any(|permission| {
+            permission
+                .tool_call
+                .canonical_mcp_tool_name
+                .as_deref()
+                .is_some_and(|name| name.starts_with("adam_tasks__"))
+        });
+        let relevant_event_snapshot = event_snapshot
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    GrokAcpEvent::ToolCall { .. }
+                        | GrokAcpEvent::ToolCallUpdate { .. }
+                        | GrokAcpEvent::SubagentSpawned { .. }
+                        | GrokAcpEvent::SubagentFinished { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !child_session_ids.is_empty(),
+            "installed Grok did not emit a child lifecycle"
+        );
+        assert!(
+            child_owned_permission,
+            "a child tool permission was not correlated back to its child session\npermissions: \
+             {permission_snapshot:#?}\nchild tool IDs: {child_tool_ids:#?}\nrelevant events: \
+             {relevant_event_snapshot:#?}\noutcome: {outcome:#?}"
+        );
+        assert!(
+            !task_tool_was_exposed,
+            "installed Grok emitted an Adam task tool even though Adam attached no MCP server\npermissions: \
+             {permission_snapshot:#?}"
+        );
+        assert!(matches!(
+            outcome.stop_reason,
+            GrokAcpStopReason::EndTurn | GrokAcpStopReason::Refusal
+        ));
+        assert!(
+            task_snapshot.is_empty(),
+            "a subagent-enabled native-plan run mutated Adam's task store"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_acp_subagent_transport_uses_native_main_progress_without_mcp() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("fake-grok-acp-subagents.py");
+        fs::write(
+            &executable,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+if "--version" in sys.argv:
+    print("grok 0.2.117 (fixture)")
+    raise SystemExit(0)
+
+def receive():
+    line = sys.stdin.readline()
+    if not line:
+        raise RuntimeError("Adam closed ACP stdin")
+    return json.loads(line)
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+initialize = receive()
+send({
+    "jsonrpc": "2.0",
+    "id": initialize["id"],
+    "result": {
+        "protocolVersion": 1,
+        "agentCapabilities": {
+            "loadSession": True,
+            "mcpCapabilities": {"http": True}
+        }
+    }
+})
+
+session = receive()
+if session["params"]["mcpServers"] != []:
+    raise RuntimeError("subagent run received an inherited MCP server")
+session_id = session["params"].get("sessionId", "fake-native-session")
+send({"jsonrpc": "2.0", "id": session["id"], "result": {"sessionId": session_id}})
+prompt = receive()
+send({
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+        "sessionId": session_id,
+        "update": {
+            "sessionUpdate": "plan",
+            "entries": [{
+                "id": "main-step",
+                "content": "Synthesize child findings",
+                "priority": "medium",
+                "status": "in_progress"
+            }]
+        },
+        "_meta": {"eventId": "root-plan-1"}
+    }
+})
+send({
+    "jsonrpc": "2.0",
+    "method": "session/update",
+    "params": {
+        "sessionId": session_id,
+        "update": {
+            "sessionUpdate": "agent_message_chunk",
+            "messageId": "answer-1",
+            "content": {"type": "text", "text": "Native progress recorded."}
+        },
+        "_meta": {"eventId": "root-answer-1"}
+    }
+})
+send({
+    "jsonrpc": "2.0",
+    "id": prompt["id"],
+    "result": {"stopReason": "end_turn"}
+})
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        for (subagents_enabled, resume_session_id, expected_session_id) in [
+            (true, None, "fake-native-session"),
+            (false, None, "fake-native-session"),
+            (true, Some("resume-on"), "resume-on"),
+            (false, Some("resume-off"), "resume-off"),
+        ] {
+            let mut run = request("grok_cli");
+            run.cwd = Some(temporary.path().to_path_buf());
+            run.model = "grok-4.5".into();
+            run.resume_session_id = resume_session_id.map(str::to_owned);
+            set_feature(&mut run, AI_FEATURE_SUBAGENTS, subagents_enabled);
+            set_feature(&mut run, AI_FEATURE_PLANNING, true);
+            let prepared = prepare_resolved_cli("grok_cli", executable.clone(), &run).unwrap();
+            let PreparedRun::GrokAcp(specification) = prepared else {
+                panic!("verified Grok 0.2.117 must use ACP");
+            };
+            assert_eq!(specification.plan_channel, PlanChannel::NativeStream);
+            assert_eq!(specification.subagents_enabled, subagents_enabled);
+
+            let registry = Arc::new(Mutex::new(TaskToolRegistry::new()));
+            lock_unpoison(&registry)
+                .register_run(
+                    run.turn_id,
+                    run.conversation_id,
+                    specification.plan_channel,
+                    &[],
+                )
+                .unwrap();
+            let (sender, receiver) = unbounded();
+            let outcome = run_grok_acp_transport(
+                &run,
+                specification,
+                &Arc::new(RunControl::default()),
+                &sender,
+                &registry,
+            );
+
+            assert!(matches!(
+                outcome,
+                RunOutcome::Completed { text, session_id }
+                    if text == "Native progress recorded."
+                        && session_id.as_deref() == Some(expected_session_id)
+            ));
+            assert!(
+                lock_unpoison(&registry)
+                    .tasks_for_conversation(run.conversation_id)
+                    .unwrap()
+                    .is_empty(),
+                "a native-plan run must not mutate the app task-tool store"
+            );
+            assert!(receiver.try_iter().any(|event| {
+                matches!(
+                    event,
+                    AiEvent::Activity {
+                        event:
+                            ActivityEvent {
+                                scope: AgentScope::Main,
+                                kind: ActivityKind::PlanUpdate { tasks, .. },
+                                ..
+                            },
+                        ..
+                    } if tasks.len() == 1
+                        && tasks[0].content == "Synthesize child findings"
+                        && tasks[0].origin == PlanItemOrigin::Native
+                )
+            }));
+        }
     }
 
     #[cfg(unix)]
@@ -8366,22 +9784,41 @@ send({
         let mut run = request("grok_cli");
         run.cwd = Some(temporary.path().to_path_buf());
         run.model = "grok-4.5".into();
+        let mut resumed = request("grok_cli");
+        resumed.cwd = Some(temporary.path().to_path_buf());
+        resumed.model = "grok-4.5".into();
+        resumed.resume_session_id = Some("version-unknown-session".into());
+        let PreparedRun::GrokAcp(resumed_specification) =
+            prepare_resolved_cli("grok_cli", executable.clone(), &resumed).unwrap()
+        else {
+            panic!("verified Grok 0.2.114 must use ACP");
+        };
+        assert_eq!(
+            resumed_specification.plan_channel,
+            PlanChannel::NativeStream,
+            "resumed Grok sessions with unrecorded creation versions must not attach task tools"
+        );
+        assert!(!resumed_specification.subagents_enabled);
+
+        let prepared = prepare_resolved_cli("grok_cli", executable, &run).unwrap();
+        let PreparedRun::GrokAcp(specification) = prepared else {
+            panic!("verified Grok 0.2.114 must use ACP");
+        };
+        assert_eq!(specification.plan_channel, PlanChannel::AppTaskTools);
+        assert!(!specification.subagents_enabled);
         let registry = Arc::new(Mutex::new(TaskToolRegistry::new()));
         lock_unpoison(&registry)
             .register_run(
                 run.turn_id,
                 run.conversation_id,
-                PlanChannel::AppTaskTools,
+                specification.plan_channel,
                 &[],
             )
             .unwrap();
         let (sender, receiver) = unbounded();
         let outcome = run_grok_acp_transport(
             &run,
-            GrokAcpSpec {
-                program: executable,
-                cwd: temporary.path().to_path_buf(),
-            },
+            specification,
             &Arc::new(RunControl::default()),
             &sender,
             &registry,
@@ -9968,6 +11405,79 @@ send({
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn grok_launch_reprobes_same_path_and_rejects_a_post_prepare_version_change() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_version_stub(path: &Path, version: &str) {
+            fs::write(path, format!("#!/bin/sh\necho 'grok {version}'\n")).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("grok-version-stub");
+        let mut run = request("grok_cli");
+        run.cwd = Some(temporary.path().to_path_buf());
+        run.model = "grok-4.5".into();
+
+        write_version_stub(&executable, "0.2.114");
+        let PreparedRun::GrokAcp(old_specification) =
+            prepare_resolved_cli("grok_cli", executable.clone(), &run).unwrap()
+        else {
+            panic!("verified Grok 0.2.114 must use ACP");
+        };
+        assert_eq!(
+            (
+                old_specification.runtime_version.major,
+                old_specification.runtime_version.minor,
+                old_specification.runtime_version.patch,
+            ),
+            (0, 2, 114)
+        );
+        assert_eq!(old_specification.plan_channel, PlanChannel::AppTaskTools);
+        assert!(!old_specification.subagents_enabled);
+
+        write_version_stub(&executable, "0.2.117");
+        let PreparedRun::GrokAcp(new_specification) =
+            prepare_resolved_cli("grok_cli", executable.clone(), &run).unwrap()
+        else {
+            panic!("verified Grok 0.2.117 must use ACP");
+        };
+        assert_eq!(
+            (
+                new_specification.runtime_version.major,
+                new_specification.runtime_version.minor,
+                new_specification.runtime_version.patch,
+            ),
+            (0, 2, 117)
+        );
+        assert_eq!(new_specification.plan_channel, PlanChannel::NativeStream);
+        assert!(new_specification.subagents_enabled);
+
+        // A queued turn can outlive an in-place provider update. The process
+        // boundary must refuse the stale prepared contract before starting a
+        // task bridge or the provider process.
+        write_version_stub(&executable, "0.2.114");
+        let registry = Arc::new(Mutex::new(TaskToolRegistry::new()));
+        let (sender, _receiver) = unbounded();
+        let outcome = run_grok_acp_transport(
+            &run,
+            new_specification,
+            &Arc::new(RunControl::default()),
+            &sender,
+            &registry,
+        );
+        assert!(matches!(
+            outcome,
+            RunOutcome::Failed {
+                kind: AiFailureKind::ProviderError,
+                message,
+                ..
+            } if message.contains("runtime changed")
+        ));
+    }
+
     #[test]
     fn fragmented_claude_jsonl_streams_text_without_duplicating_snapshot() {
         let mut decoder = OutputDecoder::new("claude_cli".into(), OutputMode::JsonLines);
@@ -11317,7 +12827,7 @@ send({
     }
 
     #[test]
-    fn grok_session_child_output_is_scoped_but_does_not_enable_the_runtime_gate() {
+    fn legacy_grok_session_child_output_is_scoped_but_does_not_enable_the_runtime_gate() {
         let mut decoder = OutputDecoder::new("grok_cli".into(), OutputMode::JsonLines);
         let updates = [
             json!({"params":{"update":{
@@ -11357,7 +12867,7 @@ send({
         assert_eq!(children[0].prose_cells[0].text, "CHILD_ONLY");
         assert!(crate::chat_core::assistant_flat_text(&accumulator.events).is_empty());
 
-        let version = CliVersion::parse("grok 0.2.117 (f1c06093089f)").unwrap();
+        let version = CliVersion::parse("grok 0.2.114 (0c785038798)").unwrap();
         assert!(
             !runtime_tuning_profile(ProviderKind::Grok, Some(&version), "grok-4.5")
                 .supports_scoped_child_text()

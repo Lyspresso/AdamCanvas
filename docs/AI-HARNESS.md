@@ -90,9 +90,11 @@ Drift captures under `tests/fixtures/ai/<provider>/<version>/` back the
 series policy: a grammar canary test asserts a drifted capture introduces
 no envelope types beyond the tested contract and keeps the shapes resume
 depends on (see grok 0.2.114 vs 0.2.111 — identical grammar, additive
-cost keys only). A single-turn capture cannot exercise subagent scoping;
-that proof waits for the parent-child re-capture when the contract row
-lands.
+cost keys only). Grok 0.2.117 has a separate redacted parent-child ACP
+capture: the parent lifecycle notification names the child session before
+that session emits its own prose. Lifecycle and prose carry independent
+event IDs; the capture also retains Grok's idless, status-only
+`model_changed` child update.
 
 Detection reuses the launch path's own resolver and version cache through the
 additive accessor `ai::probe_installed_provider` — what the panel shows and
@@ -146,6 +148,7 @@ accepted values.
 | Codex 0.144.1 | Known GPT-5.6 Sol, Terra, and Luna choices plus custom model ID | Sol/Terra: Low through Ultra; Luna: Low through Max; other models: Low through XHigh | Explicit web-search enable |
 | Claude Code 2.1.128 | Provider default, Opus, Sonnet, Haiku, or custom model ID | Low, Medium, High, XHigh, Max | Web tools on/off and optional fallback model |
 | Grok 0.2.111 / 0.2.114 | Provider default, Grok 4.5, or custom model ID | Low, Medium, High | Web search, planning, memory, and a 1–100 turn limit; subagents forced off |
+| Grok 0.2.117 | Provider default, Grok 4.5, or custom model ID | Low, Medium, High | The same controls plus scoped ACP subagents |
 | Kimi 1.49.0 | Provider default or custom model ID | Provider default | Thinking on/off |
 | Ollama 0.32.1 | Required local model ID | Low, Medium, High, or thinking on/off | Local model execution |
 | LM Studio | Required loaded model ID | Provider default | Local server endpoint and memory-only key |
@@ -160,23 +163,52 @@ The visible choices map to real provider controls:
   `--fallback-model`, and explicit WebSearch/WebFetch allow or deny filters.
   Adam does not emit a Claude `--max-turns` flag because the supported
   installed CLI does not expose one.
-- Captured Grok 0.2.111 and 0.2.114 runtimes receive
+- Captured Grok 0.2.111, 0.2.114, and 0.2.117 runtimes receive
   `--reasoning-effort` only for Low, Medium, or High, plus supported
   ability-disable flags, experimental memory enable when requested,
   `--max-turns`, and an exact read-only or workspace sandbox. Grok 0.2.114
-  uses its structured Agent Client Protocol transport so Adam can attach its
-  authenticated task-tool server and answer typed permission requests. That
-  ACP path disables Grok's native planner even when an older saved preference
-  enabled it, preserving one task authority for the run. Forced web denial is
-  reported as permission-blocked with the exact WebSearch or WebFetch retry,
-  and the per-run bridge credential is redacted across structured fields,
-  object keys, and arbitrary streamed-text chunk boundaries before activity
-  or transcript persistence.
-  Earlier captured versions use the structured CLI stream plus a live
-  session-file follower. Neither verified channel safely scopes child prose,
-  so Adam always sends `--no-subagents`. Unless web is explicitly switched
-  off, read-only Chat research grants only `WebSearch` and `WebFetch`; it
-  never turns that into blanket filesystem-mutation approval.
+  and 0.2.117 use the structured Agent Client Protocol transport and typed
+  permission requests. A fresh 0.2.114 run attaches Adam's authenticated task
+  tools, disables Grok's native planner, and forces subagents off. Every
+  0.2.117 run instead attaches no Adam MCP server at all because Grok documents
+  that children inherit connected parent MCP servers by default and Adam's
+  resume record does not preserve a session's original child capability.
+  Subagents Off still sends `--no-subagents`; it does not change this tool
+  boundary. A resumed 0.2.114 session is conservatively treated the same way
+  so an unrecorded 0.2.117-to-0.2.114 version transition cannot attach task
+  tools to an older child-capable session. These no-server runs use the root
+  session's native plan as Main Progress; child plans remain child-scoped.
+  Their active-run registry is also marked NativeStream, so retained or stale
+  task-server credentials list no tools and reject calls.
+  Adam freshly probes the executable while shaping the turn, preparing it, and
+  immediately before process launch. If the binary changes in place after
+  preparation, the queued run fails closed and asks for a retry instead of
+  reusing the older version's subagent or task-server contract.
+
+  The 0.2.117 fixture proves the parent lifecycle registration and
+  independently identified parent/child prose with event IDs. The normalizer
+  also scopes thought, tool, plan, and permission events after a child session
+  is registered; unknown sessions are never promoted to Main. Scoped child
+  prose/thought/tool/plan and spawn/finish activity without event IDs fails
+  closed. Provider status-only updates such as `model_changed` and coalesced
+  subagent progress may be ID-less; bounded pre-registration activity is never
+  silently evicted. An installed-runtime permission test observed that a child
+  tool's permission request can use a root-session envelope. Adam therefore
+  resolves the unique session that already owns the tool-call ID before
+  applying policy or projecting activity; ambiguous cross-session IDs fail
+  closed. A known child remains the owner after its lifecycle closes, while an
+  unowned request in a root envelope is answered Cancelled without delegation
+  or projection. Grok 0.2.111 and 0.2.114 still receive `--no-subagents`, and
+  any lifecycle event received while subagents are disabled is a protocol
+  error.
+
+  Forced web denial is reported as permission-blocked with the exact WebSearch
+  or WebFetch retry. When the root-only task bridge is present, its per-run
+  credential is redacted across structured fields, object keys, and arbitrary
+  streamed-text chunk boundaries before activity or transcript persistence.
+  Unless web is explicitly switched off, read-only Chat research grants only
+  `WebSearch` and `WebFetch`; it never turns that into blanket
+  filesystem-mutation approval.
 - Kimi receives `--thinking` or `--no-thinking`.
 - The captured Ollama runtime receives its supported `--think` level or
   boolean.
@@ -289,11 +321,14 @@ native snapshot reduces it to the supported mutation limit.
 
 Tool exposure is checked both when a provider lists tools and when it calls
 one. Dead runs fail closed. Claude and Codex keep their native task channel and
-never receive Adam’s task tools. Verified Grok ACP, compatible HTTP function
-calling, and the explicit Custom CLI bridge contract receive Adam’s tools and
-do not project a second native plan channel. The tools are independent of
-canvas access: a model can maintain Progress without gaining permission to
-read or mutate canvas data.
+never receive Adam’s task tools. Fresh verified Grok 0.2.114 ACP, compatible
+HTTP function calling, and the explicit Custom CLI bridge contract receive
+Adam’s tools and do not project a second main plan channel. Grok 0.2.117 and
+resumed Grok ACP runs receive no Adam task server and use their native root
+plan instead. This is deliberate mutual exclusion: Grok children inherit
+connected MCP clients without a trustworthy root/child caller identity. The
+tools are independent of canvas access: a model can maintain Progress without
+gaining permission to read or mutate canvas data.
 
 HTTP providers receive ordinary function-tool descriptors and may perform up
 to 16 bounded continuation rounds. A streamed or non-streamed function call is
@@ -382,11 +417,13 @@ parent/child indentation. **View all** opens a wider Active/Done subagent
 panel without leaving the conversation. Repeated status updates replace the
 earlier state for that child rather than creating duplicate “agent” rows.
 
-New runs on the captured Grok versions are deliberately excluded from this
-projection. Their available streams do not provide a proven, end-to-end scoped
-child-prose channel, so Adam forces subagents off instead of leaking child
-responses into the parent transcript or inventing ownership. Scoped Grok child
-lifecycle and prose events are PR3 work. Codex collaboration calls and
+Grok 0.2.117 joins this projection through its verified ACP parent/child
+sessions. The child session ID is the canonical Adam ID; a distinct provider
+subagent ID is retained as an alias. Child prose is collected into one
+response cell and never enters the main transcript or main completion text.
+Duplicate event IDs and resume replay do not create duplicate cells. Earlier
+captured Grok versions remain forced off because their available streams do
+not provide end-to-end child scope. Codex collaboration calls and
 subagent-activity items join thread aliases into the same lifecycle. Claude
 Agent/legacy Task calls, task lifecycle notifications, and tool-progress
 events join tool-use, task, and provider-agent IDs. Unsupported providers
@@ -575,7 +612,8 @@ cannot revive a completed run.
 The current harness does not claim:
 
 - a completed model-callable Adam host-tool server;
-- scoped child prose for identity-less Grok streams, which is PR3 work;
+- scoped child prose for Grok versions whose streams do not identify the
+  emitting child session;
 - native Adam task-tool attachment for Kimi or Ollama CLI builds that expose
   no verified external-tool transport;
 - an interactive approval sheet for every provider permission request—safe
