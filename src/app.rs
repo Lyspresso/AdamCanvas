@@ -1,4 +1,7 @@
 use crate::{
+    agents_panel::{
+        self, AgentsPanelAction, AgentsPanelState, PreflightNotice, agent_rows, preflight_notice,
+    },
     ai::{
         AiEngine, AiEvent, AiFailureKind, AiRunRequest, clamp_provider_preferences,
         installed_runtime_tuning, provider_exposes_app_task_tools, resolve_effective_provider_id,
@@ -489,6 +492,7 @@ struct AiWorkspaceUiAction {
     close_subagents_detail: bool,
     toggle_all_outputs: bool,
     retry_turn: Option<RetryHint>,
+    open_agents_panel: bool,
 }
 
 struct AiTilePreview {
@@ -854,6 +858,7 @@ pub struct AdamApp {
     #[allow(dead_code)]
     resume_store_path: PathBuf,
     pending_ai_action: Option<AiActionRequest>,
+    agents: AgentsPanelState,
     trash_open: bool,
     link_editor_open: bool,
     link_input: String,
@@ -1137,6 +1142,7 @@ impl AdamApp {
             resume_store,
             resume_store_path,
             pending_ai_action: None,
+            agents: AgentsPanelState::start(creation.egui_ctx.clone()),
             trash_open: false,
             link_editor_open: false,
             link_input: String::new(),
@@ -2010,7 +2016,8 @@ impl AdamApp {
             || self.details_tile.is_some()
             || self.pile_settings.is_some()
             || self.open_chat.is_some()
-            || self.trash_open;
+            || self.trash_open
+            || self.agents.open;
 
         let undo = context.input(|input| {
             input.modifiers.command && !input.modifiers.shift && input.key_pressed(Key::Z)
@@ -3211,7 +3218,9 @@ impl AdamApp {
         let mut paste = false;
         let mut duplicate = false;
         let mut clear = false;
+        let mut open_agents = false;
         let armed = self.armed_canvas_tool;
+        let agents_open = self.agents.open;
         let area = egui::Area::new(Id::new("adam-canvas-quick-bar"))
             .order(egui::Order::Foreground)
             .fixed_pos(position)
@@ -3328,7 +3337,34 @@ impl AdamApp {
                                 .on_hover_text("Clear the active canvas tool")
                                 .clicked();
 
-                            for _ in 0..3 {
+                            open_agents |= ui
+                                .add(
+                                    Button::new(
+                                        RichText::new("◎")
+                                            .size(if slot_size < 36.0 { 15.0 } else { 19.0 })
+                                            .color(colors.text),
+                                    )
+                                    .min_size(vec2(slot_size, slot_size))
+                                    .fill(if agents_open {
+                                        colors.selection_fill
+                                    } else {
+                                        colors.tile
+                                    })
+                                    .stroke(Stroke::new(
+                                        if agents_open { 2.0 } else { 1.0 },
+                                        if agents_open {
+                                            colors.accent
+                                        } else {
+                                            colors.tile_border
+                                        },
+                                    )),
+                                )
+                                .on_hover_text(
+                                    "Agents\nSee which AI providers are installed and verified",
+                                )
+                                .clicked();
+
+                            for _ in 0..2 {
                                 ui.add_enabled(
                                     false,
                                     Button::new(RichText::new("").color(colors.tertiary_text))
@@ -3362,6 +3398,10 @@ impl AdamApp {
         if clear {
             self.armed_canvas_tool = None;
             self.note_draft = None;
+        }
+        if open_agents {
+            self.agents.open = !self.agents.open;
+            self.agents.ensure_scanned();
         }
 
         area.response.rect
@@ -6070,6 +6110,12 @@ impl AdamApp {
             .filter(|request| request.conversation_id == conversation_id)
             .cloned();
         let mut action = AiWorkspaceUiAction::default();
+        self.agents.ensure_scanned();
+        let preflight = preflight_notice(
+            &settings.provider_id,
+            !settings.api_endpoint.trim().is_empty(),
+            self.agents.snapshot.as_ref(),
+        );
         let show_inspector = runtime.show_inspector && root.available_width() >= 720.0;
 
         if show_inspector {
@@ -6131,6 +6177,7 @@ impl AdamApp {
                     &mut permission,
                     &mut runtime,
                     pending_action.as_ref(),
+                    preflight.as_ref(),
                     &mut action,
                     &mut self.markdown_cache,
                     colors,
@@ -6171,6 +6218,10 @@ impl AdamApp {
             .chat_runtimes
             .get(&conversation_id)
             .is_some_and(|runtime| runtime.active_turn.is_some());
+        if action.open_agents_panel {
+            self.agents.open = true;
+            self.agents.ensure_scanned();
+        }
         if action.add_attachments {
             self.add_ai_attachments(conversation_id);
         }
@@ -8452,6 +8503,59 @@ impl AdamApp {
         self.trash_open = open;
     }
 
+    fn show_agents_panel(&mut self, context: &Context) {
+        if !self.agents.open {
+            return;
+        }
+        self.agents.ensure_scanned();
+        let colors = self.theme(context);
+        let selected_provider = self.open_chat.and_then(|conversation_id| {
+            self.workspace
+                .domain
+                .conversations
+                .conversations
+                .get(&conversation_id)
+                .map(|conversation| conversation.settings.provider_id.clone())
+        });
+        let mut open = true;
+        let mut action = AgentsPanelAction::default();
+        egui::Window::new("Agents")
+            .open(&mut open)
+            .default_width(560.0)
+            .show(context, |ui| match self.agents.snapshot.as_ref() {
+                Some(snapshot) => {
+                    let rows = agent_rows(snapshot, selected_provider.as_deref());
+                    agents_panel::agents_panel_ui(
+                        ui,
+                        &rows,
+                        self.agents.scanning(),
+                        &agents_panel_palette(colors),
+                        &mut action,
+                    );
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new("Scanning for installed agent CLIs…")
+                                .color(colors.secondary_text),
+                        );
+                    });
+                }
+            });
+        if action.refresh {
+            self.agents.request_scan(true);
+        }
+        if let Some(command) = action.copy_install {
+            context.copy_text(command.to_owned());
+            self.toast("Install command copied", context);
+        }
+        if let Some(url) = action.open_docs {
+            platform::open_url(url);
+        }
+        self.agents.open = open;
+    }
+
     fn handle_external_drops(&mut self, context: &Context) {
         let dropped: Vec<PathBuf> = context.input(|input| {
             input
@@ -9654,6 +9758,7 @@ impl eframe::App for AdamApp {
         self.poll_image_pastes(context);
         self.poll_asset_imports(context);
         self.poll_ai_events(context);
+        self.agents.poll();
         self.handle_shortcuts(context);
         self.handle_external_drops(context);
         self.poll_automation(context);
@@ -9702,6 +9807,7 @@ impl eframe::App for AdamApp {
         self.show_tag_management(&context);
         self.show_pile_settings(&context);
         self.show_trash(&context);
+        self.show_agents_panel(&context);
         self.show_toast(&context);
         // Tell the preview worker which tiles were actually painted this
         // frame so queued work from a pan/zoom can be discarded immediately.
@@ -12480,6 +12586,20 @@ fn persisted_ai_activity(conversation: &AiConversation) -> Vec<HarnessActivityEv
         .collect()
 }
 
+fn agents_panel_palette(colors: Theme) -> agents_panel::AgentsPalette {
+    agents_panel::AgentsPalette {
+        accent: colors.accent,
+        text: colors.text,
+        secondary_text: colors.secondary_text,
+        tertiary_text: colors.tertiary_text,
+        danger: colors.danger,
+        tile: colors.tile,
+        tile_border: colors.tile_border,
+        separator: colors.separator,
+        panel_inset: colors.panel_inset,
+    }
+}
+
 fn progress_stepper_palette(colors: Theme) -> crate::progress_stepper::StepperPalette {
     crate::progress_stepper::StepperPalette {
         accent: colors.accent,
@@ -13786,6 +13906,7 @@ fn render_ai_chat_page(
     permission: &mut PermissionMode,
     runtime: &mut AiChatRuntime,
     pending_action: Option<&AiActionRequest>,
+    preflight: Option<&PreflightNotice>,
     action: &mut AiWorkspaceUiAction,
     markdown_cache: &mut CommonMarkCache,
     colors: Theme,
@@ -13902,6 +14023,7 @@ fn render_ai_chat_page(
         ui.add_space(inset);
         ui.vertical(|ui| {
             ui.set_width((available - inset * 2.0).clamp(320.0, 880.0));
+            render_ai_preflight_banner(ui, preflight, action, colors);
             render_ai_chat_progress_pill(ui, runtime, colors);
             render_ai_queue_bar(ui, conversation, runtime, action, colors);
             render_ai_composer(
@@ -13915,6 +14037,55 @@ fn render_ai_chat_page(
             );
         });
     });
+}
+
+/// Pre-Send warning fed by the Agents panel's cached scan; renders nothing
+/// while no snapshot exists rather than guess.
+fn render_ai_preflight_banner(
+    ui: &mut Ui,
+    preflight: Option<&PreflightNotice>,
+    action: &mut AiWorkspaceUiAction,
+    colors: Theme,
+) {
+    let Some(notice) = preflight else {
+        return;
+    };
+    Frame::NONE
+        .fill(if notice.danger {
+            colors
+                .danger
+                .gamma_multiply(if colors.dark { 0.12 } else { 0.07 })
+        } else {
+            colors.selection_fill
+        })
+        .corner_radius(3)
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(&notice.headline)
+                            .strong()
+                            .color(if notice.danger {
+                                colors.danger
+                            } else {
+                                colors.text
+                            }),
+                    );
+                    ui.label(
+                        RichText::new(&notice.detail)
+                            .size(10.5)
+                            .color(colors.secondary_text),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("Open Agents").clicked() {
+                        action.open_agents_panel = true;
+                    }
+                });
+            });
+        });
+    ui.add_space(6.0);
 }
 
 fn render_ai_chat_progress_pill(ui: &mut Ui, runtime: &AiChatRuntime, colors: Theme) {
@@ -16231,6 +16402,20 @@ fn truncate(value: &str, max_characters: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_provider_table_matches_the_selectable_provider_options() {
+        use std::collections::BTreeSet;
+        let panel: BTreeSet<_> = crate::agents_panel::AGENT_PROVIDERS
+            .iter()
+            .map(|meta| (meta.provider_id, meta.label))
+            .collect();
+        let options: BTreeSet<_> = AI_PROVIDER_OPTIONS.iter().copied().collect();
+        assert_eq!(
+            panel, options,
+            "agents_panel::AGENT_PROVIDERS must mirror AI_PROVIDER_OPTIONS"
+        );
+    }
 
     #[test]
     fn sticky_gesture_preserves_drawn_shape_and_pressed_corner() {
