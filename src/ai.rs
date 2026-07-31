@@ -5,7 +5,7 @@
 //! are never synthesized by this module.
 
 #[cfg(not(test))]
-use crate::xai_responses::run_xai_responses;
+use crate::xai_responses::run_xai_responses_cancellable;
 use crate::{
     ai_task_bridge::TaskToolBridge,
     ai_task_tools::{TaskToolOutcome, TaskToolRegistry},
@@ -37,6 +37,7 @@ use crate::{
     xai_responses::{
         XAI_API_KEY_ENV, XAI_MULTI_AGENT_MODEL, XaiGroupStatus, XaiReasoningEffort,
         XaiResponsesError, XaiResponsesEvent, XaiResponsesLimits, XaiResponsesRequest,
+        XaiTransportAbort,
     },
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
@@ -204,6 +205,9 @@ pub enum AiEvent {
         conversation_id: Uuid,
         kind: AiFailureKind,
         message: String,
+        /// The provider rejected the saved native session before doing work.
+        /// Consumers may use this typed signal for one fresh replay.
+        resume_rejected: bool,
     },
     Cancelled {
         turn_id: Uuid,
@@ -271,6 +275,8 @@ pub enum AiEngineError {
     ExecutableNotFound(String),
     #[error("invalid AI provider configuration: {0}")]
     InvalidConfiguration(String),
+    #[error("native AI session is unavailable: {0}")]
+    NativeResumeUnavailable(String),
     #[error("could not start the AI worker: {0}")]
     WorkerStart(#[source] io::Error),
 }
@@ -402,6 +408,14 @@ impl AiEngine {
                         conversation_id,
                         kind,
                         message,
+                        resume_rejected: false,
+                    }),
+                    RunOutcome::ResumeRejected { message } => Some(AiEvent::Failed {
+                        turn_id,
+                        conversation_id,
+                        kind: AiFailureKind::ProviderError,
+                        message,
+                        resume_rejected: true,
                     }),
                     RunOutcome::Cancelled => Some(AiEvent::Cancelled {
                         turn_id,
@@ -551,6 +565,7 @@ struct RunControl {
     /// event and task-tool dispatch. Once `cancelled` is set while this gate is
     /// held, no later HTTP event or task mutation may begin.
     http_event_gate: Mutex<()>,
+    xai_transport_abort: Mutex<Option<XaiTransportAbort>>,
     #[cfg(test)]
     http_read_in_progress: AtomicBool,
 }
@@ -567,6 +582,7 @@ impl RunControl {
             return false;
         }
         self.cancelled.store(true, Ordering::Release);
+        self.abort_xai_transport();
         true
     }
 
@@ -587,6 +603,23 @@ impl RunControl {
         }
         self.terminal_claimed.store(true, Ordering::Release);
         true
+    }
+
+    fn install_xai_transport_abort(&self, abort: XaiTransportAbort) {
+        if self.cancelled.load(Ordering::Acquire) {
+            abort.cancel();
+        }
+        *lock_unpoison(&self.xai_transport_abort) = Some(abort);
+    }
+
+    fn abort_xai_transport(&self) {
+        if let Some(abort) = lock_unpoison(&self.xai_transport_abort).as_ref() {
+            abort.cancel();
+        }
+    }
+
+    fn clear_xai_transport_abort(&self) {
+        lock_unpoison(&self.xai_transport_abort).take();
     }
 }
 
@@ -715,6 +748,16 @@ pub fn installed_runtime_tuning(
         return runtime_tuning_profile(profile.runtime_family, None, model);
     };
     runtime_tuning_for_program(provider_id, &program, model)
+}
+
+/// Whether the installed `kimi` executable selects Adam's fixture-verified
+/// ACP transport. Resume eligibility calls this at the launch boundary so a
+/// same-path upgrade or downgrade cannot reuse an ACP sidecar with the legacy
+/// print-mode adapter.
+pub fn installed_kimi_uses_acp(cwd: Option<&Path>) -> bool {
+    resolve_executable("kimi", cwd)
+        .map(|program| fresh_runtime_tuning_for_program("kimi_cli", &program, ""))
+        .is_some_and(|tuning| supports_kimi_acp_transport(tuning.version.as_ref()))
 }
 
 /// Clamp saved controls to the verified runtime table. Returns true when the
@@ -1040,11 +1083,7 @@ fn prepare_resolved_cli(
         // for the exact fixture-backed runtime.
         let tuning =
             fresh_runtime_tuning_for_program(provider_id, &program, effective_model(request));
-        if tuning
-            .version
-            .as_ref()
-            .is_some_and(|version| (version.major, version.minor, version.patch) == (0, 31, 0))
-        {
+        if supports_kimi_acp_transport(tuning.version.as_ref()) {
             let cwd = match canonical_working_directory(request.cwd.as_deref())? {
                 Some(cwd) => cwd,
                 None => env::current_dir()
@@ -1063,6 +1102,18 @@ fn prepare_resolved_cli(
                     .expect("verified Kimi ACP runtime has a parsed version"),
             }));
         }
+        if request.resume_session_id.is_some() {
+            return Err(AiEngineError::NativeResumeUnavailable(
+                "the installed Kimi runtime no longer matches the 0.31.0 ACP session contract"
+                    .into(),
+            ));
+        }
+        return Ok(PreparedRun::Process(preset_process_spec_with_tuning(
+            provider_id,
+            program,
+            request,
+            &tuning,
+        )?));
     }
     Ok(PreparedRun::Process(preset_process_spec(
         provider_id,
@@ -1090,6 +1141,10 @@ fn supports_grok_acp_task_bridge(version: Option<&CliVersion>) -> bool {
             (0, 2, 114) | (0, 2, 117)
         )
     })
+}
+
+fn supports_kimi_acp_transport(version: Option<&CliVersion>) -> bool {
+    version.is_some_and(|version| (version.major, version.minor, version.patch) == (0, 31, 0))
 }
 
 fn effective_model(request: &AiRunRequest) -> &str {
@@ -1726,6 +1781,9 @@ enum RunOutcome {
         tool: Option<String>,
         retry: Option<RetryHint>,
     },
+    ResumeRejected {
+        message: String,
+    },
     Cancelled,
     /// The runner sent its user-facing terminal event before its underlying
     /// worker exited, then retained the engine slot until cleanup completed.
@@ -1782,6 +1840,14 @@ fn run_outcome_status(outcome: &RunOutcome) -> Option<ActivityKind> {
                 message: Some(message.clone()),
                 tool: tool.clone(),
                 retry,
+            });
+        }
+        RunOutcome::ResumeRejected { message } => {
+            return Some(ActivityKind::TurnStatus {
+                status: TurnStatus::ProviderError,
+                message: Some(message.clone()),
+                tool: None,
+                retry: Some(RetryHint::Retry),
             });
         }
         RunOutcome::Cancelled => (TurnStatus::UserCancelled, None, None),
@@ -3277,13 +3343,16 @@ fn emit_kimi_acp_event(
     projection: &RefCell<KimiAcpProjectionState>,
 ) {
     match event {
-        KimiAcpEvent::SessionStarted { session_id, .. } => send_provider_activity(
+        KimiAcpEvent::SessionStarted { .. } => send_provider_activity(
             request,
             event_sender,
             ActivityKind::SessionInfo {
                 model: (!effective_model(request).is_empty())
                     .then(|| effective_model(request).to_owned()),
-                session_id: Some(session_id),
+                // Provider session IDs are machine-local sidecar data. The
+                // completed outcome still carries the ID to ResumeStore, but
+                // portable conversation activity keeps only display metadata.
+                session_id: None,
             },
         ),
         KimiAcpEvent::SessionInfo { .. } => {}
@@ -4053,10 +4122,13 @@ fn run_xai_responses_transport(
         ..XaiResponsesLimits::default()
     };
 
+    let transport_abort = XaiTransportAbort::default();
+    control.install_xai_transport_abort(transport_abort.clone());
     let (result_sender, result_receiver) = bounded(1);
     let worker_request = request.clone();
     let worker_xai_request = xai_request.clone();
     let worker_control = Arc::clone(control);
+    let worker_transport_abort = transport_abort;
     let worker_events = event_sender.clone();
     let worker = match thread::Builder::new()
         .name(format!("adam-ai-xai-{}", short_uuid(request.turn_id)))
@@ -4075,6 +4147,7 @@ fn run_xai_responses_transport(
             let result = crate::xai_responses::run_xai_responses_observed(
                 &worker_xai_request,
                 &worker_control.cancelled,
+                &worker_transport_abort,
                 &worker_control.http_read_in_progress,
                 |event| {
                     if matches!(event, XaiResponsesEvent::GroupFinished { .. }) {
@@ -4082,23 +4155,31 @@ fn run_xai_responses_transport(
                         return;
                     }
                     let _event_gate = lock_unpoison(&worker_control.http_event_gate);
-                    if !worker_control.cancelled.load(Ordering::Acquire) {
+                    if !worker_control.cancelled.load(Ordering::Acquire)
+                        || xai_event_is_error_cleanup(&event)
+                    {
                         emit_xai_responses_event(&worker_request, &worker_events, event);
                     }
                 },
             );
             #[cfg(not(test))]
-            let result =
-                run_xai_responses(&worker_xai_request, &worker_control.cancelled, |event| {
+            let result = run_xai_responses_cancellable(
+                &worker_xai_request,
+                &worker_control.cancelled,
+                &worker_transport_abort,
+                |event| {
                     if matches!(event, XaiResponsesEvent::GroupFinished { .. }) {
                         *terminal_group.borrow_mut() = Some(event);
                         return;
                     }
                     let _event_gate = lock_unpoison(&worker_control.http_event_gate);
-                    if !worker_control.cancelled.load(Ordering::Acquire) {
+                    if !worker_control.cancelled.load(Ordering::Acquire)
+                        || xai_event_is_error_cleanup(&event)
+                    {
                         emit_xai_responses_event(&worker_request, &worker_events, event);
                     }
-                });
+                },
+            );
             let result_claimed = {
                 let _event_gate = lock_unpoison(&worker_control.http_event_gate);
                 if worker_control.cancelled.load(Ordering::Acquire)
@@ -4119,6 +4200,7 @@ fn run_xai_responses_transport(
         }) {
         Ok(worker) => worker,
         Err(error) => {
+            control.clear_xai_transport_abort();
             return RunOutcome::provider_error(format!(
                 "could not start the Grok Heavy API worker: {error}"
             ));
@@ -4130,12 +4212,10 @@ fn run_xai_responses_transport(
     let expected_count = effort.agent_count();
     loop {
         if control.cancelled.load(Ordering::Acquire) {
+            control.abort_xai_transport();
+            let _ = worker.join();
+            control.clear_xai_transport_abort();
             emit_xai_cancel_terminal(request, control, event_sender, expected_count);
-            // Dropping the handle detaches the already-bounded worker. Its
-            // permit is held until the socket read exits, while Adam releases
-            // the conversation/global run slot immediately.
-            drop(result_receiver);
-            drop(worker);
             return RunOutcome::TerminalAlreadyEmitted;
         }
         if started_at.elapsed() >= timeout {
@@ -4149,41 +4229,44 @@ fn run_xai_responses_transport(
                 } else {
                     control.terminal_claimed.store(true, Ordering::Release);
                     control.cancelled.store(true, Ordering::Release);
-                    emit_xai_early_group_terminal(
-                        request,
-                        event_sender,
-                        expected_count,
-                        SubagentStatus::Failed,
-                        &message,
-                    );
-                    let _ = event_sender.send(AiEvent::Activity {
-                        turn_id: request.turn_id,
-                        conversation_id: request.conversation_id,
-                        event: activity_event(ActivityKind::TurnStatus {
-                            status: TurnStatus::TimedOut,
-                            message: Some(message.clone()),
-                            tool: None,
-                            retry: Some(RetryHint::Retry),
-                        }),
-                    });
-                    let _ = event_sender.send(AiEvent::Failed {
-                        turn_id: request.turn_id,
-                        conversation_id: request.conversation_id,
-                        kind: AiFailureKind::TimedOut,
-                        message: message.clone(),
-                    });
+                    control.abort_xai_transport();
                     (true, false)
                 }
             };
             if timeout_won {
-                drop(result_receiver);
-                drop(worker);
+                let _ = worker.join();
+                control.clear_xai_transport_abort();
+                emit_xai_early_group_terminal(
+                    request,
+                    event_sender,
+                    expected_count,
+                    SubagentStatus::Failed,
+                    &message,
+                );
+                let _ = event_sender.send(AiEvent::Activity {
+                    turn_id: request.turn_id,
+                    conversation_id: request.conversation_id,
+                    event: activity_event(ActivityKind::TurnStatus {
+                        status: TurnStatus::TimedOut,
+                        message: Some(message.clone()),
+                        tool: None,
+                        retry: Some(RetryHint::Retry),
+                    }),
+                });
+                let _ = event_sender.send(AiEvent::Failed {
+                    turn_id: request.turn_id,
+                    conversation_id: request.conversation_id,
+                    kind: AiFailureKind::TimedOut,
+                    message,
+                    resume_rejected: false,
+                });
                 return RunOutcome::TerminalAlreadyEmitted;
             }
             if !completion_already_won {
+                control.abort_xai_transport();
+                let _ = worker.join();
+                control.clear_xai_transport_abort();
                 emit_xai_cancel_terminal(request, control, event_sender, expected_count);
-                drop(result_receiver);
-                drop(worker);
                 return RunOutcome::TerminalAlreadyEmitted;
             }
             // The network worker completed before the timeout gate. It sends
@@ -4193,6 +4276,7 @@ fn run_xai_responses_transport(
         match result_receiver.recv_timeout(Duration::from_millis(40)) {
             Ok((result, result_claimed)) => {
                 let _ = worker.join();
+                control.clear_xai_transport_abort();
                 if result_claimed
                     && control.terminal_claimed.load(Ordering::Acquire)
                     && !control.cancelled.load(Ordering::Acquire)
@@ -4205,6 +4289,7 @@ fn run_xai_responses_transport(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = worker.join();
+                control.clear_xai_transport_abort();
                 if control.claim_terminal_result() {
                     let message = "the Grok Heavy API worker stopped unexpectedly";
                     emit_xai_early_group_terminal(
@@ -4266,12 +4351,24 @@ fn xai_result_outcome(
         },
         Err(XaiResponsesError::Cancelled) => RunOutcome::Cancelled,
         Err(XaiResponsesError::TimedOut) => RunOutcome::timed_out("Grok Heavy timed out"),
-        Err(XaiResponsesError::Incomplete { reason, .. }) => RunOutcome::Failed {
-            kind: AiFailureKind::MaxTurnsReached,
-            message: format!("Grok Heavy stopped before completing: {reason}"),
-            tool: None,
-            retry: Some(RetryHint::Retry),
-        },
+        Err(XaiResponsesError::PreviousResponseNotFound { message }) => {
+            RunOutcome::ResumeRejected {
+                message: format!("Grok Heavy could not resume its saved response: {message}"),
+            }
+        }
+        Err(XaiResponsesError::Incomplete { reason, .. })
+            if reason.trim() == "max_output_tokens" =>
+        {
+            RunOutcome::Failed {
+                kind: AiFailureKind::MaxTurnsReached,
+                message: "Grok Heavy reached its output-token limit before completing.".into(),
+                tool: None,
+                retry: Some(RetryHint::Retry),
+            }
+        }
+        Err(XaiResponsesError::Incomplete { reason, .. }) => RunOutcome::provider_error(format!(
+            "Grok Heavy returned an incomplete response: {reason}"
+        )),
         Err(error) => RunOutcome::provider_error(format!("Grok Heavy failed: {error}")),
     }
 }
@@ -4298,6 +4395,13 @@ fn emit_xai_early_group_terminal(
             detail: Some(detail.into()),
         },
     );
+}
+
+fn xai_event_is_error_cleanup(event: &XaiResponsesEvent) -> bool {
+    matches!(
+        event,
+        XaiResponsesEvent::LeaderToolFinished { is_error: true, .. }
+    )
 }
 
 fn emit_xai_responses_event(
@@ -4423,7 +4527,7 @@ fn emit_xai_responses_event(
                 output: usage.output_tokens,
                 cached_input: usage.cached_input_tokens,
                 reasoning: usage.reasoning_tokens,
-                cost_usd: None,
+                cost_usd: usage.cost_usd(),
             },
         ),
     }
@@ -9050,6 +9154,7 @@ fn run_http(
                     conversation_id: request.conversation_id,
                     kind: AiFailureKind::TimedOut,
                     message,
+                    resume_rejected: false,
                 });
             }
             wait_for_http_worker(result_receiver, worker);
@@ -13435,6 +13540,61 @@ send({
                 ..
             } if message.contains("runtime changed")
         ));
+        assert!(supports_kimi_acp_transport(
+            CliVersion::parse("0.31.0").as_ref()
+        ));
+        assert!(!supports_kimi_acp_transport(
+            CliVersion::parse("1.49.0").as_ref()
+        ));
+
+        let mut resumed = request("kimi_cli");
+        resumed.cwd = Some(temporary.path().to_path_buf());
+        resumed.resume_session_id = Some("saved-kimi-session".into());
+        write_version_stub(&executable, "1.49.0");
+        assert!(matches!(
+            prepare_resolved_cli("kimi_cli", executable.clone(), &resumed),
+            Err(AiEngineError::NativeResumeUnavailable(message))
+                if message.contains("no longer matches")
+        ));
+
+        write_version_stub(&executable, "0.31.1");
+        assert!(matches!(
+            prepare_resolved_cli("kimi_cli", executable, &resumed),
+            Err(AiEngineError::NativeResumeUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn kimi_session_activity_keeps_the_provider_id_sidecar_only() {
+        let mut run = request("kimi_cli");
+        run.model = "kimi-for-coding".into();
+        let (sender, receiver) = unbounded();
+        emit_kimi_acp_event(
+            &run,
+            &sender,
+            KimiAcpEvent::SessionStarted {
+                session_id: "private-kimi-session".into(),
+                resumed: false,
+            },
+            &RefCell::new(KimiAcpProjectionState::default()),
+        );
+
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AiEvent::Activity {
+                event: ActivityEvent {
+                    kind: ActivityKind::SessionInfo {
+                        model: Some(model),
+                        session_id: None,
+                    },
+                    ..
+                },
+                ..
+            } if model == "kimi-for-coding"
+        ));
+        assert!(!format!("{events:?}").contains("private-kimi-session"));
     }
 
     #[test]
@@ -15923,7 +16083,7 @@ send({
     }
 
     #[test]
-    fn xai_cancel_releases_the_run_before_bounded_cleanup_and_drops_late_events() {
+    fn xai_stop_closes_live_connection_and_joins_worker() {
         use std::net::TcpListener;
 
         let _xai_test = lock_unpoison(&XAI_TRANSPORT_TEST_LOCK);
@@ -15931,7 +16091,7 @@ send({
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let (response_sender, response_receiver) = bounded(1);
-        let (close_sender, close_receiver) = bounded(1);
+        let (closed_sender, closed_receiver) = bounded(1);
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
@@ -15944,29 +16104,54 @@ send({
                 assert_ne!(count, 0, "client closed before sending HTTP headers");
                 request_bytes.extend_from_slice(&buffer[..count]);
             }
+            let header_end = request_bytes
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = std::str::from_utf8(&request_bytes[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while request_bytes.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "client closed before sending the HTTP body");
+                request_bytes.extend_from_slice(&buffer[..count]);
+            }
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\n\
                       Content-Type: text/event-stream\r\n\
                       Connection: close\r\n\
-                      \r\n",
+                      \r\n\
+                      data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-open\"}}\n\n\
+                      data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"ws-open\",\"type\":\"web_search_call\",\"status\":\"in_progress\"}}\n\n",
                 )
                 .unwrap();
             stream.flush().unwrap();
             response_sender.send(()).unwrap();
-
-            let _ = close_receiver.recv_timeout(Duration::from_secs(5));
-            let _ = stream.write_all(
-                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-late\"}}\n\n\
-                  data: {\"type\":\"response.output_text.delta\",\"delta\":\"late\"}\n\n\
-                  data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-late\",\"status\":\"completed\",\"output_text\":\"late\"}}\n\n",
-            );
-            let _ = stream.flush();
+            let closed = match stream.read(&mut buffer) {
+                Ok(0) => true,
+                Err(error) => matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                ),
+                Ok(_) => false,
+            };
+            closed_sender.send(closed).unwrap();
         });
 
         let mut run = request("xai_api");
         run.model.clear();
         run.provider_preferences.reasoning_effort = "high".into();
+        set_feature(&mut run, AI_FEATURE_WEB_SEARCH, true);
         let control = Arc::new(RunControl::default());
         let worker_control = Arc::clone(&control);
         let (sender, receiver) = unbounded();
@@ -15985,6 +16170,36 @@ send({
         response_receiver
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
+        let mut events = Vec::new();
+        let tool_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < tool_deadline {
+            if let Ok(event) = receiver.recv_timeout(Duration::from_millis(20)) {
+                let saw_tool = matches!(
+                    &event,
+                    AiEvent::Activity {
+                        event: ActivityEvent {
+                            kind: ActivityKind::ToolCall { id, .. },
+                            ..
+                        },
+                        ..
+                    } if id == "ws-open"
+                );
+                events.push(event);
+                if saw_tool {
+                    break;
+                }
+            }
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AiEvent::Activity {
+                event: ActivityEvent {
+                    kind: ActivityKind::ToolCall { id, .. },
+                    ..
+                },
+                ..
+            } if id == "ws-open"
+        )));
         let read_deadline = Instant::now() + Duration::from_secs(2);
         while !control.http_read_in_progress.load(Ordering::Acquire)
             && Instant::now() < read_deadline
@@ -16003,19 +16218,22 @@ send({
         }
         assert!(
             adapter.is_finished(),
-            "Grok Heavy kept the logical run slot while its socket was blocked"
+            "Grok Heavy did not cleanly join after closing its transport"
         );
         assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        assert!(
+            closed_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            "the server did not observe prompt connection EOF after Stop"
+        );
         assert!(matches!(
             adapter.join().unwrap(),
             RunOutcome::TerminalAlreadyEmitted
         ));
-        assert!(
-            XAI_HTTP_WORKERS.load(Ordering::Acquire) > workers_before,
-            "the detached socket worker must remain counted until it exits"
-        );
+        assert_eq!(XAI_HTTP_WORKERS.load(Ordering::Acquire), workers_before);
 
-        let events = receiver.try_iter().collect::<Vec<_>>();
+        events.extend(receiver.try_iter());
         assert_eq!(
             events
                 .iter()
@@ -16023,15 +16241,21 @@ send({
                 .count(),
             1
         );
-        close_sender.send(()).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AiEvent::Activity {
+                event: ActivityEvent {
+                    kind: ActivityKind::ToolResult {
+                        id,
+                        is_error: true,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            } if id == "ws-open"
+        )));
         server.join().unwrap();
-        let cleanup_deadline = Instant::now() + Duration::from_secs(2);
-        while XAI_HTTP_WORKERS.load(Ordering::Acquire) > workers_before
-            && Instant::now() < cleanup_deadline
-        {
-            thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(XAI_HTTP_WORKERS.load(Ordering::Acquire), workers_before);
         let late_events = receiver.try_iter().collect::<Vec<_>>();
         assert!(
             late_events.is_empty(),

@@ -9,9 +9,13 @@ use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use std::time::Instant;
 use thiserror::Error;
+use ureq::unversioned::resolver::DefaultResolver;
+use ureq::unversioned::transport::{Buffers, Connector, DefaultConnector, NextTimeout, Transport};
 use url::Url;
 
 pub const XAI_RESPONSES_ENDPOINT: &str = "https://api.x.ai/v1/responses";
@@ -29,7 +33,131 @@ const HARD_MAX_OUTPUT_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const HARD_MAX_PROVIDER_MESSAGE_BYTES: usize = 16 * 1024;
 const HARD_MAX_LEADER_TOOL_CALLS: usize = 256;
 const HARD_MAX_WALL_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+const TRANSPORT_CANCEL_POLL: Duration = Duration::from_millis(40);
+const TRANSPORT_PHASE_TIMEOUT: Duration = Duration::from_secs(10);
+const USD_TICKS_PER_DOLLAR: f64 = 10_000_000_000.0;
 const UNREQUESTED_TOOL_NOTICE: &str = "xAI reported a server-side tool call that Adam did not enable. Adam did not expose or execute a local tool, and preserved the leader response.";
+const TOOL_PROJECTION_DEGRADED_NOTICE: &str =
+    "Additional Grok Heavy web searches are still running but are omitted from Activity.";
+
+/// Cancellation handle for one live xAI request.
+///
+/// xAI does not document a synchronous Responses cancellation endpoint. Adam
+/// therefore cancels truthfully at the client boundary: the transport polls
+/// this token while blocked on network input, returns a connection-aborted I/O
+/// error, and is dropped before the worker is joined.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct XaiTransportAbort {
+    cancelled: Arc<AtomicBool>,
+}
+
+impl XaiTransportAbort {
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Debug)]
+struct AbortableConnector {
+    abort: XaiTransportAbort,
+}
+
+impl Connector<Box<dyn Transport>> for AbortableConnector {
+    type Out = AbortableTransport;
+
+    fn connect(
+        &self,
+        _details: &ureq::unversioned::transport::ConnectionDetails<'_>,
+        chained: Option<Box<dyn Transport>>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        Ok(chained.map(|inner| AbortableTransport {
+            inner,
+            abort: self.abort.clone(),
+        }))
+    }
+}
+
+#[derive(Debug)]
+struct AbortableTransport {
+    inner: Box<dyn Transport>,
+    abort: XaiTransportAbort,
+}
+
+impl AbortableTransport {
+    fn cancelled_error() -> ureq::Error {
+        ureq::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "xAI request cancelled",
+        ))
+    }
+
+    fn poll_timed_out(error: &ureq::Error) -> bool {
+        matches!(error, ureq::Error::Timeout(_))
+            || matches!(
+                error,
+                ureq::Error::Io(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    )
+            )
+    }
+}
+
+impl Transport for AbortableTransport {
+    fn buffers(&mut self) -> &mut dyn Buffers {
+        self.inner.buffers()
+    }
+
+    fn transmit_output(&mut self, amount: usize, timeout: NextTimeout) -> Result<(), ureq::Error> {
+        if self.abort.is_cancelled() {
+            return Err(Self::cancelled_error());
+        }
+        let result = self.inner.transmit_output(amount, timeout);
+        if self.abort.is_cancelled() {
+            Err(Self::cancelled_error())
+        } else {
+            result
+        }
+    }
+
+    fn await_input(&mut self, timeout: NextTimeout) -> Result<bool, ureq::Error> {
+        let started_at = Instant::now();
+        let total = timeout.not_zero().map(|duration| *duration);
+        loop {
+            if self.abort.is_cancelled() {
+                return Err(Self::cancelled_error());
+            }
+            let remaining = total.map(|total| total.saturating_sub(started_at.elapsed()));
+            if remaining.is_some_and(|remaining| remaining.is_zero()) {
+                return Err(ureq::Error::Timeout(timeout.reason));
+            }
+            let poll = remaining
+                .map(|remaining| remaining.min(TRANSPORT_CANCEL_POLL))
+                .unwrap_or(TRANSPORT_CANCEL_POLL);
+            let poll_timeout = NextTimeout {
+                after: poll.into(),
+                reason: timeout.reason,
+            };
+            match self.inner.await_input(poll_timeout) {
+                Err(error) if Self::poll_timed_out(&error) => continue,
+                result => return result,
+            }
+        }
+    }
+
+    fn is_open(&mut self) -> bool {
+        !self.abort.is_cancelled() && self.inner.is_open()
+    }
+
+    fn is_tls(&self) -> bool {
+        self.inner.is_tls()
+    }
+}
 
 /// The xAI effort spelling accepted by the multi-agent model.
 ///
@@ -193,6 +321,15 @@ pub struct XaiUsage {
     pub cached_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub total_tokens: Option<u64>,
+    /// xAI's exact integer billing unit. Ten billion ticks equal one USD.
+    pub cost_in_usd_ticks: Option<u64>,
+}
+
+impl XaiUsage {
+    pub(crate) fn cost_usd(&self) -> Option<f64> {
+        self.cost_in_usd_ticks
+            .map(|ticks| ticks as f64 / USD_TICKS_PER_DOLLAR)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -259,6 +396,8 @@ pub enum XaiResponsesError {
     TimedOut,
     #[error("xAI multi-agent API returned HTTP {status}: {message}")]
     HttpStatus { status: u16, message: String },
+    #[error("xAI no longer has the previous response: {message}")]
+    PreviousResponseNotFound { message: String },
     #[error("xAI multi-agent transport failed: {0}")]
     Transport(String),
     #[error("xAI multi-agent stream violated its limits: {0}")]
@@ -287,16 +426,39 @@ impl XaiResponsesError {
 /// A fixture-friendly, protocol-level Responses event.
 #[derive(Clone, Debug, PartialEq)]
 pub enum XaiDecodedEvent {
-    ResponseCreated { response_id: String },
+    ResponseCreated {
+        response_id: String,
+    },
     ResponseInProgress,
-    OutputTextDelta { delta: String },
-    OutputItemAdded { index: Option<u64>, item: Value },
-    OutputItemDone { index: Option<u64>, item: Value },
-    WebSearchProgress { item_id: String, phase: String },
-    ResponseCompleted { response: Value },
-    ResponseIncomplete { response: Value },
-    ResponseFailed { response: Value },
-    ProviderError { message: String },
+    OutputTextDelta {
+        delta: String,
+    },
+    OutputItemAdded {
+        index: Option<u64>,
+        item: Value,
+    },
+    OutputItemDone {
+        index: Option<u64>,
+        item: Value,
+    },
+    WebSearchProgress {
+        item_id: String,
+        phase: String,
+    },
+    ResponseCompleted {
+        response: Value,
+    },
+    ResponseIncomplete {
+        response: Value,
+    },
+    ResponseFailed {
+        response: Value,
+    },
+    ProviderError {
+        message: String,
+        code: Option<String>,
+        param: Option<String>,
+    },
     DoneMarker,
     Ignored,
 }
@@ -420,9 +582,14 @@ pub fn decode_xai_responses_value(
         "response.failed" => Ok(XaiDecodedEvent::ResponseFailed {
             response: response_value(value).clone(),
         }),
-        "error" | "response.error" => Ok(XaiDecodedEvent::ProviderError {
-            message: provider_error_message(value),
-        }),
+        "error" | "response.error" => {
+            let error = provider_error_detail(value);
+            Ok(XaiDecodedEvent::ProviderError {
+                message: error.message,
+                code: error.code,
+                param: error.param,
+            })
+        }
         // These carry no additional state required by the aggregate UI.
         "response.content_part.added"
         | "response.content_part.done"
@@ -438,6 +605,7 @@ pub fn decode_xai_responses_value(
 
 /// Run one xAI Responses turn. The callback is synchronous and receives only
 /// leader/aggregate events. It is never called with made-up child identities.
+#[cfg(test)]
 pub fn run_xai_responses<E>(
     request: &XaiResponsesRequest,
     cancelled: &AtomicBool,
@@ -446,25 +614,45 @@ pub fn run_xai_responses<E>(
 where
     E: FnMut(XaiResponsesEvent),
 {
-    run_xai_responses_with_read_observer(request, cancelled, None, emit)
+    run_xai_responses_cancellable(request, cancelled, &XaiTransportAbort::default(), emit)
+}
+
+pub(crate) fn run_xai_responses_cancellable<E>(
+    request: &XaiResponsesRequest,
+    cancelled: &AtomicBool,
+    transport_abort: &XaiTransportAbort,
+    emit: E,
+) -> Result<XaiResponsesOutcome, XaiResponsesError>
+where
+    E: FnMut(XaiResponsesEvent),
+{
+    run_xai_responses_with_read_observer(request, cancelled, transport_abort, None, emit)
 }
 
 #[cfg(test)]
 pub(crate) fn run_xai_responses_observed<E>(
     request: &XaiResponsesRequest,
     cancelled: &AtomicBool,
+    transport_abort: &XaiTransportAbort,
     read_in_progress: &AtomicBool,
     emit: E,
 ) -> Result<XaiResponsesOutcome, XaiResponsesError>
 where
     E: FnMut(XaiResponsesEvent),
 {
-    run_xai_responses_with_read_observer(request, cancelled, Some(read_in_progress), emit)
+    run_xai_responses_with_read_observer(
+        request,
+        cancelled,
+        transport_abort,
+        Some(read_in_progress),
+        emit,
+    )
 }
 
 fn run_xai_responses_with_read_observer<E>(
     request: &XaiResponsesRequest,
     cancelled: &AtomicBool,
+    transport_abort: &XaiTransportAbort,
     read_in_progress: Option<&AtomicBool>,
     mut emit: E,
 ) -> Result<XaiResponsesOutcome, XaiResponsesError>
@@ -483,7 +671,13 @@ where
         expected_count: xai_multi_agent_count(request.reasoning_effort),
     });
 
-    let result = run_xai_responses_inner(request, cancelled, read_in_progress, &mut emit);
+    let result = run_xai_responses_inner(
+        request,
+        cancelled,
+        transport_abort,
+        read_in_progress,
+        &mut emit,
+    );
     let (status, detail) = match &result {
         Ok(outcome) => (XaiGroupStatus::Completed, outcome.provider_notice.clone()),
         Err(error) => (error.group_status(), Some(public_error_detail(error))),
@@ -499,6 +693,7 @@ where
 fn run_xai_responses_inner<E>(
     request: &XaiResponsesRequest,
     cancelled: &AtomicBool,
+    transport_abort: &XaiTransportAbort,
     read_in_progress: Option<&AtomicBool>,
     emit: &mut E,
 ) -> Result<XaiResponsesOutcome, XaiResponsesError>
@@ -509,17 +704,23 @@ where
     let body = serde_json::to_vec(&build_xai_responses_body(request)?)
         .map_err(|error| XaiResponsesError::InvalidRequest(error.to_string()))?;
 
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
         .https_only(request.endpoint.scheme() == "https")
         .max_redirects(0)
         .max_redirects_will_error(true)
         .http_status_as_error(false)
         .timeout_global(Some(limits.wall_timeout))
-        .timeout_connect(Some(limits.wall_timeout.min(Duration::from_secs(30))))
+        .timeout_resolve(Some(limits.wall_timeout.min(TRANSPORT_PHASE_TIMEOUT)))
+        .timeout_connect(Some(limits.wall_timeout.min(TRANSPORT_PHASE_TIMEOUT)))
+        .timeout_send_request(Some(limits.wall_timeout.min(TRANSPORT_PHASE_TIMEOUT)))
+        .timeout_send_body(Some(limits.wall_timeout.min(TRANSPORT_PHASE_TIMEOUT)))
         .timeout_recv_response(Some(limits.wall_timeout))
         .timeout_recv_body(Some(limits.wall_timeout))
-        .build()
-        .into();
+        .build();
+    let connector = DefaultConnector::default().chain(AbortableConnector {
+        abort: transport_abort.clone(),
+    });
+    let agent = ureq::Agent::with_parts(config, connector, DefaultResolver::default());
 
     if cancelled.load(Ordering::Acquire) {
         return Err(XaiResponsesError::Cancelled);
@@ -547,9 +748,17 @@ where
         if cancelled.load(Ordering::Acquire) {
             return Err(XaiResponsesError::Cancelled);
         }
-        let mut message = bounded_provider_message(&bytes, limits.max_provider_message_bytes);
-        message = redact_secret(message, &request.bearer_key);
-        return Err(XaiResponsesError::HttpStatus { status, message });
+        let mut error = bounded_provider_error(&bytes, limits.max_provider_message_bytes);
+        error.message = redact_secret(error.message, &request.bearer_key);
+        if error.is_previous_response_not_found() {
+            return Err(XaiResponsesError::PreviousResponseNotFound {
+                message: error.message,
+            });
+        }
+        return Err(XaiResponsesError::HttpStatus {
+            status,
+            message: error.message,
+        });
     }
 
     let is_json = response
@@ -559,7 +768,7 @@ where
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
     let mut state = ResponseState::new(limits);
-    if is_json {
+    let decode_result = if is_json {
         let bytes = {
             let _read_guard = ResponseReadGuard::new(read_in_progress);
             response
@@ -567,21 +776,23 @@ where
                 .with_config()
                 .limit((limits.max_response_bytes + 1) as u64)
                 .read_to_vec()
-                .map_err(|error| map_body_error(error, cancelled))?
+                .map_err(|error| map_body_error(error, cancelled))
         };
-        if bytes.len() > limits.max_response_bytes {
-            return Err(XaiResponsesError::Limit(format!(
-                "response exceeded {} bytes",
-                limits.max_response_bytes
-            )));
-        }
-        if cancelled.load(Ordering::Acquire) {
-            return Err(XaiResponsesError::Cancelled);
-        }
-        let value = serde_json::from_slice::<Value>(&bytes).map_err(|error| {
-            XaiResponsesError::Protocol(format!("invalid JSON response: {error}"))
-        })?;
-        dispatch_nonstream_value(&value, &mut state, request, emit)?;
+        bytes.and_then(|bytes| {
+            if bytes.len() > limits.max_response_bytes {
+                return Err(XaiResponsesError::Limit(format!(
+                    "response exceeded {} bytes",
+                    limits.max_response_bytes
+                )));
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return Err(XaiResponsesError::Cancelled);
+            }
+            let value = serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+                XaiResponsesError::Protocol(format!("invalid JSON response: {error}"))
+            })?;
+            dispatch_nonstream_value(&value, &mut state, request, emit)
+        })
     } else {
         read_sse_response(
             response.body_mut().as_reader(),
@@ -590,7 +801,11 @@ where
             cancelled,
             read_in_progress,
             emit,
-        )?;
+        )
+    };
+    if let Err(error) = decode_result {
+        state.finish_open_tools(true, emit);
+        return Err(error);
     }
 
     state.finish(request, emit)
@@ -750,8 +965,13 @@ where
             emit,
         ),
         _ if value.get("error").is_some() => state.apply(
-            XaiDecodedEvent::ProviderError {
-                message: provider_error_message(value),
+            {
+                let error = provider_error_detail(value);
+                XaiDecodedEvent::ProviderError {
+                    message: error.message,
+                    code: error.code,
+                    param: error.param,
+                }
             },
             request,
             emit,
@@ -807,7 +1027,7 @@ struct LeaderTool {
 enum TerminalResponse {
     Completed,
     Incomplete(String),
-    Failed(String),
+    Failed(ProviderErrorDetail),
 }
 
 struct ResponseState {
@@ -819,6 +1039,7 @@ struct ResponseState {
     terminal: Option<TerminalResponse>,
     saw_done_marker: bool,
     quarantined_unrequested_tool: bool,
+    tool_projection_degraded: bool,
 }
 
 impl ResponseState {
@@ -832,6 +1053,7 @@ impl ResponseState {
             terminal: None,
             saw_done_marker: false,
             quarantined_unrequested_tool: false,
+            tool_projection_degraded: false,
         }
     }
 
@@ -888,11 +1110,19 @@ impl ResponseState {
                 self.capture_response_id_from_value(&response, emit)?;
                 self.capture_usage(&response, emit);
                 self.finish_open_tools(true, emit);
-                self.terminal = Some(TerminalResponse::Failed(provider_error_message(&response)));
+                self.terminal = Some(TerminalResponse::Failed(provider_error_detail(&response)));
             }
-            XaiDecodedEvent::ProviderError { message } => {
+            XaiDecodedEvent::ProviderError {
+                message,
+                code,
+                param,
+            } => {
                 self.finish_open_tools(true, emit);
-                self.terminal = Some(TerminalResponse::Failed(message));
+                self.terminal = Some(TerminalResponse::Failed(ProviderErrorDetail {
+                    message,
+                    code,
+                    param,
+                }));
             }
             XaiDecodedEvent::DoneMarker => self.saw_done_marker = true,
             XaiDecodedEvent::Ignored => {}
@@ -1024,6 +1254,7 @@ impl ResponseState {
                 .and_then(|details| details.get("reasoning_tokens"))
                 .and_then(Value::as_u64),
             total_tokens: usage.get("total_tokens").and_then(Value::as_u64),
+            cost_in_usd_ticks: usage.get("cost_in_usd_ticks").and_then(Value::as_u64),
         };
         if captured != XaiUsage::default() {
             self.usage = captured.clone();
@@ -1058,10 +1289,14 @@ impl ResponseState {
         let id = output_item_id(index, item)?;
         if !self.tools.contains_key(&id) {
             if self.tools.len() >= self.limits.max_leader_tool_calls {
-                return Err(XaiResponsesError::Limit(format!(
-                    "leader exceeded {} hosted tool calls",
-                    self.limits.max_leader_tool_calls
-                )));
+                if !self.tool_projection_degraded {
+                    self.tool_projection_degraded = true;
+                    emit(XaiResponsesEvent::GroupUpdated {
+                        group_id: request.group_id.clone(),
+                        detail: TOOL_PROJECTION_DEGRADED_NOTICE.into(),
+                    });
+                }
+                return Ok(());
             }
             self.tools.insert(
                 id.clone(),
@@ -1188,14 +1423,15 @@ impl ResponseState {
     }
 
     fn finish<E>(
-        self,
+        mut self,
         request: &XaiResponsesRequest,
-        _emit: &mut E,
+        emit: &mut E,
     ) -> Result<XaiResponsesOutcome, XaiResponsesError>
     where
         E: FnMut(XaiResponsesEvent),
     {
-        match self.terminal {
+        let terminal = self.terminal.take();
+        match terminal {
             Some(TerminalResponse::Completed) => {
                 let response_id = self.response_id.ok_or_else(|| {
                     XaiResponsesError::Protocol("completed response omitted its id".into())
@@ -1220,21 +1456,32 @@ impl ResponseState {
                 ),
                 response_id: self.response_id,
             }),
-            Some(TerminalResponse::Failed(message)) => {
-                Err(XaiResponsesError::Provider(redact_secret(
+            Some(TerminalResponse::Failed(error)) => {
+                let message = redact_secret(
                     truncate_utf8(
-                        &sanitize_provider_message(&message),
+                        &sanitize_provider_message(&error.message),
                         self.limits.max_provider_message_bytes,
                     ),
                     &request.bearer_key,
-                )))
+                );
+                if error.is_previous_response_not_found() {
+                    Err(XaiResponsesError::PreviousResponseNotFound { message })
+                } else {
+                    Err(XaiResponsesError::Provider(message))
+                }
             }
-            None if self.saw_done_marker => Err(XaiResponsesError::Protocol(
-                "stream ended with [DONE] before response.completed".into(),
-            )),
-            None => Err(XaiResponsesError::Protocol(
-                "stream ended before a terminal Responses event".into(),
-            )),
+            None if self.saw_done_marker => {
+                self.finish_open_tools(true, emit);
+                Err(XaiResponsesError::Protocol(
+                    "stream ended with [DONE] before response.completed".into(),
+                ))
+            }
+            None => {
+                self.finish_open_tools(true, emit);
+                Err(XaiResponsesError::Protocol(
+                    "stream ended before a terminal Responses event".into(),
+                ))
+            }
         }
     }
 }
@@ -1419,41 +1666,68 @@ fn incomplete_reason(response: &Value) -> String {
         .into()
 }
 
-fn provider_error_message(value: &Value) -> String {
-    value
-        .get("error")
-        .and_then(|error| {
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .or_else(|| error.as_str())
-        })
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProviderErrorDetail {
+    message: String,
+    code: Option<String>,
+    param: Option<String>,
+}
+
+impl ProviderErrorDetail {
+    fn is_previous_response_not_found(&self) -> bool {
+        self.code.as_deref() == Some("previous_response_not_found")
+            && self.param.as_deref() == Some("previous_response_id")
+    }
+}
+
+fn provider_error_detail(value: &Value) -> ProviderErrorDetail {
+    let error = value.get("error").unwrap_or(value);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| error.as_str())
         .or_else(|| value.get("message").and_then(Value::as_str))
         .or_else(|| value.get("status_details").and_then(Value::as_str))
         .unwrap_or("provider reported an unspecified error")
-        .into()
+        .into();
+    let string_field = |field: &str| {
+        error
+            .get(field)
+            .and_then(Value::as_str)
+            .or_else(|| value.get(field).and_then(Value::as_str))
+            .map(str::to_owned)
+    };
+    ProviderErrorDetail {
+        message,
+        code: string_field("code"),
+        param: string_field("param"),
+    }
 }
 
-fn bounded_provider_message(bytes: &[u8], limit: usize) -> String {
+fn bounded_provider_error(bytes: &[u8], limit: usize) -> ProviderErrorDetail {
     let value = serde_json::from_slice::<Value>(bytes).ok();
-    let message = value
+    let mut error = value
         .as_ref()
-        .map(provider_error_message)
-        .filter(|message| message != "provider reported an unspecified error")
-        .unwrap_or_else(|| {
-            String::from_utf8_lossy(bytes)
+        .map(provider_error_detail)
+        .unwrap_or_else(|| ProviderErrorDetail {
+            message: String::from_utf8_lossy(bytes)
                 .trim()
                 .to_owned()
                 .chars()
                 .filter(|character| !character.is_control() || *character == '\n')
-                .collect()
+                .collect(),
+            code: None,
+            param: None,
         });
-    let message = if message.is_empty() {
+    error.message = if error.message.is_empty() {
         "request failed".into()
     } else {
-        sanitize_provider_message(&message)
+        sanitize_provider_message(&error.message)
     };
-    truncate_utf8(&message, limit)
+    error.message = truncate_utf8(&error.message, limit);
+    error.code = error.code.map(|value| truncate_utf8(&value, limit));
+    error.param = error.param.map(|value| truncate_utf8(&value, limit));
+    error
 }
 
 fn sanitize_provider_message(value: &str) -> String {
@@ -1795,7 +2069,7 @@ mod tests {
             r#"{"type":"response.created","response":{"id":"resp_1"}}"#,
             r#"{"type":"response.output_text.delta","delta":"hello "}"#,
             r#"{"type":"response.output_text.delta","delta":"world"}"#,
-            r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello world"}]}],"usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":1},"total_tokens":12}}}"#,
+            r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello world"}]}],"usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":1},"total_tokens":12,"cost_in_usd_ticks":1250000000}}}"#,
         ] {
             let decoded = decode_xai_responses_event(None, payload).unwrap();
             state
@@ -1808,6 +2082,8 @@ mod tests {
         assert_eq!(outcome.expected_agent_count, 16);
         assert_eq!(outcome.usage.cached_input_tokens, Some(4));
         assert_eq!(outcome.usage.reasoning_tokens, Some(1));
+        assert_eq!(outcome.usage.cost_in_usd_ticks, Some(1_250_000_000));
+        assert_eq!(outcome.usage.cost_usd(), Some(0.125));
         assert!(events.iter().any(|event| matches!(
             event,
             XaiResponsesEvent::Session { response_id } if response_id == "resp_1"
@@ -1877,6 +2153,71 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn leader_tool_projection_degrades_without_aborting_the_response() {
+        let mut request = request(XaiReasoningEffort::Medium);
+        request.web_search = true;
+        request.limits.max_leader_tool_calls = 1;
+        let mut state = ResponseState::new(EffectiveLimits::new(&request.limits).unwrap());
+        let mut events = Vec::new();
+
+        for id in ["ws_1", "ws_2", "ws_3"] {
+            state
+                .apply(
+                    XaiDecodedEvent::OutputItemAdded {
+                        index: None,
+                        item: json!({
+                            "id": id,
+                            "type": "web_search_call",
+                            "status": "in_progress"
+                        }),
+                    },
+                    &request,
+                    &mut |event| events.push(event),
+                )
+                .unwrap();
+        }
+        state
+            .apply(
+                XaiDecodedEvent::ResponseCompleted {
+                    response: json!({
+                        "id":"resp_degraded",
+                        "status":"completed",
+                        "output_text":"answer"
+                    }),
+                },
+                &request,
+                &mut |event| events.push(event),
+            )
+            .unwrap();
+        let outcome = state
+            .finish(&request, &mut |event| events.push(event))
+            .unwrap();
+
+        assert_eq!(outcome.text, "answer");
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    XaiResponsesEvent::LeaderToolStarted { id, .. } => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["ws_1"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    XaiResponsesEvent::GroupUpdated { detail, .. }
+                        if detail == TOOL_PROJECTION_DEGRADED_NOTICE
+                ))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2056,6 +2397,35 @@ mod tests {
     }
 
     #[test]
+    fn only_exact_previous_response_error_gets_typed_resume_signal() {
+        let request = request(XaiReasoningEffort::Low);
+        for (code, param, typed) in [
+            ("previous_response_not_found", "previous_response_id", true),
+            ("previous_response_not_found", "response_id", false),
+            ("request_timeout", "previous_response_id", false),
+        ] {
+            let mut state = ResponseState::new(EffectiveLimits::new(&request.limits).unwrap());
+            state
+                .apply(
+                    XaiDecodedEvent::ProviderError {
+                        message: "could not continue".into(),
+                        code: Some(code.into()),
+                        param: Some(param.into()),
+                    },
+                    &request,
+                    &mut |_| {},
+                )
+                .unwrap();
+            let error = state.finish(&request, &mut |_| {}).unwrap_err();
+            assert_eq!(
+                matches!(error, XaiResponsesError::PreviousResponseNotFound { .. }),
+                typed,
+                "unexpected retry classification for {code}/{param}"
+            );
+        }
+    }
+
+    #[test]
     fn text_and_line_limits_are_enforced() {
         let mut request = request(XaiReasoningEffort::Low);
         request.limits.max_output_text_bytes = 4;
@@ -2150,6 +2520,49 @@ mod tests {
     }
 
     #[test]
+    fn transport_fails_open_tool_rows_on_protocol_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _request_text = read_request(&mut stream);
+            let body = concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_tool_error\"}}\n\n",
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"ws_open\",\"type\":\"web_search_call\",\"status\":\"in_progress\"}}\n\n",
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"fn_forbidden\",\"type\":\"function_call\",\"name\":\"delete_file\"}}\n\n",
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let mut request = request(XaiReasoningEffort::Low);
+        request.web_search = true;
+        request.endpoint = Url::parse(&format!("http://{address}/v1/responses")).unwrap();
+        let mut events = Vec::new();
+        let error = run_xai_responses(&request, &AtomicBool::new(false), |event| {
+            events.push(event)
+        })
+        .unwrap_err();
+        server.join().unwrap();
+
+        assert!(matches!(error, XaiResponsesError::Protocol(_)));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            XaiResponsesEvent::LeaderToolFinished {
+                id,
+                is_error: true,
+                detail: Some(detail),
+                ..
+            } if id == "ws_open" && detail == "interrupted"
+        )));
+    }
+
+    #[test]
     fn transport_preserves_answer_when_provider_reports_disabled_hosted_tool() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2210,6 +2623,35 @@ mod tests {
                 ..
             }) if detail == UNREQUESTED_TOOL_NOTICE
         ));
+    }
+
+    #[test]
+    fn http_error_preserves_exact_stale_previous_response_signal() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _request_text = read_request(&mut stream);
+            let body = r#"{"error":{"code":"previous_response_not_found","param":"previous_response_id","message":"saved response expired"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let mut request = request(XaiReasoningEffort::Low);
+        request.endpoint = Url::parse(&format!("http://{address}/v1/responses")).unwrap();
+        let error = run_xai_responses(&request, &AtomicBool::new(false), |_| {}).unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(
+            error,
+            XaiResponsesError::PreviousResponseNotFound {
+                message: "saved response expired".into()
+            }
+        );
     }
 
     #[test]
