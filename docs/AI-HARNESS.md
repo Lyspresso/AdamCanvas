@@ -36,19 +36,24 @@ semantics: only fixture-verified versions launch. A built-in CLI version probe
 has a five-second process-execution deadline plus at most two seconds of
 bounded output-pipe cleanup. Detection runs off the UI
 thread, caches only successful observations, and shares one result among
-overlapping callers. Saved controls are preserved, and launch fails visibly
-instead of guessing between structured and legacy adapters. A resumed turn
-that fails before provider launch retains its native session only for an exact
-same-process Retry of that locally unsent message; an app restart, changed
-history, or different prompt falls back to bounded replay. Custom CLI
-executables are not probed.
+overlapping callers. A cold or failed probe preserves saved controls. After a
+successful but unlisted generic-provider observation, Adam clears only the
+unsupported version-sensitive controls and uses provider defaults; Grok and
+Kimi preserve their exact-contract settings and remain fail-closed. Refresh
+also preserves an identity-matched last-good observation when a transient
+probe fails. A resumed turn that fails before provider launch retains its
+native session only for an exact same-process Retry of that locally unsent
+message; an app restart, changed history, or different prompt falls back to
+bounded replay. Custom CLI executables are not probed.
 
-Claude, Codex, and Ollama also re-probe on the run worker whenever the user has
-saved a version-sensitive reasoning control. The worker rebuilds the launch
-arguments from that fresh verified contract. If detection is unavailable or
-the installed version is unverified, the turn fails visibly before provider
-launch rather than silently dropping the saved control. Runs that request only
-provider defaults do not pay this extra probe cost.
+Claude, Codex, LM Studio, and Ollama also re-probe on the run worker whenever
+the user has saved a version-sensitive reasoning control; Ollama's explicit
+Thinking toggle uses the same gate. The worker rebuilds launch arguments from
+the fresh observation. A listed version applies its verified controls, while
+a successfully observed unlisted version launches with provider defaults. If
+detection fails or the observation cannot be attributed to that provider, the
+turn fails visibly before launch. Runs that request only provider defaults do
+not pay this extra probe cost.
 
 Together, the profiles identify:
 
