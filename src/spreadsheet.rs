@@ -108,6 +108,10 @@ pub struct Sheet {
     /// True extent before truncation, for telling the user what is hidden.
     pub source_rows: usize,
     pub source_columns: usize,
+    /// Visual styling from the file — fills, fonts, borders, formats,
+    /// geometry. `None` for formats without styling (csv, ods) and for
+    /// live-mirrored sheets, which inherit it from the last disk parse.
+    pub styling: Option<crate::sheet_style::SheetStyling>,
 }
 
 impl Sheet {
@@ -136,6 +140,50 @@ impl Sheet {
             truncated: false,
             source_rows: rows,
             source_columns: columns,
+            styling: None,
+        }
+    }
+
+    /// What a cell displays: its value through the cell's number format when
+    /// the file set one, else the plain rendering.
+    pub fn display_at(&self, row: usize, column: usize) -> String {
+        let Some(cell) = self.cell(row, column) else {
+            return String::new();
+        };
+        if let CellValue::Number(number) = cell.value
+            && let Some(styling) = &self.styling
+            && let Some(format) = styling.number_format_at(row, column)
+            && let Some(formatted) = crate::number_format::format_value(number, format)
+        {
+            return formatted;
+        }
+        cell.value.display()
+    }
+
+    /// The top-left corner of the sheet, styling included — what a canvas
+    /// tile snapshots. A tile shows a corner of the data; the lightbox is
+    /// the full view.
+    pub fn corner(&self, max_rows: usize, max_columns: usize) -> Sheet {
+        let rows = self.rows.min(max_rows);
+        let columns = self.columns.min(max_columns);
+        let mut cells = Vec::with_capacity(rows * columns);
+        for row in 0..rows {
+            for column in 0..columns {
+                cells.push(self.cell(row, column).cloned().unwrap_or_default());
+            }
+        }
+        Sheet {
+            name: self.name.clone(),
+            rows,
+            columns,
+            cells,
+            truncated: self.rows > rows || self.columns > columns || self.truncated,
+            source_rows: self.source_rows,
+            source_columns: self.source_columns,
+            styling: self
+                .styling
+                .as_ref()
+                .map(|styling| styling.corner(rows, columns)),
         }
     }
 
@@ -229,6 +277,21 @@ pub fn load(path: &Path) -> Result<Workbook> {
         sheets.push(build_sheet(name, &range, formulas.as_ref()));
     }
 
+    // Styling is xlsx-only (umya has no other reader); failures leave plain
+    // cells, exactly as before styling existed.
+    let is_xlsx = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("xlsx") || extension.eq_ignore_ascii_case("xlsm")
+        });
+    if is_xlsx {
+        for (index, sheet) in sheets.iter_mut().enumerate() {
+            sheet.styling =
+                crate::sheet_style::load(path, &sheet.name, index, sheet.rows, sheet.columns);
+        }
+    }
+
     Ok(Workbook {
         sheets,
         truncated_sheets: source_sheet_count > MAX_SHEETS,
@@ -275,6 +338,7 @@ fn build_sheet(
         truncated: source_rows > rows || source_columns > columns,
         source_rows,
         source_columns,
+        styling: None,
     }
 }
 
@@ -344,6 +408,22 @@ fn format_duration(serial: f64) -> String {
     format!("{}:{:02}", total_minutes / 60, (total_minutes % 60).abs())
 }
 
+/// An Excel date serial to (year, month, day), for format-driven rendering.
+pub fn civil_from_serial(serial: f64) -> Option<(i64, u32, u32)> {
+    if !serial.is_finite() || serial < 0.0 {
+        return None;
+    }
+    let days = serial.trunc() as i64;
+    let epoch_days = if days >= 61 {
+        days - 25_569
+    } else if days == 60 {
+        return None;
+    } else {
+        days - 25_568
+    };
+    Some(civil_from_days(epoch_days))
+}
+
 /// Days since the Unix epoch to a civil date, by Howard Hinnant's algorithm.
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
@@ -361,37 +441,6 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
         shifted_month - 9
     } as u32;
     (if month <= 2 { year + 1 } else { year }, month, day)
-}
-
-/// A bounded table snapshot of a sheet, in the shape the canvas already
-/// draws for CSV tiles — which is what lets a live workbook render on a tile
-/// with no new painting code.
-pub fn tile_table(sheet: &Sheet) -> crate::structured_preview::TablePreview {
-    // A tile shows a corner of the data, not the sheet; the lightbox is the
-    // full view. These bounds keep per-frame cost trivial.
-    const TILE_ROWS: usize = 24;
-    const TILE_COLUMNS: usize = 12;
-    let rows = sheet.rows.min(TILE_ROWS);
-    let columns = sheet.columns.min(TILE_COLUMNS);
-    let mut grid = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let mut cells = Vec::with_capacity(columns);
-        for column in 0..columns {
-            cells.push(
-                sheet
-                    .cell(row, column)
-                    .map(|cell| cell.value.display())
-                    .unwrap_or_default(),
-            );
-        }
-        grid.push(cells);
-    }
-    crate::structured_preview::TablePreview {
-        rows: grid,
-        column_count: columns,
-        delimiter: ',',
-        truncated: sheet.rows > rows || sheet.columns > columns || sheet.truncated,
-    }
 }
 
 /// Spreadsheet column name for a zero-based index: 0 → A, 25 → Z, 26 → AA.
@@ -658,52 +707,34 @@ mod tests {
     }
 
     #[test]
-    fn tile_tables_are_bounded_and_flag_what_they_omit() {
-        let (_directory, path) = {
-            let directory = tempfile::tempdir().expect("tempdir");
-            let path = directory.path().join("wide.xlsx");
-            let mut workbook = rust_xlsxwriter::Workbook::new();
-            let sheet = workbook.add_worksheet();
-            for row in 0..40u32 {
-                for column in 0..20u16 {
-                    sheet
-                        .write_number(row, column, (row * 100 + column as u32) as f64)
-                        .unwrap();
-                }
+    fn corner_snapshots_bound_and_keep_styling() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("wide.xlsx");
+        let mut workbook = rust_xlsxwriter::Workbook::new();
+        let sheet = workbook.add_worksheet();
+        let bold = rust_xlsxwriter::Format::new().set_bold();
+        for row in 0..40u32 {
+            for column in 0..20u16 {
+                sheet
+                    .write_number(row, column, (row * 100 + column as u32) as f64)
+                    .unwrap();
             }
-            workbook.save(&path).expect("write fixture");
-            (directory, path)
-        };
+        }
+        sheet.write_string_with_format(0, 0, "H", &bold).unwrap();
+        workbook.save(&path).expect("write fixture");
+
         let loaded = load(&path).expect("load");
-        let table = tile_table(&loaded.sheets[0]);
-        assert!(table.rows.len() <= 24, "tiles show a corner, not the sheet");
-        assert!(table.column_count <= 12);
-        assert!(table.truncated, "omitted content must be flagged");
-        assert_eq!(table.rows[0][0], "0");
-        assert_eq!(table.rows[1][1], "101");
+        let corner = loaded.sheets[0].corner(24, 12);
+        assert_eq!((corner.rows, corner.columns), (24, 12));
+        assert!(corner.truncated, "omitted content must be flagged");
+        assert_eq!(corner.display_at(1, 1), "101");
+        let styling = corner.styling.as_ref().expect("styling carried");
+        assert!(styling.style_at(0, 0).bold, "styling survives the slice");
+        assert!(!styling.style_at(1, 1).bold);
 
         // A small sheet fits whole and says so.
-        let small = Sheet::from_cells(
-            "S",
-            2,
-            2,
-            vec![
-                Cell {
-                    value: CellValue::Number(1.0),
-                    formula: None,
-                },
-                Cell {
-                    value: CellValue::Text("x".into()),
-                    formula: None,
-                },
-                Cell::default(),
-                Cell::default(),
-            ],
-        );
-        let table = tile_table(&small);
-        assert_eq!(table.rows.len(), 2);
-        assert!(!table.truncated);
-        assert_eq!(table.rows[0][1], "x");
+        let small = loaded.sheets[0].corner(500, 500);
+        assert_eq!((small.rows, small.columns), (40, 20));
     }
 
     #[test]

@@ -21,12 +21,15 @@ pub(crate) mod macos_image_io;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_vision;
 pub mod model;
+pub mod number_format;
 pub mod ocr;
 pub mod persistence;
 pub mod photo_details;
 pub mod platform;
 pub mod preview;
 pub mod progress_stepper;
+pub mod sheet_borders;
+pub mod sheet_style;
 pub mod sheet_view;
 pub mod spatial;
 pub mod spreadsheet;

@@ -1,16 +1,22 @@
-//! Layout math for displaying a [`crate::spreadsheet::Sheet`] as a real grid.
+//! Layout math and painting for displaying a [`crate::spreadsheet::Sheet`].
 //!
 //! Separate from the reader so the geometry can be tested without a file, and
-//! separate from the painting so it can be tested without a render surface —
-//! the same split that [`crate::grid_view`] uses.
+//! the geometry separate from the painting so it can be tested without a
+//! render surface — the same split that [`crate::grid_view`] uses.
 //!
 //! Positions are in **content space**: origin at the top-left of cell A1, with
-//! the row and column headers living in negative territory outside it. A
-//! scroll offset maps content space to the screen, so the headers can stay
-//! pinned while the cells move under them.
+//! the row and column headers living outside it. Column x-offsets and row
+//! y-offsets are precomputed tables, which is what lets the file's own column
+//! widths and row heights apply exactly rather than assuming uniformity.
+//! A scale factor maps content space to the screen, so the full lightbox and
+//! a small canvas tile render through the same code at different sizes.
 
+use crate::sheet_style::{column_width_to_points, typographic_to_egui};
 use crate::spreadsheet::Sheet;
-use egui::{Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Stroke, Vec2, pos2, vec2};
+use egui::{
+    Align2, Color32, CornerRadius, FontFamily, FontId, Painter, Pos2, Rect, Stroke, Vec2, pos2,
+    vec2,
+};
 
 pub const ROW_HEIGHT: f32 = 22.0;
 pub const COLUMN_HEADER_HEIGHT: f32 = 24.0;
@@ -27,19 +33,19 @@ pub const MEASURE_ROWS: usize = 200;
 pub struct SheetMetrics {
     pub rows: usize,
     pub columns: usize,
-    pub row_height: f32,
     pub column_header_height: f32,
     pub row_header_width: f32,
-    /// Per-column widths, exactly `columns` long.
-    widths: Vec<f32>,
-    /// Left edge of each column in content space, plus a trailing total, so
-    /// `x_offsets[column]` and `x_offsets[column + 1]` bracket every column.
+    /// Left edge of each column plus a trailing total.
     x_offsets: Vec<f32>,
+    /// Top edge of each row plus a trailing total.
+    y_offsets: Vec<f32>,
     pub content: Vec2,
 }
 
 impl SheetMetrics {
-    /// Sizes columns to their widest sampled cell.
+    /// Sizes the grid. The file's own column widths and row heights win when
+    /// styling carries them; otherwise columns size to their widest sampled
+    /// cell and rows to the uniform default.
     ///
     /// `character_width` is the caller's measured width of one digit in the
     /// cell font — passing it in keeps this module free of font handling.
@@ -49,26 +55,41 @@ impl SheetMetrics {
         } else {
             7.0
         };
+        let styling = sheet.styling.as_ref();
 
-        let mut widths = Vec::with_capacity(sheet.columns);
-        for column in 0..sheet.columns {
-            let mut longest = crate::spreadsheet::column_name(column).chars().count();
-            for row in 0..sheet.rows.min(MEASURE_ROWS) {
-                if let Some(cell) = sheet.cell(row, column) {
-                    longest = longest.max(cell.value.display().chars().count());
-                }
-            }
-            let width = longest as f32 * character_width + CELL_PADDING * 2.0;
-            widths.push(width.clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH));
-        }
-
-        let mut x_offsets = Vec::with_capacity(widths.len() + 1);
+        let mut x_offsets = Vec::with_capacity(sheet.columns + 1);
         let mut running = 0.0;
-        for width in &widths {
+        for column in 0..sheet.columns {
+            let from_file = styling
+                .and_then(|styling| styling.column_width_chars.get(column).copied().flatten())
+                .map(column_width_to_points);
+            let width = from_file.unwrap_or_else(|| {
+                let mut longest = crate::spreadsheet::column_name(column).chars().count();
+                for row in 0..sheet.rows.min(MEASURE_ROWS) {
+                    longest = longest.max(sheet.display_at(row, column).chars().count());
+                }
+                (longest as f32 * character_width + CELL_PADDING * 2.0)
+                    .clamp(MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH)
+            });
             x_offsets.push(running);
-            running += width;
+            running += width.max(4.0);
         }
         x_offsets.push(running);
+        let content_width = running;
+
+        let default_height = ROW_HEIGHT;
+        let mut y_offsets = Vec::with_capacity(sheet.rows + 1);
+        let mut running = 0.0;
+        for row in 0..sheet.rows {
+            let height = styling
+                .and_then(|styling| styling.row_height_points.get(row).copied().flatten())
+                .map(typographic_to_egui)
+                .unwrap_or(default_height)
+                .max(4.0);
+            y_offsets.push(running);
+            running += height;
+        }
+        y_offsets.push(running);
 
         // The row header must fit the largest row number it will ever show.
         let digits = sheet.rows.max(1).to_string().chars().count();
@@ -78,20 +99,21 @@ impl SheetMetrics {
         Self {
             rows: sheet.rows,
             columns: sheet.columns,
-            row_height: ROW_HEIGHT,
             column_header_height: COLUMN_HEADER_HEIGHT,
             row_header_width,
-            widths,
             x_offsets,
-            content: vec2(running, sheet.rows as f32 * ROW_HEIGHT),
+            y_offsets,
+            content: vec2(content_width, running),
         }
     }
 
     pub fn column_width(&self, column: usize) -> f32 {
-        self.widths.get(column).copied().unwrap_or(MIN_COLUMN_WIDTH)
+        match (self.x_offsets.get(column), self.x_offsets.get(column + 1)) {
+            (Some(left), Some(right)) => right - left,
+            _ => MIN_COLUMN_WIDTH,
+        }
     }
 
-    /// Left edge of a column in content space.
     pub fn column_x(&self, column: usize) -> f32 {
         self.x_offsets
             .get(column)
@@ -99,28 +121,41 @@ impl SheetMetrics {
             .unwrap_or(self.content.x)
     }
 
+    pub fn row_y(&self, row: usize) -> f32 {
+        self.y_offsets.get(row).copied().unwrap_or(self.content.y)
+    }
+
+    pub fn row_height(&self, row: usize) -> f32 {
+        match (self.y_offsets.get(row), self.y_offsets.get(row + 1)) {
+            (Some(top), Some(bottom)) => bottom - top,
+            _ => ROW_HEIGHT,
+        }
+    }
+
     /// Cell rect in content space.
     pub fn cell_rect(&self, row: usize, column: usize) -> Rect {
         Rect::from_min_size(
-            pos2(self.column_x(column), row as f32 * self.row_height),
-            vec2(self.column_width(column), self.row_height),
+            pos2(self.column_x(column), self.row_y(row)),
+            vec2(self.column_width(column), self.row_height(row)),
         )
     }
 
     /// Half-open range of rows touching a content-space y band, overshooting
     /// by one each way so nothing blinks out at the viewport edge.
     pub fn visible_rows(&self, top: f32, bottom: f32) -> std::ops::Range<usize> {
-        if self.rows == 0 || self.row_height <= 0.0 || !top.is_finite() || !bottom.is_finite() {
+        if self.rows == 0 || !top.is_finite() || !bottom.is_finite() {
             return 0..self.rows;
         }
-        let first = ((top / self.row_height).floor() - 1.0).max(0.0) as usize;
-        let last = ((bottom / self.row_height).ceil() + 1.0).max(0.0) as usize;
-        let start = first.min(self.rows);
-        start..last.min(self.rows).max(start)
+        let start = self
+            .y_offsets
+            .partition_point(|offset| *offset <= top)
+            .saturating_sub(1);
+        let end = self.y_offsets.partition_point(|offset| *offset < bottom);
+        let start = start.min(self.rows);
+        start..end.min(self.rows).max(start)
     }
 
-    /// Half-open range of columns touching a content-space x band. Columns
-    /// have varying widths, so this walks the offsets rather than dividing.
+    /// Half-open range of columns touching a content-space x band.
     pub fn visible_columns(&self, left: f32, right: f32) -> std::ops::Range<usize> {
         if self.columns == 0 || !left.is_finite() || !right.is_finite() {
             return 0..self.columns;
@@ -136,18 +171,21 @@ impl SheetMetrics {
 
     /// The cell at a content-space point, or `None` outside the grid.
     pub fn cell_at(&self, point: Pos2) -> Option<(usize, usize)> {
-        if point.x < 0.0 || point.y < 0.0 || self.row_height <= 0.0 {
+        if point.x < 0.0 || point.y < 0.0 {
             return None;
         }
-        let row = (point.y / self.row_height).floor() as usize;
-        if row >= self.rows || point.x >= self.content.x {
+        if point.x >= self.content.x || point.y >= self.content.y {
             return None;
         }
+        let row = self
+            .y_offsets
+            .partition_point(|offset| *offset <= point.y)
+            .saturating_sub(1);
         let column = self
             .x_offsets
             .partition_point(|offset| *offset <= point.x)
             .saturating_sub(1);
-        (column < self.columns).then_some((row, column))
+        (row < self.rows && column < self.columns).then_some((row, column))
     }
 
     /// Keeps the grid reachable: an axis shorter than its viewport pins to the
@@ -236,6 +274,46 @@ pub struct SheetPalette {
     pub accent: Color32,
 }
 
+/// The font families the sheet draws with, resolved by the app — the file
+/// names a font, the app finds and registers it, this module just uses it.
+#[derive(Clone, Debug)]
+pub struct SheetFonts {
+    pub regular: FontFamily,
+    pub bold: FontFamily,
+    /// Cell font size in egui points for cells that set none.
+    pub default_size: f32,
+}
+
+impl Default for SheetFonts {
+    fn default() -> Self {
+        Self {
+            regular: FontFamily::Proportional,
+            bold: FontFamily::Proportional,
+            default_size: 12.0,
+        }
+    }
+}
+
+/// How to draw: the lightbox draws at 1:1 with headers; a canvas tile draws
+/// scaled down without them.
+#[derive(Clone, Copy, Debug)]
+pub struct DrawOptions {
+    pub scale: f32,
+    pub headers: bool,
+    /// Highlight the selection; a tile has none.
+    pub selection: bool,
+}
+
+impl Default for DrawOptions {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            headers: true,
+            selection: true,
+        }
+    }
+}
+
 /// Scroll and selection for one open sheet.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SheetViewState {
@@ -244,10 +322,12 @@ pub struct SheetViewState {
     pub selection: Selection,
 }
 
-/// Paints the grid, with headers pinned while the cells scroll under them.
+/// Paints the grid — the file's fills, fonts, colours and borders included —
+/// with headers pinned while the cells scroll under them.
 ///
 /// Only the cells the metrics report as visible are drawn, so a 5,000-row
 /// sheet costs the same per frame as a 20-row one.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     painter: &Painter,
     rect: Rect,
@@ -255,78 +335,166 @@ pub fn draw(
     metrics: &SheetMetrics,
     state: &SheetViewState,
     palette: SheetPalette,
+    fonts: &SheetFonts,
+    options: DrawOptions,
 ) {
+    let scale = if options.scale.is_finite() {
+        options.scale.clamp(0.05, 4.0)
+    } else {
+        1.0
+    };
     painter.rect_filled(rect, CornerRadius::same(4), palette.surface);
     let painter = painter.with_clip_rect(rect);
 
+    let header_width = if options.headers {
+        metrics.row_header_width * scale
+    } else {
+        0.0
+    };
+    let header_height = if options.headers {
+        metrics.column_header_height * scale
+    } else {
+        0.0
+    };
     let body = Rect::from_min_max(
-        pos2(
-            rect.left() + metrics.row_header_width,
-            rect.top() + metrics.column_header_height,
-        ),
+        pos2(rect.left() + header_width, rect.top() + header_height),
         rect.max,
     );
     if body.width() < 4.0 || body.height() < 4.0 {
         return;
     }
 
-    let viewport = body.size();
+    // Content-space viewport implied by the screen viewport and scale.
+    let viewport = body.size() / scale;
     let scroll = metrics.clamp_scroll(state.scroll, viewport);
-    // Content space -> screen.
-    let to_screen = |point: Pos2| body.min + (point - scroll.to_pos2());
+    let to_screen = |point: Pos2| body.min + (point - scroll.to_pos2()) * scale;
+    let rect_to_screen =
+        |content: Rect| Rect::from_min_max(to_screen(content.min), to_screen(content.max));
 
     let rows = metrics.visible_rows(scroll.y, scroll.y + viewport.y);
     let columns = metrics.visible_columns(scroll.x, scroll.x + viewport.x);
-    let font = FontId::proportional(12.0);
-    let header_font = FontId::proportional(11.0);
-
-    // Cells first, then headers on top, so a cell scrolling under a header is
-    // covered rather than drawn over it.
+    let styling = sheet.styling.as_ref();
     let cell_painter = painter.with_clip_rect(body);
-    for row in rows.clone() {
-        for column in columns.clone() {
-            let cell_rect = Rect::from_min_size(
-                to_screen(metrics.cell_rect(row, column).min),
-                metrics.cell_rect(row, column).size(),
-            );
-            let selected = state.selection.row == row && state.selection.column == column;
-            if selected {
-                cell_painter.rect_filled(cell_rect, CornerRadius::ZERO, palette.selection);
-            }
-            let Some(cell) = sheet.cell(row, column) else {
-                continue;
-            };
-            let text = cell.value.display();
-            if text.is_empty() {
-                continue;
-            }
-            // Figures right, text left — the convention that makes a column of
-            // numbers readable.
-            let (anchor, x) = if cell.value.is_numeric() {
-                (Align2::RIGHT_CENTER, cell_rect.right() - CELL_PADDING)
-            } else {
-                (Align2::LEFT_CENTER, cell_rect.left() + CELL_PADDING)
-            };
-            cell_painter.text(
-                pos2(x, cell_rect.center().y),
-                anchor,
-                elide(&text, cell_rect.width()),
-                font.clone(),
-                palette.text,
-            );
-        }
-    }
-
-    // Grid lines, drawn after the fills so selection does not cover them.
     let line = Stroke::new(1.0, palette.grid_line);
+
+    // Excel's paint order: gridlines under fills — a filled cell covers the
+    // grid — then text, then the cell's own borders on top.
     for row in rows.clone() {
-        let y = to_screen(pos2(0.0, metrics.cell_rect(row, 0).bottom())).y;
+        let y = to_screen(pos2(0.0, metrics.row_y(row) + metrics.row_height(row))).y;
         cell_painter.hline(body.left()..=body.right(), y, line);
     }
     for column in columns.clone() {
-        let x = to_screen(pos2(metrics.cell_rect(0, column).right(), 0.0)).x;
+        let x = to_screen(pos2(
+            metrics.column_x(column) + metrics.column_width(column),
+            0.0,
+        ))
+        .x;
         cell_painter.vline(x, body.top()..=body.bottom(), line);
     }
+
+    for row in rows.clone() {
+        for column in columns.clone() {
+            let cell_rect = rect_to_screen(metrics.cell_rect(row, column));
+            let style = styling.map(|styling| styling.style_at(row, column));
+
+            if let Some(fill) = style.and_then(|style| style.fill) {
+                cell_painter.rect_filled(
+                    cell_rect,
+                    CornerRadius::ZERO,
+                    Color32::from_rgba_unmultiplied(fill[0], fill[1], fill[2], fill[3]),
+                );
+            }
+            let selected =
+                options.selection && state.selection.row == row && state.selection.column == column;
+            if selected {
+                cell_painter.rect_filled(cell_rect, CornerRadius::ZERO, palette.selection);
+            }
+
+            let Some(cell) = sheet.cell(row, column) else {
+                continue;
+            };
+            let text = sheet.display_at(row, column);
+            if !text.is_empty() {
+                let bold = style.is_some_and(|style| style.bold);
+                let size = style
+                    .and_then(|style| style.font_points())
+                    .map(typographic_to_egui)
+                    .unwrap_or(fonts.default_size)
+                    * scale;
+                let font = FontId::new(
+                    size.max(4.0),
+                    if bold {
+                        fonts.bold.clone()
+                    } else {
+                        fonts.regular.clone()
+                    },
+                );
+                let color = style
+                    .and_then(|style| style.font_color)
+                    .map(|c| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]))
+                    .unwrap_or(palette.text);
+                let (anchor, x) = if cell.value.is_numeric() {
+                    (
+                        Align2::RIGHT_CENTER,
+                        cell_rect.right() - CELL_PADDING * scale,
+                    )
+                } else {
+                    (Align2::LEFT_CENTER, cell_rect.left() + CELL_PADDING * scale)
+                };
+                cell_painter.text(
+                    pos2(x, cell_rect.center().y),
+                    anchor,
+                    elide(&text, cell_rect.width() / scale.max(0.01)),
+                    font,
+                    color,
+                );
+            }
+        }
+    }
+
+    // Borders over everything in the body.
+    if let Some(styling) = styling {
+        let edge_color = |c: [u8; 4]| Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3]);
+        for row in rows.clone() {
+            for column in columns.clone() {
+                let style = styling.style_at(row, column);
+                let cell_rect = rect_to_screen(metrics.cell_rect(row, column));
+                if let Some(color) = style.border_left {
+                    cell_painter.vline(
+                        cell_rect.left(),
+                        cell_rect.top()..=cell_rect.bottom(),
+                        Stroke::new(1.0, edge_color(color)),
+                    );
+                }
+                if let Some(color) = style.border_right {
+                    cell_painter.vline(
+                        cell_rect.right(),
+                        cell_rect.top()..=cell_rect.bottom(),
+                        Stroke::new(1.0, edge_color(color)),
+                    );
+                }
+                if let Some(color) = style.border_top {
+                    cell_painter.hline(
+                        cell_rect.left()..=cell_rect.right(),
+                        cell_rect.top(),
+                        Stroke::new(1.0, edge_color(color)),
+                    );
+                }
+                if let Some(color) = style.border_bottom {
+                    cell_painter.hline(
+                        cell_rect.left()..=cell_rect.right(),
+                        cell_rect.bottom(),
+                        Stroke::new(1.0, edge_color(color)),
+                    );
+                }
+            }
+        }
+    }
+
+    if !options.headers {
+        return;
+    }
+    let header_font = FontId::proportional((11.0 * scale).clamp(6.0, 22.0));
 
     // Column headers.
     let header_row = Rect::from_min_max(
@@ -336,10 +504,9 @@ pub fn draw(
     painter.rect_filled(header_row, CornerRadius::ZERO, palette.header);
     let header_painter = painter.with_clip_rect(header_row);
     for column in columns.clone() {
-        let cell = metrics.cell_rect(0, column);
-        let x = to_screen(pos2(cell.left(), 0.0)).x;
-        let width = cell.width();
-        let selected = state.selection.column == column;
+        let x = to_screen(pos2(metrics.column_x(column), 0.0)).x;
+        let width = metrics.column_width(column) * scale;
+        let selected = options.selection && state.selection.column == column;
         header_painter.text(
             pos2(x + width * 0.5, header_row.center().y),
             Align2::CENTER_CENTER,
@@ -362,11 +529,11 @@ pub fn draw(
     painter.rect_filled(header_column, CornerRadius::ZERO, palette.header);
     let row_painter = painter.with_clip_rect(header_column);
     for row in rows.clone() {
-        let cell = metrics.cell_rect(row, 0);
-        let y = to_screen(pos2(0.0, cell.top())).y;
-        let selected = state.selection.row == row;
+        let y = to_screen(pos2(0.0, metrics.row_y(row))).y;
+        let height = metrics.row_height(row) * scale;
+        let selected = options.selection && state.selection.row == row;
         row_painter.text(
-            pos2(header_column.center().x, y + cell.height() * 0.5),
+            pos2(header_column.center().x, y + height * 0.5),
             Align2::CENTER_CENTER,
             (row + 1).to_string(),
             header_font.clone(),
@@ -378,7 +545,7 @@ pub fn draw(
         );
         row_painter.hline(
             header_column.left()..=header_column.right(),
-            y + cell.height(),
+            y + height,
             line,
         );
     }
@@ -448,8 +615,6 @@ mod tests {
             metrics.column_width(1) > metrics.column_width(0),
             "the wider content should get the wider column"
         );
-        // Both stay inside the bounds, so one enormous cell cannot make a
-        // column wider than the window.
         for column in 0..metrics.columns {
             let width = metrics.column_width(column);
             assert!((MIN_COLUMN_WIDTH..=MAX_COLUMN_WIDTH).contains(&width));
@@ -457,26 +622,41 @@ mod tests {
     }
 
     #[test]
-    fn column_offsets_bracket_every_column_exactly() {
-        let sheet = simple_sheet(3, 6);
+    fn the_files_own_column_widths_and_row_heights_win() {
+        let sheet = sheet_with(|sheet| {
+            sheet.write_string(0, 0, "x").unwrap();
+            sheet.write_string(1, 0, "y").unwrap();
+            sheet.set_column_width(0, 30).unwrap();
+            sheet.set_row_height(1, 45).unwrap();
+        });
+        assert!(sheet.styling.is_some(), "styling must have loaded");
         let metrics = SheetMetrics::measure(&sheet, 7.0);
-        for column in 0..metrics.columns {
-            let rect = metrics.cell_rect(0, column);
-            assert!((rect.left() - metrics.column_x(column)).abs() < 0.01);
-            assert!((rect.width() - metrics.column_width(column)).abs() < 0.01);
-            // No gaps and no overlaps between neighbours.
-            if column + 1 < metrics.columns {
-                let next = metrics.cell_rect(0, column + 1);
-                assert!((next.left() - rect.right()).abs() < 0.01);
-            }
-        }
-        let total: f32 = (0..metrics.columns).map(|c| metrics.column_width(c)).sum();
-        assert!((metrics.content.x - total).abs() < 0.01);
+        // 30 chars (stored with padding as ~30.7) ≈ 30.7*7+5 ≈ 220 points —
+        // far beyond what content measurement would give a one-char cell.
+        assert!(
+            metrics.column_width(0) > 180.0,
+            "file width should apply, got {}",
+            metrics.column_width(0)
+        );
+        // 45pt row = 60 egui points; the default is ~22.
+        assert!(
+            (metrics.row_height(1) - 60.0).abs() < 1.0,
+            "file height should apply, got {}",
+            metrics.row_height(1)
+        );
+        assert!((metrics.row_height(0) - ROW_HEIGHT).abs() < 0.01);
     }
 
     #[test]
-    fn cell_at_round_trips_every_cell_centre() {
-        let sheet = simple_sheet(12, 8);
+    fn variable_row_heights_keep_hit_testing_and_culling_exact() {
+        let sheet = sheet_with(|sheet| {
+            for row in 0..30u32 {
+                sheet.write_number(row, 0, row as f64).unwrap();
+                sheet.write_number(row, 1, row as f64).unwrap();
+            }
+            sheet.set_row_height(5, 60).unwrap();
+            sheet.set_row_height(12, 90).unwrap();
+        });
         let metrics = SheetMetrics::measure(&sheet, 7.0);
         for row in 0..metrics.rows {
             for column in 0..metrics.columns {
@@ -488,7 +668,30 @@ mod tests {
                 );
             }
         }
-        // Outside the grid in every direction is None, not a clamped guess.
+        // Culling over a band still covers exactly the touching rows.
+        let top = metrics.row_y(5) + 1.0;
+        let bottom = metrics.row_y(13) - 1.0;
+        let range = metrics.visible_rows(top, bottom);
+        assert!(range.contains(&5) && range.contains(&12));
+        for row in 0..metrics.rows {
+            let rect = metrics.cell_rect(row, 0);
+            let touches = rect.bottom() > top && rect.top() < bottom;
+            if touches {
+                assert!(range.contains(&row), "row {row} missing from {range:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn cell_at_round_trips_every_cell_centre() {
+        let sheet = simple_sheet(12, 8);
+        let metrics = SheetMetrics::measure(&sheet, 7.0);
+        for row in 0..metrics.rows {
+            for column in 0..metrics.columns {
+                let centre = metrics.cell_rect(row, column).center();
+                assert_eq!(metrics.cell_at(centre), Some((row, column)));
+            }
+        }
         assert_eq!(metrics.cell_at(pos2(-1.0, 5.0)), None);
         assert_eq!(metrics.cell_at(pos2(5.0, -1.0)), None);
         assert_eq!(metrics.cell_at(pos2(metrics.content.x + 1.0, 5.0)), None);
@@ -553,7 +756,6 @@ mod tests {
             Vec2::ZERO
         );
 
-        // A tiny sheet in a big window cannot scroll at all.
         let small = SheetMetrics::measure(&simple_sheet(2, 2), 7.0);
         assert_eq!(
             small.clamp_scroll(vec2(500.0, 500.0), vec2(900.0, 700.0)),
@@ -580,7 +782,6 @@ mod tests {
             "revealed cell {cell:?} is not inside {window:?}"
         );
 
-        // And coming back up scrolls back.
         let back = metrics.scroll_to_reveal(0, 0, viewport, scroll);
         assert_eq!(back, Vec2::ZERO);
     }
@@ -598,7 +799,6 @@ mod tests {
             Vec2::ZERO
         );
         assert!(metrics.visible_rows(0.0, 100.0).is_empty());
-        // A nonsense character width must not produce a zero-wide column.
         for bad in [0.0, -3.0, f32::NAN] {
             let metrics = SheetMetrics::measure(&simple_sheet(2, 2), bad);
             assert!(metrics.column_width(0) >= MIN_COLUMN_WIDTH);
@@ -606,23 +806,32 @@ mod tests {
     }
 
     #[test]
+    fn formatted_numbers_measure_and_display_through_their_format() {
+        let sheet = sheet_with(|sheet| {
+            let money = rust_xlsxwriter::Format::new().set_num_format("$#,##0.00");
+            sheet
+                .write_number_with_format(0, 0, 1234567.891, &money)
+                .unwrap();
+        });
+        assert_eq!(
+            sheet.display_at(0, 0),
+            "$1,234,567.89",
+            "the file's number format drives the displayed text"
+        );
+        // And the measured column fits the formatted text, not the raw float.
+        let metrics = SheetMetrics::measure(&sheet, 7.0);
+        assert!(metrics.column_width(0) >= "$1,234,567.89".len() as f32 * 7.0);
+    }
+
+    #[test]
     fn selection_stops_at_the_edges_instead_of_wrapping() {
         let mut selection = Selection::default();
         selection.step(-1, -1, 10, 5);
-        assert_eq!(
-            (selection.row, selection.column),
-            (0, 0),
-            "cannot go above A1"
-        );
+        assert_eq!((selection.row, selection.column), (0, 0));
 
         selection.step(100, 100, 10, 5);
-        assert_eq!(
-            (selection.row, selection.column),
-            (9, 4),
-            "stops at the last cell rather than wrapping round"
-        );
+        assert_eq!((selection.row, selection.column), (9, 4));
 
-        // An empty sheet has no cell to move to.
         let mut empty = Selection::default();
         empty.step(3, 3, 0, 0);
         assert_eq!((empty.row, empty.column), (0, 0));

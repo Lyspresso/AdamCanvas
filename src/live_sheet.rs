@@ -81,8 +81,9 @@ function run(argv) {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum MirrorOutcome {
-    /// Fresh live state, already converted for display.
-    Updated(Sheet),
+    /// Fresh live state, already converted for display. Boxed: this
+    /// variant is megabytes bigger than its siblings.
+    Updated(Box<Sheet>),
     /// Excel is not running, or this workbook / sheet is not open in it.
     /// The save-watcher remains the source of truth.
     Unavailable,
@@ -222,7 +223,7 @@ fn classify_output(output: &str, sheet_name: &str) -> (MirrorOutcome, u64) {
             payload.hash(&mut hasher);
             let payload_hash = hasher.finish();
             match parse_payload(payload, sheet_name) {
-                Ok(sheet) => (MirrorOutcome::Updated(sheet), payload_hash),
+                Ok(sheet) => (MirrorOutcome::Updated(Box::new(sheet)), payload_hash),
                 Err(error) => (MirrorOutcome::Failed(error), payload_hash),
             }
         }

@@ -36,13 +36,16 @@ image = { version = "0.25", default-features = false, features = [
 libc = "0.2"
 log = "0.4"
 open = "5.3"
+quick-xml = "0.41.0"
 rfd = "0.17"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 thiserror = "2.0"
+umya-spreadsheet = "3.0.1"
 ureq = { version = "3.3", features = ["json"] }
 url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v4"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"] }

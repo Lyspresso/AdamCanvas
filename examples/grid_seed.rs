@@ -78,13 +78,25 @@ fn main() -> anyhow::Result<()> {
     // something honest to open. Written next to the images.
     let sheet_path = images.join("budget.xlsx");
     {
-        use rust_xlsxwriter::{Formula, Workbook as XlsxWorkbook};
+        use rust_xlsxwriter::{Color, Format, FormatBorder, Formula, Workbook as XlsxWorkbook};
         let mut xlsx = XlsxWorkbook::new();
         let sheet = xlsx.add_worksheet();
         sheet.set_name("Budget").map_err(anyhow::Error::from)?;
+        // Styled like a real budget sheet, so visual fidelity is visible:
+        // coloured bold header, currency columns, a boxed bold total.
+        let header_format = Format::new()
+            .set_bold()
+            .set_background_color(Color::RGB(0x4472C4))
+            .set_font_color(Color::RGB(0xFFFFFF));
+        let money = Format::new().set_num_format("$#,##0.00");
+        let total_box = Format::new()
+            .set_num_format("$#,##0.00")
+            .set_bold()
+            .set_border(FormatBorder::Thin);
+        sheet.set_column_width(0, 18).map_err(anyhow::Error::from)?;
         for (column, header) in ["Item", "Price", "Count", "Total"].iter().enumerate() {
             sheet
-                .write_string(0, column as u16, *header)
+                .write_string_with_format(0, column as u16, *header, &header_format)
                 .map_err(anyhow::Error::from)?;
         }
         let rows: [(&str, f64, f64); 4] = [
@@ -99,20 +111,25 @@ fn main() -> anyhow::Result<()> {
                 .write_string(row, 0, *item)
                 .map_err(anyhow::Error::from)?;
             sheet
-                .write_number(row, 1, *price)
+                .write_number_with_format(row, 1, *price, &money)
                 .map_err(anyhow::Error::from)?;
             sheet
                 .write_number(row, 2, *count)
                 .map_err(anyhow::Error::from)?;
             sheet
-                .write_formula(row, 3, Formula::new(format!("=B{r}*C{r}", r = row + 1)))
+                .write_formula_with_format(
+                    row,
+                    3,
+                    Formula::new(format!("=B{r}*C{r}", r = row + 1)),
+                    &money,
+                )
                 .map_err(anyhow::Error::from)?;
         }
         sheet
             .write_string(6, 0, "Grand total")
             .map_err(anyhow::Error::from)?;
         sheet
-            .write_formula(6, 3, Formula::new("=SUM(D2:D5)"))
+            .write_formula_with_format(6, 3, Formula::new("=SUM(D2:D5)"), &total_box)
             .map_err(anyhow::Error::from)?;
         xlsx.save(&sheet_path).map_err(anyhow::Error::from)?;
     }

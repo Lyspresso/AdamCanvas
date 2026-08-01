@@ -50,7 +50,7 @@ use crate::{
     },
     platform,
     preview::PreviewCache,
-    sheet_view::{self, SheetMetrics, SheetPalette, SheetViewState},
+    sheet_view::{self, SheetFonts, SheetMetrics, SheetPalette, SheetViewState},
     spatial::{DEFAULT_CELL_SIZE, SpatialIndex},
     spreadsheet,
     structured_preview::{StructuredPreview, StructuredPreviewCache},
@@ -59,7 +59,9 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use egui::{
     Align, Align2, Button, Color32, Context, CornerRadius, CursorIcon, FontData, FontDefinitions,
     FontFamily, FontId, Frame, Id, Key, Layout, Margin, Painter, PointerButton, Pos2, Rect,
-    Response, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2, pos2, vec2,
+    Response, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
+    epaint::text::{FontInsert, FontPriority, InsertFontFamily},
+    pos2, vec2,
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use std::{
@@ -921,9 +923,13 @@ pub struct AdamApp {
     live_last_hash: HashMap<Uuid, u64>,
     live_updated_at: HashMap<Uuid, Instant>,
     live_blocked: bool,
-    /// Bounded table snapshots drawn on spreadsheet tiles in place of the
-    /// Quick Look image whenever parsed (and possibly live) data exists.
-    sheet_tile_tables: HashMap<Uuid, StructuredPreview>,
+    /// Bounded corner snapshots drawn on spreadsheet tiles in place of the
+    /// Quick Look image whenever parsed (and possibly live) data exists —
+    /// through the same styled renderer as the lightbox, at tile scale.
+    sheet_tile_snapshots: HashMap<Uuid, (spreadsheet::Sheet, SheetFonts)>,
+    /// Fonts registered with egui by family name, resolved from files the
+    /// workbook names (Excel bundles its own). `None` records a miss.
+    sheet_font_cache: HashMap<String, Option<FontFamily>>,
     /// Round-robin cursor over the canvas's spreadsheet tiles.
     live_rotation: usize,
     last_automation_persist: Instant,
@@ -1224,7 +1230,8 @@ impl AdamApp {
             live_last_hash: HashMap::new(),
             live_updated_at: HashMap::new(),
             live_blocked: false,
-            sheet_tile_tables: HashMap::new(),
+            sheet_tile_snapshots: HashMap::new(),
+            sheet_font_cache: HashMap::new(),
             live_rotation: 0,
             last_automation_persist: Instant::now(),
             automation_initialized: false,
@@ -1616,16 +1623,13 @@ impl AdamApp {
         while let Some(result) = self.live_sheet.poll() {
             self.live_in_flight = false;
             match result.outcome {
-                MirrorOutcome::Updated(sheet) => {
+                MirrorOutcome::Updated(boxed_sheet) => {
+                    let sheet = *boxed_sheet;
                     let unchanged =
                         self.live_last_hash.get(&result.tile) == Some(&result.payload_hash);
                     if unchanged {
                         continue;
                     }
-                    self.sheet_tile_tables.insert(
-                        result.tile,
-                        StructuredPreview::Table(spreadsheet::tile_table(&sheet)),
-                    );
                     match self.sheets.get_mut(&result.tile) {
                         Some(Some(workbook)) => {
                             let slot = workbook
@@ -1633,16 +1637,37 @@ impl AdamApp {
                                 .iter_mut()
                                 .find(|candidate| candidate.name == sheet.name);
                             if let Some(slot) = slot {
+                                // The live payload has no styling; the last
+                                // disk parse's stays on, worn by position.
+                                let styling = slot.styling.take();
                                 *slot = sheet;
+                                slot.styling = styling;
                             } else if let Some(first) = workbook.sheets.first_mut() {
+                                let styling = first.styling.take();
                                 *first = sheet;
+                                first.styling = styling;
                             } else {
                                 workbook.sheets.push(sheet);
                             }
                         }
                         // No parse from disk yet (or evicted after a save):
-                        // the live data itself becomes the cache.
+                        // the live data itself becomes the cache, wearing
+                        // styling re-read from the file — which, in the
+                        // evicted-after-save case, just changed and is
+                        // exactly the styling to wear.
                         _ => {
+                            let mut sheet = sheet;
+                            if sheet.styling.is_none()
+                                && let Some(path) = self.tile_path(result.tile)
+                            {
+                                sheet.styling = crate::sheet_style::load(
+                                    &path,
+                                    &sheet.name,
+                                    0,
+                                    sheet.rows,
+                                    sheet.columns,
+                                );
+                            }
                             self.sheets.insert(
                                 result.tile,
                                 Some(spreadsheet::Workbook {
@@ -1653,6 +1678,7 @@ impl AdamApp {
                             );
                         }
                     }
+                    self.refresh_sheet_snapshot(context, result.tile);
                     self.live_last_hash.insert(result.tile, result.payload_hash);
                     self.live_updated_at.insert(result.tile, Instant::now());
                     context.request_repaint();
@@ -3366,7 +3392,7 @@ impl AdamApp {
                     let selection = &self.selection;
                     let previews = &mut self.previews;
                     let structured_previews = &mut self.structured_previews;
-                    let sheet_tables = &self.sheet_tile_tables;
+                    let sheet_snapshots = &self.sheet_tile_snapshots;
                     for index in render_indices {
                         let Some(tile) = page.tiles.get(index) else {
                             continue;
@@ -3423,7 +3449,7 @@ impl AdamApp {
                             pile_controls_enabled,
                             previews,
                             structured_previews,
-                            sheet_tables.get(&tile.id),
+                            sheet_snapshots.get(&tile.id),
                             &page_targets,
                             colors,
                         );
@@ -3832,8 +3858,7 @@ impl AdamApp {
         // every frame. A failed load leaves the Quick Look preview showing,
         // with the reason in the corner.
         let freshly_parsed = !self.sheets.contains_key(&id);
-        let workbook = self
-            .sheets
+        self.sheets
             .entry(id)
             .or_insert_with(|| match spreadsheet::load(path) {
                 Ok(workbook) => Some(workbook),
@@ -3842,14 +3867,36 @@ impl AdamApp {
                     None
                 }
             });
-        if freshly_parsed
-            && let Some(first) = workbook.as_ref().and_then(|workbook| workbook.sheet(0))
-        {
+        if freshly_parsed {
             // The tile mirrors what the lightbox has parsed, so closing the
             // lightbox leaves the tile showing the same data.
-            self.sheet_tile_tables
-                .insert(id, StructuredPreview::Table(spreadsheet::tile_table(first)));
+            self.refresh_sheet_snapshot(context, id);
         }
+        // Fonts are resolved before the long workbook borrow below — the
+        // resolver mutates the font cache and possibly egui's font set.
+        let font_info = self
+            .sheets
+            .get(&id)
+            .and_then(|workbook| workbook.as_ref())
+            .and_then(|workbook| {
+                let index = self
+                    .sheet_states
+                    .get(&id)
+                    .map(|state| state.sheet)
+                    .unwrap_or(0);
+                workbook.sheet(index).or_else(|| workbook.sheet(0))
+            })
+            .and_then(|sheet| sheet.styling.as_ref())
+            .map(|styling| {
+                (
+                    styling.default_font_name.clone(),
+                    styling.default_font_points,
+                )
+            });
+        let fonts = match font_info {
+            Some((name, size)) => self.resolve_fonts_by_info(context, name, size),
+            None => SheetFonts::default(),
+        };
         let workbook = self.sheets.get(&id).expect("entry just ensured");
         let Some(workbook) = workbook else {
             ui.painter().text(
@@ -3951,6 +3998,8 @@ impl AdamApp {
                 selection: color_with_alpha(colors.accent, 60),
                 accent: colors.accent,
             },
+            &fonts,
+            sheet_view::DrawOptions::default(),
         );
 
         // Status: selected cell, its formula or value, load truncation, and
@@ -4041,6 +4090,110 @@ impl AdamApp {
             self.editing_note = None;
             self.editing_focus_pending = None;
         }
+    }
+
+    /// Resolves the fonts a sheet asks for, registering font files with egui
+    /// on first use. Excel bundles its own faces (Calibri, Aptos) inside its
+    /// app bundle, so the exact family is usually available; a miss falls
+    /// back to the UI font at the right size.
+    fn resolve_sheet_fonts(&mut self, context: &Context, sheet: &spreadsheet::Sheet) -> SheetFonts {
+        let (name, size_points) = sheet
+            .styling
+            .as_ref()
+            .map(|styling| {
+                (
+                    styling.default_font_name.clone(),
+                    styling.default_font_points,
+                )
+            })
+            .unwrap_or((None, None));
+        self.resolve_fonts_by_info(context, name, size_points)
+    }
+
+    fn resolve_fonts_by_info(
+        &mut self,
+        context: &Context,
+        name: Option<String>,
+        size_points: Option<f32>,
+    ) -> SheetFonts {
+        let default_size = crate::sheet_style::typographic_to_egui(size_points.unwrap_or(11.0));
+        let Some(name) = name else {
+            return SheetFonts {
+                default_size,
+                ..SheetFonts::default()
+            };
+        };
+
+        let regular = self.ensure_font_family(context, &name, false);
+        let bold = self
+            .ensure_font_family(context, &name, true)
+            .or_else(|| regular.clone());
+        SheetFonts {
+            regular: regular.unwrap_or(FontFamily::Proportional),
+            bold: bold.unwrap_or(FontFamily::Proportional),
+            default_size,
+        }
+    }
+
+    fn ensure_font_family(
+        &mut self,
+        context: &Context,
+        name: &str,
+        bold: bool,
+    ) -> Option<FontFamily> {
+        let key = if bold {
+            format!("{name} Bold")
+        } else {
+            name.to_string()
+        };
+        if let Some(cached) = self.sheet_font_cache.get(&key) {
+            return cached.clone();
+        }
+        let resolved = find_font_file(name, bold).and_then(|path| {
+            let bytes = std::fs::read(&path).ok()?;
+            let family = FontFamily::Name(key.clone().into());
+            context.add_font(FontInsert::new(
+                &key,
+                FontData::from_owned(bytes),
+                vec![InsertFontFamily {
+                    family: family.clone(),
+                    priority: FontPriority::Highest,
+                }],
+            ));
+            Some(family)
+        });
+        self.sheet_font_cache.insert(key, resolved.clone());
+        resolved
+    }
+
+    /// Rebuilds a tile's corner snapshot from the cached workbook.
+    fn refresh_sheet_snapshot(&mut self, context: &Context, id: Uuid) {
+        const TILE_ROWS: usize = 24;
+        const TILE_COLUMNS: usize = 12;
+        let Some(Some(workbook)) = self.sheets.get(&id) else {
+            return;
+        };
+        let sheet_index = self
+            .sheet_states
+            .get(&id)
+            .map(|state| state.sheet)
+            .unwrap_or(0);
+        let Some(sheet) = workbook.sheet(sheet_index).or_else(|| workbook.sheet(0)) else {
+            return;
+        };
+        let corner = sheet.corner(TILE_ROWS, TILE_COLUMNS);
+        let fonts = self.resolve_sheet_fonts(context, &corner);
+        self.sheet_tile_snapshots.insert(id, (corner, fonts));
+    }
+
+    /// A file tile's path, wherever in the workspace it lives.
+    fn tile_path(&self, id: Uuid) -> Option<PathBuf> {
+        self.workspace.pages.iter().find_map(|page| {
+            page.tiles.iter().find_map(|tile| match &tile.content {
+                TileContent::File { path, .. } if tile.id == id => Some(path.clone()),
+                _ => None,
+            })
+        })
     }
 
     fn tile_id_at(&self, index: usize) -> Option<Uuid> {
@@ -11086,7 +11239,7 @@ fn draw_tile(
     pile_controls_enabled: bool,
     previews: &mut PreviewCache,
     structured_previews: &mut StructuredPreviewCache,
-    live_table: Option<&StructuredPreview>,
+    live_sheet: Option<&(spreadsheet::Sheet, SheetFonts)>,
     page_targets: &[(Uuid, String)],
     colors: Theme,
 ) -> TileUiEvent {
@@ -11182,9 +11335,40 @@ fn draw_tile(
     match &tile.content {
         TileContent::File { path, kind } => {
             // Parsed sheet data outranks the Quick Look image: it is the only
-            // rendering that can show a live, unsaved workbook.
-            if let Some(table) = live_table {
-                draw_structured_preview(painter, content_rect, table, accent, colors, camera.zoom);
+            // rendering that can show a live, unsaved workbook — and it
+            // renders through the same styled engine as the lightbox, scaled
+            // to the tile, so fills, fonts and borders match the spreadsheet.
+            if let Some((sheet, fonts)) = live_sheet {
+                let metrics = SheetMetrics::measure(sheet, 7.0);
+                let scale = if metrics.content.x > 0.0 && metrics.content.y > 0.0 {
+                    (content_rect.width() / metrics.content.x)
+                        .min(content_rect.height() / metrics.content.y)
+                        .clamp(0.25, 1.25)
+                } else {
+                    1.0
+                };
+                sheet_view::draw(
+                    painter,
+                    content_rect,
+                    sheet,
+                    &metrics,
+                    &SheetViewState::default(),
+                    SheetPalette {
+                        surface: colors.tile,
+                        header: colors.tile_footer,
+                        grid_line: color_with_alpha(colors.tertiary_text, 60),
+                        text: colors.text,
+                        secondary_text: colors.secondary_text,
+                        selection: color_with_alpha(colors.accent, 60),
+                        accent: colors.accent,
+                    },
+                    fonts,
+                    sheet_view::DrawOptions {
+                        scale,
+                        headers: false,
+                        selection: false,
+                    },
+                );
             } else if let Some(preview) = structured_previews.preview(tile.id, path) {
                 draw_structured_preview(
                     painter,
@@ -12138,6 +12322,53 @@ fn draw_grid_view_hint(
         color_with_alpha(colors.chrome, 224),
     );
     painter.galley(text_min, galley, colors.chrome_secondary_text);
+}
+
+/// Looks for a font file matching `name` in the places macOS and Office keep
+/// them. Handles both naming conventions seen in the wild: Calibri's
+/// suffix-letter files (Calibrib.ttf) and Aptos's hyphenated ones
+/// (Aptos-Bold.ttf).
+fn find_font_file(name: &str, bold: bool) -> Option<std::path::PathBuf> {
+    let directories = [
+        "/Applications/Microsoft Excel.app/Contents/Resources/DFonts",
+        "/Library/Fonts",
+        "/System/Library/Fonts/Supplemental",
+    ];
+    let home_fonts = dirs::home_dir().map(|home| home.join("Library/Fonts"));
+    let stems: Vec<String> = if bold {
+        vec![
+            format!("{name}b"),
+            format!("{name}-Bold"),
+            format!("{name} Bold"),
+        ]
+    } else {
+        vec![name.to_string(), format!("{name}-Regular")]
+    };
+    let candidates = directories
+        .iter()
+        .map(std::path::PathBuf::from)
+        .chain(home_fonts);
+    for directory in candidates {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+                continue;
+            };
+            if !extension.eq_ignore_ascii_case("ttf") && !extension.eq_ignore_ascii_case("otf") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if stems.iter().any(|wanted| stem.eq_ignore_ascii_case(wanted)) {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 fn draw_file_placeholder(
