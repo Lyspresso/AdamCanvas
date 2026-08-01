@@ -72,6 +72,7 @@ fn synthetic_rows() -> Vec<AgentRow> {
             program: Some("/opt/homebrew/bin/claude".into()),
             auth: agents_panel::AgentAuth::SignedIn,
             selected: true,
+            observed: true,
         },
         AgentRow {
             meta: meta("codex_cli"),
@@ -83,6 +84,7 @@ fn synthetic_rows() -> Vec<AgentRow> {
             program: Some("/usr/local/bin/codex".into()),
             auth: agents_panel::AgentAuth::SignedOut,
             selected: false,
+            observed: true,
         },
         AgentRow {
             meta: meta("grok_cli"),
@@ -95,6 +97,7 @@ fn synthetic_rows() -> Vec<AgentRow> {
             program: Some("/usr/local/bin/grok".into()),
             auth: agents_panel::AgentAuth::NotApplicable,
             selected: false,
+            observed: true,
         },
         AgentRow {
             meta: meta("kimi_cli"),
@@ -104,6 +107,7 @@ fn synthetic_rows() -> Vec<AgentRow> {
             program: None,
             auth: agents_panel::AgentAuth::Unknown,
             selected: false,
+            observed: true,
         },
         AgentRow {
             meta: meta("auto"),
@@ -113,6 +117,7 @@ fn synthetic_rows() -> Vec<AgentRow> {
             program: None,
             auth: agents_panel::AgentAuth::Unknown,
             selected: false,
+            observed: true,
         },
         AgentRow {
             meta: meta("openai_compatible"),
@@ -122,6 +127,7 @@ fn synthetic_rows() -> Vec<AgentRow> {
             program: None,
             auth: agents_panel::AgentAuth::Unknown,
             selected: false,
+            observed: true,
         },
     ]
 }

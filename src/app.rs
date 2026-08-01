@@ -4,9 +4,9 @@ use crate::{
         agent_rows, preflight_notice,
     },
     ai::{
-        AiEngine, AiEngineError, AiEvent, AiFailureKind, AiRunRequest, clamp_provider_preferences,
-        installed_kimi_uses_acp, installed_runtime_tuning, provider_exposes_app_task_tools,
-        resolve_effective_provider_id,
+        AiEngine, AiEngineError, AiEvent, AiFailureKind, AiRunRequest,
+        checked_installed_kimi_uses_acp, clamp_provider_preferences, installed_runtime_tuning,
+        provider_exposes_app_task_tools, resolve_effective_provider_id,
     },
     ai_prompt::{
         BuiltPrompt, HistoricalTurn, HistoryRole, PromptAttachment, PromptBudget, PromptContinuity,
@@ -399,6 +399,14 @@ struct AiResumeReplay {
     provider_profile: AiProviderPreferences,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreservedResumeRetry {
+    provider_id: String,
+    session_id: String,
+    user_message_sequence: u64,
+    terminal_message_sequence: u64,
+}
+
 #[derive(Debug, Default)]
 struct AiTurnLaunch {
     provider_override: Option<String>,
@@ -406,6 +414,7 @@ struct AiTurnLaunch {
     provider_profile_override: Option<AiProviderPreferences>,
     user_message_already_committed: bool,
     force_replay: bool,
+    preserved_resume_retry_sequence: Option<u64>,
 }
 
 #[derive(Default)]
@@ -445,6 +454,7 @@ struct AiChatRuntime {
     active_used_resume: bool,
     active_had_productive_activity: bool,
     resume_replay: Option<AiResumeReplay>,
+    preserved_resume_retry: Option<PreservedResumeRetry>,
     streamed_text: String,
     activities: Vec<String>,
     activity_trace: ActivityAccumulator,
@@ -479,6 +489,7 @@ impl Default for AiChatRuntime {
             active_used_resume: false,
             active_had_productive_activity: false,
             resume_replay: None,
+            preserved_resume_retry: None,
             streamed_text: String::new(),
             activities: Vec::new(),
             activity_trace: ActivityAccumulator::new(),
@@ -510,6 +521,9 @@ impl AiChatRuntime {
 #[derive(Default)]
 struct AiWorkspaceUiAction {
     send: bool,
+    /// Read-only render input carried with the frame's action accumulator so
+    /// the composer does not grow another positional argument.
+    preflight_blocks_send: bool,
     stop: bool,
     send_next_queued: bool,
     clear_queue: bool,
@@ -541,6 +555,7 @@ struct AiWorkspaceUiAction {
 /// path never borrows `AgentsPanelState` directly.
 struct AgentsChatView {
     preflight: Option<PreflightNotice>,
+    queued_preflight: Option<PreflightNotice>,
     /// Some ⇒ the empty state renders as the agents setup screen.
     setup_rows: Option<Vec<AgentRow>>,
     scanning: bool,
@@ -6158,10 +6173,53 @@ impl AdamApp {
             .filter(|request| request.conversation_id == conversation_id)
             .cloned();
         let mut action = AiWorkspaceUiAction::default();
-        self.agents.ensure_scanned();
+        let resume_provider_id = self
+            .resume_store
+            .record(conversation_id)
+            .map(|record| record.provider_key.clone());
+        let selected_provider_id =
+            resume_pinned_provider_id(&settings.provider_id, resume_provider_id.as_deref())
+                .to_owned();
+        self.agents.ensure_scanned_for(&selected_provider_id);
+        let agents_scanning = self.agents.scanning();
+        let provider_scanning = self.agents.scanning_for(&selected_provider_id);
+        let provider_preflight = preflight_notice(
+            &selected_provider_id,
+            !settings.api_endpoint.trim().is_empty(),
+            self.agents.snapshot.as_ref(),
+            provider_scanning,
+        );
+        let preflight_blocks_send = provider_preflight
+            .as_ref()
+            .is_some_and(|notice| notice.blocks_send);
+        action.preflight_blocks_send = preflight_blocks_send;
+        let queued_head = conversation.queued_turns().first();
+        let queued_provider_id = queued_head.map(|queued| {
+            resume_pinned_provider_id(
+                queued_turn_provider_id(queued, &conversation.settings),
+                resume_provider_id.as_deref(),
+            )
+            .to_owned()
+        });
+        if let Some(provider_id) = queued_provider_id.as_deref() {
+            self.agents.ensure_scanned_for(provider_id);
+        }
+        let queued_preflight = queued_head.and_then(|queued| {
+            let provider_id = queued_provider_id
+                .as_deref()
+                .expect("queued provider exists with queued head");
+            queued_turn_preflight_notice(
+                queued,
+                &conversation.settings,
+                resume_provider_id.as_deref(),
+                self.agents.snapshot.as_ref(),
+                self.agents.scanning_for(provider_id),
+            )
+        });
         let setup_active = conversation.messages().is_empty()
             && runtime.streamed_text.is_empty()
             && !self.agents.setup_dismissed
+            && !agents_scanning
             && self
                 .agents
                 .snapshot
@@ -6173,12 +6231,9 @@ impl AdamApp {
             preflight: if setup_active {
                 None
             } else {
-                preflight_notice(
-                    &settings.provider_id,
-                    !settings.api_endpoint.trim().is_empty(),
-                    self.agents.snapshot.as_ref(),
-                )
+                provider_preflight
             },
+            queued_preflight,
             setup_rows: setup_active.then(|| {
                 agent_rows(
                     self.agents
@@ -6188,7 +6243,7 @@ impl AdamApp {
                     Some(&settings.provider_id),
                 )
             }),
-            scanning: self.agents.scanning(),
+            scanning: agents_scanning,
             installing: self.agents.installing(),
             last_install: self.agents.last_install().cloned(),
         };
@@ -6284,6 +6339,12 @@ impl AdamApp {
             });
 
         let running = runtime.active_turn.is_some();
+        // Defense in depth: render paths should only set `send` when the
+        // composer is enabled, but never let an alternate UI event bypass a
+        // guaranteed-failure exact-provider preflight.
+        if !running && action.preflight_blocks_send {
+            action.send = false;
+        }
         self.chat_runtimes.insert(conversation_id, runtime);
         if !running
             && (settings != conversation.settings || permission != conversation.permission_mode)
@@ -6727,6 +6788,12 @@ impl AdamApp {
         if retry == RetryHint::AllowWebAndRetry {
             provider_profile.set_feature(AI_FEATURE_WEB_SEARCH, Some(true));
         }
+        let preserved_resume_retry_sequence = self
+            .chat_runtimes
+            .get(&conversation_id)
+            .and_then(|runtime| runtime.preserved_resume_retry.as_ref())
+            .filter(|retry| retry.user_message_sequence == previous.sequence)
+            .map(|retry| retry.user_message_sequence);
         {
             let runtime = self.chat_runtimes.entry(conversation_id).or_default();
             runtime.error = None;
@@ -6747,6 +6814,7 @@ impl AdamApp {
                 provider_profile_override: Some(provider_profile),
                 user_message_already_committed: true,
                 force_replay: false,
+                preserved_resume_retry_sequence,
             },
             context,
         ) {
@@ -6761,14 +6829,19 @@ impl AdamApp {
         &self,
         conversation: &AiConversation,
         provider_id: &str,
-    ) -> Option<ResumeGate> {
+        verify_kimi_runtime: bool,
+    ) -> Result<Option<ResumeGate>, String> {
         let configured_working_directory = conversation
             .settings
             .working_directory
             .as_deref()
             .map(Path::new);
-        if provider_id == "kimi_cli" && !installed_kimi_uses_acp(configured_working_directory) {
-            return None;
+        if provider_id == "kimi_cli" && verify_kimi_runtime {
+            match checked_installed_kimi_uses_acp(configured_working_directory) {
+                Ok(true) => {}
+                Ok(false) => return Ok(None),
+                Err(error) => return Err(error),
+            }
         }
         let (executable, arguments) = ai_provider_profile_inputs(
             provider_id,
@@ -6778,14 +6851,17 @@ impl AdamApp {
         );
         let profile = capability_profile(provider_id, &executable, &arguments);
         if !profile.supports_native_resume() || !profile.has_structured_stream() {
-            return None;
+            return Ok(None);
         }
-        let working_directory = conversation
+        let Some(working_directory) = conversation
             .settings
             .working_directory
             .as_deref()
             .map(PathBuf::from)
-            .or_else(dirs::home_dir)?;
+            .or_else(dirs::home_dir)
+        else {
+            return Ok(None);
+        };
         let parser_dialect = ai_stream_dialect_key(profile.stream_dialect);
         let sandbox_profile = match profile.sandbox {
             crate::chat_core::SandboxStrategy::None => None,
@@ -6804,7 +6880,8 @@ impl AdamApp {
                 .last()
                 .map(|message| message.sequence),
         )
-        .ok()
+        .map(Some)
+        .map_err(|error| format!("Adam could not verify native session state: {error}"))
     }
 
     fn save_ai_resume_store(&self) {
@@ -6831,8 +6908,17 @@ impl AdamApp {
             self.save_ai_resume_store();
             return;
         };
+        let resume_gate = match self.ai_resume_gate(&conversation, provider_id, false) {
+            Ok(gate) => gate,
+            Err(error) => {
+                log::error!(
+                    "could not verify native AI session compatibility for {conversation_id}: {error}"
+                );
+                return;
+            }
+        };
         let disposition = if let (Some(gate), Some(session_id)) = (
-            self.ai_resume_gate(&conversation, provider_id),
+            resume_gate,
             session_id.filter(|session_id| !session_id.trim().is_empty()),
         ) {
             ResumeRecord::from_gate(session_id, &gate, unix_now().0.max(1) as u64)
@@ -6858,6 +6944,30 @@ impl AdamApp {
         }
     }
 
+    fn arm_preserved_resume_retry(
+        &mut self,
+        conversation_id: Uuid,
+        provider_id: &str,
+        used_resume: bool,
+        sequences: Option<(u64, u64)>,
+    ) {
+        let token = used_resume.then_some(sequences).flatten().and_then(
+            |(user_message_sequence, terminal_message_sequence)| {
+                let record = self.resume_store.record(conversation_id)?;
+                (record.provider_key == provider_id).then(|| PreservedResumeRetry {
+                    provider_id: provider_id.to_owned(),
+                    session_id: record.session_id.clone(),
+                    user_message_sequence,
+                    terminal_message_sequence,
+                })
+            },
+        );
+        self.chat_runtimes
+            .entry(conversation_id)
+            .or_default()
+            .preserved_resume_retry = token;
+    }
+
     fn launch_ai_turn(
         &mut self,
         conversation_id: Uuid,
@@ -6868,6 +6978,12 @@ impl AdamApp {
     ) -> bool {
         let force_replay = launch.force_replay;
         let user_message_already_committed = launch.user_message_already_committed;
+        let preserved_resume_retry = launch.preserved_resume_retry_sequence.and_then(|sequence| {
+            self.chat_runtimes
+                .get(&conversation_id)
+                .and_then(|runtime| runtime.preserved_resume_retry.clone())
+                .filter(|retry| retry.user_message_sequence == sequence)
+        });
         let Some(conversation) = self
             .workspace
             .domain
@@ -6887,15 +7003,17 @@ impl AdamApp {
             return false;
         }
 
-        let mut provider_id = launch
+        let requested_provider_id = launch
             .provider_override
             .filter(|provider| !provider.trim().is_empty())
             .unwrap_or_else(|| conversation.settings.provider_id.clone());
-        if provider_id == "auto"
-            && let Some(record) = self.resume_store.record(conversation_id)
-        {
-            provider_id = record.provider_key.clone();
-        }
+        let provider_id = resume_pinned_provider_id(
+            &requested_provider_id,
+            self.resume_store
+                .record(conversation_id)
+                .map(|record| record.provider_key.as_str()),
+        )
+        .to_owned();
         let mut provider_profile = launch
             .provider_profile_override
             .unwrap_or_else(|| conversation.settings.profile_for(&provider_id));
@@ -6942,7 +7060,22 @@ impl AdamApp {
         let resume_gate = if force_replay {
             None
         } else {
-            self.ai_resume_gate(&conversation, &provider_id)
+            let verify_kimi_runtime = self.resume_store.record(conversation_id).is_some();
+            match self.ai_resume_gate(&conversation, &provider_id, verify_kimi_runtime) {
+                Ok(gate) => gate,
+                Err(error) => {
+                    if matches!(provider_id.as_str(), "grok_cli" | "kimi_cli") {
+                        self.agents.request_scan_for(true, &provider_id);
+                    }
+                    let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+                    runtime.error = Some(error);
+                    runtime.inspector_notice = Some(
+                        "The provider version could not be verified. Retry the turn when the machine is less busy."
+                            .into(),
+                    );
+                    return false;
+                }
+            }
         };
         let mut invalidated_resume = should_forget_unavailable_kimi_resume(
             &provider_id,
@@ -6951,8 +7084,27 @@ impl AdamApp {
                 .record(conversation_id)
                 .map(|record| record.provider_key.as_str()),
         );
+        let exact_retry_record = preserved_resume_record_for_exact_retry(
+            preserved_resume_retry.as_ref(),
+            &provider_id,
+            &conversation,
+            &user_text,
+            &attachments,
+            self.resume_store.record(conversation_id),
+        );
         let resume_session_id = resume_gate.as_ref().and_then(|gate| {
-            match self.resume_store.eligible_record(conversation_id, gate) {
+            let mut eligibility_gate = gate.clone();
+            if let Some(record) = exact_retry_record.as_ref() {
+                // The provider is still aligned with the pre-turn sequence.
+                // Only the exact Retry action for the locally-unsent user
+                // message may bridge over Adam's local terminal message.
+                eligibility_gate.last_committed_message_sequence =
+                    record.last_committed_message_sequence;
+            }
+            match self
+                .resume_store
+                .eligible_record(conversation_id, &eligibility_gate)
+            {
                 Ok(Some(record)) => Some(record.session_id.clone()),
                 Ok(None) => None,
                 Err(error) => {
@@ -6967,6 +7119,10 @@ impl AdamApp {
         if invalidated_resume {
             self.resume_store.forget(conversation_id);
             self.save_ai_resume_store();
+            self.chat_runtimes
+                .entry(conversation_id)
+                .or_default()
+                .preserved_resume_retry = None;
         }
         let runtime = self.chat_runtimes.entry(conversation_id).or_default();
         let api_key = runtime.temporary_api_key(&provider_id);
@@ -7056,6 +7212,7 @@ impl AdamApp {
                 runtime.active_used_resume = resume_session_id.is_some();
                 runtime.active_had_productive_activity = false;
                 runtime.resume_replay = None;
+                runtime.preserved_resume_retry = None;
                 runtime.streamed_text.clear();
                 runtime.activities.clear();
                 runtime.activity_trace = ActivityAccumulator::new();
@@ -7095,11 +7252,15 @@ impl AdamApp {
                         provider_profile_override: Some(provider_profile),
                         user_message_already_committed,
                         force_replay: true,
+                        preserved_resume_retry_sequence: None,
                     },
                     context,
                 )
             }
             Err(error) => {
+                if matches!(provider_id.as_str(), "grok_cli" | "kimi_cli") {
+                    self.agents.request_scan_for(true, &provider_id);
+                }
                 let runtime = self.chat_runtimes.entry(conversation_id).or_default();
                 runtime.error = Some(error.to_string());
                 runtime.show_inspector = true;
@@ -7109,19 +7270,46 @@ impl AdamApp {
         }
     }
 
+    fn provider_preflight_blocks_send(&self, provider_id: &str, endpoint_configured: bool) -> bool {
+        preflight_notice(
+            provider_id,
+            endpoint_configured,
+            self.agents.snapshot.as_ref(),
+            self.agents.scanning_for(provider_id),
+        )
+        .is_some_and(|notice| notice.blocks_send)
+    }
+
     fn drain_ai_queue(&mut self, conversation_id: Uuid, context: &Context) -> bool {
-        let queued = self
+        let conversation = self
             .workspace
             .domain
             .conversations
             .conversations
             .get(&conversation_id)
             .filter(|conversation| !conversation.queue_paused)
-            .and_then(|conversation| conversation.queued_turns().first())
             .cloned();
-        let Some(queued) = queued else {
+        let Some(conversation) = conversation else {
             return false;
         };
+        let Some(queued) = conversation.queued_turns().first().cloned() else {
+            return false;
+        };
+        let requested_provider_id = queued_turn_provider_id(&queued, &conversation.settings);
+        let provider_id = resume_pinned_provider_id(
+            requested_provider_id,
+            self.resume_store
+                .record(conversation_id)
+                .map(|record| record.provider_key.as_str()),
+        )
+        .to_owned();
+        self.agents.ensure_scanned_for(&provider_id);
+        if self.provider_preflight_blocks_send(
+            &provider_id,
+            !conversation.settings.api_endpoint.trim().is_empty(),
+        ) {
+            return false;
+        }
         if !self.launch_ai_turn(
             conversation_id,
             queued.text.clone(),
@@ -7132,6 +7320,7 @@ impl AdamApp {
                 provider_profile_override: queued.provider_profile.clone(),
                 user_message_already_committed: false,
                 force_replay: false,
+                preserved_resume_retry_sequence: None,
             },
             context,
         ) {
@@ -7221,6 +7410,7 @@ impl AdamApp {
                     provider_profile_override: Some(replay.provider_profile),
                     user_message_already_committed: true,
                     force_replay: true,
+                    preserved_resume_retry_sequence: None,
                 },
                 context,
             ) {
@@ -7478,6 +7668,7 @@ impl AdamApp {
                     kind,
                     message,
                     resume_rejected,
+                    preserve_resume,
                     ..
                 } => {
                     let retry_message = self
@@ -7491,8 +7682,11 @@ impl AdamApp {
                         .map(|last| (last.text.clone(), last.attachments.clone()));
                     let scheduled_resume_replay = {
                         let runtime = self.chat_runtimes.entry(conversation_id).or_default();
-                        let unproductive_resume =
-                            should_replay_failed_native_session(runtime, resume_rejected);
+                        let unproductive_resume = should_replay_failed_native_session(
+                            runtime,
+                            resume_rejected,
+                            preserve_resume,
+                        );
                         if unproductive_resume {
                             retry_message.map(|(text, attachments)| {
                                 let replay = AiResumeReplay {
@@ -7534,8 +7728,9 @@ impl AdamApp {
                         continue;
                     }
 
-                    let (commit_text, activities, provider_id) = {
+                    let (commit_text, activities, provider_id, used_resume) = {
                         let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+                        let used_resume = runtime.active_used_resume;
                         runtime.active_turn = None;
                         runtime.active_model = None;
                         runtime.active_provider_profile = None;
@@ -7590,8 +7785,10 @@ impl AdamApp {
                                 .active_provider_id
                                 .take()
                                 .unwrap_or_else(|| "auto".into()),
+                            used_resume,
                         )
                     };
+                    let mut retry_sequences = None;
                     if let Some(conversation) = self
                         .workspace
                         .domain
@@ -7599,26 +7796,56 @@ impl AdamApp {
                         .conversations
                         .get_mut(&conversation_id)
                     {
-                        let _ = conversation.append_message_with_activity(
-                            Uuid::new_v4(),
-                            MessageRole::Assistant,
-                            commit_text,
-                            unix_now(),
-                            Vec::new(),
-                            Vec::new(),
-                            activities,
-                            Some(turn_id),
-                        );
+                        let user_message_sequence = conversation
+                            .messages()
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == MessageRole::User)
+                            .map(|message| message.sequence);
+                        let terminal_message_sequence = conversation
+                            .append_message_with_activity(
+                                Uuid::new_v4(),
+                                MessageRole::Assistant,
+                                commit_text,
+                                unix_now(),
+                                Vec::new(),
+                                Vec::new(),
+                                activities,
+                                Some(turn_id),
+                            )
+                            .ok();
+                        retry_sequences = user_message_sequence.zip(terminal_message_sequence);
                         conversation.unread = self.open_chat != Some(conversation_id);
                         conversation_changed = true;
                     }
-                    self.finalize_ai_resume_record(conversation_id, &provider_id, None);
+                    if kind == AiFailureKind::ProviderError
+                        && matches!(provider_id.as_str(), "grok_cli" | "kimi_cli")
+                    {
+                        self.agents.request_scan_for(true, &provider_id);
+                    }
+                    if preserve_resume {
+                        self.arm_preserved_resume_retry(
+                            conversation_id,
+                            &provider_id,
+                            used_resume,
+                            retry_sequences,
+                        );
+                    } else {
+                        self.chat_runtimes
+                            .entry(conversation_id)
+                            .or_default()
+                            .preserved_resume_retry = None;
+                        self.finalize_ai_resume_record(conversation_id, &provider_id, None);
+                    }
                     refresh_folders.insert(conversation_id);
                     drain_queues.insert(conversation_id);
                 }
-                AiEvent::Cancelled { .. } => {
-                    let (commit_text, activities, provider_id) = {
+                AiEvent::Cancelled {
+                    preserve_resume, ..
+                } => {
+                    let (commit_text, activities, provider_id, used_resume) = {
                         let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+                        let used_resume = runtime.active_used_resume;
                         runtime.active_turn = None;
                         runtime.active_model = None;
                         runtime.active_provider_profile = None;
@@ -7638,7 +7865,7 @@ impl AdamApp {
                             &mut runtime.activity_trace,
                             TurnStatus::UserCancelled,
                             Some("Stopped by the user".into()),
-                            None,
+                            preserve_resume.then_some(RetryHint::Retry),
                         );
                         push_ai_activity(runtime, "Stopped".into());
                         let partial = std::mem::take(&mut runtime.streamed_text);
@@ -7666,8 +7893,10 @@ impl AdamApp {
                                 .active_provider_id
                                 .take()
                                 .unwrap_or_else(|| "auto".into()),
+                            used_resume,
                         )
                     };
+                    let mut retry_sequences = None;
                     if let Some(conversation) = self
                         .workspace
                         .domain
@@ -7676,19 +7905,41 @@ impl AdamApp {
                         .get_mut(&conversation_id)
                     {
                         conversation.queue_paused = true;
-                        let _ = conversation.append_message_with_activity(
-                            Uuid::new_v4(),
-                            MessageRole::Assistant,
-                            commit_text,
-                            unix_now(),
-                            Vec::new(),
-                            Vec::new(),
-                            activities,
-                            Some(turn_id),
-                        );
+                        let user_message_sequence = conversation
+                            .messages()
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == MessageRole::User)
+                            .map(|message| message.sequence);
+                        let terminal_message_sequence = conversation
+                            .append_message_with_activity(
+                                Uuid::new_v4(),
+                                MessageRole::Assistant,
+                                commit_text,
+                                unix_now(),
+                                Vec::new(),
+                                Vec::new(),
+                                activities,
+                                Some(turn_id),
+                            )
+                            .ok();
+                        retry_sequences = user_message_sequence.zip(terminal_message_sequence);
                         conversation_changed = true;
                     }
-                    self.finalize_ai_resume_record(conversation_id, &provider_id, None);
+                    if preserve_resume {
+                        self.arm_preserved_resume_retry(
+                            conversation_id,
+                            &provider_id,
+                            used_resume,
+                            retry_sequences,
+                        );
+                    } else {
+                        self.chat_runtimes
+                            .entry(conversation_id)
+                            .or_default()
+                            .preserved_resume_retry = None;
+                        self.finalize_ai_resume_record(conversation_id, &provider_id, None);
+                    }
                     refresh_folders.insert(conversation_id);
                 }
             }
@@ -8739,7 +8990,19 @@ impl AdamApp {
     /// Shared handler for panel-, banner-, and setup-screen actions.
     fn apply_agents_panel_action(&mut self, action: AgentsPanelAction, context: &Context) {
         if action.refresh {
-            self.agents.request_scan(true);
+            let selected_provider = self.open_chat.and_then(|conversation_id| {
+                self.workspace
+                    .domain
+                    .conversations
+                    .conversations
+                    .get(&conversation_id)
+                    .map(|conversation| conversation.settings.provider_id.clone())
+            });
+            if let Some(provider_id) = selected_provider {
+                self.agents.request_scan_for(true, &provider_id);
+            } else {
+                self.agents.request_scan(true);
+            }
         }
         if let Some(provider_id) = action.install
             && !self.agents.request_install(provider_id)
@@ -9967,7 +10230,9 @@ impl eframe::App for AdamApp {
         self.poll_image_pastes(context);
         self.poll_asset_imports(context);
         self.poll_ai_events(context);
-        self.agents.poll();
+        if self.agents.poll() {
+            self.drain_eligible_ai_queues(context);
+        }
         if self.agents.take_install_notice().is_some() {
             self.toast("Agent installed and detected", context);
         }
@@ -12479,10 +12744,11 @@ fn provider_session_is_portable_activity(provider_id: &str) -> bool {
 
 fn kimi_uses_legacy_print_transport(provider_id: &str, tuning: &RuntimeTuningProfile) -> bool {
     provider_id == "kimi_cli"
+        && tuning.verified_runtime
         && tuning
             .version
             .as_ref()
-            .is_some_and(|version| version.major == 1)
+            .is_some_and(|version| (version.major, version.minor, version.patch) == (1, 49, 0))
 }
 
 fn ai_system_delivery(profile: &crate::chat_core::CapabilityProfile) -> SystemDelivery {
@@ -12692,11 +12958,43 @@ fn turn_status_for_failure(kind: AiFailureKind) -> TurnStatus {
     }
 }
 
-fn should_replay_failed_native_session(runtime: &AiChatRuntime, resume_rejected: bool) -> bool {
+fn should_replay_failed_native_session(
+    runtime: &AiChatRuntime,
+    resume_rejected: bool,
+    preserve_resume: bool,
+) -> bool {
     let requires_typed_rejection = runtime.active_provider_id.as_deref() == Some("xai_api");
-    runtime.active_used_resume
+    !preserve_resume
+        && runtime.active_used_resume
         && !runtime.active_had_productive_activity
         && (!requires_typed_rejection || resume_rejected)
+}
+
+fn preserved_resume_record_for_exact_retry(
+    retry: Option<&PreservedResumeRetry>,
+    provider_id: &str,
+    conversation: &AiConversation,
+    user_text: &str,
+    attachments: &[AiAttachmentRef],
+    record: Option<&ResumeRecord>,
+) -> Option<ResumeRecord> {
+    let retry = retry?;
+    let record = record?;
+    let current_terminal_matches = conversation
+        .messages()
+        .last()
+        .is_some_and(|message| message.sequence == retry.terminal_message_sequence);
+    let exact_user_matches = conversation.messages().iter().any(|message| {
+        message.sequence == retry.user_message_sequence
+            && message.role == MessageRole::User
+            && message.text == user_text
+            && message.attachments == attachments
+    });
+    (retry.provider_id == provider_id
+        && retry.session_id == record.session_id
+        && current_terminal_matches
+        && exact_user_matches)
+        .then(|| record.clone())
 }
 
 fn should_forget_unavailable_kimi_resume(
@@ -14591,7 +14889,14 @@ fn render_ai_chat_page(
             ui.set_width((available - inset * 2.0).clamp(320.0, 880.0));
             render_ai_preflight_banner(ui, agents_view.preflight.as_ref(), action, colors);
             render_ai_chat_progress_pill(ui, runtime, colors);
-            render_ai_queue_bar(ui, conversation, runtime, action, colors);
+            render_ai_queue_bar(
+                ui,
+                conversation,
+                runtime,
+                agents_view.queued_preflight.as_ref(),
+                action,
+                colors,
+            );
             render_ai_composer(
                 ui,
                 conversation.id,
@@ -14694,6 +14999,7 @@ fn render_ai_queue_bar(
     ui: &mut Ui,
     conversation: &AiConversation,
     runtime: &AiChatRuntime,
+    head_preflight: Option<&PreflightNotice>,
     action: &mut AiWorkspaceUiAction,
     colors: Theme,
 ) {
@@ -14707,6 +15013,7 @@ fn render_ai_queue_bar(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let count = conversation.queued_turns().len();
+                let blocking_preflight = head_preflight.filter(|notice| notice.blocks_send);
                 ui.label(
                     RichText::new(if count == 1 {
                         format!(
@@ -14718,23 +15025,35 @@ fn render_ai_queue_bar(
                     })
                     .strong(),
                 );
+                let queue_status = if runtime.active_turn.is_some() {
+                    "· sends when the agent finishes".to_owned()
+                } else if let Some(notice) = blocking_preflight {
+                    format!("· {}", notice.headline)
+                } else if conversation.queue_paused {
+                    "· paused".to_owned()
+                } else {
+                    "· waiting for capacity".to_owned()
+                };
                 ui.label(
-                    RichText::new(if runtime.active_turn.is_some() {
-                        "· sends when the agent finishes"
-                    } else if conversation.queue_paused {
-                        "· paused"
-                    } else {
-                        "· waiting for capacity"
-                    })
-                    .size(10.5)
-                    .color(colors.secondary_text),
+                    RichText::new(queue_status)
+                        .size(10.5)
+                        .color(colors.secondary_text),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("Clear").clicked() {
                         action.clear_queue = true;
                     }
-                    if runtime.active_turn.is_none() && ui.small_button("Send next").clicked() {
-                        action.send_next_queued = true;
+                    if runtime.active_turn.is_none() {
+                        let send_next = ui.add_enabled(
+                            blocking_preflight.is_none(),
+                            Button::new("Send next").small(),
+                        );
+                        let send_next = if let Some(notice) = blocking_preflight {
+                            send_next.on_disabled_hover_text(&notice.detail)
+                        } else {
+                            send_next
+                        };
+                        action.send_next_queued |= send_next.clicked();
                     }
                 });
             });
@@ -15485,6 +15804,11 @@ fn render_ai_composer(
                     .desired_rows(3)
                     .desired_width(f32::INFINITY),
             );
+            let send_enabled = ai_send_enabled(
+                &runtime.draft,
+                running,
+                action.preflight_blocks_send,
+            );
             ui.horizontal(|ui| {
                 action.add_attachments |= ui
                     .add(Button::new("+").frame(false))
@@ -15535,7 +15859,7 @@ fn render_ai_composer(
                     }
                     action.send |= ui
                         .add_enabled(
-                            !runtime.draft.trim().is_empty(),
+                            send_enabled,
                             Button::new(if running { "Queue  ↵" } else { "Send  ↵" }),
                         )
                         .clicked();
@@ -15603,7 +15927,7 @@ fn render_ai_composer(
                 );
             }
             let send_with_return = response.has_focus()
-                && !runtime.draft.trim().is_empty()
+                && send_enabled
                 && ui.input_mut(|input| {
                     input.consume_key(egui::Modifiers::NONE, Key::Enter)
                         || input.consume_key(egui::Modifiers::COMMAND, Key::Enter)
@@ -15616,6 +15940,52 @@ fn render_ai_composer(
     if provider_profile != original_profile {
         settings.set_profile_for(&provider_id, provider_profile);
     }
+}
+
+fn ai_send_enabled(draft: &str, running: bool, preflight_blocks_send: bool) -> bool {
+    !draft.trim().is_empty() && (running || !preflight_blocks_send)
+}
+
+fn queued_turn_provider_id<'a>(
+    queued: &'a AiQueuedTurn,
+    settings: &'a AiConversationSettings,
+) -> &'a str {
+    queued
+        .provider_id
+        .as_deref()
+        .filter(|provider_id| !provider_id.trim().is_empty())
+        .unwrap_or(&settings.provider_id)
+}
+
+fn resume_pinned_provider_id<'a>(
+    requested_provider_id: &'a str,
+    recorded_provider_id: Option<&'a str>,
+) -> &'a str {
+    if requested_provider_id == "auto" {
+        recorded_provider_id
+            .filter(|provider_id| !provider_id.trim().is_empty())
+            .unwrap_or(requested_provider_id)
+    } else {
+        requested_provider_id
+    }
+}
+
+fn queued_turn_preflight_notice(
+    queued: &AiQueuedTurn,
+    settings: &AiConversationSettings,
+    recorded_provider_id: Option<&str>,
+    snapshot: Option<&agents_panel::AgentsScanSnapshot>,
+    scanning: bool,
+) -> Option<PreflightNotice> {
+    preflight_notice(
+        resume_pinned_provider_id(
+            queued_turn_provider_id(queued, settings),
+            recorded_provider_id,
+        ),
+        !settings.api_endpoint.trim().is_empty(),
+        snapshot,
+        scanning,
+    )
 }
 
 fn select_ai_provider(settings: &mut AiConversationSettings, provider_id: &str) {
@@ -15767,6 +16137,15 @@ fn render_ai_reasoning_selector(
     tuning: &RuntimeTuningProfile,
 ) {
     if tuning.reasoning_efforts.is_empty() {
+        if !tuning.verified_runtime
+            && matches!(
+                provider_id,
+                "claude_cli" | "codex_cli" | "grok_cli" | "kimi_cli" | "lm_studio" | "ollama"
+            )
+        {
+            ui.add_enabled(false, Button::new("Reasoning · refresh CLI in Agents"));
+            return;
+        }
         profile.reasoning_effort.clear();
         return;
     }
@@ -15890,7 +16269,18 @@ fn render_ai_provider_abilities(
         "grok_cli" => {
             render_ai_feature_choice(ui, profile, AI_FEATURE_WEB_SEARCH, "Web search", true, true);
             render_ai_feature_choice(ui, profile, AI_FEATURE_PLANNING, "Planning", false, true);
-            if tuning.supports_scoped_child_text() {
+            if !tuning.verified_runtime {
+                ui.label(
+                    RichText::new("Subagents · CLI version not verified")
+                        .size(10.5)
+                        .color(colors.secondary_text),
+                );
+                ui.label(
+                    RichText::new("Saved settings are unchanged. Refresh detection in Agents.")
+                        .size(9.0)
+                        .color(colors.tertiary_text),
+                );
+            } else if tuning.supports_scoped_child_text() {
                 render_ai_feature_choice(
                     ui,
                     profile,
@@ -17207,6 +17597,141 @@ mod tests {
     }
 
     #[test]
+    fn composer_blocks_a_cold_exact_provider_without_blocking_active_turn_queueing() {
+        assert!(!ai_send_enabled("", false, false));
+        assert!(!ai_send_enabled("research this", false, true));
+        assert!(ai_send_enabled("research this", false, false));
+        assert!(
+            ai_send_enabled("follow up", true, true),
+            "an already-running turn may still accept a queued follow-up"
+        );
+    }
+
+    #[test]
+    fn queued_turn_preflight_uses_its_captured_provider_until_verified() {
+        let settings = AiConversationSettings {
+            provider_id: "claude_cli".into(),
+            api_endpoint: String::new(),
+            ..AiConversationSettings::default()
+        };
+        let queued = AiQueuedTurn {
+            text: "research this".into(),
+            provider_id: Some("grok_cli".into()),
+            ..AiQueuedTurn::default()
+        };
+        assert_eq!(queued_turn_provider_id(&queued, &settings), "grok_cli");
+        assert!(
+            queued_turn_preflight_notice(&queued, &settings, None, None, false)
+                .is_some_and(|notice| notice.blocks_send)
+        );
+        assert!(
+            queued_turn_preflight_notice(&queued, &settings, None, None, true)
+                .is_some_and(|notice| notice.blocks_send)
+        );
+
+        let snapshot = |version: &str| agents_panel::AgentsScanSnapshot {
+            probes: vec![
+                (
+                    "claude_cli",
+                    crate::ai::ProviderProbe {
+                        executable: Some("claude"),
+                        program: Some(PathBuf::from("/bin/claude")),
+                        version: crate::chat_core::CliVersion::parse("2.1.128"),
+                        observation: crate::ai::ProviderProbeObservation::Observed,
+                    },
+                    agents_panel::AgentAuth::Unknown,
+                ),
+                (
+                    "grok_cli",
+                    crate::ai::ProviderProbe {
+                        executable: Some("grok"),
+                        program: Some(PathBuf::from("/bin/grok")),
+                        version: crate::chat_core::CliVersion::parse(version),
+                        observation: crate::ai::ProviderProbeObservation::Observed,
+                    },
+                    agents_panel::AgentAuth::Unknown,
+                ),
+            ],
+        };
+        let unsupported = snapshot("grok 0.2.118");
+        assert!(
+            queued_turn_preflight_notice(&queued, &settings, None, Some(&unsupported), false)
+                .is_some_and(|notice| notice.blocks_send)
+        );
+        let verified = snapshot("grok 0.2.117");
+        assert!(
+            queued_turn_preflight_notice(&queued, &settings, None, Some(&verified), false)
+                .is_none()
+        );
+        assert_eq!(queued.provider_id.as_deref(), Some("grok_cli"));
+
+        let legacy = AiQueuedTurn::default();
+        assert_eq!(queued_turn_provider_id(&legacy, &settings), "claude_cli");
+
+        assert_eq!(resume_pinned_provider_id("auto", None), "auto");
+        assert_eq!(
+            resume_pinned_provider_id("auto", Some("kimi_cli")),
+            "kimi_cli"
+        );
+        assert_eq!(
+            resume_pinned_provider_id("claude_cli", Some("grok_cli")),
+            "claude_cli",
+            "an explicitly captured provider must win over the resume record"
+        );
+
+        let auto_settings = AiConversationSettings {
+            provider_id: "auto".into(),
+            api_endpoint: String::new(),
+            ..AiConversationSettings::default()
+        };
+        let auto_queued = AiQueuedTurn {
+            text: "continue research".into(),
+            ..AiQueuedTurn::default()
+        };
+        assert_eq!(
+            queued_turn_provider_id(&auto_queued, &auto_settings),
+            "auto"
+        );
+        assert!(
+            preflight_notice("auto", false, Some(&unsupported), false).is_none(),
+            "raw Auto could safely fall back to the installed Claude CLI"
+        );
+        assert!(
+            queued_turn_preflight_notice(
+                &auto_queued,
+                &auto_settings,
+                Some("grok_cli"),
+                Some(&unsupported),
+                false,
+            )
+            .is_some_and(|notice| notice.blocks_send),
+            "an Auto resume pinned to unsupported Grok must not fall back to Claude"
+        );
+        assert!(
+            queued_turn_preflight_notice(
+                &auto_queued,
+                &auto_settings,
+                Some("grok_cli"),
+                Some(&unsupported),
+                true,
+            )
+            .is_some_and(|notice| notice.blocks_send),
+            "the pinned provider remains blocked while its refresh is running"
+        );
+        assert!(
+            queued_turn_preflight_notice(
+                &auto_queued,
+                &auto_settings,
+                Some("grok_cli"),
+                Some(&verified),
+                false,
+            )
+            .is_none(),
+            "a verified pinned provider may launch"
+        );
+    }
+
+    #[test]
     fn sticky_gesture_preserves_drawn_shape_and_pressed_corner() {
         assert_eq!(
             note_draft_rect([100.0, 100.0], [300.0, 180.0], true),
@@ -17934,13 +18459,13 @@ mod tests {
             ..AiChatRuntime::default()
         };
         assert!(
-            !should_replay_failed_native_session(&runtime, false),
+            !should_replay_failed_native_session(&runtime, false, false),
             "a generic provider or transport failure must not issue a second request"
         );
-        assert!(should_replay_failed_native_session(&runtime, true));
+        assert!(should_replay_failed_native_session(&runtime, true, false));
         runtime.active_provider_id = Some("codex_cli".into());
         assert!(
-            should_replay_failed_native_session(&runtime, false),
+            should_replay_failed_native_session(&runtime, false, false),
             "existing CLI adapters retain their bounded unproductive-resume fallback"
         );
         runtime.active_provider_id = Some("xai_api".into());
@@ -17979,7 +18504,177 @@ mod tests {
             HarnessActivityEvent::assistant_text(Uuid::new_v4(), UnixMillis(2), "provider output");
         assert!(ai_trace_has_productive_activity(&[text]));
         runtime.active_had_productive_activity = true;
-        assert!(!should_replay_failed_native_session(&runtime, true));
+        assert!(!should_replay_failed_native_session(&runtime, true, false));
+        runtime.active_had_productive_activity = false;
+        assert!(
+            !should_replay_failed_native_session(&runtime, false, true),
+            "a transient runtime probe failure must preserve the native session"
+        );
+    }
+
+    #[test]
+    fn preserved_resume_is_eligible_only_for_the_exact_locally_unsent_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let conversation_id = Uuid::new_v4();
+        let mut conversation = AiConversation::new(
+            conversation_id,
+            "Resume retry",
+            PermissionMode::Ask,
+            UnixMillis(1),
+        );
+        let base_sequence = conversation
+            .append_message(
+                Uuid::new_v4(),
+                MessageRole::Assistant,
+                "Earlier provider reply",
+                UnixMillis(1),
+                Vec::new(),
+            )
+            .unwrap();
+        let gate = ResumeGate::capture(
+            conversation_id,
+            true,
+            "claude_cli",
+            Path::new("claude"),
+            temporary.path(),
+            "claude-stream-json:v1",
+            Some("ask".into()),
+            Some(base_sequence),
+        )
+        .unwrap();
+        let record = ResumeRecord::from_gate("native-session", &gate, 1).unwrap();
+        let mut store = ResumeStore::new();
+        store
+            .record_or_forget(conversation_id, record.clone())
+            .unwrap();
+
+        let user_sequence = conversation
+            .append_message(
+                Uuid::new_v4(),
+                MessageRole::User,
+                "retry this exact request",
+                UnixMillis(2),
+                Vec::new(),
+            )
+            .unwrap();
+        let terminal_sequence = conversation
+            .append_message(
+                Uuid::new_v4(),
+                MessageRole::Assistant,
+                "Version verification failed locally",
+                UnixMillis(3),
+                Vec::new(),
+            )
+            .unwrap();
+        let retry = PreservedResumeRetry {
+            provider_id: "claude_cli".into(),
+            session_id: "native-session".into(),
+            user_message_sequence: user_sequence,
+            terminal_message_sequence: terminal_sequence,
+        };
+
+        let mut current_gate = gate.clone();
+        current_gate.last_committed_message_sequence = Some(terminal_sequence);
+        assert!(matches!(
+            store.eligible_record(conversation_id, &current_gate),
+            Err(crate::ai_state::ResumeIneligibility::CommittedMessageSequenceMismatch)
+        ));
+
+        let preserved = preserved_resume_record_for_exact_retry(
+            Some(&retry),
+            "claude_cli",
+            &conversation,
+            "retry this exact request",
+            &[],
+            store.record(conversation_id),
+        )
+        .expect("the exact Retry action keeps the pre-turn provider session");
+        current_gate.last_committed_message_sequence = preserved.last_committed_message_sequence;
+        assert_eq!(
+            store
+                .eligible_record(conversation_id, &current_gate)
+                .unwrap()
+                .map(|record| record.session_id.as_str()),
+            Some("native-session")
+        );
+
+        assert!(
+            preserved_resume_record_for_exact_retry(
+                Some(&retry),
+                "claude_cli",
+                &conversation,
+                "a different prompt",
+                &[],
+                store.record(conversation_id),
+            )
+            .is_none(),
+            "an arbitrary next prompt must not inherit the unsent turn's session bridge"
+        );
+        assert!(
+            preserved_resume_record_for_exact_retry(
+                Some(&retry),
+                "codex_cli",
+                &conversation,
+                "retry this exact request",
+                &[],
+                store.record(conversation_id),
+            )
+            .is_none(),
+            "a provider switch must expire the bridge"
+        );
+        let mut wrong_session = retry.clone();
+        wrong_session.session_id = "different-session".into();
+        assert!(
+            preserved_resume_record_for_exact_retry(
+                Some(&wrong_session),
+                "claude_cli",
+                &conversation,
+                "retry this exact request",
+                &[],
+                store.record(conversation_id),
+            )
+            .is_none(),
+            "a replaced resume record must expire the bridge"
+        );
+        let changed_attachment = AiAttachmentRef {
+            id: Uuid::new_v4(),
+            name: "different.txt".into(),
+            path: "/tmp/different.txt".into(),
+            size_bytes: Some(1),
+        };
+        assert!(
+            preserved_resume_record_for_exact_retry(
+                Some(&retry),
+                "claude_cli",
+                &conversation,
+                "retry this exact request",
+                &[changed_attachment],
+                store.record(conversation_id),
+            )
+            .is_none(),
+            "changed attachments must expire the bridge"
+        );
+        conversation
+            .append_message(
+                Uuid::new_v4(),
+                MessageRole::User,
+                "new conversation turn",
+                UnixMillis(4),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(
+            preserved_resume_record_for_exact_retry(
+                Some(&retry),
+                "claude_cli",
+                &conversation,
+                "retry this exact request",
+                &[],
+                store.record(conversation_id),
+            )
+            .is_none(),
+            "the bridge expires as soon as conversation history advances"
+        );
     }
 
     #[test]
@@ -18539,6 +19234,7 @@ mod tests {
         let acp_version = crate::chat_core::CliVersion::parse("0.31.0").unwrap();
         let unsupported_version = crate::chat_core::CliVersion::parse("0.31.1").unwrap();
         let legacy_version = crate::chat_core::CliVersion::parse("1.49.0").unwrap();
+        let unverified_legacy_version = crate::chat_core::CliVersion::parse("1.50.0").unwrap();
         let acp = crate::chat_core::runtime_tuning_profile(
             crate::chat_core::ProviderKind::Kimi,
             Some(&acp_version),
@@ -18554,6 +19250,11 @@ mod tests {
             Some(&unsupported_version),
             "",
         );
+        let unverified_legacy = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            Some(&unverified_legacy_version),
+            "",
+        );
         let unknown = crate::chat_core::runtime_tuning_profile(
             crate::chat_core::ProviderKind::Kimi,
             None,
@@ -18562,9 +19263,89 @@ mod tests {
 
         assert!(!kimi_uses_legacy_print_transport("kimi_cli", &acp));
         assert!(!kimi_uses_legacy_print_transport("kimi_cli", &unsupported));
+        assert!(!kimi_uses_legacy_print_transport(
+            "kimi_cli",
+            &unverified_legacy
+        ));
         assert!(!kimi_uses_legacy_print_transport("kimi_cli", &unknown));
         assert!(kimi_uses_legacy_print_transport("kimi_cli", &legacy));
         assert!(!kimi_uses_legacy_print_transport("codex_cli", &legacy));
+    }
+
+    #[test]
+    fn unverified_parseable_cli_renderers_preserve_saved_controls() {
+        let grok_version = crate::chat_core::CliVersion::parse("grok 0.2.118").unwrap();
+        let grok_tuning = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Grok,
+            Some(&grok_version),
+            "grok-4.5",
+        );
+        assert!(!grok_tuning.verified_runtime);
+        assert!(grok_tuning.version.is_some());
+        let mut grok_profile = AiProviderPreferences {
+            reasoning_effort: "high".into(),
+            ..AiProviderPreferences::default()
+        };
+        grok_profile.set_feature(AI_FEATURE_SUBAGENTS, Some(true));
+
+        let kimi_version = crate::chat_core::CliVersion::parse("kimi 0.31.1").unwrap();
+        let kimi_tuning = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            Some(&kimi_version),
+            "",
+        );
+        assert!(!kimi_tuning.verified_runtime);
+        assert!(kimi_tuning.version.is_some());
+        let mut kimi_profile = AiProviderPreferences {
+            reasoning_effort: "high".into(),
+            ..AiProviderPreferences::default()
+        };
+        kimi_profile.set_feature(AI_FEATURE_SWARM, Some(true));
+
+        let context = Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            render_ai_reasoning_selector(
+                ui,
+                Uuid::new_v4(),
+                "grok_cli",
+                &mut grok_profile,
+                &grok_tuning,
+            );
+            render_ai_provider_abilities(
+                ui,
+                "grok_cli",
+                &mut grok_profile,
+                &grok_tuning,
+                Theme::new(true),
+            );
+            render_ai_reasoning_selector(
+                ui,
+                Uuid::new_v4(),
+                "kimi_cli",
+                &mut kimi_profile,
+                &kimi_tuning,
+            );
+            render_ai_provider_abilities(
+                ui,
+                "kimi_cli",
+                &mut kimi_profile,
+                &kimi_tuning,
+                Theme::new(true),
+            );
+        });
+
+        assert_eq!(grok_profile.reasoning_effort, "high");
+        assert_eq!(
+            grok_profile.feature(AI_FEATURE_SUBAGENTS),
+            Some(true),
+            "an unverified Grok version must not disable the saved subagent preference"
+        );
+        assert_eq!(kimi_profile.reasoning_effort, "high");
+        assert_eq!(
+            kimi_profile.feature(AI_FEATURE_SWARM),
+            Some(true),
+            "an unverified Kimi version must not disable the saved swarm preference"
+        );
     }
 
     #[test]

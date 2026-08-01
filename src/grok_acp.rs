@@ -133,6 +133,13 @@ pub struct GrokAcpRequest {
     pub executable: PathBuf,
     pub cwd: PathBuf,
     pub prompt: String,
+    /// Exact runtime version established by Adam's executable probe.
+    ///
+    /// Grok repeats this value in `initialize._meta.agentVersion` on the
+    /// captured ACP contracts. When present, the adapter compares the two so
+    /// an executable replacement between probing and ACP initialization
+    /// cannot silently select a different protocol contract.
+    pub verified_runtime_version: String,
     pub rules: String,
     pub sandbox: String,
     pub permission_mode: String,
@@ -156,6 +163,7 @@ impl fmt::Debug for GrokAcpRequest {
             .field("executable", &self.executable)
             .field("cwd", &self.cwd)
             .field("prompt", &format_args!("<{} bytes>", self.prompt.len()))
+            .field("verified_runtime_version", &self.verified_runtime_version)
             .field("rules", &format_args!("<{} bytes>", self.rules.len()))
             .field("sandbox", &self.sandbox)
             .field("permission_mode", &self.permission_mode)
@@ -468,6 +476,13 @@ pub enum GrokAcpEvent {
 pub enum GrokAcpError {
     #[error("invalid Grok ACP configuration: {0}")]
     InvalidConfiguration(&'static str),
+    #[error("Grok ACP launch was cancelled before the provider process started")]
+    CancelledBeforeLaunch,
+    #[error("Grok ACP advertised runtime {advertised} after Adam verified runtime {verified}")]
+    RuntimeVersionMismatch {
+        verified: String,
+        advertised: String,
+    },
     #[error("could not start the Grok ACP process")]
     Spawn(#[source] io::Error),
     #[error("the Grok ACP process did not expose its {0} pipe")]
@@ -540,6 +555,9 @@ where
         command.process_group(0);
     }
 
+    if cancelled.load(Ordering::Acquire) {
+        return Err(GrokAcpError::CancelledBeforeLaunch);
+    }
     let mut child = ManagedChild::new(command.spawn().map_err(GrokAcpError::Spawn)?);
     let stdin = child
         .child
@@ -640,6 +658,13 @@ fn validate_request(request: &GrokAcpRequest) -> Result<(), GrokAcpError> {
     if !request.cwd.is_dir() {
         return Err(GrokAcpError::InvalidConfiguration(
             "cwd must identify an existing directory",
+        ));
+    }
+    if request.verified_runtime_version.trim().is_empty()
+        || request.verified_runtime_version.trim() != request.verified_runtime_version
+    {
+        return Err(GrokAcpError::InvalidConfiguration(
+            "the verified runtime version must be a non-empty normalized value",
         ));
     }
     match (request.progress_route, request.http_mcp_server.is_some()) {
@@ -1204,7 +1229,11 @@ where
         AwaitedResponse::Result(result) => result,
         AwaitedResponse::Cancelled => return state.cancelled_outcome(emit),
     };
-    validate_initialize_response(&initialize, request.resume_session_id.is_some())?;
+    validate_initialize_response(
+        &initialize,
+        request.resume_session_id.is_some(),
+        &request.verified_runtime_version,
+    )?;
 
     if stdin.write_json_line(&session_request(request))? == StdinWriteDisposition::Cancelled {
         return state.cancelled_outcome(emit);
@@ -3371,7 +3400,11 @@ fn prompt_request(session_id: &str, prompt: &str) -> Value {
     })
 }
 
-fn validate_initialize_response(result: &Value, loading_session: bool) -> Result<(), GrokAcpError> {
+fn validate_initialize_response(
+    result: &Value,
+    loading_session: bool,
+    verified_runtime_version: &str,
+) -> Result<(), GrokAcpError> {
     if result.get("protocolVersion").and_then(Value::as_u64) != Some(GROK_ACP_PROTOCOL_VERSION) {
         return Err(GrokAcpError::Protocol(
             "Grok did not negotiate ACP protocol version 1".into(),
@@ -3395,6 +3428,19 @@ fn validate_initialize_response(result: &Value, loading_session: bool) -> Result
         return Err(GrokAcpError::Protocol(
             "Grok does not advertise session/load support".into(),
         ));
+    }
+    if let Some(advertised) = result.pointer("/_meta/agentVersion") {
+        let Some(advertised) = advertised.as_str() else {
+            return Err(GrokAcpError::Protocol(
+                "Grok advertised a non-string runtime version".into(),
+            ));
+        };
+        if advertised != verified_runtime_version {
+            return Err(GrokAcpError::RuntimeVersionMismatch {
+                verified: verified_runtime_version.to_owned(),
+                advertised: advertised.to_owned(),
+            });
+        }
     }
     Ok(())
 }
@@ -4298,6 +4344,7 @@ mod tests {
             executable: PathBuf::from("grok"),
             cwd: std::env::current_dir().unwrap(),
             prompt: "Build the feature".into(),
+            verified_runtime_version: "0.2.114".into(),
             rules: "Use the task tools for multi-step work.".into(),
             sandbox: "read-only".into(),
             permission_mode: "default".into(),
@@ -6647,7 +6694,7 @@ mod tests {
         let fixture = include_str!("../tests/fixtures/ai/grok/0.2.114/acp-initialize.jsonl");
         let mut lines = fixture.lines();
         let response: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
-        validate_initialize_response(&response["result"], true).unwrap();
+        validate_initialize_response(&response["result"], true, "0.2.114").unwrap();
         assert_eq!(response["result"]["_meta"]["agentVersion"], "0.2.114");
         let efforts = response["result"]["_meta"]["modelState"]["availableModels"][0]["_meta"]
             ["reasoningEfforts"]
@@ -6661,6 +6708,47 @@ mod tests {
         let notification: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
         assert_eq!(notification["method"], "_x.ai/mcp/servers_updated");
         assert!(lines.next().is_none());
+    }
+
+    #[test]
+    fn initialize_rejects_a_runtime_changed_after_the_executable_probe() {
+        let response = json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "loadSession": true,
+                "mcpCapabilities": {"http": true}
+            },
+            "_meta": {"agentVersion": "0.2.117"}
+        });
+        assert!(matches!(
+            validate_initialize_response(&response, true, "0.2.114"),
+            Err(GrokAcpError::RuntimeVersionMismatch { verified, advertised })
+                if verified == "0.2.114" && advertised == "0.2.117"
+        ));
+
+        let mut without_version = response;
+        without_version["_meta"] = json!({});
+        validate_initialize_response(&without_version, true, "0.2.114")
+            .expect("older captured initialize responses may omit agentVersion");
+    }
+
+    #[test]
+    fn prelaunch_cancellation_never_spawns_grok() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut request = request();
+        request.executable = temporary.path().join("provider-must-not-start");
+        request.cwd = temporary.path().to_path_buf();
+        let cancelled = AtomicBool::new(true);
+
+        assert!(matches!(
+            run_grok_acp(
+                &request,
+                &cancelled,
+                |_| GrokAcpPermissionDecision::Cancel,
+                |_| {}
+            ),
+            Err(GrokAcpError::CancelledBeforeLaunch)
+        ));
     }
 
     #[test]

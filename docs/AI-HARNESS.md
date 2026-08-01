@@ -27,10 +27,33 @@ Provider support is derived from a capability profile rather than a single
 pile of provider conditionals. Optional runtime controls are a second,
 version-pinned profile shared by launch shaping and the composer. Adam probes
 the exact installed built-in CLI version and exposes or emits a control only
-when that version has a captured, tested contract. An unknown, unparseable, or
-unlisted version falls back conservatively to provider defaults: no guessed
-reasoning flag is sent, and child-agent execution stays off when the stream
-cannot safely identify child text. Custom CLI executables are not probed.
+when that version has a captured, tested contract. A successfully observed but
+unlisted Claude, Codex, LM Studio, or Ollama version falls back conservatively
+to provider defaults: no guessed reasoning flag is sent, and child-agent
+execution stays off when the stream cannot safely identify child text. Grok
+and Kimi are stricter because version selects both transport and permission
+semantics: only fixture-verified versions launch. A built-in CLI version probe
+has a five-second process-execution deadline plus at most two seconds of
+bounded output-pipe cleanup. Detection runs off the UI
+thread, caches only successful observations, and shares one result among
+overlapping callers. A cold or failed probe preserves saved controls. After a
+successful but unlisted generic-provider observation, Adam clears only the
+unsupported version-sensitive controls and uses provider defaults; Grok and
+Kimi preserve their exact-contract settings and remain fail-closed. Refresh
+also preserves an identity-matched last-good observation when a transient
+probe fails. A resumed turn that fails before provider launch retains its
+native session only for an exact same-process Retry of that locally unsent
+message; an app restart, changed history, or different prompt falls back to
+bounded replay. Custom CLI executables are not probed.
+
+Claude, Codex, LM Studio, and Ollama also re-probe on the run worker whenever
+the user has saved a version-sensitive reasoning control; Ollama's explicit
+Thinking toggle uses the same gate. The worker rebuilds launch arguments from
+the fresh observation. A listed version applies its verified controls, while
+a successfully observed unlisted version launches with provider defaults. If
+detection fails or the observation cannot be attributed to that provider, the
+turn fails visibly before launch. Runs that request only provider defaults do
+not pay this extra probe cost.
 
 Together, the profiles identify:
 
@@ -63,10 +86,10 @@ provider profile at enqueue time—model, reasoning effort, fallback, turn
 limit, and explicit ability choices—so later settings changes cannot silently
 switch its provider or retune already submitted work.
 Desktop-launch discovery checks Adam’s process `PATH`, `~/.local/bin`,
-`~/.codex/bin`, `~/.grok/bin`, `~/.lmstudio/bin`, `/opt/homebrew/bin`, and
-`/usr/local/bin`. A CLI installed only through shell startup tooling can be
-entered by absolute path as a Custom CLI; Adam deliberately does not execute a
-login shell just to discover commands.
+`~/.codex/bin`, `~/.grok/bin`, `~/.kimi-code/bin`, `~/.lmstudio/bin`,
+`/opt/homebrew/bin`, and `/usr/local/bin`. A CLI installed only through shell
+startup tooling can be entered by absolute path as a Custom CLI; Adam
+deliberately does not execute a login shell just to discover commands.
 
 ## Detection preflight (Agents panel)
 
@@ -76,22 +99,26 @@ so a missing CLI is visible before Send instead of after it fails. Statuses:
 
 - **Not detected** — the binary was not found on the discovery paths above.
 - **Detected vX.Y.Z** — found, but no captured runtime contract covers this
-  version; provider defaults apply and no tuning controls are exposed. When
-  a contract exists for a different version, the hover names it so drift is
-  visible instead of silent.
-- **Detected vX.Y.Z · tested series (vA.B.C)** — found in the same
+  version. Claude, Codex, LM Studio, and Ollama use provider defaults and
+  expose no unverified tuning controls. Grok and Kimi instead pause Send
+  because their exact version selects transport and permission behavior.
+  When a contract exists for a different version, the hover names it so
+  drift is visible instead of silent.
+- **Detected vX.Y.Z · tested series (vA.B.C)** — for providers whose transport
+  does not change by patch version, found in the same
   major.minor series as a tested contract version with only a newer patch
   (the usual self-update drift). Safe defaults still apply; full "verified"
   returns with the next contract capture. Never granted on downgrades or a
-  different series.
+  different series. Grok and Kimi never receive this badge: their exact
+  version selects transport and permission behavior.
 - **Detected vX.Y.Z · verified** — found and the version matches a captured
   contract row in `runtime_tuning_profile`.
 
 Drift captures under `tests/fixtures/ai/<provider>/<version>/` back the
-series policy: a grammar canary test asserts a drifted capture introduces
-no envelope types beyond the tested contract and keeps the shapes resume
-depends on (see grok 0.2.114 vs 0.2.111 — identical grammar, additive
-cost keys only). Grok 0.2.117 has a separate redacted parent-child ACP
+generic-provider series policy and the exact Grok/Kimi rows. Grok 0.2.111,
+0.2.114, and 0.2.117 remain separate fixture-verified contracts even where
+their captured grammar overlaps, because the selected transport and
+permission semantics differ. Grok 0.2.117 has a separate redacted parent-child ACP
 capture: the parent lifecycle notification names the child session before
 that session emits its own prose. Lifecycle and prose carry independent
 event IDs; the capture also retains Grok's idless, status-only
@@ -117,10 +144,19 @@ additive accessor `ai::probe_installed_provider` — what the panel shows and
 what a turn runs cannot drift. Scans run on a background worker
 (`adam-agents-scan`); the panel's Refresh bypasses the version cache so an
 upgraded binary re-probes. The chat composer surfaces a pre-Send banner from
-the same cached snapshot (LM Studio is exempt while an endpoint is
-configured, and Automatic only warns when all four CLI candidates are
-missing). When every probed CLI is missing, the chat's empty state becomes
-a setup screen with the same rows.
+the same cached snapshot. For exact-contract Grok and Kimi it distinguishes
+Checking, unsupported version, failed check, and an identity-matched last
+verified observation; Send stays paused until a runnable observation exists,
+while a transient refresh failure may keep the matching last-verified
+contract usable with a warning. Selected Grok and Kimi are checked first and
+published before unrelated auth probes finish. LM Studio is exempt while an
+endpoint is configured, and Automatic only warns when a complete inventory
+proves that no supported CLI candidate is runnable. Automatic skips an
+installed Grok or Kimi whose exact transport contract is not verified and
+continues to the next supported CLI or configured endpoint. While an
+inventory is incomplete, affected Send and queued-turn actions remain paused.
+When every probed CLI is missing, the chat's empty state becomes a setup
+screen with the same rows.
 
 Install buttons execute **only** commands compiled into `AGENT_PROVIDERS`
 — vendor-official installers verified against vendor domains, never
@@ -202,10 +238,11 @@ The visible choices map to real provider controls:
   session's native plan as Main Progress; child plans remain child-scoped.
   Their active-run registry is also marked NativeStream, so retained or stale
   task-server credentials list no tools and reject calls.
-  Adam freshly probes the executable while shaping the turn, preparing it, and
-  immediately before process launch. If the binary changes in place after
-  preparation, the queued run fails closed and asks for a retry instead of
-  reusing the older version's subagent or task-server contract.
+  Prompt shaping and preparation read the latest successful background
+  observation, so a slow `--version` process never blocks the UI thread. The
+  worker freshly re-probes at the process boundary. If the binary changes in
+  place after preparation, the queued run fails closed and asks for a retry
+  instead of reusing the older version's subagent or task-server contract.
 
   The 0.2.117 fixture proves the parent lifecycle registration and
   independently identified parent/child prose with event IDs. The normalizer
@@ -258,12 +295,14 @@ The visible choices map to real provider controls:
   blocked solely for dismissing the unsupported question. Background `Agent`
   jobs are refused: Adam’s
   per-turn ACP host cannot truthfully keep such a job alive or receive its
-  later notification after the root turn exits. Adam freshly re-probes Kimi
-  both at the resume gate and again at process preparation. If the executable
-  changes between those checks, preparation rejects the saved ACP session,
-  deletes its sidecar, and makes one explicitly session-free replay with the
-  full conversation context. The ACP ID is never passed into legacy print
-  mode. Only a detected legacy 1.x runtime receives the visible Cowork/Code
+  later notification after the root turn exits. Kimi resume gating and
+  preparation use the latest successful background observation; the worker
+  freshly re-probes at the process boundary. A transient boundary failure is
+  surfaced without selecting legacy mode, and an exact same-process Retry may
+  reuse the untouched ACP session. Verified incompatibility uses one bounded,
+  explicitly session-free replay with full conversation context. The ACP ID is
+  never passed into legacy print mode. Only the exact detected legacy 1.49.0
+  runtime receives the visible Cowork/Code
   plus Automatic-access warning; unknown and unverified 0.x builds do not.
 - xAI Grok Heavy is a dedicated Responses API adapter, not the generic
   OpenAI-compatible path and not a Grok Build mode. It fixes the model to
@@ -628,9 +667,14 @@ The gates are:
 
 The provider session ID is machine-local state, not portable workspace data.
 It is saved atomically with a validated previous generation. A failed,
-cancelled, or ID-less turn forgets the record, and a settings or permission
-change invalidates it. Adam never falls back to a provider’s vague “continue
-most recent” behavior.
+cancelled, or ID-less turn normally forgets the record, and a settings or
+permission change invalidates it. The narrow exception is a version-check
+failure or Stop before provider launch: Adam can bridge the untouched record
+only to the exact same-process Retry action for that locally unsent user
+message. The bridge binds provider, session ID, user text and attachments, and
+the local terminal sequence; it expires after restart, history changes, a
+different prompt, or a successful launch. Adam never falls back to a
+provider’s vague “continue most recent” behavior.
 
 The existing CLI-native adapters can make one bounded fresh replay when a
 resumed process fails before any text, thinking, tool, command, file, plan, or
