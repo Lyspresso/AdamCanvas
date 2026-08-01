@@ -555,6 +555,7 @@ struct AiWorkspaceUiAction {
 /// path never borrows `AgentsPanelState` directly.
 struct AgentsChatView {
     preflight: Option<PreflightNotice>,
+    queued_preflight: Option<PreflightNotice>,
     /// Some ⇒ the empty state renders as the agents setup screen.
     setup_rows: Option<Vec<AgentRow>>,
     scanning: bool,
@@ -6172,18 +6173,49 @@ impl AdamApp {
             .filter(|request| request.conversation_id == conversation_id)
             .cloned();
         let mut action = AiWorkspaceUiAction::default();
-        self.agents.ensure_scanned_for(&settings.provider_id);
+        let resume_provider_id = self
+            .resume_store
+            .record(conversation_id)
+            .map(|record| record.provider_key.clone());
+        let selected_provider_id =
+            resume_pinned_provider_id(&settings.provider_id, resume_provider_id.as_deref())
+                .to_owned();
+        self.agents.ensure_scanned_for(&selected_provider_id);
         let agents_scanning = self.agents.scanning();
+        let provider_scanning = self.agents.scanning_for(&selected_provider_id);
         let provider_preflight = preflight_notice(
-            &settings.provider_id,
+            &selected_provider_id,
             !settings.api_endpoint.trim().is_empty(),
             self.agents.snapshot.as_ref(),
-            agents_scanning,
+            provider_scanning,
         );
         let preflight_blocks_send = provider_preflight
             .as_ref()
             .is_some_and(|notice| notice.blocks_send);
         action.preflight_blocks_send = preflight_blocks_send;
+        let queued_head = conversation.queued_turns().first();
+        let queued_provider_id = queued_head.map(|queued| {
+            resume_pinned_provider_id(
+                queued_turn_provider_id(queued, &conversation.settings),
+                resume_provider_id.as_deref(),
+            )
+            .to_owned()
+        });
+        if let Some(provider_id) = queued_provider_id.as_deref() {
+            self.agents.ensure_scanned_for(provider_id);
+        }
+        let queued_preflight = queued_head.and_then(|queued| {
+            let provider_id = queued_provider_id
+                .as_deref()
+                .expect("queued provider exists with queued head");
+            queued_turn_preflight_notice(
+                queued,
+                &conversation.settings,
+                resume_provider_id.as_deref(),
+                self.agents.snapshot.as_ref(),
+                self.agents.scanning_for(provider_id),
+            )
+        });
         let setup_active = conversation.messages().is_empty()
             && runtime.streamed_text.is_empty()
             && !self.agents.setup_dismissed
@@ -6201,6 +6233,7 @@ impl AdamApp {
             } else {
                 provider_preflight
             },
+            queued_preflight,
             setup_rows: setup_active.then(|| {
                 agent_rows(
                     self.agents
@@ -6970,15 +7003,17 @@ impl AdamApp {
             return false;
         }
 
-        let mut provider_id = launch
+        let requested_provider_id = launch
             .provider_override
             .filter(|provider| !provider.trim().is_empty())
             .unwrap_or_else(|| conversation.settings.provider_id.clone());
-        if provider_id == "auto"
-            && let Some(record) = self.resume_store.record(conversation_id)
-        {
-            provider_id = record.provider_key.clone();
-        }
+        let provider_id = resume_pinned_provider_id(
+            &requested_provider_id,
+            self.resume_store
+                .record(conversation_id)
+                .map(|record| record.provider_key.as_str()),
+        )
+        .to_owned();
         let mut provider_profile = launch
             .provider_profile_override
             .unwrap_or_else(|| conversation.settings.profile_for(&provider_id));
@@ -7029,9 +7064,7 @@ impl AdamApp {
             match self.ai_resume_gate(&conversation, &provider_id, verify_kimi_runtime) {
                 Ok(gate) => gate,
                 Err(error) => {
-                    if matches!(provider_id.as_str(), "grok_cli" | "kimi_cli")
-                        && !self.agents.scanning()
-                    {
+                    if matches!(provider_id.as_str(), "grok_cli" | "kimi_cli") {
                         self.agents.request_scan_for(true, &provider_id);
                     }
                     let runtime = self.chat_runtimes.entry(conversation_id).or_default();
@@ -7225,9 +7258,7 @@ impl AdamApp {
                 )
             }
             Err(error) => {
-                if matches!(provider_id.as_str(), "grok_cli" | "kimi_cli")
-                    && !self.agents.scanning()
-                {
+                if matches!(provider_id.as_str(), "grok_cli" | "kimi_cli") {
                     self.agents.request_scan_for(true, &provider_id);
                 }
                 let runtime = self.chat_runtimes.entry(conversation_id).or_default();
@@ -7239,19 +7270,46 @@ impl AdamApp {
         }
     }
 
+    fn provider_preflight_blocks_send(&self, provider_id: &str, endpoint_configured: bool) -> bool {
+        preflight_notice(
+            provider_id,
+            endpoint_configured,
+            self.agents.snapshot.as_ref(),
+            self.agents.scanning_for(provider_id),
+        )
+        .is_some_and(|notice| notice.blocks_send)
+    }
+
     fn drain_ai_queue(&mut self, conversation_id: Uuid, context: &Context) -> bool {
-        let queued = self
+        let conversation = self
             .workspace
             .domain
             .conversations
             .conversations
             .get(&conversation_id)
             .filter(|conversation| !conversation.queue_paused)
-            .and_then(|conversation| conversation.queued_turns().first())
             .cloned();
-        let Some(queued) = queued else {
+        let Some(conversation) = conversation else {
             return false;
         };
+        let Some(queued) = conversation.queued_turns().first().cloned() else {
+            return false;
+        };
+        let requested_provider_id = queued_turn_provider_id(&queued, &conversation.settings);
+        let provider_id = resume_pinned_provider_id(
+            requested_provider_id,
+            self.resume_store
+                .record(conversation_id)
+                .map(|record| record.provider_key.as_str()),
+        )
+        .to_owned();
+        self.agents.ensure_scanned_for(&provider_id);
+        if self.provider_preflight_blocks_send(
+            &provider_id,
+            !conversation.settings.api_endpoint.trim().is_empty(),
+        ) {
+            return false;
+        }
         if !self.launch_ai_turn(
             conversation_id,
             queued.text.clone(),
@@ -7759,6 +7817,11 @@ impl AdamApp {
                         retry_sequences = user_message_sequence.zip(terminal_message_sequence);
                         conversation.unread = self.open_chat != Some(conversation_id);
                         conversation_changed = true;
+                    }
+                    if kind == AiFailureKind::ProviderError
+                        && matches!(provider_id.as_str(), "grok_cli" | "kimi_cli")
+                    {
+                        self.agents.request_scan_for(true, &provider_id);
                     }
                     if preserve_resume {
                         self.arm_preserved_resume_retry(
@@ -10167,7 +10230,9 @@ impl eframe::App for AdamApp {
         self.poll_image_pastes(context);
         self.poll_asset_imports(context);
         self.poll_ai_events(context);
-        self.agents.poll();
+        if self.agents.poll() {
+            self.drain_eligible_ai_queues(context);
+        }
         if self.agents.take_install_notice().is_some() {
             self.toast("Agent installed and detected", context);
         }
@@ -14824,7 +14889,14 @@ fn render_ai_chat_page(
             ui.set_width((available - inset * 2.0).clamp(320.0, 880.0));
             render_ai_preflight_banner(ui, agents_view.preflight.as_ref(), action, colors);
             render_ai_chat_progress_pill(ui, runtime, colors);
-            render_ai_queue_bar(ui, conversation, runtime, action, colors);
+            render_ai_queue_bar(
+                ui,
+                conversation,
+                runtime,
+                agents_view.queued_preflight.as_ref(),
+                action,
+                colors,
+            );
             render_ai_composer(
                 ui,
                 conversation.id,
@@ -14927,6 +14999,7 @@ fn render_ai_queue_bar(
     ui: &mut Ui,
     conversation: &AiConversation,
     runtime: &AiChatRuntime,
+    head_preflight: Option<&PreflightNotice>,
     action: &mut AiWorkspaceUiAction,
     colors: Theme,
 ) {
@@ -14940,6 +15013,7 @@ fn render_ai_queue_bar(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let count = conversation.queued_turns().len();
+                let blocking_preflight = head_preflight.filter(|notice| notice.blocks_send);
                 ui.label(
                     RichText::new(if count == 1 {
                         format!(
@@ -14951,23 +15025,35 @@ fn render_ai_queue_bar(
                     })
                     .strong(),
                 );
+                let queue_status = if runtime.active_turn.is_some() {
+                    "· sends when the agent finishes".to_owned()
+                } else if let Some(notice) = blocking_preflight {
+                    format!("· {}", notice.headline)
+                } else if conversation.queue_paused {
+                    "· paused".to_owned()
+                } else {
+                    "· waiting for capacity".to_owned()
+                };
                 ui.label(
-                    RichText::new(if runtime.active_turn.is_some() {
-                        "· sends when the agent finishes"
-                    } else if conversation.queue_paused {
-                        "· paused"
-                    } else {
-                        "· waiting for capacity"
-                    })
-                    .size(10.5)
-                    .color(colors.secondary_text),
+                    RichText::new(queue_status)
+                        .size(10.5)
+                        .color(colors.secondary_text),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("Clear").clicked() {
                         action.clear_queue = true;
                     }
-                    if runtime.active_turn.is_none() && ui.small_button("Send next").clicked() {
-                        action.send_next_queued = true;
+                    if runtime.active_turn.is_none() {
+                        let send_next = ui.add_enabled(
+                            blocking_preflight.is_none(),
+                            Button::new("Send next").small(),
+                        );
+                        let send_next = if let Some(notice) = blocking_preflight {
+                            send_next.on_disabled_hover_text(&notice.detail)
+                        } else {
+                            send_next
+                        };
+                        action.send_next_queued |= send_next.clicked();
                     }
                 });
             });
@@ -15858,6 +15944,48 @@ fn render_ai_composer(
 
 fn ai_send_enabled(draft: &str, running: bool, preflight_blocks_send: bool) -> bool {
     !draft.trim().is_empty() && (running || !preflight_blocks_send)
+}
+
+fn queued_turn_provider_id<'a>(
+    queued: &'a AiQueuedTurn,
+    settings: &'a AiConversationSettings,
+) -> &'a str {
+    queued
+        .provider_id
+        .as_deref()
+        .filter(|provider_id| !provider_id.trim().is_empty())
+        .unwrap_or(&settings.provider_id)
+}
+
+fn resume_pinned_provider_id<'a>(
+    requested_provider_id: &'a str,
+    recorded_provider_id: Option<&'a str>,
+) -> &'a str {
+    if requested_provider_id == "auto" {
+        recorded_provider_id
+            .filter(|provider_id| !provider_id.trim().is_empty())
+            .unwrap_or(requested_provider_id)
+    } else {
+        requested_provider_id
+    }
+}
+
+fn queued_turn_preflight_notice(
+    queued: &AiQueuedTurn,
+    settings: &AiConversationSettings,
+    recorded_provider_id: Option<&str>,
+    snapshot: Option<&agents_panel::AgentsScanSnapshot>,
+    scanning: bool,
+) -> Option<PreflightNotice> {
+    preflight_notice(
+        resume_pinned_provider_id(
+            queued_turn_provider_id(queued, settings),
+            recorded_provider_id,
+        ),
+        !settings.api_endpoint.trim().is_empty(),
+        snapshot,
+        scanning,
+    )
 }
 
 fn select_ai_provider(settings: &mut AiConversationSettings, provider_id: &str) {
@@ -17476,6 +17604,130 @@ mod tests {
         assert!(
             ai_send_enabled("follow up", true, true),
             "an already-running turn may still accept a queued follow-up"
+        );
+    }
+
+    #[test]
+    fn queued_turn_preflight_uses_its_captured_provider_until_verified() {
+        let settings = AiConversationSettings {
+            provider_id: "claude_cli".into(),
+            api_endpoint: String::new(),
+            ..AiConversationSettings::default()
+        };
+        let queued = AiQueuedTurn {
+            text: "research this".into(),
+            provider_id: Some("grok_cli".into()),
+            ..AiQueuedTurn::default()
+        };
+        assert_eq!(queued_turn_provider_id(&queued, &settings), "grok_cli");
+        assert!(
+            queued_turn_preflight_notice(&queued, &settings, None, None, false)
+                .is_some_and(|notice| notice.blocks_send)
+        );
+        assert!(
+            queued_turn_preflight_notice(&queued, &settings, None, None, true)
+                .is_some_and(|notice| notice.blocks_send)
+        );
+
+        let snapshot = |version: &str| agents_panel::AgentsScanSnapshot {
+            probes: vec![
+                (
+                    "claude_cli",
+                    crate::ai::ProviderProbe {
+                        executable: Some("claude"),
+                        program: Some(PathBuf::from("/bin/claude")),
+                        version: crate::chat_core::CliVersion::parse("2.1.128"),
+                        observation: crate::ai::ProviderProbeObservation::Observed,
+                    },
+                    agents_panel::AgentAuth::Unknown,
+                ),
+                (
+                    "grok_cli",
+                    crate::ai::ProviderProbe {
+                        executable: Some("grok"),
+                        program: Some(PathBuf::from("/bin/grok")),
+                        version: crate::chat_core::CliVersion::parse(version),
+                        observation: crate::ai::ProviderProbeObservation::Observed,
+                    },
+                    agents_panel::AgentAuth::Unknown,
+                ),
+            ],
+        };
+        let unsupported = snapshot("grok 0.2.118");
+        assert!(
+            queued_turn_preflight_notice(&queued, &settings, None, Some(&unsupported), false)
+                .is_some_and(|notice| notice.blocks_send)
+        );
+        let verified = snapshot("grok 0.2.117");
+        assert!(
+            queued_turn_preflight_notice(&queued, &settings, None, Some(&verified), false)
+                .is_none()
+        );
+        assert_eq!(queued.provider_id.as_deref(), Some("grok_cli"));
+
+        let legacy = AiQueuedTurn::default();
+        assert_eq!(queued_turn_provider_id(&legacy, &settings), "claude_cli");
+
+        assert_eq!(resume_pinned_provider_id("auto", None), "auto");
+        assert_eq!(
+            resume_pinned_provider_id("auto", Some("kimi_cli")),
+            "kimi_cli"
+        );
+        assert_eq!(
+            resume_pinned_provider_id("claude_cli", Some("grok_cli")),
+            "claude_cli",
+            "an explicitly captured provider must win over the resume record"
+        );
+
+        let auto_settings = AiConversationSettings {
+            provider_id: "auto".into(),
+            api_endpoint: String::new(),
+            ..AiConversationSettings::default()
+        };
+        let auto_queued = AiQueuedTurn {
+            text: "continue research".into(),
+            ..AiQueuedTurn::default()
+        };
+        assert_eq!(
+            queued_turn_provider_id(&auto_queued, &auto_settings),
+            "auto"
+        );
+        assert!(
+            preflight_notice("auto", false, Some(&unsupported), false).is_none(),
+            "raw Auto could safely fall back to the installed Claude CLI"
+        );
+        assert!(
+            queued_turn_preflight_notice(
+                &auto_queued,
+                &auto_settings,
+                Some("grok_cli"),
+                Some(&unsupported),
+                false,
+            )
+            .is_some_and(|notice| notice.blocks_send),
+            "an Auto resume pinned to unsupported Grok must not fall back to Claude"
+        );
+        assert!(
+            queued_turn_preflight_notice(
+                &auto_queued,
+                &auto_settings,
+                Some("grok_cli"),
+                Some(&unsupported),
+                true,
+            )
+            .is_some_and(|notice| notice.blocks_send),
+            "the pinned provider remains blocked while its refresh is running"
+        );
+        assert!(
+            queued_turn_preflight_notice(
+                &auto_queued,
+                &auto_settings,
+                Some("grok_cli"),
+                Some(&verified),
+                false,
+            )
+            .is_none(),
+            "a verified pinned provider may launch"
         );
     }
 

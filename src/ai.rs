@@ -1702,7 +1702,9 @@ fn prepare_run(request: &AiRunRequest) -> Result<PreparedRun, AiEngineError> {
                 ("grok_cli", "grok"),
                 ("kimi_cli", "kimi"),
             ] {
-                if let Some(program) = resolve_executable(executable, request.cwd.as_deref()) {
+                if let Some(program) = resolve_executable(executable, request.cwd.as_deref())
+                    && auto_cli_candidate_is_runnable(provider_id, &program)
+                {
                     return prepare_resolved_cli(provider_id, program, request);
                 }
             }
@@ -1744,6 +1746,25 @@ fn prepare_run(request: &AiRunRequest) -> Result<PreparedRun, AiEngineError> {
     }
 }
 
+/// Automatic may safely use generic CLI defaults, but Grok and Kimi select
+/// their transport and permission contract by exact observed version. Skip
+/// an installed exact provider until its identity-matched cached contract is
+/// runnable, allowing a later supported CLI or endpoint to take over.
+fn auto_cli_candidate_is_runnable(provider_id: &str, program: &Path) -> bool {
+    let tuning = cached_runtime_tuning_for_program(provider_id, program, "");
+    match provider_id {
+        "grok_cli" => {
+            supports_grok_acp_task_bridge(tuning.version.as_ref())
+                || supports_grok_legacy_process(tuning.version.as_ref())
+        }
+        "kimi_cli" => {
+            supports_kimi_acp_transport(tuning.version.as_ref())
+                || supports_kimi_legacy_process(tuning.version.as_ref())
+        }
+        _ => true,
+    }
+}
+
 /// Resolve the provider family Adam's `auto` launch will select without
 /// starting a process. Prompt shaping uses this same order so a first auto
 /// turn receives task-tool guidance only when the selected adapter exposes
@@ -1763,7 +1784,9 @@ pub fn resolve_effective_provider_id(
         ("grok_cli", "grok"),
         ("kimi_cli", "kimi"),
     ] {
-        if resolve_executable(executable, cwd).is_some() {
+        if let Some(program) = resolve_executable(executable, cwd)
+            && auto_cli_candidate_is_runnable(provider_id, &program)
+        {
             return Some(provider_id.into());
         }
     }
@@ -15272,6 +15295,7 @@ send({
         fs::write(&grok, "#!/bin/sh\necho 'grok 0.2.118'\n").expect("write Grok stub");
         fs::set_permissions(&grok, fs::Permissions::from_mode(0o755)).expect("chmod Grok stub");
         assert_eq!(cached_cli_version(&grok), CliVersion::parse("grok 0.2.118"));
+        assert!(!auto_cli_candidate_is_runnable("grok_cli", &grok));
         assert!(matches!(
             prepare_resolved_cli("grok_cli", grok, &request("grok_cli")),
             Err(AiEngineError::InvalidConfiguration(message))
@@ -15282,12 +15306,24 @@ send({
         fs::write(&kimi, "#!/bin/sh\necho 'kimi 1.50.0'\n").expect("write Kimi stub");
         fs::set_permissions(&kimi, fs::Permissions::from_mode(0o755)).expect("chmod Kimi stub");
         assert_eq!(cached_cli_version(&kimi), CliVersion::parse("kimi 1.50.0"));
+        assert!(!auto_cli_candidate_is_runnable("kimi_cli", &kimi));
         assert!(matches!(
             prepare_resolved_cli("kimi_cli", kimi, &request("kimi_cli")),
             Err(AiEngineError::InvalidConfiguration(message))
                 if message.contains("unverified")
                     && message.contains("auto-approving legacy adapter")
         ));
+
+        let supported = directory.path().join("supported-kimi-stub");
+        fs::write(&supported, "#!/bin/sh\necho 'kimi 0.31.0'\n")
+            .expect("write supported Kimi stub");
+        fs::set_permissions(&supported, fs::Permissions::from_mode(0o755))
+            .expect("chmod supported Kimi stub");
+        assert_eq!(
+            cached_cli_version(&supported),
+            CliVersion::parse("kimi 0.31.0")
+        );
+        assert!(auto_cli_candidate_is_runnable("kimi_cli", &supported));
     }
 
     #[cfg(unix)]

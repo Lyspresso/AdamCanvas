@@ -267,6 +267,8 @@ const PROBED_PROVIDER_IDS: &[&str] = &[
     "ollama",
 ];
 
+const EXACT_PROVIDER_IDS: &[&str] = &["grok_cli", "kimi_cli"];
+
 pub enum AgentsWorkerJob {
     Scan {
         refresh: bool,
@@ -350,6 +352,10 @@ pub enum AgentsWorkerResult {
         /// scan job; the final inventory is the only result that clears the
         /// in-flight state.
         complete: bool,
+        /// One exact-provider probe has finished. This is separate from the
+        /// full inventory because the worker may continue probing unrelated
+        /// rows after Grok or Kimi is ready.
+        completed_exact: Option<(&'static str, bool)>,
     },
     Install(InstallOutcome),
 }
@@ -662,10 +668,16 @@ fn ordered_probe_ids(priority_provider: Option<&'static str>) -> Vec<&'static st
     priority_provider
         .into_iter()
         .chain(
-            PROBED_PROVIDER_IDS
+            EXACT_PROVIDER_IDS
                 .iter()
                 .copied()
                 .filter(|provider_id| Some(*provider_id) != priority_provider),
+        )
+        .chain(
+            PROBED_PROVIDER_IDS
+                .iter()
+                .copied()
+                .filter(|provider_id| !EXACT_PROVIDER_IDS.contains(provider_id)),
         )
         .collect()
 }
@@ -727,23 +739,25 @@ pub fn start_agents_scan_worker(
                     } => {
                         let order = ordered_probe_ids(priority_provider);
                         let mut probes = Vec::with_capacity(order.len());
-                        for (index, provider_id) in order.into_iter().enumerate() {
+                        for provider_id in order {
                             probes.push(scan_provider(provider_id, refresh, &mut auth_cache));
-                            if index == 0 && priority_provider == Some(provider_id) {
+                            if EXACT_PROVIDER_IDS.contains(&provider_id) {
                                 if result_sender
                                     .send(AgentsWorkerResult::Snapshot {
                                         snapshot: AgentsScanSnapshot {
                                             probes: probes.clone(),
                                         },
                                         complete: false,
+                                        completed_exact: Some((provider_id, refresh)),
                                     })
                                     .is_err()
                                 {
                                     return;
                                 }
-                                // Do not wait for slow auth/version checks on
-                                // unrelated rows before unpausing the selected
-                                // exact provider's composer.
+                                // Publish each exact-contract row before slow
+                                // auth/version checks on unrelated providers.
+                                // This also keeps a Grok -> Kimi (or reverse)
+                                // switch responsive during the same cold scan.
                                 context.request_repaint();
                             }
                         }
@@ -751,6 +765,7 @@ pub fn start_agents_scan_worker(
                             .send(AgentsWorkerResult::Snapshot {
                                 snapshot: AgentsScanSnapshot { probes },
                                 complete: true,
+                                completed_exact: None,
                             })
                             .is_err()
                         {
@@ -786,6 +801,7 @@ pub fn start_agents_scan_worker(
                         let snapshot_send = result_sender.send(AgentsWorkerResult::Snapshot {
                             snapshot: scan_all(true, &mut auth_cache),
                             complete: true,
+                            completed_exact: None,
                         });
                         let install_send = result_sender.send(AgentsWorkerResult::Install(outcome));
                         if install_send.is_err() || snapshot_send.is_err() {
@@ -807,12 +823,21 @@ pub struct AgentsPanelState {
     pub setup_dismissed: bool,
     scans_in_flight: usize,
     install_in_flight: Option<&'static str>,
+    /// Outstanding exact-provider rows across every accepted scan. Counts,
+    /// rather than a set, prevent scan A from clearing scan B's pending row.
+    pending_exact_scans: HashMap<&'static str, PendingExactScans>,
     /// Retained only for problem outcomes; successes surface as a toast and
     /// the refreshed snapshot speaks for itself.
     last_install: Option<InstallOutcome>,
     pending_install_notice: Option<String>,
     jobs: Sender<AgentsWorkerJob>,
     results: Receiver<AgentsWorkerResult>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PendingExactScans {
+    total: usize,
+    refreshing: usize,
 }
 
 impl AgentsPanelState {
@@ -824,6 +849,7 @@ impl AgentsPanelState {
             setup_dismissed: false,
             scans_in_flight: 0,
             install_in_flight: None,
+            pending_exact_scans: HashMap::new(),
             last_install: None,
             pending_install_notice: None,
             jobs,
@@ -831,10 +857,34 @@ impl AgentsPanelState {
         }
     }
 
-    pub fn poll(&mut self) {
+    /// Applies every available worker result and reports whether provider
+    /// readiness changed. Queue draining uses this signal so a turn paused
+    /// on an exact-provider check resumes as soon as its priority row lands.
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(result) = self.results.try_recv() {
+            changed = true;
             match result {
-                AgentsWorkerResult::Snapshot { snapshot, complete } => {
+                AgentsWorkerResult::Snapshot {
+                    snapshot,
+                    complete,
+                    completed_exact,
+                } => {
+                    if let Some((provider_id, refresh)) = completed_exact {
+                        let remove =
+                            self.pending_exact_scans
+                                .get_mut(provider_id)
+                                .is_some_and(|pending| {
+                                    pending.total = pending.total.saturating_sub(1);
+                                    if refresh {
+                                        pending.refreshing = pending.refreshing.saturating_sub(1);
+                                    }
+                                    pending.total == 0
+                                });
+                        if remove {
+                            self.pending_exact_scans.remove(provider_id);
+                        }
+                    }
                     if complete {
                         self.scans_in_flight = self.scans_in_flight.saturating_sub(1);
                         self.snapshot = Some(snapshot);
@@ -855,10 +905,27 @@ impl AgentsPanelState {
                 }
             }
         }
+        changed
     }
 
     pub fn scanning(&self) -> bool {
         self.scans_in_flight > 0
+    }
+
+    /// Whether this exact provider still has a probe ahead of it. A provider
+    /// missing from an in-progress cold inventory is also still being
+    /// checked, even when another exact provider was the original priority.
+    pub fn scanning_for(&self, provider_id: &str) -> bool {
+        let Some(provider_id) = selected_exact_provider_id(provider_id) else {
+            return self.scanning();
+        };
+        self.pending_exact_scans.contains_key(provider_id)
+            || (self.scanning()
+                && self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.probe(provider_id))
+                    .is_none())
     }
 
     pub fn installing(&self) -> Option<&'static str> {
@@ -908,6 +975,12 @@ impl AgentsPanelState {
         refresh: bool,
         priority_provider: Option<&'static str>,
     ) {
+        if let Some(provider_id) = priority_provider
+            && let Some(pending) = self.pending_exact_scans.get(provider_id)
+            && (!refresh || pending.refreshing > 0)
+        {
+            return;
+        }
         if self
             .jobs
             .try_send(AgentsWorkerJob::Scan {
@@ -917,6 +990,13 @@ impl AgentsPanelState {
             .is_ok()
         {
             self.scans_in_flight += 1;
+            for &provider_id in EXACT_PROVIDER_IDS {
+                let pending = self.pending_exact_scans.entry(provider_id).or_default();
+                pending.total += 1;
+                if refresh {
+                    pending.refreshing += 1;
+                }
+            }
         }
     }
 
@@ -993,6 +1073,9 @@ pub struct AgentRow {
     pub program: Option<PathBuf>,
     pub auth: AgentAuth,
     pub selected: bool,
+    /// False only for a row not yet present in an in-progress partial
+    /// inventory. A missing binary after a completed probe is still observed.
+    pub observed: bool,
 }
 
 pub fn agent_rows(snapshot: &AgentsScanSnapshot, selected_provider: Option<&str>) -> Vec<AgentRow> {
@@ -1022,19 +1105,30 @@ pub fn agent_rows(snapshot: &AgentsScanSnapshot, selected_provider: Option<&str>
                     .and_then(|probe| probe.program.clone()),
                 auth: snapshot.auth(meta.provider_id),
                 selected: selected_provider.is_some_and(|selected| selected == meta.provider_id),
+                observed: meta.binary.is_none() || snapshot.probe(meta.provider_id).is_some(),
             }
         })
         .collect()
 }
 
+fn auto_provider_is_runnable(snapshot: &AgentsScanSnapshot, provider_id: &str) -> bool {
+    let Some(probe) = snapshot.probe(provider_id) else {
+        return false;
+    };
+    if probe.program.is_none() {
+        return false;
+    }
+    !transport_requires_exact_contract(provider_id)
+        || matches!(
+            exact_provider_readiness(provider_id, Some(snapshot), false),
+            ExactProviderReadiness::Verified { .. }
+        )
+}
+
 fn first_available_auto_provider(snapshot: &AgentsScanSnapshot) -> Option<&'static str> {
     AUTO_PROBE_ORDER
         .iter()
-        .find(|provider_id| {
-            snapshot
-                .probe(provider_id)
-                .is_some_and(|probe| probe.program.is_some())
-        })
+        .find(|provider_id| auto_provider_is_runnable(snapshot, provider_id))
         .and_then(|provider_id| {
             AGENT_PROVIDERS
                 .iter()
@@ -1149,12 +1243,11 @@ pub fn exact_provider_readiness(
     if !transport_requires_exact_contract(&provider_id) {
         return ExactProviderReadiness::NotApplicable;
     }
+    if scanning {
+        return ExactProviderReadiness::Probing;
+    }
     let Some(probe) = snapshot.and_then(|snapshot| snapshot.probe(&provider_id)) else {
-        return if scanning {
-            ExactProviderReadiness::Probing
-        } else {
-            ExactProviderReadiness::NotRun
-        };
+        return ExactProviderReadiness::NotRun;
     };
     if probe.program.is_none() {
         return ExactProviderReadiness::Missing;
@@ -1286,28 +1379,56 @@ pub fn preflight_notice(
     if !matches!(exact, ExactProviderReadiness::NotApplicable) {
         return exact_preflight_notice(&provider_id, exact);
     }
+    if scanning {
+        return match provider_id.as_str() {
+            "lm_studio" if endpoint_configured => None,
+            "auto" => Some(PreflightNotice {
+                headline: "Checking installed agents — Send is paused".into(),
+                detail: "Automatic resumes when the complete provider inventory is ready.".into(),
+                danger: false,
+                blocks_send: true,
+            }),
+            id => AGENT_PROVIDERS
+                .iter()
+                .find(|meta| meta.provider_id == id && meta.binary.is_some())
+                .map(|meta| PreflightNotice {
+                    headline: format!("Checking {} — Send is paused", meta.label),
+                    detail: "Send resumes when this provider check finishes.".into(),
+                    danger: false,
+                    blocks_send: true,
+                }),
+        };
+    }
     let snapshot = snapshot?;
     match provider_id.as_str() {
         "auto" => {
-            let all_missing = AUTO_PROBE_ORDER.iter().all(|id| {
-                snapshot
-                    .probe(id)
-                    .is_none_or(|probe| probe.program.is_none())
-            });
-            if !all_missing {
+            if first_available_auto_provider(snapshot).is_some() {
                 return None;
             }
+            let any_installed = AUTO_PROBE_ORDER.iter().any(|id| {
+                snapshot
+                    .probe(id)
+                    .is_some_and(|probe| probe.program.is_some())
+            });
             Some(if endpoint_configured {
                 PreflightNotice {
-                    headline: "No agent CLIs detected".into(),
-                    detail: "Automatic will fall back to the configured endpoint. Open Agents to install a CLI.".into(),
+                    headline: if any_installed {
+                        "No supported agent CLI detected".into()
+                    } else {
+                        "No agent CLIs detected".into()
+                    },
+                    detail: "Automatic will fall back to the configured endpoint. Open Agents to inspect installed CLI versions.".into(),
                     danger: false,
                     blocks_send: false,
                 }
             } else {
                 PreflightNotice {
-                    headline: "No agent CLIs detected — Send will fail".into(),
-                    detail: "Automatic has nothing to run. Open Agents to install a provider."
+                    headline: if any_installed {
+                        "No supported agent CLI detected — Send is paused".into()
+                    } else {
+                        "No agent CLIs detected — Send will fail".into()
+                    },
+                    detail: "Automatic has nothing runnable. Open Agents to install or verify a provider."
                         .into(),
                     danger: true,
                     blocks_send: true,
@@ -1407,9 +1528,12 @@ pub fn agents_panel_ui(
                 ui.add_space(4.0);
                 ui.separator();
                 ui.add_space(4.0);
-                let text = match first_available {
-                    Some(label) => format!("Automatic — uses the first available: {label}"),
-                    None => {
+                let text = match (scanning, first_available) {
+                    (true, _) => "Automatic — checking provider order…".into(),
+                    (false, Some(label)) => {
+                        format!("Automatic — uses the first supported available: {label}")
+                    }
+                    (false, None) => {
                         "Automatic — no CLI detected; falls back to the configured endpoint".into()
                     }
                 };
@@ -1423,7 +1547,7 @@ pub fn agents_panel_ui(
     ui.add_space(6.0);
     ui.label(
         RichText::new(
-            "Adam checks PATH plus ~/.local/bin, ~/.codex/bin, ~/.grok/bin, ~/.lmstudio/bin, /opt/homebrew/bin and /usr/local/bin. Custom CLI accepts an absolute path.",
+            "Adam checks PATH plus ~/.local/bin, ~/.codex/bin, ~/.grok/bin, ~/.kimi-code/bin, ~/.lmstudio/bin, /opt/homebrew/bin and /usr/local/bin. Custom CLI accepts an absolute path.",
         )
         .size(10.0)
         .color(palette.tertiary_text),
@@ -1439,14 +1563,19 @@ fn probed_row_ui(
     palette: &AgentsPalette,
     action: &mut AgentsPanelAction,
 ) {
-    let tone = match availability {
-        AgentAvailability::NotDetected => palette.tertiary_text,
-        AgentAvailability::Detected { .. } | AgentAvailability::DetectedSeriesTested { .. } => {
-            palette.secondary_text
+    let checking = scanning && !row.observed;
+    let tone = if checking {
+        palette.secondary_text
+    } else {
+        match availability {
+            AgentAvailability::NotDetected => palette.tertiary_text,
+            AgentAvailability::Detected { .. } | AgentAvailability::DetectedSeriesTested { .. } => {
+                palette.secondary_text
+            }
+            AgentAvailability::DetectedVerified { .. } => palette.accent,
         }
-        AgentAvailability::DetectedVerified { .. } => palette.accent,
     };
-    let missing = *availability == AgentAvailability::NotDetected;
+    let missing = !checking && *availability == AgentAvailability::NotDetected;
     let this_installing = installing == Some(row.meta.provider_id);
     let frame = Frame::NONE
         .fill(palette.tile)
@@ -1470,7 +1599,12 @@ fn probed_row_ui(
                         .strong()
                         .color(palette.text),
                 );
-                status_chip(ui, &availability_label(availability), tone);
+                let availability = if checking {
+                    "Checking…".into()
+                } else {
+                    availability_label(availability)
+                };
+                status_chip(ui, &availability, tone);
                 match row.auth {
                     AgentAuth::SignedIn => status_chip(ui, "Signed in", palette.secondary_text),
                     AgentAuth::SignedOut => status_chip(ui, "Signed out", palette.danger),
@@ -1875,6 +2009,21 @@ mod tests {
     }
 
     #[test]
+    fn partial_inventory_marks_only_unpublished_rows_as_unobserved() {
+        let partial = snapshot(&[("grok_cli", Some("/bin/grok"), Some("grok 0.2.117"))]);
+        let rows = agent_rows(&partial, None);
+        let observed = |provider_id: &str| {
+            rows.iter()
+                .find(|row| row.meta.provider_id == provider_id)
+                .expect("provider row")
+                .observed
+        };
+        assert!(observed("grok_cli"));
+        assert!(!observed("claude_cli"));
+        assert!(observed("auto"), "informational rows are never probed");
+    }
+
+    #[test]
     fn endpoint_and_custom_rows_are_informational_and_never_probed() {
         let rows = agent_rows(&all_missing_snapshot(), None);
         for provider_id in ["openai_compatible", "custom_cli"] {
@@ -1927,8 +2076,42 @@ mod tests {
         assert!(without_endpoint.blocks_send);
 
         let mut one_present = all_missing_snapshot();
-        one_present.probes[3].1.program = Some(PathBuf::from("/bin/kimi"));
+        one_present.probes[0].1.program = Some(PathBuf::from("/bin/claude"));
         assert!(preflight_notice("auto", false, Some(&one_present), false).is_none());
+
+        let partial = snapshot(&[("grok_cli", None, None)]);
+        let checking =
+            preflight_notice("auto", false, Some(&partial), true).expect("checking notice");
+        assert!(checking.blocks_send);
+        assert!(checking.headline.contains("Checking"));
+
+        let checking_claude =
+            preflight_notice("claude_cli", false, Some(&partial), true).expect("checking notice");
+        assert!(checking_claude.blocks_send);
+        assert!(checking_claude.headline.contains("Claude CLI"));
+    }
+
+    #[test]
+    fn auto_skips_an_unsupported_exact_provider_for_a_verified_later_candidate() {
+        let supported_later = snapshot(&[
+            ("grok_cli", Some("/bin/grok"), Some("grok 0.2.118")),
+            ("kimi_cli", Some("/bin/kimi"), Some("kimi 0.31.0")),
+        ]);
+        assert_eq!(
+            first_available_auto_provider(&supported_later),
+            Some("Kimi CLI")
+        );
+        assert!(preflight_notice("auto", false, Some(&supported_later), false).is_none());
+
+        let unsupported_only = snapshot(&[("grok_cli", Some("/bin/grok"), Some("grok 0.2.118"))]);
+        let blocked =
+            preflight_notice("auto", false, Some(&unsupported_only), false).expect("blocked");
+        assert!(blocked.blocks_send);
+        assert!(blocked.headline.contains("No supported"));
+        let endpoint_fallback =
+            preflight_notice("auto", true, Some(&unsupported_only), false).expect("fallback");
+        assert!(!endpoint_fallback.blocks_send);
+        assert!(endpoint_fallback.detail.contains("endpoint"));
     }
 
     #[test]
@@ -1960,6 +2143,13 @@ mod tests {
             assert!(!probing.danger);
             assert!(probing.headline.starts_with("Checking"));
         }
+
+        let verified = snapshot(&[("grok_cli", Some("/bin/grok"), Some("grok 0.2.117 (abc123)"))]);
+        assert_eq!(
+            exact_provider_readiness("grok_cli", Some(&verified), true),
+            ExactProviderReadiness::Probing,
+            "a queued launch-triggered refresh must hide a stale green row"
+        );
     }
 
     #[test]
@@ -2019,12 +2209,12 @@ mod tests {
     #[test]
     fn selected_exact_provider_is_prioritized_and_partial_snapshot_keeps_scan_live() {
         assert_eq!(
-            ordered_probe_ids(Some("kimi_cli")).first().copied(),
-            Some("kimi_cli")
+            &ordered_probe_ids(Some("kimi_cli"))[..2],
+            &["kimi_cli", "grok_cli"]
         );
         assert_eq!(
-            ordered_probe_ids(Some("grok_cli")).first().copied(),
-            Some("grok_cli")
+            &ordered_probe_ids(Some("grok_cli"))[..2],
+            &["grok_cli", "kimi_cli"]
         );
 
         let (jobs, queued_jobs) = bounded::<AgentsWorkerJob>(2);
@@ -2038,14 +2228,20 @@ mod tests {
             setup_dismissed: false,
             scans_in_flight: 0,
             install_in_flight: None,
+            pending_exact_scans: HashMap::new(),
             last_install: None,
             pending_install_notice: None,
             jobs,
             results,
         };
+        assert!(
+            !state.poll(),
+            "an empty result channel reports no readiness change"
+        );
 
         state.request_scan_for(true, "grok_cli");
         assert!(state.scanning());
+        assert!(state.scanning_for("grok_cli"));
         assert!(matches!(
             queued_jobs.try_recv().expect("scan job"),
             AgentsWorkerJob::Scan {
@@ -2053,6 +2249,11 @@ mod tests {
                 priority_provider: Some("grok_cli")
             }
         ));
+        state.request_scan_for(true, "grok_cli");
+        assert!(
+            queued_jobs.try_recv().is_err(),
+            "a targeted refresh already in flight must be coalesced"
+        );
 
         let priority_snapshot =
             snapshot(&[("grok_cli", Some("/bin/grok"), Some("grok 0.2.117 (abc123)"))]);
@@ -2060,10 +2261,15 @@ mod tests {
             .send(AgentsWorkerResult::Snapshot {
                 snapshot: priority_snapshot,
                 complete: false,
+                completed_exact: Some(("grok_cli", true)),
             })
             .expect("partial result");
-        state.poll();
+        assert!(state.poll(), "the priority row reports a readiness change");
         assert!(state.scanning(), "partial result must not finish the scan");
+        assert!(
+            !state.scanning_for("grok_cli"),
+            "the selected provider is ready as soon as its priority result arrives"
+        );
         assert!(
             state
                 .snapshot
@@ -2085,12 +2291,124 @@ mod tests {
 
         result_sender
             .send(AgentsWorkerResult::Snapshot {
+                snapshot: snapshot(&[("kimi_cli", Some("/bin/kimi"), Some("kimi 0.31.0"))]),
+                complete: false,
+                completed_exact: Some(("kimi_cli", true)),
+            })
+            .expect("second exact-provider partial result");
+        assert!(state.scanning_for("kimi_cli"));
+        assert!(state.poll());
+        assert!(
+            !state.scanning_for("kimi_cli"),
+            "switching exact providers must not wait for unrelated auth probes"
+        );
+
+        result_sender
+            .send(AgentsWorkerResult::Snapshot {
                 snapshot: all_missing_snapshot(),
                 complete: true,
+                completed_exact: None,
             })
             .expect("complete result");
-        state.poll();
+        assert!(state.poll());
         assert!(!state.scanning());
+    }
+
+    #[test]
+    fn forced_exact_refresh_is_queued_behind_a_non_refresh_scan() {
+        let (jobs, queued_jobs) = bounded::<AgentsWorkerJob>(3);
+        let (result_sender, results) = bounded::<AgentsWorkerResult>(4);
+        let mut state = AgentsPanelState {
+            open: false,
+            snapshot: Some(all_missing_snapshot()),
+            setup_dismissed: false,
+            scans_in_flight: 0,
+            install_in_flight: None,
+            pending_exact_scans: HashMap::new(),
+            last_install: None,
+            pending_install_notice: None,
+            jobs,
+            results,
+        };
+
+        state.request_scan_for(false, "grok_cli");
+        assert!(matches!(
+            queued_jobs.try_recv().expect("ordinary scan job"),
+            AgentsWorkerJob::Scan {
+                refresh: false,
+                priority_provider: Some("grok_cli")
+            }
+        ));
+
+        state.request_scan_for(true, "grok_cli");
+        assert!(matches!(
+            queued_jobs.try_recv().expect("forced refresh job"),
+            AgentsWorkerJob::Scan {
+                refresh: true,
+                priority_provider: Some("grok_cli")
+            }
+        ));
+        state.request_scan_for(true, "grok_cli");
+        assert!(
+            queued_jobs.try_recv().is_err(),
+            "a second forced refresh must coalesce with the queued refresh"
+        );
+
+        result_sender
+            .send(AgentsWorkerResult::Snapshot {
+                snapshot: snapshot(&[(
+                    "grok_cli",
+                    Some("/bin/grok"),
+                    Some("grok 0.2.117 (abc123)"),
+                )]),
+                complete: false,
+                completed_exact: Some(("grok_cli", false)),
+            })
+            .expect("ordinary partial result");
+        assert!(state.poll());
+        assert!(
+            state.scanning_for("grok_cli"),
+            "the queued forced refresh must keep the provider pending"
+        );
+
+        result_sender
+            .send(AgentsWorkerResult::Snapshot {
+                snapshot: snapshot(&[("kimi_cli", Some("/bin/kimi"), Some("kimi 0.31.0"))]),
+                complete: false,
+                completed_exact: Some(("kimi_cli", false)),
+            })
+            .expect("ordinary Kimi partial result");
+        assert!(state.poll());
+        result_sender
+            .send(AgentsWorkerResult::Snapshot {
+                snapshot: all_missing_snapshot(),
+                complete: true,
+                completed_exact: None,
+            })
+            .expect("ordinary full result");
+        assert!(state.poll());
+        assert!(state.scanning(), "the forced refresh job remains queued");
+        assert!(
+            state.scanning_for("grok_cli"),
+            "finishing the ordinary scan must not clear the forced refresh"
+        );
+
+        result_sender
+            .send(AgentsWorkerResult::Snapshot {
+                snapshot: snapshot(&[(
+                    "grok_cli",
+                    Some("/bin/grok"),
+                    Some("grok 0.2.117 (abc123)"),
+                )]),
+                complete: false,
+                completed_exact: Some(("grok_cli", true)),
+            })
+            .expect("forced partial result");
+        assert!(state.poll());
+        assert!(
+            !state.scanning_for("grok_cli"),
+            "the provider is ready after the forced probe finishes"
+        );
     }
 
     #[test]

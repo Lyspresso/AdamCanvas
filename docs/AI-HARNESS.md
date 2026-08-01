@@ -86,10 +86,10 @@ provider profile at enqueue time—model, reasoning effort, fallback, turn
 limit, and explicit ability choices—so later settings changes cannot silently
 switch its provider or retune already submitted work.
 Desktop-launch discovery checks Adam’s process `PATH`, `~/.local/bin`,
-`~/.codex/bin`, `~/.grok/bin`, `~/.lmstudio/bin`, `/opt/homebrew/bin`, and
-`/usr/local/bin`. A CLI installed only through shell startup tooling can be
-entered by absolute path as a Custom CLI; Adam deliberately does not execute a
-login shell just to discover commands.
+`~/.codex/bin`, `~/.grok/bin`, `~/.kimi-code/bin`, `~/.lmstudio/bin`,
+`/opt/homebrew/bin`, and `/usr/local/bin`. A CLI installed only through shell
+startup tooling can be entered by absolute path as a Custom CLI; Adam
+deliberately does not execute a login shell just to discover commands.
 
 ## Detection preflight (Agents panel)
 
@@ -99,9 +99,11 @@ so a missing CLI is visible before Send instead of after it fails. Statuses:
 
 - **Not detected** — the binary was not found on the discovery paths above.
 - **Detected vX.Y.Z** — found, but no captured runtime contract covers this
-  version; provider defaults apply and no tuning controls are exposed. When
-  a contract exists for a different version, the hover names it so drift is
-  visible instead of silent.
+  version. Claude, Codex, LM Studio, and Ollama use provider defaults and
+  expose no unverified tuning controls. Grok and Kimi instead pause Send
+  because their exact version selects transport and permission behavior.
+  When a contract exists for a different version, the hover names it so
+  drift is visible instead of silent.
 - **Detected vX.Y.Z · tested series (vA.B.C)** — for providers whose transport
   does not change by patch version, found in the same
   major.minor series as a tested contract version with only a newer patch
@@ -142,10 +144,19 @@ additive accessor `ai::probe_installed_provider` — what the panel shows and
 what a turn runs cannot drift. Scans run on a background worker
 (`adam-agents-scan`); the panel's Refresh bypasses the version cache so an
 upgraded binary re-probes. The chat composer surfaces a pre-Send banner from
-the same cached snapshot (LM Studio is exempt while an endpoint is
-configured, and Automatic only warns when all four CLI candidates are
-missing). When every probed CLI is missing, the chat's empty state becomes
-a setup screen with the same rows.
+the same cached snapshot. For exact-contract Grok and Kimi it distinguishes
+Checking, unsupported version, failed check, and an identity-matched last
+verified observation; Send stays paused until a runnable observation exists,
+while a transient refresh failure may keep the matching last-verified
+contract usable with a warning. Selected Grok and Kimi are checked first and
+published before unrelated auth probes finish. LM Studio is exempt while an
+endpoint is configured, and Automatic only warns when a complete inventory
+proves that no supported CLI candidate is runnable. Automatic skips an
+installed Grok or Kimi whose exact transport contract is not verified and
+continues to the next supported CLI or configured endpoint. While an
+inventory is incomplete, affected Send and queued-turn actions remain paused.
+When every probed CLI is missing, the chat's empty state becomes a setup
+screen with the same rows.
 
 Install buttons execute **only** commands compiled into `AGENT_PROVIDERS`
 — vendor-official installers verified against vendor domains, never
