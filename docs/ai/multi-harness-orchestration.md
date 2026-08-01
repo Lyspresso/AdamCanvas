@@ -14,7 +14,7 @@ Three parties, three roles, one source of truth:
 | Claude (Claude Code) | Integrator / project manager — repo custody, review, merges, CI, task assignment, documentation | `~/Developer/AdamCanvas-claude` on `work/claude` |
 | Codex | Feature developer — harness internals (PRs 1–4 of the parity plan) | remote workspace → PRs (target) or export ingestion (fallback) |
 
-Source of truth: https://github.com/Lyspresso/AdamCanvas (private). `main` advances only
+Source of truth: https://github.com/Lyspresso/AdamCanvas (public). `main` advances only
 by reviewed merge with CI green. Spec of record for current work:
 `docs/plans/progress-artifacts-parity.md`.
 
