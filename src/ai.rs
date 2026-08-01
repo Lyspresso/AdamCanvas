@@ -836,13 +836,16 @@ pub fn clamp_provider_preferences(
     tuning: &RuntimeTuningProfile,
 ) -> bool {
     if built_in_cli_executable(provider_id).is_some() && !tuning.verified_runtime {
-        // Missing or transiently unverified is not evidence that a saved
-        // control became unsupported. That includes a missing probe result and
-        // a parseable version that has no fixture-verified contract. In
-        // particular, never persistently turn off Grok subagents or Kimi
-        // swarms because a busy machine delayed `--version` beyond the probe
-        // deadline or because the CLI was upgraded ahead of Adam's table.
-        return false;
+        // A missing observation may be a transient probe failure, so preserve
+        // saved controls. Grok and Kimi also retain their exact-contract
+        // settings for unlisted versions because their transport and
+        // permission semantics are version-selected and launch remains
+        // fail-closed. Generic providers can safely heal only their
+        // version-sensitive controls to provider defaults after a successful,
+        // parseable but unlisted observation.
+        if tuning.version.is_none() || matches!(provider_id, "grok_cli" | "kimi_cli") {
+            return false;
+        }
     }
     let original = preferences.clone();
     let requested = preferences.reasoning_effort.trim();
@@ -852,6 +855,9 @@ pub fn clamp_provider_preferences(
         preferences.reasoning_effort = effort.to_owned();
     } else {
         preferences.reasoning_effort.clear();
+    }
+    if provider_id == "ollama" && !tuning.verified_runtime {
+        preferences.set_feature(AI_FEATURE_THINKING, None);
     }
     if provider_id == "grok_cli" && !tuning.supports_scoped_child_text() {
         preferences.set_feature(AI_FEATURE_SUBAGENTS, Some(false));
@@ -875,6 +881,22 @@ pub struct ProviderProbe {
     pub executable: Option<&'static str>,
     pub program: Option<PathBuf>,
     pub version: Option<CliVersion>,
+    pub observation: ProviderProbeObservation,
+}
+
+/// Whether the installed provider was observed, has not been checked, or
+/// failed its latest explicit refresh. A failed refresh may retain a
+/// previously verified version only while the executable identity still
+/// matches.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ProviderProbeObservation {
+    #[default]
+    NotObserved,
+    Observed,
+    Failed {
+        message: String,
+        retained_last_good: bool,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -906,8 +928,8 @@ struct CliVersionProbeFailureEntry {
 }
 
 /// Resolve and version-probe a built-in provider CLI without launching a
-/// turn. `refresh` drops the resolved path's cached version first so an
-/// upgraded binary at the same path re-probes; plain calls stay cache-cheap.
+/// turn. `refresh` forces a new observation without discarding an
+/// identity-matched last-good version; plain calls stay cache-cheap.
 pub fn probe_installed_provider(provider_id: &str, refresh: bool) -> ProviderProbe {
     let Some(executable) = built_in_cli_executable(provider_id) else {
         return ProviderProbe::default();
@@ -917,25 +939,107 @@ pub fn probe_installed_provider(provider_id: &str, refresh: bool) -> ProviderPro
             executable: Some(executable),
             program: None,
             version: None,
+            observation: ProviderProbeObservation::NotObserved,
         };
     };
-    if refresh {
-        invalidate_cached_cli_version(&program);
-    }
-    let version = cached_cli_version(&program);
-    ProviderProbe {
-        executable: Some(executable),
-        program: Some(program),
-        version,
+    provider_probe_for_program(executable, program, refresh)
+}
+
+fn provider_probe_for_program(
+    executable: &'static str,
+    program: PathBuf,
+    refresh: bool,
+) -> ProviderProbe {
+    let result = if refresh {
+        refresh_cli_version(&program)
+    } else {
+        verified_cli_version(&program)
+    };
+    match result {
+        Ok(version) => ProviderProbe {
+            executable: Some(executable),
+            program: Some(program),
+            version: Some(version),
+            observation: ProviderProbeObservation::Observed,
+        },
+        Err(failure) => {
+            let retained = cached_verified_cli_version(&program).ok();
+            ProviderProbe {
+                executable: Some(executable),
+                program: Some(program),
+                version: retained.clone(),
+                observation: ProviderProbeObservation::Failed {
+                    message: sanitized_cli_version_probe_failure(&failure),
+                    retained_last_good: retained.is_some(),
+                },
+            }
+        }
     }
 }
 
-fn invalidate_cached_cli_version(program: &Path) {
+fn sanitized_cli_version_probe_failure(failure: &CliVersionProbeFailure) -> String {
+    const MAX_FAILURE_BYTES: usize = 512;
+
+    let mut message = String::new();
+    let mut pending_space = false;
+    for character in failure.to_string().chars() {
+        if character.is_control() || character.is_whitespace() {
+            pending_space = !message.is_empty();
+            continue;
+        }
+        if pending_space {
+            message.push(' ');
+            pending_space = false;
+        }
+        message.push(character);
+    }
+    truncate_utf8(message.trim(), MAX_FAILURE_BYTES).to_owned()
+}
+
+fn refresh_cli_version(program: &Path) -> Result<CliVersion, CliVersionProbeFailure> {
+    let requested_at = Instant::now();
+    let lock_deadline = requested_at + CLI_VERSION_TIMEOUT;
     let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let probe_lock = cli_version_probe_lock(&key);
+    let _probe_guard = lock_cli_version_probe(&probe_lock, lock_deadline, None)?;
+    let identity = cli_executable_identity(&key)?;
     let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    lock_unpoison(cache).remove(&key);
+    {
+        let mut cache = lock_unpoison(cache);
+        match cache.get(&key) {
+            Some(entry) if entry.identity == identity && entry.observed_at >= requested_at => {
+                return Ok(entry.version.clone());
+            }
+            Some(entry) if entry.identity != identity => {
+                cache.remove(&key);
+            }
+            _ => {}
+        }
+    }
     let failures = CLI_VERSION_PROBE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let failures = lock_unpoison(failures);
+        if let Some(entry) = failures.get(&key)
+            && entry.identity == identity
+            && entry.completed_at >= requested_at
+        {
+            return Err(entry.failure.clone());
+        }
+    }
+    let Some(probe_timeout) = lock_deadline.checked_duration_since(Instant::now()) else {
+        return Err(CliVersionProbeFailure::TimedOut);
+    };
+    let entry = match probe_cli_version_entry_with_timeout(&key, probe_timeout, None) {
+        Ok(entry) => entry,
+        Err(failure) => {
+            record_cli_version_probe_failure(&key, identity, &failure);
+            return Err(failure);
+        }
+    };
+    let version = entry.version.clone();
     lock_unpoison(failures).remove(&key);
+    lock_unpoison(cache).insert(key, entry);
+    Ok(version)
 }
 
 fn cli_version_probe_lock(program: &Path) -> Arc<Mutex<()>> {
@@ -953,16 +1057,20 @@ fn cached_runtime_tuning_for_program(
     model: &str,
 ) -> RuntimeTuningProfile {
     let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let identity = match cli_executable_identity(&key) {
+        Ok(identity) => identity,
+        Err(_) => return runtime_tuning_for_version(provider_id, program, model, None),
+    };
     let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let identity = cli_executable_identity(&key).ok();
     let mut cache = lock_unpoison(cache);
-    let version = cache
-        .get(&key)
-        .filter(|entry| identity.as_ref() == Some(&entry.identity))
-        .map(|entry| entry.version.clone());
-    if version.is_none() {
-        cache.remove(&key);
-    }
+    let version = match cache.get(&key) {
+        Some(entry) if entry.identity == identity => Some(entry.version.clone()),
+        Some(_) => {
+            cache.remove(&key);
+            None
+        }
+        None => None,
+    };
     runtime_tuning_for_version(provider_id, program, model, version)
 }
 
@@ -1090,6 +1198,7 @@ fn cached_verified_runtime_tuning_for_program(
     ))
 }
 
+#[cfg(test)]
 fn cached_cli_version(program: &Path) -> Option<CliVersion> {
     verified_cli_version(program).ok()
 }
@@ -2123,15 +2232,17 @@ fn preset_process_spec_with_tuning(
                 ));
             }
             push_args(&mut arguments, &["run", model]);
-            if let Some(effort) =
-                tuning.normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
-            {
-                push_args(&mut arguments, &["--think", effort]);
-            } else {
-                match request.provider_preferences.feature(AI_FEATURE_THINKING) {
-                    Some(true) => push_args(&mut arguments, &["--think", "true"]),
-                    Some(false) => push_args(&mut arguments, &["--think", "false"]),
-                    None => {}
+            if tuning.verified_runtime {
+                if let Some(effort) = tuning
+                    .normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
+                {
+                    push_args(&mut arguments, &["--think", effort]);
+                } else {
+                    match request.provider_preferences.feature(AI_FEATURE_THINKING) {
+                        Some(true) => push_args(&mut arguments, &["--think", "true"]),
+                        Some(false) => push_args(&mut arguments, &["--think", "false"]),
+                        None => {}
+                    }
                 }
             }
             (PromptInput::Stdin, OutputMode::PlainText)
@@ -5389,9 +5500,9 @@ fn run_process(
                 ));
             }
         };
-        if !tuning.verified_runtime {
+        if tuning.version.is_none() {
             return RunOutcome::runtime_probe_failed(format!(
-                "Adam found an unverified {} runtime and did not launch it without the saved reasoning control. Refresh Agents after installing a fixture-verified version, then retry the turn.",
+                "Adam could not verify that the observed {} version belongs to that provider and did not launch it with saved version-sensitive controls. Refresh Agents, then retry the turn.",
                 specification.provider_id
             ));
         }
@@ -5500,12 +5611,22 @@ fn run_process(
 }
 
 fn version_sensitive_process_controls_requested(provider_id: &str, request: &AiRunRequest) -> bool {
-    matches!(provider_id, "claude_cli" | "codex_cli" | "ollama")
-        && !request
-            .provider_preferences
-            .reasoning_effort
-            .trim()
-            .is_empty()
+    let saved_effort = !request
+        .provider_preferences
+        .reasoning_effort
+        .trim()
+        .is_empty();
+    match provider_id {
+        "claude_cli" | "codex_cli" | "lm_studio" => saved_effort,
+        "ollama" => {
+            saved_effort
+                || request
+                    .provider_preferences
+                    .feature(AI_FEATURE_THINKING)
+                    .is_some()
+        }
+        _ => false,
+    }
 }
 
 fn run_process_with_timeout(
@@ -13218,6 +13339,60 @@ send({
     }
 
     #[test]
+    fn observed_unlisted_generic_versions_clear_only_version_sensitive_controls() {
+        for (provider_id, kind, banner) in [
+            ("claude_cli", ProviderKind::Claude, "2.1.129 (Claude Code)"),
+            ("codex_cli", ProviderKind::Codex, "codex-cli 0.144.2"),
+            ("lm_studio", ProviderKind::LmStudio, "lms 0.3.30"),
+            (
+                "ollama",
+                ProviderKind::Ollama,
+                "Warning: client version is 0.32.2",
+            ),
+        ] {
+            let version = CliVersion::parse(banner).expect("unlisted version parses");
+            let tuning = runtime_tuning_profile(kind, Some(&version), "test-model");
+            assert!(!tuning.verified_runtime, "{provider_id}");
+            assert!(tuning.version.is_some(), "{provider_id}");
+
+            let mut preferences = AiProviderPreferences {
+                reasoning_effort: "high".into(),
+                fallback_model: "preserved-fallback".into(),
+                ..AiProviderPreferences::default()
+            };
+            if provider_id == "ollama" {
+                preferences.set_feature(AI_FEATURE_THINKING, Some(true));
+            }
+            assert!(clamp_provider_preferences(
+                provider_id,
+                &mut preferences,
+                &tuning
+            ));
+            assert!(preferences.reasoning_effort.is_empty(), "{provider_id}");
+            assert_eq!(preferences.fallback_model, "preserved-fallback");
+            if provider_id == "ollama" {
+                assert_eq!(preferences.feature(AI_FEATURE_THINKING), None);
+            }
+
+            let mut unobserved = AiProviderPreferences {
+                reasoning_effort: "high".into(),
+                ..AiProviderPreferences::default()
+            };
+            if provider_id == "ollama" {
+                unobserved.set_feature(AI_FEATURE_THINKING, Some(false));
+            }
+            let original = unobserved.clone();
+            let tuning = runtime_tuning_profile(kind, None, "test-model");
+            assert!(!clamp_provider_preferences(
+                provider_id,
+                &mut unobserved,
+                &tuning
+            ));
+            assert_eq!(unobserved, original, "{provider_id}");
+        }
+    }
+
+    #[test]
     fn saved_xai_model_overrides_self_heal_to_the_fixed_heavy_contract() {
         let tuning = runtime_tuning_profile(ProviderKind::Xai, None, XAI_MULTI_AGENT_MODEL);
         let mut preferences = AiProviderPreferences {
@@ -13284,6 +13459,20 @@ send({
             "--think",
             "false"
         ));
+
+        ollama.provider_preferences.reasoning_effort = "medium".into();
+        set_feature(&mut ollama, AI_FEATURE_THINKING, true);
+        let unlisted = preset_process_spec_for_version(
+            "ollama",
+            PathBuf::from("/tmp/ollama"),
+            &ollama,
+            "Warning: client version is 0.32.2",
+        )
+        .unwrap();
+        assert!(
+            !argument_strings(&unlisted).contains(&"--think".into()),
+            "an unlisted Ollama version must use its own thinking default"
+        );
     }
 
     #[test]
@@ -14406,12 +14595,100 @@ send({
 
         fs::write(&stub, "#!/bin/sh\necho 9.9.11\n").expect("rewrite stub");
         fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
-        invalidate_cached_cli_version(&program);
         assert_eq!(
-            cached_cli_version(&program),
+            refresh_cli_version(&program).ok(),
             CliVersion::parse("9.9.11"),
-            "refresh drops the cache entry so the new version is probed"
+            "refresh forces a new observation"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_retains_only_an_identity_matched_last_good_observation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let state = directory.path().join("probe-state");
+        let stub = directory.path().join("refresh-version-stub");
+        fs::write(&state, "9.9.9\n").expect("write initial state");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nstate=$(cat '{}')\nif [ \"$state\" = \"fail\" ]; then\n  echo 'temporary failure' >&2\n  exit 7\nfi\necho \"$state\"\n",
+                state.display()
+            ),
+        )
+        .expect("write refresh stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let first = provider_probe_for_program("claude", stub.clone(), false);
+        assert_eq!(first.version, CliVersion::parse("9.9.9"));
+        assert_eq!(first.observation, ProviderProbeObservation::Observed);
+
+        fs::write(&state, "fail\n").expect("make probe fail");
+        let failed = provider_probe_for_program("claude", stub.clone(), true);
+        assert_eq!(failed.version, CliVersion::parse("9.9.9"));
+        assert!(matches!(
+            failed.observation,
+            ProviderProbeObservation::Failed {
+                retained_last_good: true,
+                ..
+            }
+        ));
+
+        fs::write(&state, "9.9.10\n").expect("recover probe");
+        let recovered = provider_probe_for_program("claude", stub.clone(), true);
+        assert_eq!(recovered.version, CliVersion::parse("9.9.10"));
+        assert_eq!(recovered.observation, ProviderProbeObservation::Observed);
+
+        let replacement = directory.path().join("refresh-version-replacement");
+        fs::write(&replacement, "#!/bin/sh\necho failed >&2\nexit 7\n").expect("write replacement");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755))
+            .expect("chmod replacement");
+        fs::rename(&replacement, &stub).expect("replace executable identity");
+        let replaced = provider_probe_for_program("claude", stub, true);
+        assert_eq!(replaced.version, None);
+        assert!(matches!(
+            replaced.observation,
+            ProviderProbeObservation::Failed {
+                retained_last_good: false,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_metadata_failure_does_not_destroy_the_version_cache() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("metadata-version-stub");
+        let hidden = directory.path().join("metadata-version-stub-hidden");
+        fs::write(&stub, "#!/bin/sh\necho 'codex-cli 0.144.1'\n").expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+        let key = fs::canonicalize(&stub).expect("canonical stub");
+        assert_eq!(
+            verified_cli_version(&stub).ok(),
+            CliVersion::parse("codex-cli 0.144.1")
+        );
+
+        fs::rename(&stub, &hidden).expect("hide executable temporarily");
+        let tuning = cached_runtime_tuning_for_program("codex_cli", &stub, "gpt-5.6-sol");
+        assert_eq!(tuning.version, None);
+        assert!(
+            lock_unpoison(CLI_VERSION_CACHE.get().expect("version cache")).contains_key(&key),
+            "metadata failure removed the last-good observation"
+        );
+    }
+
+    #[test]
+    fn provider_probe_failure_text_is_single_line_and_bounded() {
+        let raw = format!("first line\nsecond\tline\0{}", "x".repeat(700));
+        let sanitized = sanitized_cli_version_probe_failure(&CliVersionProbeFailure::Metadata(raw));
+        assert!(!sanitized.chars().any(char::is_control));
+        assert!(sanitized.len() <= 512);
+        assert!(sanitized.contains("first line second line"));
     }
 
     #[cfg(unix)]
@@ -14478,6 +14755,108 @@ send({
         assert!(
             arguments.contains("model_reasoning_effort=\"high\""),
             "saved effort was silently omitted after a slow probe: {arguments}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_unlisted_generic_versions_launch_with_provider_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (provider_id, banner, forbidden_argument) in [
+            ("claude_cli", "2.1.129 (Claude Code)", "--effort"),
+            ("codex_cli", "codex-cli 0.144.2", "model_reasoning_effort"),
+            ("lm_studio", "lms 0.3.30", "--effort"),
+        ] {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let executable = directory.path().join(format!("{provider_id}-stub"));
+            let invoked = directory.path().join("provider-arguments");
+            fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo '{banner}'\n  exit 0\nfi\nprintf '%s\\n' \"$@\" > '{}'\n",
+                    invoked.display()
+                ),
+            )
+            .expect("write provider stub");
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+                .expect("chmod provider stub");
+
+            let mut run = request(provider_id);
+            run.cwd = Some(directory.path().to_path_buf());
+            run.provider_preferences.reasoning_effort = "high".into();
+            let unobserved = preset_process_spec(provider_id, executable, &run).unwrap();
+            let (sender, _receiver) = unbounded();
+            let outcome = run_process(
+                &run,
+                unobserved,
+                &Arc::new(RunControl::default()),
+                &sender,
+                &Arc::new(Mutex::new(TaskToolRegistry::new())),
+            );
+            assert!(
+                matches!(outcome, RunOutcome::Completed { .. }),
+                "{provider_id} did not launch with provider defaults"
+            );
+            let arguments = fs::read_to_string(&invoked).expect("provider invocation arguments");
+            assert!(
+                !arguments.contains(forbidden_argument),
+                "{provider_id} received an unverified control: {arguments}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ollama_thinking_drift_reprobes_and_launches_without_an_unverified_flag() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let executable = directory.path().join("ollama-version-stub");
+        let version = directory.path().join("version");
+        let invoked = directory.path().join("provider-arguments");
+        fs::write(&version, "Warning: client version is 0.32.1\n").expect("write version");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  cat '{}'\n  exit 0\nfi\nprintf '%s\\n' \"$@\" > '{}'\n",
+                version.display(),
+                invoked.display()
+            ),
+        )
+        .expect("write Ollama stub");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("chmod Ollama stub");
+
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("Warning: client version is 0.32.1")
+        );
+        let mut run = request("ollama");
+        run.cwd = Some(directory.path().to_path_buf());
+        set_feature(&mut run, AI_FEATURE_THINKING, true);
+        let prepared = preset_process_spec("ollama", executable, &run).unwrap();
+        assert!(has_argument_pair(
+            &argument_strings(&prepared),
+            "--think",
+            "true"
+        ));
+
+        fs::write(&version, "Warning: client version is 0.32.2\n")
+            .expect("advance version without replacing executable");
+        let (sender, _receiver) = unbounded();
+        let outcome = run_process(
+            &run,
+            prepared,
+            &Arc::new(RunControl::default()),
+            &sender,
+            &Arc::new(Mutex::new(TaskToolRegistry::new())),
+        );
+        assert!(matches!(outcome, RunOutcome::Completed { .. }));
+        let arguments = fs::read_to_string(&invoked).expect("provider invocation arguments");
+        assert!(
+            !arguments.lines().any(|argument| argument == "--think"),
+            "unlisted Ollama received a stale thinking flag: {arguments}"
         );
     }
 
