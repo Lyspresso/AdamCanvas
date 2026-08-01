@@ -521,6 +521,9 @@ impl AiChatRuntime {
 #[derive(Default)]
 struct AiWorkspaceUiAction {
     send: bool,
+    /// Read-only render input carried with the frame's action accumulator so
+    /// the composer does not grow another positional argument.
+    preflight_blocks_send: bool,
     stop: bool,
     send_next_queued: bool,
     clear_queue: bool,
@@ -6169,10 +6172,22 @@ impl AdamApp {
             .filter(|request| request.conversation_id == conversation_id)
             .cloned();
         let mut action = AiWorkspaceUiAction::default();
-        self.agents.ensure_scanned();
+        self.agents.ensure_scanned_for(&settings.provider_id);
+        let agents_scanning = self.agents.scanning();
+        let provider_preflight = preflight_notice(
+            &settings.provider_id,
+            !settings.api_endpoint.trim().is_empty(),
+            self.agents.snapshot.as_ref(),
+            agents_scanning,
+        );
+        let preflight_blocks_send = provider_preflight
+            .as_ref()
+            .is_some_and(|notice| notice.blocks_send);
+        action.preflight_blocks_send = preflight_blocks_send;
         let setup_active = conversation.messages().is_empty()
             && runtime.streamed_text.is_empty()
             && !self.agents.setup_dismissed
+            && !agents_scanning
             && self
                 .agents
                 .snapshot
@@ -6184,11 +6199,7 @@ impl AdamApp {
             preflight: if setup_active {
                 None
             } else {
-                preflight_notice(
-                    &settings.provider_id,
-                    !settings.api_endpoint.trim().is_empty(),
-                    self.agents.snapshot.as_ref(),
-                )
+                provider_preflight
             },
             setup_rows: setup_active.then(|| {
                 agent_rows(
@@ -6199,7 +6210,7 @@ impl AdamApp {
                     Some(&settings.provider_id),
                 )
             }),
-            scanning: self.agents.scanning(),
+            scanning: agents_scanning,
             installing: self.agents.installing(),
             last_install: self.agents.last_install().cloned(),
         };
@@ -6295,6 +6306,12 @@ impl AdamApp {
             });
 
         let running = runtime.active_turn.is_some();
+        // Defense in depth: render paths should only set `send` when the
+        // composer is enabled, but never let an alternate UI event bypass a
+        // guaranteed-failure exact-provider preflight.
+        if !running && action.preflight_blocks_send {
+            action.send = false;
+        }
         self.chat_runtimes.insert(conversation_id, runtime);
         if !running
             && (settings != conversation.settings || permission != conversation.permission_mode)
@@ -7015,7 +7032,7 @@ impl AdamApp {
                     if matches!(provider_id.as_str(), "grok_cli" | "kimi_cli")
                         && !self.agents.scanning()
                     {
-                        self.agents.request_scan(true);
+                        self.agents.request_scan_for(true, &provider_id);
                     }
                     let runtime = self.chat_runtimes.entry(conversation_id).or_default();
                     runtime.error = Some(error);
@@ -7211,7 +7228,7 @@ impl AdamApp {
                 if matches!(provider_id.as_str(), "grok_cli" | "kimi_cli")
                     && !self.agents.scanning()
                 {
-                    self.agents.request_scan(true);
+                    self.agents.request_scan_for(true, &provider_id);
                 }
                 let runtime = self.chat_runtimes.entry(conversation_id).or_default();
                 runtime.error = Some(error.to_string());
@@ -8910,7 +8927,19 @@ impl AdamApp {
     /// Shared handler for panel-, banner-, and setup-screen actions.
     fn apply_agents_panel_action(&mut self, action: AgentsPanelAction, context: &Context) {
         if action.refresh {
-            self.agents.request_scan(true);
+            let selected_provider = self.open_chat.and_then(|conversation_id| {
+                self.workspace
+                    .domain
+                    .conversations
+                    .conversations
+                    .get(&conversation_id)
+                    .map(|conversation| conversation.settings.provider_id.clone())
+            });
+            if let Some(provider_id) = selected_provider {
+                self.agents.request_scan_for(true, &provider_id);
+            } else {
+                self.agents.request_scan(true);
+            }
         }
         if let Some(provider_id) = action.install
             && !self.agents.request_install(provider_id)
@@ -15689,6 +15718,11 @@ fn render_ai_composer(
                     .desired_rows(3)
                     .desired_width(f32::INFINITY),
             );
+            let send_enabled = ai_send_enabled(
+                &runtime.draft,
+                running,
+                action.preflight_blocks_send,
+            );
             ui.horizontal(|ui| {
                 action.add_attachments |= ui
                     .add(Button::new("+").frame(false))
@@ -15739,7 +15773,7 @@ fn render_ai_composer(
                     }
                     action.send |= ui
                         .add_enabled(
-                            !runtime.draft.trim().is_empty(),
+                            send_enabled,
                             Button::new(if running { "Queue  ↵" } else { "Send  ↵" }),
                         )
                         .clicked();
@@ -15807,7 +15841,7 @@ fn render_ai_composer(
                 );
             }
             let send_with_return = response.has_focus()
-                && !runtime.draft.trim().is_empty()
+                && send_enabled
                 && ui.input_mut(|input| {
                     input.consume_key(egui::Modifiers::NONE, Key::Enter)
                         || input.consume_key(egui::Modifiers::COMMAND, Key::Enter)
@@ -15820,6 +15854,10 @@ fn render_ai_composer(
     if provider_profile != original_profile {
         settings.set_profile_for(&provider_id, provider_profile);
     }
+}
+
+fn ai_send_enabled(draft: &str, running: bool, preflight_blocks_send: bool) -> bool {
+    !draft.trim().is_empty() && (running || !preflight_blocks_send)
 }
 
 fn select_ai_provider(settings: &mut AiConversationSettings, provider_id: &str) {
@@ -17427,6 +17465,17 @@ mod tests {
         assert_eq!(
             panel, options,
             "agents_panel::AGENT_PROVIDERS must mirror AI_PROVIDER_OPTIONS"
+        );
+    }
+
+    #[test]
+    fn composer_blocks_a_cold_exact_provider_without_blocking_active_turn_queueing() {
+        assert!(!ai_send_enabled("", false, false));
+        assert!(!ai_send_enabled("research this", false, true));
+        assert!(ai_send_enabled("research this", false, false));
+        assert!(
+            ai_send_enabled("follow up", true, true),
+            "an already-running turn may still accept a queued follow-up"
         );
     }
 
