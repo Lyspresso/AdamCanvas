@@ -1,5 +1,6 @@
 pub mod agents_panel;
 pub mod ai;
+pub(crate) mod ai_canvas_tools;
 pub mod ai_prompt;
 pub mod ai_state;
 pub(crate) mod ai_task_bridge;

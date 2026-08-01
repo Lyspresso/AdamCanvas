@@ -7,6 +7,7 @@
 #[cfg(not(test))]
 use crate::xai_responses::run_xai_responses_cancellable;
 use crate::{
+    ai_canvas_tools::{CanvasToolBroker, CanvasToolRequest},
     ai_task_bridge::TaskToolBridge,
     ai_task_tools::{TaskToolOutcome, TaskToolRegistry},
     chat_core::{
@@ -109,6 +110,9 @@ static XAI_HTTP_WORKERS: AtomicUsize = AtomicUsize::new(0);
 pub struct AiRunRequest {
     pub turn_id: Uuid,
     pub conversation_id: Uuid,
+    /// Canvas page captured when the user starts the turn. Providers never
+    /// choose an arbitrary page identifier.
+    pub canvas_page_id: Option<Uuid>,
     pub provider_id: String,
     pub workspace_mode: AiWorkspaceMode,
     pub permission_mode: PermissionMode,
@@ -134,6 +138,7 @@ impl fmt::Debug for AiRunRequest {
             .debug_struct("AiRunRequest")
             .field("turn_id", &self.turn_id)
             .field("conversation_id", &self.conversation_id)
+            .field("canvas_page_id", &self.canvas_page_id)
             .field("provider_id", &self.provider_id)
             .field("workspace_mode", &self.workspace_mode)
             .field("permission_mode", &self.permission_mode)
@@ -276,6 +281,8 @@ pub enum AiEngineError {
     AlreadyRunning(Uuid),
     #[error("conversation {0} already has a running turn")]
     ConversationBusy(Uuid),
+    #[error("conversation {0} was permanently deleted")]
+    ConversationDeleted(Uuid),
     #[error("the AI run limit ({0}) has been reached")]
     RunLimitReached(usize),
     #[error("the prompt is empty")]
@@ -297,6 +304,8 @@ pub struct AiEngine {
     event_sender: Sender<AiEvent>,
     active: Arc<Mutex<HashMap<Uuid, ActiveRun>>>,
     task_tools: Arc<Mutex<TaskToolRegistry>>,
+    canvas_tools: Arc<CanvasToolBroker>,
+    deleted_conversations: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl Default for AiEngine {
@@ -313,6 +322,8 @@ impl AiEngine {
             event_sender,
             active: Arc::new(Mutex::new(HashMap::new())),
             task_tools: Arc::new(Mutex::new(TaskToolRegistry::new())),
+            canvas_tools: Arc::new(CanvasToolBroker::new()),
+            deleted_conversations: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -320,13 +331,28 @@ impl AiEngine {
         if request.prompt.trim().is_empty() {
             return Err(AiEngineError::EmptyPrompt);
         }
+        if lock_unpoison(&self.deleted_conversations).contains(&request.conversation_id) {
+            return Err(AiEngineError::ConversationDeleted(request.conversation_id));
+        }
         let prepared = prepare_run(&request)?;
         let effective_provider = prepared.provider_id().to_owned();
         let plan_channel = prepared.plan_channel();
         let accepts_returned_session_id = prepared.accepts_returned_session_id();
+        let canvas_tools_enabled = prepared.exposes_canvas_tools()
+            && request.workspace_mode != AiWorkspaceMode::Chat
+            && ai_permission_verdict(request.permission_mode, AiPermissionClass::Mutate)
+                == AiPermissionVerdict::Allow;
         let control = Arc::new(RunControl::default());
 
         {
+            // Keep deletion and run registration in one critical section.
+            // Otherwise a concurrent permanent delete could cancel the
+            // active slot before its tool registries are installed, allowing
+            // a deleted conversation to regain a short-lived live tool gate.
+            let deleted_conversations = lock_unpoison(&self.deleted_conversations);
+            if deleted_conversations.contains(&request.conversation_id) {
+                return Err(AiEngineError::ConversationDeleted(request.conversation_id));
+            }
             let mut active = lock_unpoison(&self.active);
             if active.contains_key(&request.turn_id) {
                 return Err(AiEngineError::AlreadyRunning(request.turn_id));
@@ -347,15 +373,29 @@ impl AiEngine {
                     control: Arc::clone(&control),
                 },
             );
-        }
-        if let Err(error) = lock_unpoison(&self.task_tools).register_run(
-            request.turn_id,
-            request.conversation_id,
-            plan_channel,
-            &request.initial_tasks,
-        ) {
-            lock_unpoison(&self.active).remove(&request.turn_id);
-            return Err(AiEngineError::InvalidConfiguration(error.to_string()));
+            if let Err(error) = lock_unpoison(&self.task_tools).register_run(
+                request.turn_id,
+                request.conversation_id,
+                plan_channel,
+                &request.initial_tasks,
+            ) {
+                active.remove(&request.turn_id);
+                return Err(AiEngineError::InvalidConfiguration(error.to_string()));
+            }
+            if let Some(page_id) = request.canvas_page_id
+                && let Err(error) = self.canvas_tools.register_run(
+                    request.turn_id,
+                    request.conversation_id,
+                    page_id,
+                    canvas_tools_enabled,
+                )
+            {
+                lock_unpoison(&self.task_tools).unregister_run(request.turn_id);
+                active.remove(&request.turn_id);
+                return Err(AiEngineError::InvalidConfiguration(error.into()));
+            }
+            drop(active);
+            drop(deleted_conversations);
         }
 
         let turn_id = request.turn_id;
@@ -363,6 +403,7 @@ impl AiEngine {
         let events = self.event_sender.clone();
         let active = Arc::clone(&self.active);
         let task_tools = Arc::clone(&self.task_tools);
+        let canvas_tools = Arc::clone(&self.canvas_tools);
         let spawn = thread::Builder::new()
             .name(format!("adam-ai-{}", short_uuid(turn_id)))
             .spawn(move || {
@@ -385,6 +426,7 @@ impl AiEngine {
                             &control,
                             &events,
                             &task_tools,
+                            &canvas_tools,
                         ),
                         PreparedRun::KimiAcp(specification) => {
                             run_kimi_acp_transport(&request, specification, &control, &events)
@@ -401,6 +443,7 @@ impl AiEngine {
                 // Tool-list and tool-call gates fail closed before the
                 // terminal event becomes observable to consumers.
                 lock_unpoison(&task_tools).unregister_run(turn_id);
+                canvas_tools.unregister_run(turn_id);
                 if let Some(status) = run_outcome_status(&outcome) {
                     let _ = events.send(AiEvent::Activity {
                         turn_id,
@@ -423,6 +466,7 @@ impl AiEngine {
         if let Err(error) = spawn {
             lock_unpoison(&self.active).remove(&turn_id);
             lock_unpoison(&self.task_tools).unregister_run(turn_id);
+            self.canvas_tools.unregister_run(turn_id);
             return Err(AiEngineError::WorkerStart(error));
         }
         Ok(())
@@ -432,30 +476,87 @@ impl AiEngine {
         let control = lock_unpoison(&self.active)
             .get(&turn_id)
             .map(|run| Arc::clone(&run.control));
+        if control.is_some() {
+            // Revoke queued and future canvas calls before cooperative process
+            // cancellation can yield back to the UI.
+            self.canvas_tools.unregister_run(turn_id);
+        }
         control.is_some_and(|control| control.cancel())
     }
 
-    pub fn try_recv(&self) -> Option<AiEvent> {
-        let event = self.events.try_recv().ok()?;
-        if let AiEvent::Activity {
-            conversation_id,
-            event: activity,
-            ..
-        } = &event
-        {
-            lock_unpoison(&self.task_tools).observe_activity(*conversation_id, activity);
-        } else if let AiEvent::ActivityBatch {
-            conversation_id,
-            events,
-            ..
-        } = &event
-        {
-            let mut task_tools = lock_unpoison(&self.task_tools);
-            for activity in events {
-                task_tools.observe_activity(*conversation_id, activity);
-            }
+    pub fn cancel_conversation(&self, conversation_id: Uuid) -> bool {
+        let runs = lock_unpoison(&self.active)
+            .iter()
+            .filter(|(_, run)| run.conversation_id == conversation_id)
+            .map(|(turn_id, run)| (*turn_id, Arc::clone(&run.control)))
+            .collect::<Vec<_>>();
+        for (turn_id, _) in &runs {
+            self.canvas_tools.unregister_run(*turn_id);
         }
-        Some(event)
+        for (_, control) in &runs {
+            let _ = control.cancel();
+        }
+        !runs.is_empty()
+    }
+
+    /// Permanently retires a conversation. Cancellation is cooperative, so a
+    /// tombstone also prevents already-buffered/late events from rebuilding
+    /// checklist state after the UI has erased it.
+    pub fn delete_conversation(&self, conversation_id: Uuid) -> bool {
+        let newly_deleted = lock_unpoison(&self.deleted_conversations).insert(conversation_id);
+        let cancelled = self.cancel_conversation(conversation_id);
+        let forgot_tasks = lock_unpoison(&self.task_tools).forget_conversation(conversation_id);
+        self.canvas_tools.forget_conversation(conversation_id);
+        newly_deleted || cancelled || forgot_tasks
+    }
+
+    pub fn try_recv_canvas_tool(&self) -> Option<CanvasToolRequest> {
+        self.canvas_tools.try_recv()
+    }
+
+    /// Final UI-thread gate for a queued canvas mutation.
+    pub(crate) fn canvas_tool_request_is_active(&self, request: &CanvasToolRequest) -> bool {
+        !lock_unpoison(&self.deleted_conversations).contains(&request.conversation_id)
+            && self.canvas_tools.request_is_active(request)
+    }
+
+    /// Atomically hands a still-live canvas request to the UI owner at the
+    /// last boundary before the workspace mutation. A successful claim is
+    /// intentionally not revocable by a later cancellation: once Adam has
+    /// changed the canvas, the provider must receive the truthful receipt.
+    pub(crate) fn claim_canvas_tool_for_commit(&self, request: &CanvasToolRequest) -> bool {
+        !lock_unpoison(&self.deleted_conversations).contains(&request.conversation_id)
+            && self.canvas_tools.claim_for_commit(request)
+    }
+
+    pub fn try_recv(&self) -> Option<AiEvent> {
+        loop {
+            let event = self.events.try_recv().ok()?;
+            let deleted = lock_unpoison(&self.deleted_conversations);
+            if deleted.contains(&event.conversation_id()) {
+                continue;
+            }
+            if let AiEvent::Activity {
+                conversation_id,
+                event: activity,
+                ..
+            } = &event
+            {
+                lock_unpoison(&self.task_tools).observe_activity(*conversation_id, activity);
+            } else if let AiEvent::ActivityBatch {
+                conversation_id,
+                events,
+                ..
+            } = &event
+            {
+                let mut task_tools = lock_unpoison(&self.task_tools);
+                for activity in events {
+                    task_tools.observe_activity(*conversation_id, activity);
+                }
+            }
+            drop(deleted);
+            return Some(event);
+        }
     }
 
     /// Tool-list-time exposure gate for provider adapters.
@@ -517,11 +618,14 @@ impl AiEngine {
     }
 
     pub fn cancel_all(&self) {
-        let controls: Vec<_> = lock_unpoison(&self.active)
-            .values()
-            .map(|run| Arc::clone(&run.control))
+        let runs: Vec<_> = lock_unpoison(&self.active)
+            .iter()
+            .map(|(turn_id, run)| (*turn_id, Arc::clone(&run.control)))
             .collect();
-        for control in controls {
+        for (turn_id, _) in &runs {
+            self.canvas_tools.unregister_run(*turn_id);
+        }
+        for (_, control) in runs {
             let _ = control.cancel();
         }
     }
@@ -718,6 +822,19 @@ impl PreparedRun {
             Self::Process(specification) if specification.provider_id == "kimi_cli"
         )
     }
+
+    /// Canvas mutations are exposed only when the transport proves every
+    /// call belongs to the foreground agent. Grok ACP is root-safe only when
+    /// child sessions are disabled. Unknown/custom/API transports fail
+    /// closed until their caller identity is equally explicit.
+    fn exposes_canvas_tools(&self) -> bool {
+        match self {
+            Self::GrokAcp(specification) => specification.canvas_tools_supported,
+            Self::Process(_) | Self::KimiAcp(_) | Self::XaiResponses(_) | Self::Http { .. } => {
+                false
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -752,6 +869,9 @@ struct GrokAcpSpec {
     runtime_version: CliVersion,
     plan_channel: PlanChannel,
     subagents_enabled: bool,
+    /// A freshly-created foreground session can attach the canvas-only MCP
+    /// subset even when its Main Progress authority remains provider-native.
+    canvas_tools_supported: bool,
 }
 
 #[derive(Debug)]
@@ -1868,6 +1988,7 @@ fn prepare_resolved_cli(
                 request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) != Some(false);
             let plan_channel = grok_acp_plan_channel(&tuning, request.resume_session_id.is_some());
             let subagents_enabled = tuning.supports_scoped_child_text() && subagents_requested;
+            let canvas_tools_supported = request.resume_session_id.is_none() && !subagents_enabled;
             let cwd = match canonical_working_directory(request.cwd.as_deref())? {
                 Some(cwd) => cwd,
                 None => env::current_dir()
@@ -1884,6 +2005,7 @@ fn prepare_resolved_cli(
                 runtime_version,
                 plan_channel,
                 subagents_enabled,
+                canvas_tools_supported,
             }));
         }
         if !supports_grok_legacy_process(tuning.version.as_ref()) {
@@ -2808,6 +2930,7 @@ struct GrokAcpProjectionState {
     root_session_id: Option<String>,
     child_scope_by_session: HashMap<String, GrokAcpSessionScope>,
     emitted_tool_calls: HashSet<(String, String)>,
+    emitted_file_changes: HashSet<(String, String)>,
     permission_tools: HashMap<(String, String), String>,
     child_permission_blocks: HashMap<String, GrokPermissionBlock>,
     workflow_members: HashMap<String, Vec<AgentGroupMember>>,
@@ -2911,6 +3034,7 @@ fn run_grok_acp_transport(
     control: &Arc<RunControl>,
     event_sender: &Sender<AiEvent>,
     task_tools: &Arc<Mutex<TaskToolRegistry>>,
+    canvas_tools: &Arc<CanvasToolBroker>,
 ) -> RunOutcome {
     // Prepared runs can wait in Adam's queue while a CLI updates in place.
     // Re-probe at the process boundary and fail closed instead of launching a
@@ -2942,6 +3066,8 @@ fn run_grok_acp_transport(
         request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) != Some(false);
     let current_plan_channel = grok_acp_plan_channel(&tuning, request.resume_session_id.is_some());
     let current_subagents_enabled = tuning.supports_scoped_child_text() && subagents_requested;
+    let current_canvas_tools_supported =
+        request.resume_session_id.is_none() && !current_subagents_enabled;
     if !tuning
         .version
         .as_ref()
@@ -2949,6 +3075,7 @@ fn run_grok_acp_transport(
         || !supports_grok_acp_task_bridge(tuning.version.as_ref())
         || current_plan_channel != specification.plan_channel
         || current_subagents_enabled != specification.subagents_enabled
+        || current_canvas_tools_supported != specification.canvas_tools_supported
     {
         return RunOutcome::runtime_probe_failed(
             "the installed Grok runtime changed after this turn was prepared; retry the turn so Adam can apply the current capability contract",
@@ -2967,8 +3094,10 @@ fn run_grok_acp_transport(
     let bridge_events = event_sender.clone();
     let turn_id = request.turn_id;
     let conversation_id = request.conversation_id;
-    let mut bridge = if specification.plan_channel == PlanChannel::AppTaskTools {
-        match TaskToolBridge::start(
+    let has_canvas_tools = !canvas_tools.descriptors_for_run(turn_id).is_empty();
+    let mut bridge = if specification.plan_channel == PlanChannel::AppTaskTools || has_canvas_tools
+    {
+        match TaskToolBridge::start_with_canvas(
             turn_id,
             Arc::clone(task_tools),
             Arc::new(move |events| {
@@ -2980,6 +3109,7 @@ fn run_grok_acp_transport(
                     })
                     .expect("AI event receiver must remain available while task bridge is active");
             }),
+            Some(Arc::clone(canvas_tools)),
         ) {
             Ok(bridge) => Some(bridge),
             Err(error) => {
@@ -2998,6 +3128,14 @@ fn run_grok_acp_transport(
         .map(str::to_owned);
     let subagents_enabled = specification.subagents_enabled;
     let mut rules = request.system_prompt.clone().unwrap_or_default();
+    if has_canvas_tools {
+        if !rules.is_empty() {
+            rules.push_str("\n\n");
+        }
+        rules.push_str(
+            "Adam has attached canvas_create_note and canvas_create_pile for deliberate canvas output. Use them only when the user asks for a canvas deliverable, supply a unique idempotency_key for each intended entity, and treat a returned receipt as the only proof that creation succeeded.",
+        );
+    }
     if !subagents_enabled {
         if !rules.is_empty() {
             rules.push_str("\n\n");
@@ -3011,9 +3149,10 @@ fn run_grok_acp_transport(
             rules.push_str("\n\n");
         }
         rules.push_str(
-            "Keep the foreground session's provider-native plan current as the main task checklist. Child plans belong only to their child sessions. Adam's task-tool MCP server is intentionally not attached to this run because Grok resume records do not preserve the session's original child capability.",
+            "Keep the foreground session's provider-native plan current as the main task checklist. Child plans belong only to their child sessions. Adam's checklist tools are intentionally not attached to this run. A fresh foreground-only run may still receive Adam's separately gated canvas tools.",
         );
     }
+    let task_tools_enabled = specification.plan_channel == PlanChannel::AppTaskTools;
     let acp_request = GrokAcpRequest {
         executable: specification.program,
         cwd: specification.cwd,
@@ -3050,6 +3189,8 @@ fn run_grok_acp_transport(
         reasoning_effort,
         resume_session_id: request.resume_session_id.clone(),
         progress_route,
+        task_tools_enabled,
+        canvas_tools_enabled: has_canvas_tools,
         http_mcp_server: bridge.as_ref().map(|bridge| {
             GrokAcpHttpMcpServer::bearer("adam_tasks", bridge.endpoint(), bridge.bearer_token())
         }),
@@ -3064,7 +3205,8 @@ fn run_grok_acp_transport(
         root_plan_channel: specification.plan_channel,
         ..GrokAcpProjectionState::default()
     });
-    let root_task_tools_enabled = specification.plan_channel == PlanChannel::AppTaskTools;
+    let root_task_tools_enabled = task_tools_enabled;
+    let root_canvas_tools_enabled = has_canvas_tools;
     let result = run_grok_acp(
         &acp_request,
         &control.cancelled,
@@ -3074,6 +3216,7 @@ fn run_grok_acp_transport(
                 request.permission_mode,
                 request.workspace_mode,
                 root_task_tools_enabled,
+                root_canvas_tools_enabled,
                 &permission_block,
             )
         },
@@ -3179,7 +3322,14 @@ fn grok_acp_permission_decision(
     workspace_mode: AiWorkspaceMode,
     blocked: &RefCell<GrokPermissionBlockState>,
 ) -> GrokAcpPermissionDecision {
-    grok_acp_permission_decision_with_subagents(permission, mode, workspace_mode, false, blocked)
+    grok_acp_permission_decision_with_subagents(
+        permission,
+        mode,
+        workspace_mode,
+        false,
+        false,
+        blocked,
+    )
 }
 
 fn grok_acp_permission_decision_with_subagents(
@@ -3187,6 +3337,7 @@ fn grok_acp_permission_decision_with_subagents(
     mode: PermissionMode,
     workspace_mode: AiWorkspaceMode,
     root_task_tools_enabled: bool,
+    root_canvas_tools_enabled: bool,
     blocked: &RefCell<GrokPermissionBlockState>,
 ) -> GrokAcpPermissionDecision {
     let tool = grok_acp_tool_label(&permission.tool_call);
@@ -3214,6 +3365,10 @@ fn grok_acp_permission_decision_with_subagents(
         canonical,
         "adam_tasks__task_create" | "adam_tasks__task_update" | "adam_tasks__task_list"
     );
+    let is_exact_canvas_tool = matches!(
+        canonical,
+        "adam_tasks__canvas_create_note" | "adam_tasks__canvas_create_pile"
+    );
     let is_task_lookalike = [&normalized_title, &normalized_canonical]
         .into_iter()
         .any(|name| {
@@ -3227,6 +3382,9 @@ fn grok_acp_permission_decision_with_subagents(
                     | "adamtaskstasklist"
             )
         });
+    let is_canvas_lookalike = [&normalized_title, &normalized_canonical]
+        .into_iter()
+        .any(|name| name.contains("canvascreatenote") || name.contains("canvascreatepile"));
     let asks_for_child = [&normalized_title, &normalized_canonical]
         .into_iter()
         .any(|name| {
@@ -3247,11 +3405,14 @@ fn grok_acp_permission_decision_with_subagents(
         | None => AiPermissionClass::Destructive,
         _ => AiPermissionClass::Mutate,
     };
-    // Exact task tools are available only in a root-only AppTaskTools run.
-    // Scoped-child runs use NativeStream and the inherited MCP endpoint stays
-    // inert at list and call time. Title lookalikes and child calls never
-    // establish authority.
-    let verdict = if asks_for_child || (is_task_lookalike && !is_exact_task_tool) {
+    // Exact task tools are available only in a root-owned AppTaskTools run.
+    // Canvas tools are independently enabled for a fresh foreground-only run,
+    // including 0.2.117's native Progress route. Title lookalikes and child
+    // calls never establish either authority.
+    let verdict = if asks_for_child
+        || (is_task_lookalike && !is_exact_task_tool)
+        || (is_canvas_lookalike && !is_exact_canvas_tool)
+    {
         // The verified 0.2.117 child path is a lifecycle notification, not a
         // permission-gated tool call. Treat provider-controlled spellings
         // only as a reason to deny; they never establish authority.
@@ -3259,6 +3420,12 @@ fn grok_acp_permission_decision_with_subagents(
     } else if is_exact_task_tool {
         if is_root && root_task_tools_enabled {
             AiPermissionVerdict::Allow
+        } else {
+            AiPermissionVerdict::Deny
+        }
+    } else if is_exact_canvas_tool {
+        if is_root && root_canvas_tools_enabled && workspace_mode != AiWorkspaceMode::Chat {
+            ai_permission_verdict(mode, AiPermissionClass::Mutate)
         } else {
             AiPermissionVerdict::Deny
         }
@@ -3783,6 +3950,7 @@ fn emit_grok_acp_tool_call(
     let Some(scope) = projection.borrow().adam_scope_for_session(session_id) else {
         return;
     };
+    let tool = grok_acp_tool_label(tool_call);
     if !scope.is_main() {
         let clears_denial = projection
             .borrow()
@@ -3810,7 +3978,7 @@ fn emit_grok_acp_tool_call(
             scope.clone(),
             ActivityKind::ToolCall {
                 id: tool_call.id.clone(),
-                name: grok_acp_tool_label(tool_call),
+                name: tool.clone(),
                 server: Some("grok".into()),
                 input_summary: tool_call
                     .locations
@@ -3819,6 +3987,50 @@ fn emit_grok_acp_tool_call(
             },
             None,
         );
+    }
+    let file_status = match tool_call.status {
+        Some(GrokAcpToolStatus::Completed) => Some(ActivityStatus::Completed),
+        Some(GrokAcpToolStatus::Failed) => Some(ActivityStatus::Failed),
+        _ => None,
+    };
+    if let Some(status) = file_status
+        && matches!(
+            tool_call.kind,
+            Some(GrokAcpToolKind::Edit | GrokAcpToolKind::Delete)
+        )
+    {
+        let kind = if tool_call.kind == Some(GrokAcpToolKind::Delete) {
+            FileChangeKind::Delete
+        } else {
+            FileChangeKind::Update
+        };
+        let changes = structured_file_changes(
+            request.cwd.as_deref(),
+            tool_call
+                .locations
+                .iter()
+                .map(|location| location.path.as_str()),
+            kind,
+        );
+        if !changes.is_empty()
+            && projection
+                .borrow_mut()
+                .emitted_file_changes
+                .insert((session_id.to_owned(), tool_call.id.clone()))
+        {
+            send_grok_acp_activity(
+                request,
+                event_sender,
+                scope.clone(),
+                ActivityKind::FileChange {
+                    id: tool_call.id.clone(),
+                    tool: Some(tool),
+                    changes,
+                    status,
+                },
+                None,
+            );
+        }
     }
     if is_update
         && matches!(
@@ -3919,6 +4131,7 @@ struct KimiDelegationState {
 struct KimiAcpProjectionState {
     emitted_tool_calls: HashSet<String>,
     emitted_tool_results: HashSet<String>,
+    emitted_file_changes: HashSet<String>,
     permission_tools: HashMap<String, String>,
     delegations: HashMap<String, KimiDelegationState>,
 }
@@ -4399,6 +4612,7 @@ fn emit_kimi_acp_tool_call(
     tool_call: &KimiAcpToolCall,
     projection: &RefCell<KimiAcpProjectionState>,
 ) {
+    let tool = kimi_acp_tool_label(tool_call);
     let first = projection
         .borrow_mut()
         .emitted_tool_calls
@@ -4409,7 +4623,7 @@ fn emit_kimi_acp_tool_call(
             event_sender,
             ActivityKind::ToolCall {
                 id: tool_call.id.clone(),
-                name: kimi_acp_tool_label(tool_call),
+                name: tool.clone(),
                 server: Some("kimi".into()),
                 input_summary: tool_call
                     .raw_input
@@ -4438,6 +4652,47 @@ fn emit_kimi_acp_tool_call(
             .borrow_mut()
             .emitted_tool_results
             .insert(tool_call.id.clone());
+    if terminal
+        && matches!(
+            tool_call.kind,
+            Some(KimiAcpToolKind::Edit | KimiAcpToolKind::Delete)
+        )
+    {
+        let kind = if tool_call.kind == Some(KimiAcpToolKind::Delete) {
+            FileChangeKind::Delete
+        } else {
+            FileChangeKind::Update
+        };
+        let changes = structured_file_changes(
+            request.cwd.as_deref(),
+            tool_call
+                .locations
+                .iter()
+                .map(|location| location.path.as_str()),
+            kind,
+        );
+        if !changes.is_empty()
+            && projection
+                .borrow_mut()
+                .emitted_file_changes
+                .insert(tool_call.id.clone())
+        {
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::FileChange {
+                    id: tool_call.id.clone(),
+                    tool: Some(tool),
+                    changes,
+                    status: if tool_call.status == Some(KimiAcpToolStatus::Failed) {
+                        ActivityStatus::Failed
+                    } else {
+                        ActivityStatus::Completed
+                    },
+                },
+            );
+        }
+    }
     if first_terminal {
         send_provider_activity(
             request,
@@ -6030,6 +6285,12 @@ struct PendingTaskUpdate {
     active_form: Option<String>,
 }
 
+struct PendingFileChange {
+    tool: String,
+    changes: Vec<FileChange>,
+    scope: AgentScope,
+}
+
 #[derive(Clone, Debug, Default)]
 struct KnownSubagent {
     parent_id: Option<String>,
@@ -6064,7 +6325,7 @@ struct OutputDecoder {
     poisoned: bool,
     stream_reset_emitted: bool,
     command_calls: HashMap<String, String>,
-    file_calls: HashMap<String, Vec<FileChange>>,
+    file_calls: HashMap<(AgentScope, String), PendingFileChange>,
     pending_task_creates: HashMap<String, String>,
     pending_task_updates: HashMap<String, PendingTaskUpdate>,
     task_subjects: HashMap<String, String>,
@@ -6699,31 +6960,38 @@ impl OutputDecoder {
             }
             "file_change" | "fileChange" => {
                 decoded.recognized = true;
+                let tool = string_at(item, &["tool", "tool_name", "toolName"])
+                    .filter(|tool| !tool.trim().is_empty())
+                    .unwrap_or_else(|| "Codex file change".into());
                 let changes = item
                     .get("changes")
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
-                    .map(|change| FileChange {
-                        path: self.resolve_path(
-                            change
-                                .get("path")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default(),
-                        ),
-                        kind: file_change_kind(
-                            change
-                                .get("kind")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default(),
-                        ),
+                    .filter_map(|change| {
+                        let path = resolve_provider_path(
+                            self.working_directory.as_deref(),
+                            change.get("path").and_then(Value::as_str)?,
+                        )?;
+                        Some(FileChange {
+                            path,
+                            kind: file_change_kind(
+                                change
+                                    .get("kind")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                            ),
+                        })
                     })
-                    .collect();
-                decoded.kinds.push(ActivityKind::FileChange {
-                    id: id.into(),
-                    changes,
-                    status: lifecycle_status(item, phase),
-                });
+                    .collect::<Vec<_>>();
+                if !changes.is_empty() {
+                    decoded.kinds.push(ActivityKind::FileChange {
+                        id: id.into(),
+                        tool: Some(tool),
+                        changes,
+                        status: lifecycle_status(item, phase),
+                    });
+                }
             }
             "web_search" | "webSearch" => {
                 decoded.recognized = true;
@@ -7685,7 +7953,7 @@ impl OutputDecoder {
                             let kind = if matches!(name.as_str(), "Agent" | "Task") {
                                 self.decode_claude_agent_tool_use(block, value)
                             } else {
-                                self.decode_tool_use(block)
+                                self.decode_tool_use(block, scope.clone())
                             };
                             if let Some(kind) = kind {
                                 decoded.kinds.push_scoped(scope.clone(), kind);
@@ -8306,11 +8574,11 @@ impl OutputDecoder {
         decoded
     }
 
-    fn decode_tool_use(&mut self, block: &Value) -> Option<ActivityKind> {
+    fn decode_tool_use(&mut self, block: &Value, scope: AgentScope) -> Option<ActivityKind> {
         let id = string_at(block, &["id"]).unwrap_or_else(|| Uuid::new_v4().to_string());
         let name = string_at(block, &["name"]).unwrap_or_else(|| "tool".into());
         let input = block.get("input").cloned().unwrap_or(Value::Null);
-        self.map_tool_call(id, name, input)
+        self.map_tool_call_scoped(id, name, input, scope)
     }
 
     fn decode_openai_tool_call(&mut self, call: &Value) -> Option<ActivityKind> {
@@ -8335,6 +8603,16 @@ impl OutputDecoder {
     }
 
     fn map_tool_call(&mut self, id: String, name: String, input: Value) -> Option<ActivityKind> {
+        self.map_tool_call_scoped(id, name, input, AgentScope::Main)
+    }
+
+    fn map_tool_call_scoped(
+        &mut self,
+        id: String,
+        name: String,
+        input: Value,
+        scope: AgentScope,
+    ) -> Option<ActivityKind> {
         match name.as_str() {
             "TodoWrite" => {
                 let tasks = input
@@ -8423,19 +8701,43 @@ impl OutputDecoder {
                 })
             }
             "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
-                let path =
-                    string_at(&input, &["file_path", "notebook_path", "path"]).unwrap_or_default();
+                let Some(path) = string_at(&input, &["file_path", "notebook_path", "path"])
+                    .filter(|path| !path.trim().is_empty())
+                else {
+                    return Some(ActivityKind::ToolCall {
+                        id,
+                        name,
+                        server: None,
+                        input_summary: compact_input_summary(&input),
+                    });
+                };
+                let Some(path) = resolve_provider_path(self.working_directory.as_deref(), &path)
+                else {
+                    return Some(ActivityKind::ToolCall {
+                        id,
+                        name,
+                        server: None,
+                        input_summary: compact_input_summary(&input),
+                    });
+                };
                 let changes = vec![FileChange {
-                    path: self.resolve_path(&path),
-                    kind: if name == "Write" {
-                        FileChangeKind::Add
-                    } else {
-                        FileChangeKind::Update
-                    },
+                    path,
+                    // Claude does not say whether Write created a new file or
+                    // replaced an existing one. Update materializes a
+                    // first-seen artifact without resetting its producer.
+                    kind: FileChangeKind::Update,
                 }];
-                self.file_calls.insert(id.clone(), changes.clone());
+                self.file_calls.insert(
+                    (scope.clone(), id.clone()),
+                    PendingFileChange {
+                        tool: name.clone(),
+                        changes: changes.clone(),
+                        scope,
+                    },
+                );
                 Some(ActivityKind::FileChange {
                     id,
+                    tool: Some(name),
                     changes,
                     status: ActivityStatus::InProgress,
                 })
@@ -8493,10 +8795,19 @@ impl OutputDecoder {
                 },
             });
         }
-        if let Some(changes) = self.file_calls.remove(&id) {
+        let result_scope = if self.provider_kind == ProviderKind::Claude {
+            envelope.and_then(|value| self.claude_envelope_scope(value))
+        } else {
+            Some(AgentScope::Main)
+        };
+        if let Some(result_scope) = result_scope
+            && let Some(pending) = self.file_calls.remove(&(result_scope.clone(), id.clone()))
+        {
+            debug_assert_eq!(pending.scope, result_scope);
             return Some(ActivityKind::FileChange {
                 id,
-                changes,
+                tool: Some(pending.tool),
+                changes: pending.changes,
                 status: if is_error {
                     ActivityStatus::Failed
                 } else {
@@ -8682,17 +8993,6 @@ impl OutputDecoder {
                 )
             }),
         })
-    }
-
-    fn resolve_path(&self, path: &str) -> String {
-        let path = Path::new(path);
-        if path.is_absolute() {
-            return path.to_string_lossy().into_owned();
-        }
-        self.working_directory
-            .as_deref()
-            .map(|directory| directory.join(path).to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string_lossy().into_owned())
     }
 }
 
@@ -10066,6 +10366,93 @@ fn file_change_kind(kind: &str) -> FileChangeKind {
     }
 }
 
+fn structured_file_changes<'a>(
+    cwd: Option<&Path>,
+    paths: impl IntoIterator<Item = &'a str>,
+    kind: FileChangeKind,
+) -> Vec<FileChange> {
+    let mut seen = HashSet::new();
+    paths
+        .into_iter()
+        .filter_map(|raw_path| {
+            let path = resolve_provider_path(cwd, raw_path)?;
+            seen.insert(path.clone())
+                .then_some(FileChange { path, kind })
+        })
+        .collect()
+}
+
+/// Resolves a provider-reported file path inside the run workspace.
+///
+/// Provider output is untrusted: lexical traversal, absolute paths outside
+/// the workspace, and symlink escapes are all rejected. Existing targets and
+/// the nearest existing ancestor of new targets are canonicalized so aliases
+/// converge on one artifact identity.
+fn resolve_provider_path(cwd: Option<&Path>, raw_path: &str) -> Option<String> {
+    let raw_path = raw_path.trim();
+    if raw_path.is_empty() {
+        return None;
+    }
+
+    let cwd = fs::canonicalize(cwd?).ok()?;
+    if !cwd.is_dir() {
+        return None;
+    }
+
+    let raw_path = Path::new(raw_path);
+    let is_absolute = raw_path.is_absolute();
+    let candidate = if is_absolute {
+        raw_path.to_path_buf()
+    } else {
+        cwd.join(raw_path)
+    };
+    let candidate = lexical_normalize_absolute(&candidate)?;
+    if !is_absolute && (candidate == cwd || !candidate.starts_with(&cwd)) {
+        return None;
+    }
+
+    let mut existing_ancestor = candidate.as_path();
+    loop {
+        match fs::symlink_metadata(existing_ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                existing_ancestor = existing_ancestor.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+    let canonical_ancestor = fs::canonicalize(existing_ancestor).ok()?;
+    if !canonical_ancestor.starts_with(&cwd) {
+        return None;
+    }
+    let unresolved_suffix = candidate.strip_prefix(existing_ancestor).ok()?;
+    let resolved = lexical_normalize_absolute(&canonical_ancestor.join(unresolved_suffix))?;
+    (resolved != cwd && resolved.starts_with(&cwd)).then(|| resolved.to_string_lossy().into_owned())
+}
+
+fn lexical_normalize_absolute(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(component) => normalized.push(component),
+        }
+    }
+    Some(normalized)
+}
+
 fn plan_status(status: Option<&str>) -> PlanItemStatus {
     parsed_plan_status(status).unwrap_or_default()
 }
@@ -11321,6 +11708,7 @@ mod tests {
         AiRunRequest {
             turn_id: Uuid::from_u128(1),
             conversation_id: Uuid::from_u128(2),
+            canvas_page_id: Some(Uuid::from_u128(3)),
             provider_id: provider_id.into(),
             workspace_mode: AiWorkspaceMode::Code,
             permission_mode: PermissionMode::Sandbox,
@@ -11736,6 +12124,7 @@ mod tests {
                 PermissionMode::Ask,
                 AiWorkspaceMode::Cowork,
                 true,
+                false,
                 &blocked,
             ),
             GrokAcpPermissionDecision::Allow { .. }
@@ -11753,6 +12142,7 @@ mod tests {
                 PermissionMode::Bypass,
                 AiWorkspaceMode::Cowork,
                 true,
+                false,
                 &blocked,
             ),
             GrokAcpPermissionDecision::Reject { .. }
@@ -11769,6 +12159,7 @@ mod tests {
                 PermissionMode::Ask,
                 AiWorkspaceMode::Cowork,
                 true,
+                false,
                 &blocked,
             ),
             GrokAcpPermissionDecision::Reject { .. }
@@ -11778,6 +12169,7 @@ mod tests {
                 &spawn,
                 PermissionMode::Bypass,
                 AiWorkspaceMode::Cowork,
+                false,
                 false,
                 &blocked,
             ),
@@ -11791,6 +12183,121 @@ mod tests {
                 &title_lookalike,
                 PermissionMode::Bypass,
                 AiWorkspaceMode::Cowork,
+                true,
+                false,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn grok_acp_canvas_permissions_require_exact_root_enabled_identity() {
+        let blocked = RefCell::new(GrokPermissionBlockState::default());
+
+        for mode in [PermissionMode::Auto, PermissionMode::Bypass] {
+            let mut root_canvas = acp_permission(
+                "provider-controlled title",
+                GrokAcpToolKind::Other("mcp".into()),
+            );
+            root_canvas.tool_call.canonical_mcp_tool_name =
+                Some("adam_tasks__canvas_create_note".into());
+            assert!(matches!(
+                grok_acp_permission_decision_with_subagents(
+                    &root_canvas,
+                    mode,
+                    AiWorkspaceMode::Cowork,
+                    false,
+                    true,
+                    &blocked,
+                ),
+                GrokAcpPermissionDecision::Allow { .. }
+            ));
+            assert!(blocked.borrow().pending.is_none());
+        }
+
+        let mut disabled = acp_permission(
+            "provider-controlled title",
+            GrokAcpToolKind::Other("mcp".into()),
+        );
+        disabled.tool_call.canonical_mcp_tool_name = Some("adam_tasks__canvas_create_pile".into());
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &disabled,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Cowork,
+                false,
+                false,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+        blocked.borrow_mut().pending = None;
+
+        let mut child = disabled.clone();
+        child.session_id = "child-session".into();
+        child.scope = GrokAcpSessionScope::Child {
+            subagent_id: "provider-child".into(),
+            parent_session_id: "session".into(),
+        };
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &child,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Cowork,
+                false,
+                true,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+        assert!(
+            blocked.borrow().pending.is_none(),
+            "a child canvas denial must not become the root terminal cause"
+        );
+
+        let title_only = acp_permission(
+            "adam_tasks__canvas_create_note",
+            GrokAcpToolKind::Other("mcp".into()),
+        );
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &title_only,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Cowork,
+                false,
+                true,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+        blocked.borrow_mut().pending = None;
+
+        let mut canonical_lookalike = acp_permission(
+            "provider-controlled title",
+            GrokAcpToolKind::Other("mcp".into()),
+        );
+        canonical_lookalike.tool_call.canonical_mcp_tool_name =
+            Some("adam_tasks__canvas_create_note_backup".into());
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &canonical_lookalike,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Cowork,
+                false,
+                true,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+        blocked.borrow_mut().pending = None;
+
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &disabled,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                false,
                 true,
                 &blocked,
             ),
@@ -11955,6 +12462,163 @@ mod tests {
                 ..
             } if tool == "Switch mode"
         ));
+    }
+
+    #[test]
+    fn grok_acp_projects_only_structured_terminal_file_mutations_with_verified_scope() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_root = fs::canonicalize(workspace.path()).unwrap();
+        let old_absolute = workspace_root.join("old.md").to_string_lossy().into_owned();
+        let mut run = request("grok_cli");
+        run.cwd = Some(workspace_root.clone());
+        let (sender, receiver) = unbounded();
+        let projection = RefCell::new(GrokAcpProjectionState {
+            root_session_id: Some("root-session".into()),
+            ..GrokAcpProjectionState::default()
+        });
+        projection.borrow_mut().remember_child(
+            "child-session",
+            GrokAcpSessionScope::Child {
+                subagent_id: "provider-child".into(),
+                parent_session_id: "root-session".into(),
+            },
+        );
+        let tool = |id: &str,
+                    title: &str,
+                    kind: GrokAcpToolKind,
+                    status: GrokAcpToolStatus,
+                    path: &str| GrokAcpToolCall {
+            id: id.into(),
+            title: Some(title.into()),
+            canonical_mcp_tool_name: None,
+            kind: Some(kind),
+            status: Some(status),
+            content: Vec::new(),
+            locations: vec![crate::grok_acp::GrokAcpToolLocation {
+                path: path.into(),
+                line: None,
+            }],
+        };
+
+        for (session_id, tool_call) in [
+            (
+                "root-session",
+                tool(
+                    "edit-report",
+                    "Edit report",
+                    GrokAcpToolKind::Edit,
+                    GrokAcpToolStatus::Completed,
+                    "report.md",
+                ),
+            ),
+            (
+                "root-session",
+                tool(
+                    "edit-old",
+                    "Edit old report",
+                    GrokAcpToolKind::Edit,
+                    GrokAcpToolStatus::Completed,
+                    "old.md",
+                ),
+            ),
+            (
+                "child-session",
+                tool(
+                    "delete-old",
+                    "Delete old report",
+                    GrokAcpToolKind::Delete,
+                    GrokAcpToolStatus::Completed,
+                    &old_absolute,
+                ),
+            ),
+            (
+                "root-session",
+                tool(
+                    "failed-edit",
+                    "Edit denied file",
+                    GrokAcpToolKind::Edit,
+                    GrokAcpToolStatus::Failed,
+                    "denied.md",
+                ),
+            ),
+            (
+                "unknown-session",
+                tool(
+                    "unscoped-edit",
+                    "Edit unscoped file",
+                    GrokAcpToolKind::Edit,
+                    GrokAcpToolStatus::Completed,
+                    "unscoped.md",
+                ),
+            ),
+            (
+                "root-session",
+                tool(
+                    "read-lookalike",
+                    "Edit-looking read",
+                    GrokAcpToolKind::Read,
+                    GrokAcpToolStatus::Completed,
+                    "not-edited.md",
+                ),
+            ),
+        ] {
+            emit_grok_acp_tool_call(&run, &sender, session_id, &tool_call, &projection, true);
+        }
+
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for event in receiver.try_iter() {
+            if let AiEvent::Activity { event, .. } = event {
+                accumulator.ingest(event);
+            }
+        }
+        let files = accumulator
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, ActivityKind::FileChange { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 4);
+        assert!(files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { tool, changes, status: ActivityStatus::Completed, .. }
+                if event.scope.is_main()
+                    && tool.as_deref() == Some("Edit report")
+                    && changes[0].path == workspace_root.join("report.md").to_string_lossy()
+        )));
+        assert!(files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { tool, changes, status: ActivityStatus::Completed, .. }
+                if matches!(&event.scope, AgentScope::Child { id } if id == "child-session")
+                    && tool.as_deref() == Some("Delete old report")
+                    && changes[0].kind == FileChangeKind::Delete
+        )));
+        assert!(files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { changes, status: ActivityStatus::Failed, .. }
+                if changes[0].path == workspace_root.join("denied.md").to_string_lossy()
+        )));
+        assert!(!files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { changes, .. }
+                if changes[0].path.ends_with("unscoped.md")
+                    || changes[0].path.ends_with("not-edited.md")
+        )));
+
+        let artifacts = crate::chat_core::project_artifacts(&accumulator.events);
+        assert_eq!(artifacts.len(), 2);
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.file_path() == Some(old_absolute.as_str()) && artifact.is_deleted
+        }));
+        assert!(artifacts.iter().all(|artifact| {
+            !artifact
+                .file_path()
+                .is_some_and(|path| path.ends_with("denied.md"))
+                && !artifact
+                    .file_path()
+                    .is_some_and(|path| path.ends_with("unscoped.md"))
+                && !artifact
+                    .file_path()
+                    .is_some_and(|path| path.ends_with("not-edited.md"))
+        }));
     }
 
     #[test]
@@ -12450,6 +13114,8 @@ mod tests {
             reasoning_effort: Some("low".into()),
             resume_session_id: None,
             progress_route: GrokAcpProgressRoute::NativeStream,
+            task_tools_enabled: false,
+            canvas_tools_enabled: false,
             http_mcp_server: None,
             limits: GrokAcpLimits {
                 wall_timeout: Duration::from_secs(120),
@@ -12564,7 +13230,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn grok_acp_subagent_transport_uses_native_main_progress_without_mcp() {
+    fn grok_acp_native_progress_attaches_canvas_only_to_fresh_root_sessions() {
         use std::os::unix::fs::PermissionsExt;
 
         let temporary = tempfile::tempdir().unwrap();
@@ -12603,8 +13269,30 @@ send({
 })
 
 session = receive()
-if session["params"]["mcpServers"] != []:
-    raise RuntimeError("subagent run received an inherited MCP server")
+fresh_root_only = "--no-subagents" in sys.argv and "sessionId" not in session["params"]
+servers = session["params"]["mcpServers"]
+if len(servers) != (1 if fresh_root_only else 0):
+    raise RuntimeError("Adam MCP attachment did not match the fresh root-only gate")
+canvas_rules = {
+    "MCPTool(adam_tasks__canvas_create_note)",
+    "MCPTool(adam_tasks__canvas_create_pile)"
+}
+task_rules = {
+    "MCPTool(adam_tasks__task_create)",
+    "MCPTool(adam_tasks__task_update)",
+    "MCPTool(adam_tasks__task_list)"
+}
+allowed = {
+    sys.argv[index + 1]
+    for index, argument in enumerate(sys.argv[:-1])
+    if argument == "--allow"
+}
+if fresh_root_only and not canvas_rules.issubset(allowed):
+    raise RuntimeError("fresh root-only canvas allow rules were omitted")
+if not fresh_root_only and canvas_rules.intersection(allowed):
+    raise RuntimeError("canvas allow rules escaped the fresh root-only gate")
+if task_rules.intersection(allowed):
+    raise RuntimeError("native-progress run received Adam task allow rules")
 session_id = session["params"].get("sessionId", "fake-native-session")
 send({"jsonrpc": "2.0", "id": session["id"], "result": {"sessionId": session_id}})
 prompt = receive()
@@ -12672,6 +13360,8 @@ send({
             };
             assert_eq!(specification.plan_channel, PlanChannel::NativeStream);
             assert_eq!(specification.subagents_enabled, subagents_enabled);
+            let expects_canvas = !subagents_enabled && resume_session_id.is_none();
+            assert_eq!(specification.canvas_tools_supported, expects_canvas);
 
             let registry = Arc::new(Mutex::new(TaskToolRegistry::new()));
             lock_unpoison(&registry)
@@ -12683,20 +13373,38 @@ send({
                 )
                 .unwrap();
             let (sender, receiver) = unbounded();
+            let canvas_tools = Arc::new(CanvasToolBroker::new());
+            if expects_canvas {
+                canvas_tools
+                    .register_run(run.turn_id, run.conversation_id, Uuid::new_v4(), true)
+                    .unwrap();
+                assert_eq!(canvas_tools.descriptors_for_run(run.turn_id).len(), 2);
+            }
             let outcome = run_grok_acp_transport(
                 &run,
                 specification,
                 &Arc::new(RunControl::default()),
                 &sender,
                 &registry,
+                &canvas_tools,
             );
 
-            assert!(matches!(
-                outcome,
-                RunOutcome::Completed { text, session_id }
-                    if text == "Native progress recorded."
-                        && session_id.as_deref() == Some(expected_session_id)
-            ));
+            match outcome {
+                RunOutcome::Completed { text, session_id } => {
+                    assert_eq!(text, "Native progress recorded.");
+                    assert_eq!(session_id.as_deref(), Some(expected_session_id));
+                }
+                RunOutcome::Failed { message, .. }
+                | RunOutcome::ResumeRejected { message }
+                | RunOutcome::RuntimeProbeFailed { message } => panic!(
+                    "Grok native-progress case failed (subagents={subagents_enabled}, resume={resume_session_id:?}): {message}"
+                ),
+                RunOutcome::Cancelled
+                | RunOutcome::CancelledBeforeLaunch
+                | RunOutcome::TerminalAlreadyEmitted => panic!(
+                    "Grok native-progress case stopped without completion (subagents={subagents_enabled}, resume={resume_session_id:?})"
+                ),
+            }
             assert!(
                 lock_unpoison(&registry)
                     .tasks_for_conversation(run.conversation_id)
@@ -12867,6 +13575,7 @@ send({
             "resumed Grok sessions with unrecorded creation versions must not attach task tools"
         );
         assert!(!resumed_specification.subagents_enabled);
+        assert!(!resumed_specification.canvas_tools_supported);
 
         let prepared = prepare_resolved_cli("grok_cli", executable, &run).unwrap();
         let PreparedRun::GrokAcp(specification) = prepared else {
@@ -12874,6 +13583,7 @@ send({
         };
         assert_eq!(specification.plan_channel, PlanChannel::AppTaskTools);
         assert!(!specification.subagents_enabled);
+        assert!(specification.canvas_tools_supported);
         let registry = Arc::new(Mutex::new(TaskToolRegistry::new()));
         lock_unpoison(&registry)
             .register_run(
@@ -12884,12 +13594,14 @@ send({
             )
             .unwrap();
         let (sender, receiver) = unbounded();
+        let canvas_tools = Arc::new(CanvasToolBroker::new());
         let outcome = run_grok_acp_transport(
             &run,
             specification,
             &Arc::new(RunControl::default()),
             &sender,
             &registry,
+            &canvas_tools,
         );
 
         assert!(matches!(
@@ -13730,6 +14442,130 @@ send({
         );
         assert!(!outcome.is_error());
         assert!(delivered.get());
+    }
+
+    #[test]
+    fn cancel_immediately_invalidates_a_queued_canvas_request() {
+        let engine = AiEngine::new();
+        let turn_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let page_id = Uuid::new_v4();
+        let control = Arc::new(RunControl::default());
+        lock_unpoison(&engine.active).insert(
+            turn_id,
+            ActiveRun {
+                conversation_id,
+                control: Arc::clone(&control),
+            },
+        );
+        engine
+            .canvas_tools
+            .register_run(turn_id, conversation_id, page_id, true)
+            .unwrap();
+
+        let broker = Arc::clone(&engine.canvas_tools);
+        let worker_control = Arc::clone(&control);
+        let call = thread::spawn(move || {
+            broker.call_for_run(
+                turn_id,
+                crate::ai_canvas_tools::CANVAS_CREATE_NOTE,
+                &json!({
+                    "idempotency_key": "cancelled-note",
+                    "title": "Report",
+                    "text": "Done"
+                }),
+                &worker_control.cancelled,
+            )
+        });
+        let request = loop {
+            if let Some(request) = engine.try_recv_canvas_tool() {
+                break request;
+            }
+            thread::yield_now();
+        };
+
+        assert!(engine.canvas_tool_request_is_active(&request));
+        assert!(engine.cancel(turn_id));
+        assert!(!engine.canvas_tool_request_is_active(&request));
+        let _ = request.respond(crate::ai_canvas_tools::CanvasToolResult::Rejected(
+            "The AI run ended before canvas creation completed".into(),
+        ));
+        assert_eq!(call.join().unwrap()["isError"], true);
+    }
+
+    #[test]
+    fn cancel_conversation_immediately_revokes_its_canvas_runs() {
+        let engine = AiEngine::new();
+        let conversation_id = Uuid::new_v4();
+        let turn_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        for turn_id in turn_ids {
+            lock_unpoison(&engine.active).insert(
+                turn_id,
+                ActiveRun {
+                    conversation_id,
+                    control: Arc::new(RunControl::default()),
+                },
+            );
+            engine
+                .canvas_tools
+                .register_run(turn_id, conversation_id, Uuid::new_v4(), true)
+                .unwrap();
+        }
+
+        assert!(engine.cancel_conversation(conversation_id));
+        for turn_id in turn_ids {
+            assert!(engine.canvas_tools.descriptors_for_run(turn_id).is_empty());
+        }
+    }
+
+    #[test]
+    fn cancel_all_immediately_revokes_every_canvas_run() {
+        let engine = AiEngine::new();
+        let turn_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        for turn_id in turn_ids {
+            lock_unpoison(&engine.active).insert(
+                turn_id,
+                ActiveRun {
+                    conversation_id: Uuid::new_v4(),
+                    control: Arc::new(RunControl::default()),
+                },
+            );
+            engine
+                .canvas_tools
+                .register_run(turn_id, Uuid::new_v4(), Uuid::new_v4(), true)
+                .unwrap();
+        }
+
+        engine.cancel_all();
+
+        for turn_id in turn_ids {
+            assert!(engine.canvas_tools.descriptors_for_run(turn_id).is_empty());
+        }
+    }
+
+    #[test]
+    fn deleted_conversation_rejects_restart_and_drops_late_events() {
+        let engine = AiEngine::new();
+        let conversation_id = Uuid::new_v4();
+        assert!(engine.delete_conversation(conversation_id));
+
+        let mut run = request("openai_compatible");
+        run.turn_id = Uuid::new_v4();
+        run.conversation_id = conversation_id;
+        assert!(matches!(
+            engine.start(run),
+            Err(AiEngineError::ConversationDeleted(id)) if id == conversation_id
+        ));
+
+        engine
+            .event_sender
+            .send(AiEvent::Delta {
+                turn_id: Uuid::new_v4(),
+                conversation_id,
+                text: "late".into(),
+            })
+            .unwrap();
+        assert!(engine.try_recv().is_none());
     }
 
     #[test]
@@ -15389,6 +16225,7 @@ send({
         // task bridge or the provider process.
         write_version_stub(&executable, "0.2.114");
         let registry = Arc::new(Mutex::new(TaskToolRegistry::new()));
+        let canvas_tools = Arc::new(CanvasToolBroker::new());
         let (sender, _receiver) = unbounded();
         let outcome = run_grok_acp_transport(
             &run,
@@ -15396,6 +16233,7 @@ send({
             &Arc::new(RunControl::default()),
             &sender,
             &registry,
+            &canvas_tools,
         );
         assert!(matches!(
             outcome,
@@ -15961,7 +16799,22 @@ send({
         stream: &str,
         chunk_size: usize,
     ) -> (OutputDecoder, Vec<Decoded>) {
-        let mut decoder = OutputDecoder::new(provider_id.into(), OutputMode::JsonLines);
+        decode_in_chunks_with_cwd(provider_id, stream, chunk_size, None)
+    }
+
+    fn decode_in_chunks_with_cwd(
+        provider_id: &str,
+        stream: &str,
+        chunk_size: usize,
+        cwd: Option<PathBuf>,
+    ) -> (OutputDecoder, Vec<Decoded>) {
+        let profile = capability_profile(provider_id, provider_id, &[]);
+        let mut decoder = OutputDecoder::with_context(
+            provider_id.into(),
+            profile.runtime_family,
+            OutputMode::JsonLines,
+            cwd,
+        );
         let mut decoded = Vec::new();
         for chunk in stream.as_bytes().chunks(chunk_size) {
             decoder.push(chunk, |event| decoded.push(event));
@@ -15986,6 +16839,143 @@ send({
             serde_json::from_str::<Value>(line)
                 .unwrap_or_else(|error| panic!("fixture line {} is invalid: {error}", index + 1));
         }
+    }
+
+    #[test]
+    fn provider_file_paths_are_workspace_scoped_and_canonicalized() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("real")).unwrap();
+        fs::write(workspace.path().join("real/existing.txt"), "ok").unwrap();
+
+        let relative = resolve_provider_path(Some(workspace.path()), "real/existing.txt").unwrap();
+        let absolute = resolve_provider_path(
+            Some(workspace.path()),
+            workspace
+                .path()
+                .join("real/existing.txt")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .unwrap();
+        assert_eq!(relative, absolute);
+        assert_eq!(
+            relative,
+            fs::canonicalize(workspace.path().join("real/existing.txt"))
+                .unwrap()
+                .to_string_lossy()
+        );
+
+        assert!(resolve_provider_path(Some(workspace.path()), "../outside.txt").is_none());
+        assert!(
+            resolve_provider_path(
+                Some(workspace.path()),
+                outside
+                    .path()
+                    .join("outside.txt")
+                    .to_string_lossy()
+                    .as_ref(),
+            )
+            .is_none()
+        );
+        assert!(resolve_provider_path(Some(workspace.path()), "").is_none());
+        assert!(resolve_provider_path(Some(workspace.path()), "   ").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_file_paths_reject_symlink_escapes_and_dedupe_internal_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("real")).unwrap();
+        symlink(outside.path(), workspace.path().join("escape")).unwrap();
+        symlink(
+            workspace.path().join("real"),
+            workspace.path().join("alias"),
+        )
+        .unwrap();
+
+        assert!(resolve_provider_path(Some(workspace.path()), "escape/new.txt").is_none());
+        let changes = structured_file_changes(
+            Some(workspace.path()),
+            ["alias/new.txt", "real/new.txt"],
+            FileChangeKind::Update,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].path,
+            fs::canonicalize(workspace.path().join("real"))
+                .unwrap()
+                .join("new.txt")
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn codex_ignores_missing_null_and_blank_file_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let stream = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"invalid\",\"type\":\"file_change\",\"changes\":[",
+            "{\"path\":\"\",\"kind\":\"add\"},{\"path\":\"   \",\"kind\":\"add\"},{\"path\":null,\"kind\":\"add\"},{\"kind\":\"add\"}],\"status\":\"completed\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"valid\",\"type\":\"file_change\",\"changes\":[{\"path\":\"notes.txt\",\"kind\":\"add\"}],\"status\":\"completed\"}}\n"
+        );
+        let (_, decoded) =
+            decode_in_chunks_with_cwd("codex_cli", stream, 5, Some(workspace.path().to_path_buf()));
+        let events = accumulated(&decoded).events;
+        let files = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ActivityKind::FileChange { id, changes, .. } => Some((id, changes)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "valid");
+        assert_eq!(files[0].1.len(), 1);
+        assert_ne!(files[0].1[0].path, workspace.path().to_string_lossy());
+    }
+
+    #[test]
+    fn claude_file_results_must_match_the_calling_agent_scope() {
+        let workspace = tempfile::tempdir().unwrap();
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"shared-id\",\"name\":\"Write\",\"input\":{\"file_path\":\"main.txt\"}}]}}\n",
+            "{\"type\":\"user\",\"parent_tool_use_id\":\"child-a\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"shared-id\",\"content\":\"wrong scope\",\"is_error\":false}]}}\n",
+            "{\"type\":\"user\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"shared-id\",\"content\":\"right scope\",\"is_error\":false}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks_with_cwd(
+            "claude_cli",
+            stream,
+            7,
+            Some(workspace.path().to_path_buf()),
+        );
+        assert!(decoder.file_calls.is_empty());
+        let events = accumulated(&decoded).events;
+        let file_events = events
+            .iter()
+            .filter(|event| matches!(event.kind, ActivityKind::FileChange { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(file_events.len(), 1);
+        assert!(file_events[0].scope.is_main());
+        assert!(matches!(
+            &file_events[0].kind,
+            ActivityKind::FileChange {
+                changes,
+                status: ActivityStatus::Completed,
+                ..
+            } if changes[0].kind == FileChangeKind::Update
+        ));
+        assert!(events.iter().any(|event| {
+            matches!(
+                (&event.scope, &event.kind),
+                (
+                    AgentScope::Child { id },
+                    ActivityKind::ToolResult { id: tool_id, .. }
+                ) if id == "child-a" && tool_id == "shared-id"
+            )
+        }));
     }
 
     #[test]
@@ -16627,19 +17617,22 @@ send({
 
     #[test]
     fn codex_fixture_shape_maps_lifecycles_plan_usage_and_session_at_chunk_size_seven() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_root = fs::canonicalize(workspace.path()).unwrap();
         let stream = concat!(
             "{\"type\":\"thread.started\",\"thread_id\":\"codex-session\"}\n",
             "{\"type\":\"turn.started\"}\n",
             "{\"type\":\"item.completed\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"Starting 🧠\"}}\n",
             "{\"type\":\"item.started\",\"item\":{\"id\":\"p1\",\"type\":\"todo_list\",\"items\":[{\"text\":\"Edit file\",\"completed\":false}]}}\n",
-            "{\"type\":\"item.started\",\"item\":{\"id\":\"f1\",\"type\":\"file_change\",\"changes\":[{\"path\":\"/work/notes.txt\",\"kind\":\"add\"}],\"status\":\"in_progress\"}}\n",
-            "{\"type\":\"item.completed\",\"item\":{\"id\":\"f1\",\"type\":\"file_change\",\"changes\":[{\"path\":\"/work/notes.txt\",\"kind\":\"add\"}],\"status\":\"completed\"}}\n",
+            "{\"type\":\"item.started\",\"item\":{\"id\":\"f1\",\"type\":\"file_change\",\"changes\":[{\"path\":\"notes.txt\",\"kind\":\"add\"}],\"status\":\"in_progress\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"f1\",\"type\":\"file_change\",\"changes\":[{\"path\":\"notes.txt\",\"kind\":\"add\"}],\"status\":\"completed\"}}\n",
             "{\"type\":\"item.started\",\"item\":{\"id\":\"c1\",\"type\":\"command_execution\",\"command\":\"ls -la\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}}\n",
             "{\"type\":\"item.completed\",\"item\":{\"id\":\"c1\",\"type\":\"command_execution\",\"command\":\"ls -la\",\"aggregated_output\":\"notes.txt\\n\",\"exit_code\":0,\"status\":\"completed\"}}\n",
             "{\"type\":\"item.updated\",\"item\":{\"id\":\"p1\",\"type\":\"todo_list\",\"items\":[{\"text\":\"Edit file\",\"completed\":true}]}}\n",
             "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":20,\"cached_input_tokens\":4,\"output_tokens\":7,\"reasoning_output_tokens\":2}}\n"
         );
-        let (decoder, decoded) = decode_in_chunks("codex_cli", stream, 7);
+        let (decoder, decoded) =
+            decode_in_chunks_with_cwd("codex_cli", stream, 7, Some(workspace.path().to_path_buf()));
         assert_eq!(decoder.output, "Starting 🧠");
         assert_eq!(decoder.session_id.as_deref(), Some("codex-session"));
         assert!(!decoder.poisoned);
@@ -16662,13 +17655,25 @@ send({
         assert_eq!(commands.len(), 1);
         assert_eq!(*commands[0].1, ActivityStatus::Completed);
         assert_eq!(commands[0].2.as_deref(), Some("notes.txt\n"));
+        let file_changes = accumulator
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ActivityKind::FileChange {
+                    tool,
+                    changes,
+                    status,
+                    ..
+                } => Some((tool, changes, status)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(file_changes.len(), 1);
+        assert_eq!(file_changes[0].0.as_deref(), Some("Codex file change"));
+        assert_eq!(*file_changes[0].2, ActivityStatus::Completed);
         assert_eq!(
-            accumulator
-                .events
-                .iter()
-                .filter(|event| matches!(event.kind, ActivityKind::FileChange { .. }))
-                .count(),
-            1
+            file_changes[0].1[0].path,
+            workspace_root.join("notes.txt").to_string_lossy()
         );
         let plan = crate::chat_core::newest_plan(&accumulator.events).unwrap();
         assert_eq!(plan.completed, 1);
@@ -16723,6 +17728,100 @@ send({
         let usage = crate::chat_core::project_usage(&accumulator.events);
         assert_eq!((usage.input, usage.output, usage.cached_input), (10, 5, 3));
         assert_eq!(usage.cost_usd, Some(0.01));
+    }
+
+    #[test]
+    fn claude_exact_file_tools_project_only_structured_successful_results() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_root = fs::canonicalize(workspace.path()).unwrap();
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[",
+            "{\"type\":\"tool_use\",\"id\":\"write-1\",\"name\":\"Write\",\"input\":{\"file_path\":\"new.md\"}},",
+            "{\"type\":\"tool_use\",\"id\":\"multi-1\",\"name\":\"MultiEdit\",\"input\":{\"file_path\":\"multi.rs\"}},",
+            "{\"type\":\"tool_use\",\"id\":\"notebook-1\",\"name\":\"NotebookEdit\",\"input\":{\"notebook_path\":\"notes.ipynb\"}},",
+            "{\"type\":\"tool_use\",\"id\":\"failed-1\",\"name\":\"Write\",\"input\":{\"file_path\":\"failed.md\"}},",
+            "{\"type\":\"tool_use\",\"id\":\"lookalike-1\",\"name\":\"write\",\"input\":{\"file_path\":\"lookalike.md\"}}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":[",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"write-1\",\"content\":\"created\",\"is_error\":false},",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"multi-1\",\"content\":\"updated\",\"is_error\":false},",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"notebook-1\",\"content\":\"updated\",\"is_error\":false},",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"failed-1\",\"content\":\"permission denied\",\"is_error\":true},",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"lookalike-1\",\"content\":\"Wrote /work/lookalike.md\",\"is_error\":false},",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"untracked-1\",\"content\":\"Wrote /work/invented.md\",\"is_error\":false}]}}\n",
+            "{\"type\":\"assistant\",\"parent_tool_use_id\":\"child-a\",\"message\":{\"content\":[",
+            "{\"type\":\"tool_use\",\"id\":\"edit-1\",\"name\":\"Edit\",\"input\":{\"file_path\":\"child.rs\"}}]}}\n",
+            "{\"type\":\"user\",\"parent_tool_use_id\":\"child-a\",\"message\":{\"content\":[",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"edit-1\",\"content\":\"updated\",\"is_error\":false}]}}\n"
+        );
+        let (_, decoded) = decode_in_chunks_with_cwd(
+            "claude_cli",
+            stream,
+            11,
+            Some(workspace.path().to_path_buf()),
+        );
+        let accumulator = accumulated(&decoded);
+        let file_events = accumulator
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, ActivityKind::FileChange { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(file_events.len(), 5);
+
+        let exact = |path: &str| {
+            file_events.iter().find(|event| {
+                matches!(
+                    &event.kind,
+                    ActivityKind::FileChange { changes, .. }
+                        if changes.first().is_some_and(|change| change.path == path)
+                )
+            })
+        };
+        for (path, expected_tool, expected_status) in [
+            ("new.md", "Write", ActivityStatus::Completed),
+            ("multi.rs", "MultiEdit", ActivityStatus::Completed),
+            ("notes.ipynb", "NotebookEdit", ActivityStatus::Completed),
+            ("failed.md", "Write", ActivityStatus::Failed),
+            ("child.rs", "Edit", ActivityStatus::Completed),
+        ] {
+            let path = workspace_root.join(path).to_string_lossy().into_owned();
+            let event = exact(&path).unwrap_or_else(|| panic!("missing {path}"));
+            assert!(matches!(
+                &event.kind,
+                ActivityKind::FileChange { tool, status, .. }
+                    if tool.as_deref() == Some(expected_tool) && *status == expected_status
+            ));
+        }
+        let write_path = workspace_root.join("new.md").to_string_lossy().into_owned();
+        assert!(matches!(
+            &exact(&write_path).unwrap().kind,
+            ActivityKind::FileChange { changes, .. }
+                if changes[0].kind == FileChangeKind::Update
+        ));
+        let child_path = workspace_root
+            .join("child.rs")
+            .to_string_lossy()
+            .into_owned();
+        assert!(matches!(
+            exact(&child_path).unwrap().scope,
+            AgentScope::Child { ref id } if id == "child-a"
+        ));
+        let lookalike_path = workspace_root
+            .join("lookalike.md")
+            .to_string_lossy()
+            .into_owned();
+        let failed_path = workspace_root
+            .join("failed.md")
+            .to_string_lossy()
+            .into_owned();
+        assert!(exact(&lookalike_path).is_none());
+
+        let artifacts = crate::chat_core::project_artifacts(&accumulator.events);
+        assert_eq!(artifacts.len(), 4);
+        assert!(artifacts.iter().all(|artifact| {
+            artifact.file_path() != Some(failed_path.as_str())
+                && artifact.file_path() != Some(lookalike_path.as_str())
+                && artifact.file_path() != Some("/work/invented.md")
+        }));
     }
 
     #[test]
@@ -18599,6 +19698,130 @@ send({
                 .iter()
                 .any(|event| matches!(event, AiEvent::Cancelled { .. }))
         );
+    }
+
+    #[test]
+    fn kimi_acp_projects_only_root_scoped_structured_terminal_file_mutations() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_root = fs::canonicalize(workspace.path()).unwrap();
+        let old_absolute = workspace_root.join("old.md").to_string_lossy().into_owned();
+        let mut run = request("kimi_cli");
+        run.cwd = Some(workspace_root.clone());
+        let (sender, receiver) = unbounded();
+        let projection = RefCell::new(KimiAcpProjectionState::default());
+        let tool = |id: &str,
+                    title: &str,
+                    kind: KimiAcpToolKind,
+                    status: KimiAcpToolStatus,
+                    path: &str| KimiAcpToolCall {
+            id: id.into(),
+            title: Some(title.into()),
+            kind: Some(kind),
+            status: Some(status),
+            content: Vec::new(),
+            locations: vec![crate::kimi_acp::KimiAcpToolLocation {
+                path: path.into(),
+                line: None,
+            }],
+            raw_input: None,
+            raw_output: None,
+        };
+
+        let calls = [
+            tool(
+                "edit-report",
+                "Edit report",
+                KimiAcpToolKind::Edit,
+                KimiAcpToolStatus::Completed,
+                "report.md",
+            ),
+            tool(
+                "edit-old",
+                "Edit old report",
+                KimiAcpToolKind::Edit,
+                KimiAcpToolStatus::Completed,
+                "old.md",
+            ),
+            tool(
+                "delete-old",
+                "Delete old report",
+                KimiAcpToolKind::Delete,
+                KimiAcpToolStatus::Completed,
+                &old_absolute,
+            ),
+            tool(
+                "failed-edit",
+                "Edit denied file",
+                KimiAcpToolKind::Edit,
+                KimiAcpToolStatus::Failed,
+                "denied.md",
+            ),
+            tool(
+                "read-lookalike",
+                "Edit-looking read",
+                KimiAcpToolKind::Read,
+                KimiAcpToolStatus::Completed,
+                "not-edited.md",
+            ),
+        ];
+        for tool_call in &calls {
+            emit_kimi_acp_tool_call(&run, &sender, tool_call, &projection);
+        }
+        emit_kimi_acp_tool_call(&run, &sender, &calls[0], &projection);
+
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for event in receiver.try_iter() {
+            if let AiEvent::Activity { event, .. } = event {
+                accumulator.ingest(event);
+            }
+        }
+        let files = accumulator
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, ActivityKind::FileChange { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            files.len(),
+            4,
+            "terminal replay must not duplicate artifacts"
+        );
+        assert!(files.iter().all(|event| event.scope.is_main()));
+        assert!(files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { tool, changes, status: ActivityStatus::Completed, .. }
+                if tool.as_deref() == Some("Edit report")
+                    && changes[0].path == workspace_root.join("report.md").to_string_lossy()
+        )));
+        assert!(files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { tool, changes, status: ActivityStatus::Completed, .. }
+                if tool.as_deref() == Some("Delete old report")
+                    && changes[0].kind == FileChangeKind::Delete
+        )));
+        assert!(files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { changes, status: ActivityStatus::Failed, .. }
+                if changes[0].path == workspace_root.join("denied.md").to_string_lossy()
+        )));
+        assert!(!files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { changes, .. }
+                if changes[0].path.ends_with("not-edited.md")
+        )));
+
+        let artifacts = crate::chat_core::project_artifacts(&accumulator.events);
+        assert_eq!(artifacts.len(), 2);
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.file_path() == Some(old_absolute.as_str()) && artifact.is_deleted
+        }));
+        assert!(artifacts.iter().all(|artifact| {
+            !artifact
+                .file_path()
+                .is_some_and(|path| path.ends_with("denied.md"))
+                && !artifact
+                    .file_path()
+                    .is_some_and(|path| path.ends_with("not-edited.md"))
+        }));
     }
 
     #[test]

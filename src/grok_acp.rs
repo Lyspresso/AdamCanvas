@@ -35,6 +35,10 @@ pub const ADAM_TASK_MCP_ALLOW_RULES: [&str; 3] = [
     "MCPTool(adam_tasks__task_update)",
     "MCPTool(adam_tasks__task_list)",
 ];
+pub const ADAM_CANVAS_MCP_ALLOW_RULES: [&str; 2] = [
+    "MCPTool(adam_tasks__canvas_create_note)",
+    "MCPTool(adam_tasks__canvas_create_pile)",
+];
 
 const INITIALIZE_REQUEST_ID: u64 = 1;
 const SESSION_REQUEST_ID: u64 = 2;
@@ -152,6 +156,10 @@ pub struct GrokAcpRequest {
     pub reasoning_effort: Option<String>,
     pub resume_session_id: Option<String>,
     pub progress_route: GrokAcpProgressRoute,
+    /// Whether the attached endpoint exposes Adam's checklist mutation tools.
+    pub task_tools_enabled: bool,
+    /// Whether the attached endpoint exposes Adam's root-only canvas tools.
+    pub canvas_tools_enabled: bool,
     pub http_mcp_server: Option<GrokAcpHttpMcpServer>,
     pub limits: GrokAcpLimits,
 }
@@ -179,6 +187,8 @@ impl fmt::Debug for GrokAcpRequest {
                 &self.resume_session_id.as_ref().map(|_| "[REDACTED]"),
             )
             .field("progress_route", &self.progress_route)
+            .field("task_tools_enabled", &self.task_tools_enabled)
+            .field("canvas_tools_enabled", &self.canvas_tools_enabled)
             .field("http_mcp_server", &self.http_mcp_server)
             .field("limits", &self.limits)
             .finish()
@@ -667,24 +677,29 @@ fn validate_request(request: &GrokAcpRequest) -> Result<(), GrokAcpError> {
             "the verified runtime version must be a non-empty normalized value",
         ));
     }
-    match (request.progress_route, request.http_mcp_server.is_some()) {
-        (GrokAcpProgressRoute::NativeStream, false) => {}
-        (GrokAcpProgressRoute::AdamTaskTools, true) if !request.subagents_enabled => {}
-        (GrokAcpProgressRoute::NativeStream, true) => {
-            return Err(GrokAcpError::InvalidConfiguration(
-                "native-progress Grok runs may not attach Adam's inherited task MCP server",
-            ));
-        }
-        (GrokAcpProgressRoute::AdamTaskTools, false) => {
-            return Err(GrokAcpError::InvalidConfiguration(
-                "Adam-task-progress Grok runs require the authenticated task MCP server",
-            ));
-        }
-        (GrokAcpProgressRoute::AdamTaskTools, true) => {
-            return Err(GrokAcpError::InvalidConfiguration(
-                "subagent-enabled Grok runs may not attach Adam's inherited task MCP server",
-            ));
-        }
+    let tools_enabled = request.task_tools_enabled || request.canvas_tools_enabled;
+    if tools_enabled != request.http_mcp_server.is_some() {
+        return Err(GrokAcpError::InvalidConfiguration(
+            "the authenticated Adam MCP server must be attached exactly when Adam tools are enabled",
+        ));
+    }
+    if request.task_tools_enabled != (request.progress_route == GrokAcpProgressRoute::AdamTaskTools)
+    {
+        return Err(GrokAcpError::InvalidConfiguration(
+            "Adam task tools must be the exclusive authority for Adam-task progress and must be absent from native-progress runs",
+        ));
+    }
+    if request.canvas_tools_enabled
+        && (request.subagents_enabled || request.resume_session_id.is_some())
+    {
+        return Err(GrokAcpError::InvalidConfiguration(
+            "canvas tools require a fresh root-only Grok session",
+        ));
+    }
+    if request.subagents_enabled && request.http_mcp_server.is_some() {
+        return Err(GrokAcpError::InvalidConfiguration(
+            "subagent-enabled Grok runs may not attach Adam's inherited MCP server",
+        ));
     }
     if request.progress_route == GrokAcpProgressRoute::AdamTaskTools && request.planning_enabled {
         return Err(GrokAcpError::InvalidConfiguration(
@@ -692,10 +707,11 @@ fn validate_request(request: &GrokAcpRequest) -> Result<(), GrokAcpError> {
         ));
     }
     if request.resume_session_id.is_some()
-        && request.progress_route != GrokAcpProgressRoute::NativeStream
+        && (request.progress_route != GrokAcpProgressRoute::NativeStream
+            || request.http_mcp_server.is_some())
     {
         return Err(GrokAcpError::InvalidConfiguration(
-            "resumed Grok sessions must use native progress without Adam's task MCP server",
+            "resumed Grok sessions must use native progress without an inherited Adam MCP server",
         ));
     }
     if request
@@ -852,11 +868,17 @@ fn command_arguments(request: &GrokAcpRequest) -> Vec<OsString> {
         arguments.push(OsString::from("--rules"));
         arguments.push(OsString::from(&request.rules));
     }
-    // Only the root-only AppTaskTools contract receives process-wide allow
-    // rules. Native-plan runs attach no Adam MCP server, whether subagents are
-    // enabled or explicitly disabled.
-    if request.http_mcp_server.is_some() {
+    // Allow rules mirror the exact descriptors Adam put on this run's MCP
+    // endpoint. Native progress may coexist only with the root-only canvas
+    // subset; it never implies checklist-tool authority.
+    if request.task_tools_enabled {
         for rule in ADAM_TASK_MCP_ALLOW_RULES {
+            arguments.push(OsString::from("--allow"));
+            arguments.push(OsString::from(rule));
+        }
+    }
+    if request.canvas_tools_enabled {
+        for rule in ADAM_CANVAS_MCP_ALLOW_RULES {
             arguments.push(OsString::from("--allow"));
             arguments.push(OsString::from(rule));
         }
@@ -4357,6 +4379,8 @@ mod tests {
             reasoning_effort: Some("high".into()),
             resume_session_id: None,
             progress_route: GrokAcpProgressRoute::AdamTaskTools,
+            task_tools_enabled: true,
+            canvas_tools_enabled: false,
             http_mcp_server: Some(GrokAcpHttpMcpServer::new(
                 "adam",
                 "http://127.0.0.1:43123/mcp",
@@ -4478,6 +4502,7 @@ mod tests {
         ));
         request.http_mcp_server = None;
         request.progress_route = GrokAcpProgressRoute::NativeStream;
+        request.task_tools_enabled = false;
         let arguments = command_arguments(&request);
         assert!(!arguments.contains(&OsString::from("--no-subagents")));
         for rule in ADAM_TASK_MCP_ALLOW_RULES {
@@ -4503,18 +4528,23 @@ mod tests {
             "http://127.0.0.1:43123/mcp",
             "Bearer very-secret",
         ));
-        assert!(matches!(
-            validate_request(&request),
-            Err(GrokAcpError::InvalidConfiguration(message))
-                if message.contains("native-progress")
-        ));
+        request.canvas_tools_enabled = true;
+        assert!(validate_request(&request).is_ok());
+        for rule in ADAM_CANVAS_MCP_ALLOW_RULES {
+            assert!(command_arguments(&request).contains(&OsString::from(rule)));
+        }
+        for rule in ADAM_TASK_MCP_ALLOW_RULES {
+            assert!(!command_arguments(&request).contains(&OsString::from(rule)));
+        }
         request.progress_route = GrokAcpProgressRoute::AdamTaskTools;
+        request.task_tools_enabled = true;
         assert!(matches!(
             validate_request(&request),
             Err(GrokAcpError::InvalidConfiguration(message))
                 if message.contains("native planner")
         ));
         request.planning_enabled = false;
+        request.canvas_tools_enabled = false;
         request.resume_session_id = Some("resumed-root".into());
         assert!(matches!(
             validate_request(&request),
@@ -4523,6 +4553,8 @@ mod tests {
         ));
         request.resume_session_id = None;
         request.progress_route = GrokAcpProgressRoute::NativeStream;
+        request.task_tools_enabled = false;
+        request.canvas_tools_enabled = false;
         request.http_mcp_server = None;
 
         request.sandbox = "strict".into();
@@ -4536,6 +4568,53 @@ mod tests {
             validate_request(&request),
             Err(GrokAcpError::InvalidConfiguration(_))
         ));
+    }
+
+    #[test]
+    fn native_progress_canvas_tools_are_fresh_root_only_with_narrow_allows() {
+        let mut request = request();
+        request.progress_route = GrokAcpProgressRoute::NativeStream;
+        request.task_tools_enabled = false;
+        request.canvas_tools_enabled = true;
+        request.planning_enabled = true;
+        assert!(validate_request(&request).is_ok());
+        assert_eq!(
+            session_request(&request)["params"]["mcpServers"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let arguments = command_arguments(&request);
+        for rule in ADAM_CANVAS_MCP_ALLOW_RULES {
+            assert!(arguments.contains(&OsString::from(rule)));
+        }
+        for rule in ADAM_TASK_MCP_ALLOW_RULES {
+            assert!(!arguments.contains(&OsString::from(rule)));
+        }
+
+        let mut child_enabled = request.clone();
+        child_enabled.subagents_enabled = true;
+        assert!(matches!(
+            validate_request(&child_enabled),
+            Err(GrokAcpError::InvalidConfiguration(message))
+                if message.contains("fresh root-only")
+        ));
+
+        let mut resumed = request.clone();
+        resumed.resume_session_id = Some("existing-session".into());
+        assert!(matches!(
+            validate_request(&resumed),
+            Err(GrokAcpError::InvalidConfiguration(message))
+                if message.contains("fresh root-only")
+        ));
+
+        request.canvas_tools_enabled = false;
+        request.http_mcp_server = None;
+        assert!(validate_request(&request).is_ok());
+        for rule in ADAM_CANVAS_MCP_ALLOW_RULES {
+            assert!(!command_arguments(&request).contains(&OsString::from(rule)));
+        }
     }
 
     #[test]
@@ -7660,6 +7739,7 @@ send({
         request.cwd = temporary.path().to_path_buf();
         request.subagents_enabled = true;
         request.progress_route = GrokAcpProgressRoute::NativeStream;
+        request.task_tools_enabled = false;
         request.http_mcp_server = None;
         let cancelled = AtomicBool::new(false);
         let mut events = Vec::new();
@@ -7764,6 +7844,7 @@ send({
         request.cwd = temporary.path().to_path_buf();
         request.resume_session_id = Some("resume-session".into());
         request.progress_route = GrokAcpProgressRoute::NativeStream;
+        request.task_tools_enabled = false;
         request.http_mcp_server = None;
         request.rules.clear();
         let cancelled = AtomicBool::new(false);

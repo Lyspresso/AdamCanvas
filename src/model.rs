@@ -450,6 +450,7 @@ impl Workspace {
     /// library. Runtime-only camera and selection state are not introduced.
     pub fn normalized(mut self) -> Self {
         self.version = CURRENT_WORKSPACE_VERSION;
+        self.domain.conversations.normalize_in_place();
         for record in self.domain.photo_records.values_mut() {
             record.normalize_in_place();
         }

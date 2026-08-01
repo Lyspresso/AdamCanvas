@@ -6,8 +6,12 @@
 //! evaluation, authorization, history, and recovery repeatable in tests.
 
 use crate::{
-    chat_core::ActivityEvent,
-    model::{TileKind, WorldRect},
+    chat_core::{
+        ActivityEvent, ActivityKind, ArtifactEventRef, ArtifactProjection, ArtifactSource,
+        HostMutationKind, artifact_effective_at, project_artifacts_with_provenance,
+        project_global_artifacts_with_provenance,
+    },
+    model::{CanvasPage, TileContent, TileKind, Workspace, WorldRect},
     photo_details::PhotoRecord,
 };
 use serde::{Deserialize, Deserializer, Serialize};
@@ -67,6 +71,8 @@ pub enum DomainError {
     HistoryEntryAlreadyUndone(Uuid),
     #[error("conversation {0} does not exist")]
     MissingConversation(ConversationId),
+    #[error("conversation {0} was permanently deleted")]
+    DeletedConversation(ConversationId),
     #[error("conversation {0} already has the maximum number of queued turns")]
     AiQueueFull(ConversationId),
     #[error("trash item {0} does not exist")]
@@ -2564,6 +2570,15 @@ pub struct AiConversation {
     pub pinned: bool,
     #[serde(default)]
     pub unread: bool,
+    /// Hidden chats remain durable and discoverable, but provider activity
+    /// never promotes them back into the ordinary sidebar list.
+    #[serde(default)]
+    pub hidden: bool,
+    /// Monotonic disclosure marker: at least one accepted turn used xAI's
+    /// server-stored Grok Heavy conversation state. Provider switching must
+    /// never hide that fact from the permanent-delete confirmation.
+    #[serde(default)]
+    pub used_xai_server_storage: bool,
     #[serde(default = "default_ai_tools_enabled")]
     pub tools_enabled: bool,
     #[serde(default)]
@@ -2599,6 +2614,8 @@ impl AiConversation {
             kind: AiConversationKind::Chat,
             pinned: false,
             unread: false,
+            hidden: false,
+            used_xai_server_storage: false,
             tools_enabled: false,
             project_id: None,
             character_id: None,
@@ -2612,6 +2629,32 @@ impl AiConversation {
 
     pub fn messages(&self) -> &[ConversationMessage] {
         &self.messages
+    }
+
+    /// Conversation-scoped artifact view with durable turn provenance and an
+    /// optional in-flight turn. Inspector rendering can consume this without
+    /// flattening away the message/turn boundary.
+    pub fn artifacts_with_live_turn(
+        &self,
+        live_turn_id: Option<Uuid>,
+        live_events: &[ActivityEvent],
+    ) -> Vec<ArtifactProjection> {
+        let persisted = self.messages.iter().flat_map(|message| {
+            message
+                .activities
+                .iter()
+                .map(move |event| ArtifactEventRef {
+                    conversation_id: Some(self.id),
+                    turn_id: message.turn_id,
+                    event,
+                })
+        });
+        let live = live_events.iter().map(|event| ArtifactEventRef {
+            conversation_id: Some(self.id),
+            turn_id: live_turn_id,
+            event,
+        });
+        project_artifacts_with_provenance(persisted.chain(live))
     }
 
     /// Activities for the newest persisted provider turn only.
@@ -2639,6 +2682,10 @@ impl AiConversation {
 
     pub fn checkpoints(&self) -> &[AiCheckpoint] {
         &self.checkpoints
+    }
+
+    pub(crate) fn checkpoints_mut(&mut self) -> &mut [AiCheckpoint] {
+        &mut self.checkpoints
     }
 
     pub fn queued_turns(&self) -> &[AiQueuedTurn] {
@@ -2830,6 +2877,16 @@ impl AiConversation {
             &remote.unread,
             prefer_local,
         );
+        merged.hidden = merge_persisted_value(
+            base.map(|conversation| &conversation.hidden),
+            &local.hidden,
+            &remote.hidden,
+            prefer_local,
+        );
+        merged.used_xai_server_storage = base
+            .is_some_and(|conversation| conversation.used_xai_server_storage)
+            || local.used_xai_server_storage
+            || remote.used_xai_server_storage;
         merged.tools_enabled = merge_persisted_value(
             base.map(|conversation| &conversation.tools_enabled),
             &local.tools_enabled,
@@ -2866,30 +2923,24 @@ impl AiConversation {
             .queued_turns
             .sort_by_key(|turn| (turn.queued_at, turn.id));
 
-        merged.messages = merge_persisted_records(
+        merged.messages = merge_persisted_records_causally(
             base.map(|conversation| conversation.messages.as_slice()),
             &local.messages,
             &remote.messages,
             |message| message.id,
             prefer_local,
         );
-        merged
-            .messages
-            .sort_by_key(|message| (message.at, message.sequence, message.id));
         for (index, message) in merged.messages.iter_mut().enumerate() {
             message.sequence = (index as u64).saturating_add(1);
         }
 
-        merged.actions = merge_persisted_records(
+        merged.actions = merge_persisted_records_causally(
             base.map(|conversation| conversation.actions.as_slice()),
             &local.actions,
             &remote.actions,
             |action| action.id,
             prefer_local,
         );
-        merged
-            .actions
-            .sort_by_key(|action| (action.at, action.sequence, action.id));
         for (index, action) in merged.actions.iter_mut().enumerate() {
             action.sequence = (index as u64).saturating_add(1);
         }
@@ -2915,15 +2966,345 @@ impl AiConversation {
     }
 }
 
+/// The immutable, durable origin of one canvas entity created by an AI turn.
+///
+/// The exact normalized activity is retained so scope and tool provenance do
+/// not have to be reconstructed from transcript prose after a reload.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct HostArtifactOrigin {
+    entity_id: Uuid,
+    conversation_id: ConversationId,
+    turn_id: Uuid,
+    event: ActivityEvent,
+}
+
+impl HostArtifactOrigin {
+    pub fn new(
+        entity_id: Uuid,
+        conversation_id: ConversationId,
+        turn_id: Uuid,
+        event: ActivityEvent,
+    ) -> Result<Self, HostArtifactLedgerError> {
+        let origin = Self {
+            entity_id,
+            conversation_id,
+            turn_id,
+            event,
+        };
+        origin.validate()?;
+        Ok(origin)
+    }
+
+    pub fn entity_id(&self) -> Uuid {
+        self.entity_id
+    }
+
+    pub fn conversation_id(&self) -> ConversationId {
+        self.conversation_id
+    }
+
+    pub fn turn_id(&self) -> Uuid {
+        self.turn_id
+    }
+
+    pub fn event(&self) -> &ActivityEvent {
+        &self.event
+    }
+
+    fn validate(&self) -> Result<(), HostArtifactLedgerError> {
+        for (field, value) in [
+            ("entity", self.entity_id),
+            ("conversation", self.conversation_id),
+            ("turn", self.turn_id),
+            ("event", self.event.id),
+        ] {
+            if value.is_nil() {
+                return Err(HostArtifactLedgerError::NilIdentity(field));
+            }
+        }
+        let ActivityKind::HostMutation {
+            entity_id,
+            kind: HostMutationKind::Create,
+            ..
+        } = &self.event.kind
+        else {
+            return Err(HostArtifactLedgerError::OriginIsNotCreate(self.entity_id));
+        };
+        let event_entity = entity_id
+            .as_deref()
+            .and_then(|value| Uuid::parse_str(value).ok());
+        if event_entity != Some(self.entity_id) {
+            return Err(HostArtifactLedgerError::EntityMismatch {
+                key: self.entity_id,
+                event_entity,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum HostArtifactLedgerError {
+    #[error("host artifact {0} identity cannot be nil")]
+    NilIdentity(&'static str),
+    #[error("host artifact {0} origin is not a create event")]
+    OriginIsNotCreate(Uuid),
+    #[error("host artifact key {key} does not match event entity {event_entity:?}")]
+    EntityMismatch {
+        key: Uuid,
+        event_entity: Option<Uuid>,
+    },
+    #[error("host artifact {0} already has a different immutable origin")]
+    ConflictingOrigin(Uuid),
+    #[error("host artifact event {event_id} is already assigned to entity {entity_id}")]
+    ConflictingEvent { event_id: Uuid, entity_id: Uuid },
+    #[error("host artifact conversation {0} does not exist")]
+    MissingConversation(ConversationId),
+}
+
+/// Append-only origins keyed by the stable canvas entity identity.
+///
+/// The transparent representation keeps the persisted top-level field a map
+/// rather than adding a second implementation-specific nesting level.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct HostArtifactLedger(BTreeMap<Uuid, HostArtifactOrigin>);
+
+impl<'de> Deserialize<'de> for HostArtifactLedger {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let persisted = BTreeMap::<Uuid, HostArtifactOrigin>::deserialize(deserializer)?;
+        let mut ledger = Self::default();
+        for (key, origin) in persisted {
+            if key != origin.entity_id {
+                return Err(serde::de::Error::custom(format!(
+                    "host artifact key {key} does not match origin entity {}",
+                    origin.entity_id
+                )));
+            }
+            ledger.record(origin).map_err(serde::de::Error::custom)?;
+        }
+        Ok(ledger)
+    }
+}
+
+impl HostArtifactLedger {
+    pub fn origins(&self) -> &BTreeMap<Uuid, HostArtifactOrigin> {
+        &self.0
+    }
+
+    pub fn origin(&self, entity_id: Uuid) -> Option<&HostArtifactOrigin> {
+        self.0.get(&entity_id)
+    }
+
+    /// Records an origin once. An exact retry is idempotent; reusing an
+    /// entity or event identity for different provenance is rejected.
+    pub fn record(&mut self, origin: HostArtifactOrigin) -> Result<bool, HostArtifactLedgerError> {
+        origin.validate()?;
+        if let Some(existing) = self.0.get(&origin.entity_id) {
+            return if existing == &origin {
+                Ok(false)
+            } else {
+                Err(HostArtifactLedgerError::ConflictingOrigin(origin.entity_id))
+            };
+        }
+        if let Some(existing) = self
+            .0
+            .values()
+            .find(|existing| existing.event.id == origin.event.id)
+        {
+            return Err(HostArtifactLedgerError::ConflictingEvent {
+                event_id: origin.event.id,
+                entity_id: existing.entity_id,
+            });
+        }
+        self.0.insert(origin.entity_id, origin);
+        Ok(true)
+    }
+
+    pub fn remove(&mut self, entity_id: Uuid) -> Option<HostArtifactOrigin> {
+        self.0.remove(&entity_id)
+    }
+
+    pub fn remove_conversation(&mut self, conversation_id: ConversationId) -> usize {
+        let before = self.0.len();
+        self.0
+            .retain(|_, origin| origin.conversation_id != conversation_id);
+        before.saturating_sub(self.0.len())
+    }
+
+    /// Returns the lossless union of immutable origins. The operation is
+    /// atomic: a conflict leaves both inputs untouched.
+    pub fn union(&self, other: &Self) -> Result<Self, HostArtifactLedgerError> {
+        let mut merged = self.clone();
+        for origin in other.0.values().cloned() {
+            merged.record(origin)?;
+        }
+        Ok(merged)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConversationStore {
     pub conversations: BTreeMap<ConversationId, AiConversation>,
     /// Deleting a chat tile removes this link, not its conversation.
     pub tile_links: BTreeMap<TileId, ConversationId>,
+    /// Monotonic deletion markers prevent a stale Adam window from
+    /// resurrecting a permanently deleted chat during a three-way save.
+    #[serde(default)]
+    pub deleted_conversations: BTreeSet<ConversationId>,
+}
+
+/// One searchable artifact-library row derived from durable conversation
+/// history. The library itself is not persisted, so it cannot drift from the
+/// messages and provenance that created it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationArtifact {
+    pub conversation_id: ConversationId,
+    pub conversation_title: String,
+    pub artifact: ArtifactProjection,
+    /// Files do not have a host availability. Canvas entities are reconciled
+    /// against the workspace instead of trusting stale transcript events.
+    pub host_availability: Option<HostArtifactAvailability>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostArtifactAvailability {
+    Available { page_id: PageId },
+    Trashed,
+    Missing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ArtifactReadyKey {
+    persisted_at: UnixMillis,
+    conversation_id: ConversationId,
+    message_sequence: u64,
+    activity_index: usize,
+    message_id: Uuid,
+    event_id: Uuid,
+}
+
+/// Produces a deterministic workspace timeline before global artifact
+/// reduction. Every conversation is one causal stream: only its next event is
+/// eligible, so clock skew can never move a later message ahead of an earlier
+/// one. Provider event time chooses among currently-ready conversations, with
+/// stable persisted identities breaking ties.
+fn ordered_persisted_artifact_events<'a>(
+    conversations: &'a BTreeMap<ConversationId, AiConversation>,
+    host_artifacts: Option<&'a HostArtifactLedger>,
+) -> Vec<ArtifactEventRef<'a>> {
+    let mut streams = Vec::new();
+    for conversation in conversations.values() {
+        let mut events = Vec::new();
+        for message in conversation.messages() {
+            for (activity_index, event) in message.activities.iter().enumerate() {
+                if let Some(entity_id) = activity_host_entity_id(event)
+                    && host_artifacts
+                        .and_then(|ledger| ledger.origin(entity_id))
+                        .is_some_and(|origin| origin.conversation_id != conversation.id)
+                {
+                    continue;
+                }
+                let effective_at = artifact_effective_at(event);
+                let persisted_at = if event.at == UnixMillis::ZERO {
+                    message.at.saturating_add(effective_at.0)
+                } else {
+                    effective_at
+                };
+                events.push((
+                    ArtifactReadyKey {
+                        persisted_at,
+                        conversation_id: conversation.id,
+                        message_sequence: message.sequence,
+                        activity_index,
+                        message_id: message.id,
+                        event_id: event.id,
+                    },
+                    ArtifactEventRef {
+                        conversation_id: Some(conversation.id),
+                        turn_id: message.turn_id,
+                        event,
+                    },
+                ));
+            }
+        }
+        if !events.is_empty() {
+            streams.push((0_usize, events));
+        }
+    }
+
+    let mut ordered = Vec::new();
+    if let Some(host_artifacts) = host_artifacts {
+        let mut origins = Vec::new();
+        for (entity_id, origin) in host_artifacts.origins() {
+            if *entity_id != origin.entity_id
+                || origin.validate().is_err()
+                || !conversations.contains_key(&origin.conversation_id)
+            {
+                continue;
+            }
+            origins.push((
+                ArtifactReadyKey {
+                    persisted_at: artifact_effective_at(&origin.event),
+                    conversation_id: origin.conversation_id,
+                    message_sequence: 0,
+                    activity_index: 0,
+                    message_id: Uuid::nil(),
+                    event_id: origin.event.id,
+                },
+                ArtifactEventRef {
+                    conversation_id: Some(origin.conversation_id),
+                    turn_id: Some(origin.turn_id),
+                    event: &origin.event,
+                },
+            ));
+        }
+        // Immutable host origins seed the reducer before transcript
+        // transitions. They may be the only surviving Create after activity
+        // compaction, and are independent of file lifecycles.
+        origins.sort_by_key(|(key, _)| *key);
+        ordered.extend(origins.into_iter().map(|(_, event)| event));
+    }
+
+    while let Some(stream_index) = (0..streams.len())
+        .filter(|index| streams[*index].0 < streams[*index].1.len())
+        .min_by_key(|index| streams[*index].1[streams[*index].0].0)
+    {
+        let (cursor, events) = &mut streams[stream_index];
+        ordered.push(events[*cursor].1);
+        *cursor += 1;
+    }
+    ordered
+}
+
+fn activity_host_entity_id(event: &ActivityEvent) -> Option<Uuid> {
+    let ActivityKind::HostMutation { entity_id, .. } = &event.kind else {
+        return None;
+    };
+    entity_id
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok())
 }
 
 impl ConversationStore {
+    /// Repairs mixed-version or hand-edited state so a durable deletion marker
+    /// is always authoritative over an embedded record or tile link.
+    pub fn normalize_in_place(&mut self) {
+        self.conversations
+            .retain(|id, _| !self.deleted_conversations.contains(id));
+        self.tile_links.retain(|_, conversation_id| {
+            !self.deleted_conversations.contains(conversation_id)
+                && self.conversations.contains_key(conversation_id)
+        });
+    }
+
     pub fn add(&mut self, conversation: AiConversation) -> Result<(), DomainError> {
+        if self.deleted_conversations.contains(&conversation.id) {
+            return Err(DomainError::DeletedConversation(conversation.id));
+        }
         if self.conversations.contains_key(&conversation.id) {
             return Err(DomainError::DuplicateId(conversation.id));
         }
@@ -2934,6 +3315,13 @@ impl ConversationStore {
     /// Merge the conversation portion of independently edited workspace
     /// snapshots without resurrecting an ordinary one-sided deletion.
     pub(crate) fn merge_persisted(base: &Self, local: &Self, remote: &Self) -> Self {
+        let deleted_conversations = base
+            .deleted_conversations
+            .iter()
+            .chain(local.deleted_conversations.iter())
+            .chain(remote.deleted_conversations.iter())
+            .copied()
+            .collect::<BTreeSet<_>>();
         let mut conversation_ids = BTreeSet::new();
         conversation_ids.extend(base.conversations.keys().copied());
         conversation_ids.extend(local.conversations.keys().copied());
@@ -2941,6 +3329,9 @@ impl ConversationStore {
 
         let mut conversations = BTreeMap::new();
         for id in conversation_ids {
+            if deleted_conversations.contains(&id) {
+                continue;
+            }
             let base_value = base.conversations.get(&id);
             let local_value = local.conversations.get(&id);
             let remote_value = remote.conversations.get(&id);
@@ -2987,6 +3378,7 @@ impl ConversationStore {
         Self {
             conversations,
             tile_links,
+            deleted_conversations,
         }
     }
 
@@ -3004,6 +3396,71 @@ impl ConversationStore {
 
     pub fn unlink_tile(&mut self, tile_id: TileId) -> Option<ConversationId> {
         self.tile_links.remove(&tile_id)
+    }
+
+    /// Removes the durable chat and every live tile link that names it.
+    /// Workspace owns the actual canvas tiles and removes them in the same
+    /// confirmed UI transaction.
+    pub fn remove(&mut self, conversation_id: ConversationId) -> Option<AiConversation> {
+        self.deleted_conversations.insert(conversation_id);
+        let removed = self.conversations.remove(&conversation_id);
+        self.tile_links
+            .retain(|_, linked| *linked != conversation_id);
+        removed
+    }
+
+    /// Searchable, uncapped artifact history across every conversation.
+    /// Compact inspector rails may take the first eight; a library surface
+    /// can search the complete result, including hidden conversations and
+    /// struck/deleted artifacts.
+    pub fn artifact_library(&self, query: &str) -> Vec<ConversationArtifact> {
+        let events = ordered_persisted_artifact_events(&self.conversations, None);
+        let query = query.trim().to_lowercase();
+        let mut artifacts = project_global_artifacts_with_provenance(events)
+            .into_iter()
+            .filter_map(|artifact| {
+                let conversation_id = artifact
+                    .produced_by
+                    .conversation_id
+                    .or(artifact.last_changed_by.conversation_id)?;
+                let conversation = self.conversations.get(&conversation_id)?;
+                let last_changed_conversation = artifact
+                    .last_changed_by
+                    .conversation_id
+                    .and_then(|conversation_id| self.conversations.get(&conversation_id))
+                    .map(|conversation| conversation.title.as_str())
+                    .unwrap_or_default();
+                let searchable = format!(
+                    "{}\n{}\n{}\n{}\n{}\n{}",
+                    conversation.title,
+                    last_changed_conversation,
+                    artifact.title,
+                    artifact.subtitle.as_deref().unwrap_or_default(),
+                    artifact.produced_by.tool.as_deref().unwrap_or_default(),
+                    artifact.last_changed_by.tool.as_deref().unwrap_or_default(),
+                )
+                .to_lowercase();
+                (query.is_empty() || searchable.contains(&query)).then(|| ConversationArtifact {
+                    conversation_id,
+                    conversation_title: conversation.title.clone(),
+                    artifact,
+                    host_availability: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|left, right| {
+            right
+                .artifact
+                .at
+                .cmp(&left.artifact.at)
+                .then_with(|| {
+                    left.conversation_title
+                        .to_lowercase()
+                        .cmp(&right.conversation_title.to_lowercase())
+                })
+                .then_with(|| left.artifact.id.cmp(&right.artifact.id))
+        });
+        artifacts
     }
 
     /// Clipboard duplication intentionally creates a link to a caller-created
@@ -3100,6 +3557,113 @@ where
                 prefer_local,
             )
         })
+        .collect()
+}
+
+/// Orders retained append-log records from causal source adjacency alone.
+///
+/// Wall clocks are not a valid ordering source across processes. Each source
+/// contributes edges between adjacent retained IDs, and a deterministic
+/// topological walk resolves concurrent ready nodes by their earliest source
+/// position and then UUID. A corrupted or conflicting reorder can introduce
+/// a cycle; in that case the same tie-break selects one node and severs only
+/// its remaining incoming constraints so every merge still converges.
+fn merge_persisted_records_causally<T>(
+    base: Option<&[T]>,
+    local: &[T],
+    remote: &[T],
+    key: impl Fn(&T) -> Uuid,
+    prefer_local: bool,
+) -> Vec<T>
+where
+    T: Clone + PartialEq,
+{
+    let merged = merge_persisted_records(base, local, remote, |record| key(record), prefer_local);
+    let mut records = merged
+        .into_iter()
+        .map(|record| (key(&record), record))
+        .collect::<BTreeMap<_, _>>();
+    let retained = records.keys().copied().collect::<BTreeSet<_>>();
+    let mut earliest_position = retained
+        .iter()
+        .copied()
+        .map(|id| (id, usize::MAX))
+        .collect::<BTreeMap<_, _>>();
+    let mut outgoing = retained
+        .iter()
+        .copied()
+        .map(|id| (id, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut indegree = retained
+        .iter()
+        .copied()
+        .map(|id| (id, 0usize))
+        .collect::<BTreeMap<_, _>>();
+
+    for source in [base.unwrap_or_default(), local, remote] {
+        let mut source_seen = BTreeSet::new();
+        let ordered = source
+            .iter()
+            .enumerate()
+            .filter_map(|(position, record)| {
+                let id = key(record);
+                retained.contains(&id).then_some((position, id))
+            })
+            .filter(|(_, id)| source_seen.insert(*id))
+            .collect::<Vec<_>>();
+        for (position, id) in &ordered {
+            if let Some(earliest) = earliest_position.get_mut(id) {
+                *earliest = (*earliest).min(*position);
+            }
+        }
+        for pair in ordered.windows(2) {
+            let from = pair[0].1;
+            let to = pair[1].1;
+            if from != to && outgoing.get_mut(&from).unwrap().insert(to) {
+                *indegree.get_mut(&to).unwrap() += 1;
+            }
+        }
+    }
+
+    let rank = |id: Uuid| (earliest_position[&id], id);
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(id, degree)| (*degree == 0).then_some(rank(*id)))
+        .collect::<BTreeSet<_>>();
+    let mut remaining = retained;
+    let mut ordered_ids = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+        let next = if let Some(next) = ready.pop_first() {
+            next.1
+        } else {
+            // Conflicting source orders formed a cycle. Break it at the same
+            // stable node on every process; the remainder then continues as
+            // an ordinary topological walk.
+            remaining
+                .iter()
+                .copied()
+                .min_by_key(|id| rank(*id))
+                .expect("a non-empty causal merge has a remaining record")
+        };
+        if !remaining.remove(&next) {
+            continue;
+        }
+        ordered_ids.push(next);
+        for successor in outgoing.get(&next).into_iter().flatten() {
+            if !remaining.contains(successor) {
+                continue;
+            }
+            let degree = indegree.get_mut(successor).unwrap();
+            *degree = degree.saturating_sub(1);
+            if *degree == 0 {
+                ready.insert(rank(*successor));
+            }
+        }
+    }
+
+    ordered_ids
+        .into_iter()
+        .filter_map(|id| records.remove(&id))
         .collect()
 }
 
@@ -3245,6 +3809,29 @@ impl TrashBin {
         })
     }
 
+    /// Irreversibly removes every trash record for the supplied live tile
+    /// identities. Used only by a human-confirmed parent-record deletion.
+    pub fn permanently_forget_tiles(
+        &mut self,
+        tile_ids: &BTreeSet<TileId>,
+        actor: TrashActor,
+    ) -> Result<usize, DomainError> {
+        if !matches!(actor, TrashActor::Human) {
+            return Err(DomainError::HumanRequiredForPermanentDelete);
+        }
+        let item_ids = self
+            .items
+            .iter()
+            .filter(|(_, item)| tile_ids.contains(&item.tile_id))
+            .map(|(item_id, _)| *item_id)
+            .collect::<BTreeSet<_>>();
+        let removed = item_ids.len();
+        self.items.retain(|item_id, _| !item_ids.contains(item_id));
+        self.events
+            .retain(|event| !item_ids.contains(&event.trash_item_id));
+        Ok(removed)
+    }
+
     fn next_sequence(&self) -> u64 {
         self.events
             .last()
@@ -3269,9 +3856,315 @@ pub struct DomainState {
     pub tags: TagStore,
     pub piles: BTreeMap<PileId, Pile>,
     pub conversations: ConversationStore,
+    /// Immutable provenance for canvas entities created by AI turns. Current
+    /// availability is always reconciled from pages, piles, and trash.
+    pub host_artifacts: HostArtifactLedger,
     pub trash: TrashBin,
     pub protected_tiles: BTreeSet<TileId>,
     pub photo_records: BTreeMap<TileId, PhotoRecord>,
+}
+
+impl DomainState {
+    /// Records one durable canvas-artifact origin after its entity commit.
+    pub fn record_host_artifact(
+        &mut self,
+        origin: HostArtifactOrigin,
+    ) -> Result<bool, HostArtifactLedgerError> {
+        if !self
+            .conversations
+            .conversations
+            .contains_key(&origin.conversation_id)
+        {
+            return Err(HostArtifactLedgerError::MissingConversation(
+                origin.conversation_id,
+            ));
+        }
+        self.host_artifacts.record(origin)
+    }
+
+    /// Projects one conversation's files and canvas creations, then
+    /// reconciles every canvas entity against the authoritative workspace.
+    pub fn conversation_artifacts(
+        &self,
+        pages: &[CanvasPage],
+        conversation_id: ConversationId,
+        live_turn_id: Option<Uuid>,
+        live_events: &[ActivityEvent],
+    ) -> Vec<ConversationArtifact> {
+        let Some(conversation) = self.conversations.conversations.get(&conversation_id) else {
+            return Vec::new();
+        };
+        self.project_conversation_artifacts(pages, conversation, live_turn_id, live_events)
+    }
+
+    /// Searchable, uncapped artifact history across durable conversations.
+    /// Host rows include their reconciled live, trash, or missing state.
+    pub fn artifact_library(&self, pages: &[CanvasPage], query: &str) -> Vec<ConversationArtifact> {
+        let query = query.trim().to_lowercase();
+        let events = ordered_persisted_artifact_events(
+            &self.conversations.conversations,
+            Some(&self.host_artifacts),
+        );
+        let mut artifacts = project_global_artifacts_with_provenance(events)
+            .into_iter()
+            .filter_map(|mut artifact| {
+                let ledger_origin = host_entity_id(&artifact)
+                    .and_then(|entity_id| self.host_artifacts.origin(entity_id));
+                let conversation_id = if let Some(origin) = ledger_origin {
+                    // The ledger owns immutable production provenance. It can
+                    // be the only surviving copy of the Create event after
+                    // transcript compaction, and must also win over corrupt
+                    // cross-chat ownership claims.
+                    let origin_projection = project_artifacts_with_provenance([ArtifactEventRef {
+                        conversation_id: Some(origin.conversation_id),
+                        turn_id: Some(origin.turn_id),
+                        event: &origin.event,
+                    }])
+                    .pop()?;
+                    artifact.produced_by = origin_projection.produced_by;
+                    origin.conversation_id
+                } else {
+                    artifact
+                        .produced_by
+                        .conversation_id
+                        .or(artifact.last_changed_by.conversation_id)?
+                };
+                let conversation = self.conversations.conversations.get(&conversation_id)?;
+                let host_availability = self.host_availability(pages, &artifact);
+                if let Some(availability) = host_availability {
+                    artifact.is_deleted =
+                        !matches!(availability, HostArtifactAvailability::Available { .. });
+                }
+                let row = ConversationArtifact {
+                    conversation_id,
+                    conversation_title: conversation.title.clone(),
+                    artifact,
+                    host_availability,
+                };
+                (artifact_matches_query(&row, &query)
+                    || artifact_provenance_conversation_matches(
+                        &row.artifact,
+                        &self.conversations.conversations,
+                        &query,
+                    ))
+                .then_some(row)
+            })
+            .collect::<Vec<_>>();
+        artifacts.sort_by(|left, right| {
+            right
+                .artifact
+                .at
+                .cmp(&left.artifact.at)
+                .then_with(|| {
+                    left.conversation_title
+                        .to_lowercase()
+                        .cmp(&right.conversation_title.to_lowercase())
+                })
+                .then_with(|| left.artifact.id.cmp(&right.artifact.id))
+        });
+        artifacts
+    }
+
+    fn project_conversation_artifacts(
+        &self,
+        pages: &[CanvasPage],
+        conversation: &AiConversation,
+        live_turn_id: Option<Uuid>,
+        live_events: &[ActivityEvent],
+    ) -> Vec<ConversationArtifact> {
+        let mut projected = conversation.artifacts_with_live_turn(live_turn_id, live_events);
+        let mut positions = projected
+            .iter()
+            .enumerate()
+            .map(|(index, artifact)| (artifact.id.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut missing_origins = Vec::new();
+        for (entity_id, origin) in self.host_artifacts.origins() {
+            if *entity_id != origin.entity_id
+                || origin.conversation_id != conversation.id
+                || origin.validate().is_err()
+            {
+                continue;
+            }
+            let mut origin_projection = project_artifacts_with_provenance([ArtifactEventRef {
+                conversation_id: Some(origin.conversation_id),
+                turn_id: Some(origin.turn_id),
+                event: &origin.event,
+            }]);
+            let Some(origin_projection) = origin_projection.pop() else {
+                continue;
+            };
+            if let Some(index) = positions.get(&origin_projection.id).copied() {
+                // The ledger owns immutable production provenance even when
+                // later transcript lifecycle events changed availability.
+                projected[index].produced_by = origin_projection.produced_by;
+            } else {
+                missing_origins.push(origin_projection);
+            }
+        }
+        missing_origins
+            .sort_by(|left, right| right.at.cmp(&left.at).then_with(|| left.id.cmp(&right.id)));
+        for artifact in missing_origins {
+            positions.insert(artifact.id.clone(), projected.len());
+            projected.push(artifact);
+        }
+        projected.sort_by(|left, right| {
+            right
+                .at
+                .cmp(&left.at)
+                .then_with(|| left.id.cmp(&right.id))
+                .then_with(|| {
+                    left.last_changed_by
+                        .event_id
+                        .cmp(&right.last_changed_by.event_id)
+                })
+        });
+
+        projected
+            .into_iter()
+            .filter(|artifact| {
+                let Some(entity_id) = host_entity_id(artifact) else {
+                    return true;
+                };
+                self.host_artifacts
+                    .origin(entity_id)
+                    .is_none_or(|origin| origin.conversation_id == conversation.id)
+            })
+            .map(|mut artifact| {
+                let host_availability = self.host_availability(pages, &artifact);
+                if let Some(availability) = host_availability {
+                    artifact.is_deleted =
+                        !matches!(availability, HostArtifactAvailability::Available { .. });
+                }
+                ConversationArtifact {
+                    conversation_id: conversation.id,
+                    conversation_title: conversation.title.clone(),
+                    artifact,
+                    host_availability,
+                }
+            })
+            .collect()
+    }
+
+    fn host_availability(
+        &self,
+        pages: &[CanvasPage],
+        artifact: &ArtifactProjection,
+    ) -> Option<HostArtifactAvailability> {
+        let ArtifactSource::Host {
+            tool, entity_id, ..
+        } = &artifact.source
+        else {
+            return None;
+        };
+        let Some(entity_id) = entity_id
+            .as_deref()
+            .and_then(|value| Uuid::parse_str(value).ok())
+        else {
+            return Some(HostArtifactAvailability::Missing);
+        };
+
+        if self.trash.active_item_for_tile(entity_id).is_some() {
+            return Some(HostArtifactAvailability::Trashed);
+        }
+        for page in pages {
+            let Some(tile) = page.tile(entity_id) else {
+                continue;
+            };
+            let valid = match (&tile.content, tool.as_str()) {
+                (TileContent::Note { .. }, "canvas_create_note") => true,
+                (TileContent::Pile { pile_id }, "canvas_create_pile") => {
+                    *pile_id == entity_id
+                        && self
+                            .piles
+                            .get(&entity_id)
+                            .is_some_and(|pile| pile.id == entity_id && pile.page_id == page.id)
+                }
+                (TileContent::Pile { pile_id }, _) => {
+                    *pile_id == entity_id
+                        && self
+                            .piles
+                            .get(&entity_id)
+                            .is_some_and(|pile| pile.id == entity_id && pile.page_id == page.id)
+                }
+                (_, "canvas_create_note" | "canvas_create_pile") => false,
+                _ => true,
+            };
+            if valid {
+                return Some(HostArtifactAvailability::Available { page_id: page.id });
+            }
+        }
+        Some(HostArtifactAvailability::Missing)
+    }
+}
+
+impl Workspace {
+    pub fn conversation_artifacts(
+        &self,
+        conversation_id: ConversationId,
+        live_turn_id: Option<Uuid>,
+        live_events: &[ActivityEvent],
+    ) -> Vec<ConversationArtifact> {
+        self.domain
+            .conversation_artifacts(&self.pages, conversation_id, live_turn_id, live_events)
+    }
+
+    pub fn artifact_library(&self, query: &str) -> Vec<ConversationArtifact> {
+        self.domain.artifact_library(&self.pages, query)
+    }
+}
+
+fn host_entity_id(artifact: &ArtifactProjection) -> Option<Uuid> {
+    let ArtifactSource::Host { entity_id, .. } = &artifact.source else {
+        return None;
+    };
+    entity_id
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn artifact_matches_query(row: &ConversationArtifact, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let availability = match row.host_availability {
+        Some(HostArtifactAvailability::Available { .. }) => "available",
+        Some(HostArtifactAvailability::Trashed) => "trashed",
+        Some(HostArtifactAvailability::Missing) => "missing",
+        None => "file",
+    };
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        row.conversation_title,
+        row.artifact.title,
+        row.artifact.subtitle.as_deref().unwrap_or_default(),
+        row.artifact.produced_by.tool.as_deref().unwrap_or_default(),
+        row.artifact
+            .last_changed_by
+            .tool
+            .as_deref()
+            .unwrap_or_default(),
+        availability,
+    )
+    .to_lowercase()
+    .contains(query)
+}
+
+fn artifact_provenance_conversation_matches(
+    artifact: &ArtifactProjection,
+    conversations: &BTreeMap<ConversationId, AiConversation>,
+    query: &str,
+) -> bool {
+    !query.is_empty()
+        && [
+            artifact.produced_by.conversation_id,
+            artifact.last_changed_by.conversation_id,
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|conversation_id| conversations.get(&conversation_id))
+        .any(|conversation| conversation.title.to_lowercase().contains(query))
 }
 
 // MARK: - Tests
@@ -4405,10 +5298,358 @@ mod tests {
         assert_eq!(conversation.settings, AiConversationSettings::default());
         assert_eq!(conversation.messages().len(), 1);
         assert!(conversation.messages()[0].attachments.is_empty());
+        assert!(!conversation.hidden);
+        assert!(!conversation.used_xai_server_storage);
 
         let round_trip: AiConversation =
             serde_json::from_slice(&serde_json::to_vec(&conversation).unwrap()).unwrap();
         assert_eq!(round_trip, conversation);
+    }
+
+    #[test]
+    fn xai_storage_disclosure_marker_is_monotonic_across_merges() {
+        let base = AiConversation::new(id(1), "Heavy", PermissionMode::Ask, at(1));
+        let mut used_xai = base.clone();
+        used_xai.used_xai_server_storage = true;
+        used_xai.settings.provider_id = "codex_cli".into();
+        used_xai.updated_at = at(2);
+        let mut stale_provider_edit = base.clone();
+        stale_provider_edit.settings.provider_id = "grok_cli".into();
+        stale_provider_edit.updated_at = at(3);
+
+        let merged = AiConversation::merge_persisted(Some(&base), &used_xai, &stale_provider_edit);
+        assert!(merged.used_xai_server_storage);
+        assert_eq!(merged.settings.provider_id, "grok_cli");
+
+        let mut marked_base = base;
+        marked_base.used_xai_server_storage = true;
+        let local_without_marker = AiConversation {
+            used_xai_server_storage: false,
+            ..marked_base.clone()
+        };
+        let remote_without_marker = local_without_marker.clone();
+        assert!(
+            AiConversation::merge_persisted(
+                Some(&marked_base),
+                &local_without_marker,
+                &remote_without_marker,
+            )
+            .used_xai_server_storage
+        );
+    }
+
+    fn merge_test_message(message_id: u128, text: &str) -> ConversationMessage {
+        ConversationMessage {
+            id: id(message_id),
+            sequence: message_id as u64,
+            role: MessageRole::Assistant,
+            text: text.into(),
+            at: at(message_id as i64),
+            related_action_ids: Vec::new(),
+            attachments: Vec::new(),
+            activities: Vec::new(),
+            turn_id: Some(id(10_000 + message_id)),
+        }
+    }
+
+    fn append_merge_test_action(conversation: &mut AiConversation, action_id: u128, at_value: i64) {
+        conversation
+            .append_action(AiActionRecord {
+                id: id(action_id),
+                sequence: 0,
+                request: AiActionRequest {
+                    id: id(10_000 + action_id),
+                    conversation_id: conversation.id,
+                    page_id: id(900),
+                    kind: AiActionKind::CreateNote,
+                    target_tile_ids: BTreeSet::new(),
+                    summary: format!("Action {action_id}"),
+                },
+                permission_mode: PermissionMode::Auto,
+                plain_language_line: format!("Applied {action_id}"),
+                at: at(at_value),
+                outcome: AiActionOutcome::Applied,
+                checkpoint_id: None,
+                undo_action_id: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn conversation_merge_preserves_artifact_causality_under_clock_skew() {
+        let base = AiConversation::new(id(1), "Artifacts", PermissionMode::Ask, at(0));
+        let mut local = base.clone();
+        let add_event = ActivityEvent::new(
+            id(100),
+            at(100),
+            ActivityKind::FileChange {
+                id: "write".into(),
+                tool: Some("Write".into()),
+                changes: vec![crate::chat_core::FileChange {
+                    path: "/tmp/causal.md".into(),
+                    kind: crate::chat_core::FileChangeKind::Add,
+                }],
+                status: crate::chat_core::ActivityStatus::Completed,
+            },
+        );
+        let delete_event = ActivityEvent::new(
+            id(101),
+            at(1),
+            ActivityKind::FileChange {
+                id: "delete".into(),
+                tool: Some("Delete".into()),
+                changes: vec![crate::chat_core::FileChange {
+                    path: "/tmp/causal.md".into(),
+                    kind: crate::chat_core::FileChangeKind::Delete,
+                }],
+                status: crate::chat_core::ActivityStatus::Completed,
+            },
+        );
+        local
+            .append_message_with_activity(
+                id(10),
+                MessageRole::Assistant,
+                "Created",
+                at(100),
+                Vec::new(),
+                Vec::new(),
+                vec![add_event],
+                Some(id(200)),
+            )
+            .unwrap();
+        local
+            .append_message_with_activity(
+                id(11),
+                MessageRole::Assistant,
+                "Deleted",
+                at(1),
+                Vec::new(),
+                Vec::new(),
+                vec![delete_event],
+                Some(id(201)),
+            )
+            .unwrap();
+
+        let merged = AiConversation::merge_persisted(Some(&base), &local, &base);
+        assert_eq!(
+            merged
+                .messages()
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![id(10), id(11)]
+        );
+        assert_eq!(
+            merged
+                .messages()
+                .iter()
+                .map(|message| message.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let artifacts = merged.artifacts_with_live_turn(None, &[]);
+        assert_eq!(artifacts.len(), 1);
+        assert!(artifacts[0].is_deleted);
+        assert_eq!(artifacts[0].produced_by.event_id, id(100));
+        assert_eq!(artifacts[0].last_changed_by.event_id, id(101));
+    }
+
+    #[test]
+    fn message_merge_is_commutative_idempotent_and_keeps_prior_merged_order() {
+        let mut base = AiConversation::new(id(1), "Merge", PermissionMode::Ask, at(0));
+        base.messages = vec![merge_test_message(10, "base")];
+        let mut local = base.clone();
+        local.messages.push(merge_test_message(30, "local"));
+        let mut remote = base.clone();
+        remote.messages.push(merge_test_message(20, "remote"));
+
+        let merged = AiConversation::merge_persisted(Some(&base), &local, &remote);
+        let swapped = AiConversation::merge_persisted(Some(&base), &remote, &local);
+        let ids = |conversation: &AiConversation| {
+            conversation
+                .messages()
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&merged), vec![id(10), id(20), id(30)]);
+        assert_eq!(ids(&swapped), ids(&merged));
+
+        let idempotent = AiConversation::merge_persisted(Some(&base), &merged, &merged);
+        assert_eq!(idempotent.messages(), merged.messages());
+
+        let prior_left = AiConversation::merge_persisted(Some(&base), &merged, &local);
+        let prior_right = AiConversation::merge_persisted(Some(&base), &local, &merged);
+        assert_eq!(ids(&prior_left), ids(&merged));
+        assert_eq!(ids(&prior_right), ids(&merged));
+    }
+
+    #[test]
+    fn message_merge_breaks_conflicting_order_cycles_deterministically() {
+        let base = AiConversation::new(id(1), "Cycle", PermissionMode::Ask, at(0));
+        let mut forward = base.clone();
+        forward.messages = vec![
+            merge_test_message(10, "ten"),
+            merge_test_message(20, "twenty"),
+        ];
+        let mut reverse = base.clone();
+        reverse.messages = vec![
+            merge_test_message(20, "twenty"),
+            merge_test_message(10, "ten"),
+        ];
+
+        let first = AiConversation::merge_persisted(Some(&base), &forward, &reverse);
+        let swapped = AiConversation::merge_persisted(Some(&base), &reverse, &forward);
+        let ids = |conversation: &AiConversation| {
+            conversation
+                .messages()
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&first), vec![id(10), id(20)]);
+        assert_eq!(ids(&swapped), ids(&first));
+        assert_eq!(
+            first
+                .messages()
+                .iter()
+                .map(|message| message.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn action_merge_uses_causal_order_under_skew_and_converges_across_branches() {
+        let base = AiConversation::new(id(1), "Actions", PermissionMode::Ask, at(0));
+        let mut skewed = base.clone();
+        append_merge_test_action(&mut skewed, 10, 100);
+        append_merge_test_action(&mut skewed, 20, 1);
+        let skewed_merge = AiConversation::merge_persisted(Some(&base), &skewed, &base);
+        assert_eq!(
+            skewed_merge
+                .actions()
+                .iter()
+                .map(|action| (action.id, action.sequence))
+                .collect::<Vec<_>>(),
+            vec![(id(10), 1), (id(20), 2)]
+        );
+
+        let mut branch_base = base.clone();
+        append_merge_test_action(&mut branch_base, 30, 50);
+        let mut local = branch_base.clone();
+        append_merge_test_action(&mut local, 50, 1);
+        let mut remote = branch_base.clone();
+        append_merge_test_action(&mut remote, 40, 500);
+        let merged = AiConversation::merge_persisted(Some(&branch_base), &local, &remote);
+        let swapped = AiConversation::merge_persisted(Some(&branch_base), &remote, &local);
+        let action_ids = |conversation: &AiConversation| {
+            conversation
+                .actions()
+                .iter()
+                .map(|action| action.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(action_ids(&merged), vec![id(30), id(40), id(50)]);
+        assert_eq!(action_ids(&swapped), action_ids(&merged));
+        assert_eq!(
+            AiConversation::merge_persisted(Some(&branch_base), &merged, &merged).actions(),
+            merged.actions()
+        );
+        assert_eq!(
+            action_ids(&AiConversation::merge_persisted(
+                Some(&branch_base),
+                &merged,
+                &local,
+            )),
+            action_ids(&merged),
+            "a prior merged order remains a causal constraint"
+        );
+    }
+
+    #[test]
+    fn conversation_deletion_markers_are_legacy_safe_monotonic_and_block_reuse() {
+        let legacy: ConversationStore = serde_json::from_value(json!({
+            "conversations": {},
+            "tile_links": {}
+        }))
+        .unwrap();
+        assert!(legacy.deleted_conversations.is_empty());
+
+        let mut store = legacy;
+        assert!(store.remove(id(1)).is_none());
+        assert!(store.deleted_conversations.contains(&id(1)));
+        assert_eq!(
+            store.add(AiConversation::new(
+                id(1),
+                "Must stay deleted",
+                PermissionMode::Ask,
+                at(1),
+            )),
+            Err(DomainError::DeletedConversation(id(1)))
+        );
+    }
+
+    #[test]
+    fn deletion_marker_wins_concurrent_edit_in_either_branch_and_filters_links() {
+        let conversation_id = id(1);
+        let tile_id = id(20);
+        let mut base = ConversationStore::default();
+        base.add(AiConversation::new(
+            conversation_id,
+            "Original",
+            PermissionMode::Ask,
+            at(0),
+        ))
+        .unwrap();
+        base.link_tile(tile_id, conversation_id).unwrap();
+
+        let mut edited = base.clone();
+        let conversation = edited.conversations.get_mut(&conversation_id).unwrap();
+        conversation.title = "Edited concurrently".into();
+        conversation.updated_at = at(2);
+        let mut deleted = base.clone();
+        assert!(deleted.remove(conversation_id).is_some());
+
+        for merged in [
+            ConversationStore::merge_persisted(&base, &edited, &deleted),
+            ConversationStore::merge_persisted(&base, &deleted, &edited),
+        ] {
+            assert!(merged.deleted_conversations.contains(&conversation_id));
+            assert!(!merged.conversations.contains_key(&conversation_id));
+            assert!(!merged.tile_links.contains_key(&tile_id));
+            assert!(
+                merged
+                    .tile_links
+                    .values()
+                    .all(|linked| *linked != conversation_id)
+            );
+        }
+    }
+
+    #[test]
+    fn normalization_makes_a_serialized_tombstone_authoritative_over_records_and_links() {
+        let conversation_id = id(1);
+        let tile_id = id(20);
+        let mut store = ConversationStore::default();
+        store
+            .add(AiConversation::new(
+                conversation_id,
+                "Must remain deleted",
+                PermissionMode::Ask,
+                at(0),
+            ))
+            .unwrap();
+        store.link_tile(tile_id, conversation_id).unwrap();
+        store.deleted_conversations.insert(conversation_id);
+
+        let mut restored: ConversationStore =
+            serde_json::from_value(serde_json::to_value(store).unwrap()).unwrap();
+        restored.normalize_in_place();
+
+        assert!(restored.deleted_conversations.contains(&conversation_id));
+        assert!(!restored.conversations.contains_key(&conversation_id));
+        assert!(!restored.tile_links.contains_key(&tile_id));
     }
 
     #[test]
@@ -4439,6 +5680,863 @@ mod tests {
         let decoded: ConversationStore = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, store);
         assert_eq!(decoded.conversations[&id(1)].checkpoints().len(), 1);
+
+        let mut removable = decoded;
+        removable.link_tile(id(21), id(1)).unwrap();
+        assert!(removable.remove(id(1)).is_some());
+        assert!(!removable.conversations.contains_key(&id(1)));
+        assert!(
+            !removable
+                .tile_links
+                .values()
+                .any(|conversation_id| *conversation_id == id(1))
+        );
+    }
+
+    #[test]
+    fn artifact_library_is_searchable_cross_conversation_and_keeps_provenance() {
+        let artifact_event = |event_id, path: &str, tool: &str, kind, at_value| {
+            ActivityEvent::new(
+                event_id,
+                at(at_value),
+                ActivityKind::FileChange {
+                    id: format!("call-{at_value}"),
+                    tool: Some(tool.into()),
+                    changes: vec![crate::chat_core::FileChange {
+                        path: path.into(),
+                        kind,
+                    }],
+                    status: crate::chat_core::ActivityStatus::Completed,
+                },
+            )
+        };
+        let mut first = AiConversation::new(id(1), "Visible research", PermissionMode::Ask, at(0));
+        first
+            .append_message_with_activity(
+                id(10),
+                MessageRole::Assistant,
+                "Made it",
+                at(2),
+                Vec::new(),
+                Vec::new(),
+                vec![artifact_event(
+                    id(11),
+                    "/tmp/report.md",
+                    "Write",
+                    crate::chat_core::FileChangeKind::Add,
+                    2,
+                )],
+                Some(id(12)),
+            )
+            .unwrap();
+        let live_turn = id(13);
+        let live_event = ActivityEvent::new(
+            id(14),
+            at(4),
+            ActivityKind::HostMutation {
+                tool: "canvas_create_note".into(),
+                summary: "Research card".into(),
+                entity_id: Some(id(15).to_string()),
+                container_name: Some("Main".into()),
+                kind: crate::chat_core::HostMutationKind::Create,
+            },
+        );
+        let scoped = first.artifacts_with_live_turn(Some(live_turn), &[live_event]);
+        assert_eq!(scoped.len(), 2);
+        assert!(scoped.iter().all(|artifact| {
+            artifact.produced_by.conversation_id == Some(id(1))
+                && artifact.produced_by.turn_id.is_some()
+        }));
+        assert!(scoped.iter().any(|artifact| {
+            artifact.title == "Research card" && artifact.produced_by.turn_id == Some(live_turn)
+        }));
+        let mut hidden = AiConversation::new(id(2), "Hidden analysis", PermissionMode::Ask, at(0));
+        hidden.hidden = true;
+        hidden
+            .append_message_with_activity(
+                id(20),
+                MessageRole::Assistant,
+                "Made it too",
+                at(3),
+                Vec::new(),
+                Vec::new(),
+                vec![artifact_event(
+                    id(21),
+                    "/tmp/report.md",
+                    "Edit",
+                    crate::chat_core::FileChangeKind::Update,
+                    3,
+                )],
+                Some(id(22)),
+            )
+            .unwrap();
+        let mut store = ConversationStore::default();
+        store.add(first).unwrap();
+        store.add(hidden).unwrap();
+
+        let all = store.artifact_library("");
+        assert_eq!(all.len(), 1, "a physical path has one global library row");
+        assert_eq!(all[0].conversation_id, id(1));
+        assert_eq!(all[0].artifact.produced_by.turn_id, Some(id(12)));
+        assert_eq!(all[0].artifact.produced_by.tool.as_deref(), Some("Write"));
+        assert_eq!(all[0].artifact.last_changed_by.turn_id, Some(id(22)));
+        assert_eq!(
+            all[0].artifact.last_changed_by.tool.as_deref(),
+            Some("Edit")
+        );
+        assert_eq!(store.artifact_library("hidden").len(), 1);
+        assert_eq!(store.artifact_library("write").len(), 1);
+    }
+
+    fn host_create_event(
+        event_id: Uuid,
+        entity_id: Uuid,
+        tool: &str,
+        title: &str,
+        at_value: i64,
+    ) -> ActivityEvent {
+        ActivityEvent::new(
+            event_id,
+            at(at_value),
+            ActivityKind::HostMutation {
+                tool: tool.into(),
+                summary: title.into(),
+                entity_id: Some(entity_id.to_string()),
+                container_name: Some("Canvas 1".into()),
+                kind: HostMutationKind::Create,
+            },
+        )
+    }
+
+    #[test]
+    fn host_artifact_ledger_validates_is_idempotent_and_round_trips() {
+        let mut event = host_create_event(id(101), id(100), "canvas_create_note", "Brief", 2);
+        event.scope = crate::chat_core::AgentScope::Child {
+            id: "researcher-1".into(),
+        };
+        let origin = HostArtifactOrigin::new(id(100), id(1), id(10), event).unwrap();
+        let mut state = DomainState::default();
+        state
+            .conversations
+            .add(AiConversation::new(
+                id(1),
+                "Ledger",
+                PermissionMode::Ask,
+                at(0),
+            ))
+            .unwrap();
+        assert!(state.record_host_artifact(origin.clone()).unwrap());
+        assert!(!state.record_host_artifact(origin.clone()).unwrap());
+
+        let restored: DomainState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(restored.host_artifacts.origin(id(100)), Some(&origin));
+        assert!(matches!(
+            restored
+                .host_artifacts
+                .origin(id(100))
+                .unwrap()
+                .event()
+                .scope,
+            crate::chat_core::AgentScope::Child { .. }
+        ));
+
+        let conflict = HostArtifactOrigin::new(
+            id(100),
+            id(1),
+            id(10),
+            host_create_event(id(102), id(100), "canvas_create_note", "Other", 3),
+        )
+        .unwrap();
+        assert!(matches!(
+            restored.host_artifacts.union(&HostArtifactLedger(
+                BTreeMap::from([(id(100), conflict)])
+            )),
+            Err(HostArtifactLedgerError::ConflictingOrigin(entity)) if entity == id(100)
+        ));
+
+        let second = HostArtifactOrigin::new(
+            id(200),
+            id(2),
+            id(20),
+            host_create_event(id(201), id(200), "canvas_create_note", "Second", 4),
+        )
+        .unwrap();
+        let mut other = HostArtifactLedger::default();
+        other.record(second).unwrap();
+        let mut union = restored.host_artifacts.union(&other).unwrap();
+        assert_eq!(union.origins().len(), 2);
+        assert_eq!(union.remove_conversation(id(2)), 1);
+        assert!(union.origin(id(200)).is_none());
+        assert_eq!(restored.host_artifacts.origins().len(), 1);
+
+        let update = ActivityEvent::new(
+            id(103),
+            at(4),
+            ActivityKind::HostMutation {
+                tool: "canvas_create_note".into(),
+                summary: "Brief".into(),
+                entity_id: Some(id(100).to_string()),
+                container_name: None,
+                kind: HostMutationKind::Update,
+            },
+        );
+        assert!(matches!(
+            HostArtifactOrigin::new(id(100), id(1), id(10), update),
+            Err(HostArtifactLedgerError::OriginIsNotCreate(entity)) if entity == id(100)
+        ));
+    }
+
+    #[test]
+    fn workspace_reconciles_note_and_complete_pile_availability() {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let conversation_id = id(1);
+        workspace
+            .domain
+            .conversations
+            .add(AiConversation::new(
+                conversation_id,
+                "Canvas work",
+                PermissionMode::Ask,
+                at(0),
+            ))
+            .unwrap();
+
+        let note_id = id(110);
+        let note_event =
+            host_create_event(id(111), note_id, "canvas_create_note", "Research brief", 2);
+        workspace
+            .domain
+            .record_host_artifact(
+                HostArtifactOrigin::new(note_id, conversation_id, id(10), note_event).unwrap(),
+            )
+            .unwrap();
+        let mut note = crate::model::Tile::note(
+            "Research brief",
+            "Findings",
+            WorldRect::new(0.0, 0.0, 200.0, 120.0),
+        );
+        note.id = note_id;
+        workspace.page_mut(page_id).unwrap().add_tile(note);
+
+        let pile_id = id(120);
+        workspace
+            .domain
+            .record_host_artifact(
+                HostArtifactOrigin::new(
+                    pile_id,
+                    conversation_id,
+                    id(10),
+                    host_create_event(id(121), pile_id, "canvas_create_pile", "Sources", 3),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        workspace
+            .page_mut(page_id)
+            .unwrap()
+            .add_tile(crate::model::Tile::pile(
+                pile_id,
+                "Sources",
+                WorldRect::new(240.0, 0.0, 300.0, 220.0),
+            ));
+        workspace.domain.piles.insert(
+            pile_id,
+            Pile::new(
+                pile_id,
+                page_id,
+                WorldRect::new(240.0, 0.0, 300.0, 220.0),
+                "Sources",
+                id(122),
+                PaletteColor::Blue,
+            )
+            .unwrap(),
+        );
+
+        let rows = workspace.conversation_artifacts(conversation_id, None, &[]);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| {
+            row.host_availability == Some(HostArtifactAvailability::Available { page_id })
+                && !row.artifact.is_deleted
+        }));
+
+        workspace.domain.piles.remove(&pile_id);
+        let rows = workspace.conversation_artifacts(conversation_id, None, &[]);
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.artifact.id == format!("host:{pile_id}"))
+                .unwrap()
+                .host_availability,
+            Some(HostArtifactAvailability::Missing),
+            "a pile tile without its domain pile is not revealable"
+        );
+
+        workspace.page_mut(page_id).unwrap().remove_tile(pile_id);
+        workspace.domain.piles.insert(
+            pile_id,
+            Pile::new(
+                pile_id,
+                page_id,
+                WorldRect::new(240.0, 0.0, 300.0, 220.0),
+                "Sources",
+                id(122),
+                PaletteColor::Blue,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            workspace
+                .conversation_artifacts(conversation_id, None, &[])
+                .into_iter()
+                .find(|row| row.artifact.id == format!("host:{pile_id}"))
+                .unwrap()
+                .host_availability,
+            Some(HostArtifactAvailability::Missing),
+            "a pile record without its tile is also not revealable"
+        );
+    }
+
+    #[test]
+    fn host_availability_follows_trash_restore_and_missing_workspace_state() {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let conversation_id = id(1);
+        let entity_id = id(130);
+        workspace
+            .domain
+            .conversations
+            .add(AiConversation::new(
+                conversation_id,
+                "Lifecycle",
+                PermissionMode::Ask,
+                at(0),
+            ))
+            .unwrap();
+        workspace
+            .domain
+            .record_host_artifact(
+                HostArtifactOrigin::new(
+                    entity_id,
+                    conversation_id,
+                    id(10),
+                    host_create_event(id(131), entity_id, "canvas_create_note", "Draft", 2),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut tile =
+            crate::model::Tile::note("Draft", "Text", WorldRect::new(0.0, 0.0, 200.0, 120.0));
+        tile.id = entity_id;
+        workspace.page_mut(page_id).unwrap().add_tile(tile.clone());
+
+        workspace.page_mut(page_id).unwrap().remove_tile(entity_id);
+        workspace
+            .domain
+            .trash
+            .move_to_trash(
+                TrashItem {
+                    id: id(132),
+                    tile_id: entity_id,
+                    original_page_id: page_id,
+                    original_rect: tile.rect,
+                    original_z_index: 0,
+                    trashed_at: at(3),
+                    actor: TrashActor::Human,
+                    snapshot: json!({"tile": "draft"}),
+                },
+                id(133),
+            )
+            .unwrap();
+        let trashed = workspace.conversation_artifacts(conversation_id, None, &[]);
+        assert_eq!(
+            trashed[0].host_availability,
+            Some(HostArtifactAvailability::Trashed)
+        );
+        assert!(trashed[0].artifact.is_deleted);
+        let produced_by = trashed[0].artifact.produced_by.clone();
+
+        workspace
+            .domain
+            .trash
+            .restore(id(134), id(132), page_id, at(4), TrashActor::Human)
+            .unwrap();
+        workspace.page_mut(page_id).unwrap().add_tile(tile);
+        let restored = workspace.conversation_artifacts(conversation_id, None, &[]);
+        assert_eq!(
+            restored[0].host_availability,
+            Some(HostArtifactAvailability::Available { page_id })
+        );
+        assert!(!restored[0].artifact.is_deleted);
+        assert_eq!(restored[0].artifact.produced_by, produced_by);
+
+        workspace.page_mut(page_id).unwrap().remove_tile(entity_id);
+        let missing = workspace.conversation_artifacts(conversation_id, None, &[]);
+        assert_eq!(
+            missing[0].host_availability,
+            Some(HostArtifactAvailability::Missing)
+        );
+        assert_eq!(missing[0].artifact.produced_by, produced_by);
+    }
+
+    #[test]
+    fn workspace_library_includes_deduped_ledger_origins_and_searches_across_chats() {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        for (conversation_value, title, entity_value, artifact_title, event_value) in [
+            (1, "Visible research", 140, "Research brief", 141),
+            (2, "Hidden analysis", 150, "Market summary", 151),
+        ] {
+            let conversation_id = id(conversation_value);
+            let entity_id = id(entity_value);
+            let event = host_create_event(
+                id(event_value),
+                entity_id,
+                "canvas_create_note",
+                artifact_title,
+                event_value as i64,
+            );
+            let mut conversation =
+                AiConversation::new(conversation_id, title, PermissionMode::Ask, at(0));
+            if conversation_value == 1 {
+                conversation
+                    .append_message_with_activity(
+                        id(160),
+                        MessageRole::Assistant,
+                        "Created it",
+                        at(5),
+                        Vec::new(),
+                        Vec::new(),
+                        vec![event.clone(), event.clone()],
+                        Some(id(10)),
+                    )
+                    .unwrap();
+            } else {
+                conversation.hidden = true;
+            }
+            workspace.domain.conversations.add(conversation).unwrap();
+            workspace
+                .domain
+                .record_host_artifact(
+                    HostArtifactOrigin::new(entity_id, conversation_id, id(10), event).unwrap(),
+                )
+                .unwrap();
+            let mut tile = crate::model::Tile::note(
+                artifact_title,
+                "Text",
+                WorldRect::new(0.0, 0.0, 200.0, 120.0),
+            );
+            tile.id = entity_id;
+            workspace.page_mut(page_id).unwrap().add_tile(tile);
+        }
+
+        let all = workspace.artifact_library("");
+        assert_eq!(
+            all.len(),
+            2,
+            "ledger/message retries dedupe by event and entity"
+        );
+        assert_eq!(workspace.artifact_library("hidden").len(), 1);
+        assert_eq!(workspace.artifact_library("market").len(), 1);
+        assert_eq!(workspace.artifact_library("available").len(), 2);
+        assert!(all.iter().all(|row| {
+            row.artifact.produced_by.turn_id == Some(id(10))
+                && row.artifact.produced_by.tool.as_deref() == Some("canvas_create_note")
+        }));
+    }
+
+    #[test]
+    fn workspace_library_reduces_cross_chat_file_lifecycle_globally() {
+        let file_event = |event_id, tool: &str, kind, at_value| {
+            ActivityEvent::new(
+                event_id,
+                at(at_value),
+                ActivityKind::FileChange {
+                    id: format!("call-{at_value}"),
+                    tool: Some(tool.into()),
+                    changes: vec![crate::chat_core::FileChange {
+                        path: "/tmp/shared-report.md".into(),
+                        kind,
+                    }],
+                    status: crate::chat_core::ActivityStatus::Completed,
+                },
+            )
+        };
+        let conversation_with_event =
+            |conversation_id, title: &str, message_id, turn_id, event: ActivityEvent| {
+                let mut conversation =
+                    AiConversation::new(conversation_id, title, PermissionMode::Ask, at(0));
+                conversation
+                    .append_message_with_activity(
+                        message_id,
+                        MessageRole::Assistant,
+                        "Changed the report",
+                        event.at,
+                        Vec::new(),
+                        Vec::new(),
+                        vec![event],
+                        Some(turn_id),
+                    )
+                    .unwrap();
+                conversation
+            };
+
+        let mut workspace = Workspace::new();
+        workspace
+            .domain
+            .conversations
+            .add(conversation_with_event(
+                id(1),
+                "Producer chat",
+                id(11),
+                id(12),
+                file_event(id(13), "Write", crate::chat_core::FileChangeKind::Add, 1),
+            ))
+            .unwrap();
+        workspace
+            .domain
+            .conversations
+            .add(conversation_with_event(
+                id(2),
+                "Updater chat",
+                id(21),
+                id(22),
+                file_event(id(23), "Edit", crate::chat_core::FileChangeKind::Update, 2),
+            ))
+            .unwrap();
+
+        let updated = workspace.artifact_library("");
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].conversation_id, id(1));
+        assert_eq!(updated[0].artifact.produced_by.conversation_id, Some(id(1)));
+        assert_eq!(updated[0].artifact.produced_by.turn_id, Some(id(12)));
+        assert_eq!(
+            updated[0].artifact.produced_by.tool.as_deref(),
+            Some("Write")
+        );
+        assert_eq!(
+            updated[0].artifact.last_changed_by.conversation_id,
+            Some(id(2))
+        );
+        assert_eq!(updated[0].artifact.last_changed_by.turn_id, Some(id(22)));
+        assert_eq!(
+            updated[0].artifact.last_changed_by.tool.as_deref(),
+            Some("Edit")
+        );
+        assert!(!updated[0].artifact.is_deleted);
+        assert_eq!(workspace.artifact_library("updater").len(), 1);
+
+        workspace
+            .domain
+            .conversations
+            .add(conversation_with_event(
+                id(3),
+                "Deleter chat",
+                id(31),
+                id(32),
+                file_event(
+                    id(33),
+                    "Delete",
+                    crate::chat_core::FileChangeKind::Delete,
+                    3,
+                ),
+            ))
+            .unwrap();
+
+        let deleted = workspace.artifact_library("");
+        assert_eq!(deleted.len(), 1);
+        assert!(deleted[0].artifact.is_deleted);
+        assert_eq!(deleted[0].artifact.produced_by.conversation_id, Some(id(1)));
+        assert_eq!(
+            deleted[0].artifact.last_changed_by.conversation_id,
+            Some(id(3))
+        );
+        assert_eq!(
+            deleted[0].artifact.last_changed_by.tool.as_deref(),
+            Some("Delete")
+        );
+    }
+
+    #[test]
+    fn workspace_artifact_library_preserves_same_chat_causality_under_clock_skew() {
+        let path = "/tmp/skewed-report.md";
+        let file_event = |event_id, tool: &str, kind, at_value| {
+            ActivityEvent::new(
+                event_id,
+                at(at_value),
+                ActivityKind::FileChange {
+                    id: format!("call-{event_id}"),
+                    tool: Some(tool.into()),
+                    changes: vec![crate::chat_core::FileChange {
+                        path: path.into(),
+                        kind,
+                    }],
+                    status: crate::chat_core::ActivityStatus::Completed,
+                },
+            )
+        };
+        let mut conversation =
+            AiConversation::new(id(1), "Clock-skewed chat", PermissionMode::Ask, at(0));
+        conversation
+            .append_message_with_activity(
+                id(10),
+                MessageRole::Assistant,
+                "Created it",
+                at(100),
+                Vec::new(),
+                Vec::new(),
+                vec![file_event(
+                    id(11),
+                    "Write",
+                    crate::chat_core::FileChangeKind::Add,
+                    100,
+                )],
+                Some(id(12)),
+            )
+            .unwrap();
+        conversation
+            .append_message_with_activity(
+                id(20),
+                MessageRole::Assistant,
+                "Deleted it later",
+                at(1),
+                Vec::new(),
+                Vec::new(),
+                vec![file_event(
+                    id(21),
+                    "Delete",
+                    crate::chat_core::FileChangeKind::Delete,
+                    1,
+                )],
+                Some(id(22)),
+            )
+            .unwrap();
+
+        let mut workspace = Workspace::new();
+        workspace.domain.conversations.add(conversation).unwrap();
+        let rows = workspace.artifact_library("");
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].artifact.is_deleted);
+        assert_eq!(rows[0].artifact.produced_by.event_id, id(11));
+        assert_eq!(rows[0].artifact.last_changed_by.event_id, id(21));
+    }
+
+    #[test]
+    fn workspace_artifact_library_orders_file_changes_by_completion_instant() {
+        let path = "/tmp/long-running-report.md";
+        let conversation_with_event = |conversation_id,
+                                       message_id,
+                                       turn_id,
+                                       event: ActivityEvent| {
+            let mut conversation =
+                AiConversation::new(conversation_id, "Artifact turn", PermissionMode::Ask, at(0));
+            conversation
+                .append_message_with_activity(
+                    message_id,
+                    MessageRole::Assistant,
+                    "Changed the report",
+                    event.at,
+                    Vec::new(),
+                    Vec::new(),
+                    vec![event],
+                    Some(turn_id),
+                )
+                .unwrap();
+            conversation
+        };
+
+        let mut long_write = ActivityEvent::new(
+            id(13),
+            at(100),
+            ActivityKind::FileChange {
+                id: "write-call".into(),
+                tool: Some("Write".into()),
+                changes: vec![crate::chat_core::FileChange {
+                    path: path.into(),
+                    kind: crate::chat_core::FileChangeKind::Add,
+                }],
+                status: crate::chat_core::ActivityStatus::Completed,
+            },
+        );
+        long_write.duration_ms = Some(900_000);
+        assert_eq!(artifact_effective_at(&long_write), at(1_000));
+        let delete = ActivityEvent::new(
+            id(23),
+            at(500),
+            ActivityKind::FileChange {
+                id: "delete-call".into(),
+                tool: Some("Delete".into()),
+                changes: vec![crate::chat_core::FileChange {
+                    path: path.into(),
+                    kind: crate::chat_core::FileChangeKind::Delete,
+                }],
+                status: crate::chat_core::ActivityStatus::Completed,
+            },
+        );
+
+        let mut workspace = Workspace::new();
+        workspace
+            .domain
+            .conversations
+            .add(conversation_with_event(id(1), id(11), id(12), long_write))
+            .unwrap();
+        workspace
+            .domain
+            .conversations
+            .add(conversation_with_event(id(2), id(21), id(22), delete))
+            .unwrap();
+
+        let ordered =
+            ordered_persisted_artifact_events(&workspace.domain.conversations.conversations, None);
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|event| event.event.id)
+                .collect::<Vec<_>>(),
+            vec![id(23), id(13)]
+        );
+        let rows = workspace.artifact_library("");
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].artifact.is_deleted);
+        assert_eq!(rows[0].artifact.at, at(1_000));
+        assert_eq!(rows[0].artifact.produced_by.event_id, id(13));
+        assert_eq!(rows[0].artifact.last_changed_by.at, at(1_000));
+    }
+
+    #[test]
+    fn workspace_artifact_library_breaks_cross_chat_time_ties_deterministically() {
+        let conversation_with_change =
+            |conversation_id, title: &str, message_id, turn_id, event_id, tool: &str, kind| {
+                let mut conversation =
+                    AiConversation::new(conversation_id, title, PermissionMode::Ask, at(0));
+                conversation
+                    .append_message_with_activity(
+                        message_id,
+                        MessageRole::Assistant,
+                        "Changed the shared file",
+                        at(10),
+                        Vec::new(),
+                        Vec::new(),
+                        vec![ActivityEvent::new(
+                            event_id,
+                            at(10),
+                            ActivityKind::FileChange {
+                                id: format!("call-{event_id}"),
+                                tool: Some(tool.into()),
+                                changes: vec![crate::chat_core::FileChange {
+                                    path: "/tmp/tied-report.md".into(),
+                                    kind,
+                                }],
+                                status: crate::chat_core::ActivityStatus::Completed,
+                            },
+                        )],
+                        Some(turn_id),
+                    )
+                    .unwrap();
+                conversation
+            };
+        let add = conversation_with_change(
+            id(1),
+            "Add chat",
+            id(11),
+            id(12),
+            id(13),
+            "Write",
+            crate::chat_core::FileChangeKind::Add,
+        );
+        let delete = conversation_with_change(
+            id(2),
+            "Delete chat",
+            id(21),
+            id(22),
+            id(23),
+            "Delete",
+            crate::chat_core::FileChangeKind::Delete,
+        );
+
+        let mut add_first = Workspace::new();
+        add_first.domain.conversations.add(add.clone()).unwrap();
+        add_first.domain.conversations.add(delete.clone()).unwrap();
+        let mut delete_first = Workspace::new();
+        delete_first.domain.conversations.add(delete).unwrap();
+        delete_first.domain.conversations.add(add).unwrap();
+
+        let add_first_rows = add_first.artifact_library("");
+        let delete_first_rows = delete_first.artifact_library("");
+        assert_eq!(add_first_rows, delete_first_rows);
+        assert_eq!(add_first_rows.len(), 1);
+        assert!(add_first_rows[0].artifact.is_deleted);
+        assert_eq!(add_first_rows[0].artifact.produced_by.event_id, id(13));
+        assert_eq!(add_first_rows[0].artifact.last_changed_by.event_id, id(23));
+    }
+
+    #[test]
+    fn ledger_only_new_artifact_sorts_into_the_compact_rail_window() {
+        let conversation_id = id(1);
+        let mut conversation =
+            AiConversation::new(conversation_id, "Many outputs", PermissionMode::Ask, at(0));
+        let file_events = (1..=9_u128)
+            .map(|value| {
+                ActivityEvent::new(
+                    id(100 + value),
+                    at(value as i64),
+                    ActivityKind::FileChange {
+                        id: format!("file-{value}"),
+                        tool: Some("Write".into()),
+                        changes: vec![crate::chat_core::FileChange {
+                            path: format!("/tmp/old-{value}.md"),
+                            kind: crate::chat_core::FileChangeKind::Add,
+                        }],
+                        status: crate::chat_core::ActivityStatus::Completed,
+                    },
+                )
+            })
+            .collect();
+        conversation
+            .append_message_with_activity(
+                id(10),
+                MessageRole::Assistant,
+                "Created files",
+                at(10),
+                Vec::new(),
+                Vec::new(),
+                file_events,
+                Some(id(11)),
+            )
+            .unwrap();
+
+        let mut workspace = Workspace::new();
+        workspace.domain.conversations.add(conversation).unwrap();
+        let entity_id = id(200);
+        workspace
+            .domain
+            .record_host_artifact(
+                HostArtifactOrigin::new(
+                    entity_id,
+                    conversation_id,
+                    id(12),
+                    host_create_event(
+                        id(201),
+                        entity_id,
+                        "canvas_create_note",
+                        "Newest brief",
+                        100,
+                    ),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let rows = workspace.conversation_artifacts(conversation_id, None, &[]);
+        assert_eq!(rows.len(), 10);
+        assert_eq!(rows[0].artifact.id, format!("host:{entity_id}"));
+        assert!(
+            rows.iter()
+                .take(8)
+                .any(|row| row.artifact.id == format!("host:{entity_id}")),
+            "the newest ledger-only artifact must not fall behind old transcript rows"
+        );
     }
 
     #[test]
@@ -4485,6 +6583,53 @@ mod tests {
             .unwrap();
         assert!(!trash.is_active(id(4)));
         assert_eq!(trash.events().len(), 2);
+    }
+
+    #[test]
+    fn human_confirmed_parent_delete_forgets_matching_trash_records() {
+        let mut trash = TrashBin::default();
+        for (item_id, tile_id, event_id) in [(4, 10, 5), (6, 11, 7)] {
+            trash
+                .move_to_trash(
+                    TrashItem {
+                        id: id(item_id),
+                        tile_id: id(tile_id),
+                        original_page_id: id(1),
+                        original_rect: WorldRect::new(1.0, 2.0, 3.0, 4.0),
+                        original_z_index: 0,
+                        trashed_at: at(1),
+                        actor: TrashActor::Human,
+                        snapshot: json!({"tile": tile_id}),
+                    },
+                    id(event_id),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            trash
+                .permanently_forget_tiles(&BTreeSet::from([id(10)]), TrashActor::Human)
+                .unwrap(),
+            1
+        );
+        assert!(trash.active_item_for_tile(id(10)).is_none());
+        assert!(trash.active_item_for_tile(id(11)).is_some());
+        assert!(
+            trash
+                .events()
+                .iter()
+                .all(|event| event.trash_item_id != id(4))
+        );
+        assert_eq!(
+            trash.permanently_forget_tiles(
+                &BTreeSet::from([id(11)]),
+                TrashActor::Assistant {
+                    conversation_id: id(2),
+                    action_id: id(3),
+                },
+            ),
+            Err(DomainError::HumanRequiredForPermanentDelete)
+        );
     }
 
     #[test]
