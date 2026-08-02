@@ -1,5 +1,5 @@
 use crate::{
-    domain::{ConversationStore, Pile, TrashActor},
+    domain::{ConversationStore, PathwayStore, Pile, TrashActor},
     model::{Tile, TileContent, Workspace},
 };
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
@@ -30,6 +30,7 @@ const DOMAIN_KNOWN_JSON_FIELDS: &[&str] = &[
     "trash",
     "protected_tiles",
     "photo_records",
+    "pathways",
 ];
 const CONVERSATION_STORE_KNOWN_JSON_FIELDS: &[&str] =
     &["conversations", "tile_links", "deleted_conversations"];
@@ -1123,6 +1124,11 @@ fn save_workspace_merged(
         &local.domain.conversations,
         &remote.domain.conversations,
     );
+    merged.domain.pathways = PathwayStore::merge_persisted(
+        &base.domain.pathways,
+        &local.domain.pathways,
+        &remote.domain.pathways,
+    )?;
     merge_remote_workspace_additions(base, &remote, &mut merged)?;
     let deleted_conversations = merged
         .domain
@@ -1594,8 +1600,9 @@ mod tests {
     use crate::{
         chat_core::{ActivityEvent, ActivityKind, HostMutationKind},
         domain::{
-            AiCheckpoint, AiConversation, HostArtifactOrigin, MessageRole, PaletteColor,
-            PermissionMode, TrashItem, UnixMillis,
+            AiCheckpoint, AiConversation, HostArtifactOrigin, MessageRole, PaletteColor, Pathway,
+            PathwayEvent, PathwayEventKind, PathwayEventPayload, PermissionMode, TrashItem,
+            UnixMicros, UnixMillis,
         },
         model::WorldRect,
         photo_details::PhotoRecord,
@@ -3356,6 +3363,95 @@ mod tests {
         assert_eq!(load_workspace(&paths).unwrap().active_page().name, "second");
     }
 
+    #[test]
+    fn stale_canvas_save_retains_a_remote_pathway_event() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let pathway_id = Uuid::from_u128(80_000);
+        let base = workspace_with_pathway(pathway_id);
+        save_workspace_atomic(&paths, &base).unwrap();
+
+        let mut remote = base.clone();
+        remote
+            .domain
+            .pathways
+            .append_event(pathway_event(80_010, pathway_id, "remote"))
+            .unwrap();
+        save_workspace_merged(&paths, &base, &remote).unwrap();
+
+        let mut stale = base.clone();
+        stale.active_page_mut().name = "stale canvas edit".into();
+        let merged = save_workspace_merged(&paths, &base, &stale).unwrap();
+        assert_eq!(merged.domain.pathways.events().len(), 1);
+        assert_eq!(
+            merged.domain.pathways.events()[0].id,
+            Uuid::from_u128(80_010)
+        );
+        assert_eq!(merged.active_page().name, "stale canvas edit");
+    }
+
+    #[test]
+    fn concurrent_pathway_events_are_unioned_with_fresh_sequences() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let pathway_id = Uuid::from_u128(81_000);
+        let base = workspace_with_pathway(pathway_id);
+        save_workspace_atomic(&paths, &base).unwrap();
+
+        let mut first_writer = base.clone();
+        first_writer
+            .domain
+            .pathways
+            .append_event(pathway_event(81_012, pathway_id, "first"))
+            .unwrap();
+        save_workspace_merged(&paths, &base, &first_writer).unwrap();
+        let mut second_writer = base.clone();
+        second_writer
+            .domain
+            .pathways
+            .append_event(pathway_event(81_011, pathway_id, "second"))
+            .unwrap();
+        let merged = save_workspace_merged(&paths, &base, &second_writer).unwrap();
+
+        assert_eq!(
+            merged
+                .domain
+                .pathways
+                .events()
+                .iter()
+                .map(|event| (event.id, event.sequence))
+                .collect::<Vec<_>>(),
+            vec![(Uuid::from_u128(81_011), 1), (Uuid::from_u128(81_012), 2)]
+        );
+    }
+
+    #[test]
+    fn conflicting_pathway_event_identity_fails_without_replacing_the_library() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let pathway_id = Uuid::from_u128(82_000);
+        let base = workspace_with_pathway(pathway_id);
+        save_workspace_atomic(&paths, &base).unwrap();
+
+        let mut remote = base.clone();
+        remote
+            .domain
+            .pathways
+            .append_event(pathway_event(82_010, pathway_id, "remote"))
+            .unwrap();
+        let persisted_remote = save_workspace_merged(&paths, &base, &remote).unwrap();
+        let mut stale = base.clone();
+        stale
+            .domain
+            .pathways
+            .append_event(pathway_event(82_010, pathway_id, "local conflict"))
+            .unwrap();
+
+        let error = save_workspace_merged(&paths, &base, &stale).unwrap_err();
+        assert!(error.to_string().contains("conflicting immutable contents"));
+        assert_eq!(load_workspace(&paths).unwrap(), persisted_remote);
+    }
+
     fn wait_for_completion(worker: &SaveWorker, request_id: u64) -> SaveCompletion {
         for _ in 0..200 {
             while let Some(completion) = worker.poll_completion() {
@@ -3376,6 +3472,40 @@ mod tests {
             .add(conversation_with_prompt(conversation_id))
             .unwrap();
         workspace
+    }
+
+    fn workspace_with_pathway(pathway_id: Uuid) -> Workspace {
+        let mut workspace = Workspace::default();
+        workspace
+            .domain
+            .pathways
+            .insert_pathway(
+                Pathway::new(
+                    pathway_id,
+                    workspace.active_page,
+                    "Persistence route",
+                    "#0A84FF",
+                    UnixMicros(1_000_001),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        workspace
+    }
+
+    fn pathway_event(event_id: u128, pathway_id: Uuid, actor: &str) -> PathwayEvent {
+        PathwayEvent::new(
+            Uuid::from_u128(event_id),
+            Uuid::from_u128(89_000),
+            pathway_id,
+            UnixMicros(event_id as i64),
+            actor,
+            PathwayEventKind::ConfigurationChanged,
+            PathwayEventPayload {
+                explanation: actor.into(),
+                ..PathwayEventPayload::default()
+            },
+        )
     }
 
     fn conversation_with_prompt(conversation_id: Uuid) -> AiConversation {

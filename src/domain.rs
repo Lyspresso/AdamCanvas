@@ -26,6 +26,10 @@ pub type PileId = Uuid;
 pub type RuleId = Uuid;
 pub type TagId = Uuid;
 pub type ConversationId = Uuid;
+pub type PathwayId = Uuid;
+pub type PathwayNodeId = Uuid;
+pub type PathwaySegmentId = Uuid;
+pub type PathwayAssignmentId = Uuid;
 
 #[derive(
     Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
@@ -42,6 +46,42 @@ impl UnixMillis {
 
     pub fn saturating_add(self, milliseconds: i64) -> Self {
         Self(self.0.saturating_add(milliseconds.max(0)))
+    }
+}
+
+/// Wall-clock time for pathway state and history, stored as Unix microseconds.
+///
+/// Pathway reconciliation needs to distinguish a 10-microsecond departure
+/// backdate from a 1-microsecond candidate filter. Converting those instants to
+/// [`UnixMillis`] would collapse both protections to the same value, so pathway
+/// timestamps stay in this type until they cross an external seam.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct UnixMicros(pub i64);
+
+impl UnixMicros {
+    pub const ZERO: Self = Self(0);
+
+    pub fn elapsed_seconds_since(self, earlier: Self) -> f64 {
+        self.0.saturating_sub(earlier.0).max(0) as f64 / 1_000_000.0
+    }
+
+    /// Adds a signed microsecond delta. Negative deltas are intentional for
+    /// the pathway departure protocol and must not be clamped away.
+    pub fn saturating_add_micros(self, microseconds: i64) -> Self {
+        Self(self.0.saturating_add(microseconds))
+    }
+
+    pub fn to_unix_millis_floor(self) -> UnixMillis {
+        UnixMillis(self.0.div_euclid(1_000))
+    }
+}
+
+impl From<UnixMillis> for UnixMicros {
+    fn from(value: UnixMillis) -> Self {
+        Self(value.0.saturating_mul(1_000))
     }
 }
 
@@ -71,6 +111,8 @@ pub enum DomainError {
     HistoryEntryAlreadyUndone(Uuid),
     #[error("conversation {0} does not exist")]
     MissingConversation(ConversationId),
+    #[error("pathway {0} does not exist")]
+    MissingPathway(PathwayId),
     #[error("conversation {0} was permanently deleted")]
     DeletedConversation(ConversationId),
     #[error("conversation {0} already has the maximum number of queued turns")]
@@ -83,6 +125,8 @@ pub enum DomainError {
     NotInTrash(TileId),
     #[error("only a person may permanently delete an item")]
     HumanRequiredForPermanentDelete,
+    #[error("invalid pathway: {0}")]
+    InvalidPathway(String),
     #[error("{0}")]
     InvalidRule(String),
 }
@@ -3917,6 +3961,668 @@ impl TrashBin {
     }
 }
 
+// MARK: - Pathways
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathwayPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl PathwayPoint {
+    pub const ZERO: Self = Self { x: 0.0, y: 0.0 };
+
+    pub const fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
+
+    pub fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite()
+    }
+
+    pub fn distance_to(self, other: Self) -> f64 {
+        (other.x - self.x).hypot(other.y - self.y)
+    }
+
+    pub fn interpolated_to(self, other: Self, progress: f64) -> Self {
+        let progress = progress.clamp(0.0, 1.0);
+        Self {
+            x: self.x + (other.x - self.x) * progress,
+            y: self.y + (other.y - self.y) * progress,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PathwayNodeKind {
+    Waypoint,
+    #[default]
+    Destination,
+    ApprovalGate,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PathwayAssignmentState {
+    Moving,
+    Waiting,
+    Blocked,
+    #[default]
+    Paused,
+    Completed,
+    Detached,
+    NeedsAttention,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PathwayEventKind {
+    Assigned,
+    SegmentStarted,
+    PileEntered,
+    PileExited,
+    DestinationReached,
+    WaitStarted,
+    WaitCompleted,
+    ApprovalRequired,
+    ApprovalGranted,
+    Paused,
+    Resumed,
+    Completed,
+    Detached,
+    OfflineCatchUp,
+    ConfigurationChanged,
+    SaveFailed,
+    SaveRecovered,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathwayNode {
+    pub id: PathwayNodeId,
+    pub point: PathwayPoint,
+    pub sort_index: f64,
+    pub title: String,
+    pub kind: PathwayNodeKind,
+    pub wait_duration_seconds: f64,
+    pub created_at: UnixMicros,
+    pub modified_at: UnixMicros,
+}
+
+impl PathwayNode {
+    pub fn new(
+        id: PathwayNodeId,
+        point: PathwayPoint,
+        sort_index: f64,
+        title: impl Into<String>,
+        kind: PathwayNodeKind,
+        wait_duration_seconds: f64,
+        now: UnixMicros,
+    ) -> Result<Self, DomainError> {
+        validate_pathway_point(point, "node point")?;
+        validate_finite_pathway_value(sort_index, "node sort index")?;
+        validate_finite_pathway_value(wait_duration_seconds, "node wait duration")?;
+        Ok(Self {
+            id,
+            point,
+            sort_index,
+            title: validate_pathway_title(title)?,
+            kind,
+            wait_duration_seconds: wait_duration_seconds.max(0.0),
+            created_at: now,
+            modified_at: now,
+        })
+    }
+}
+
+fn default_pathway_speed() -> f64 {
+    80.0
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathwaySegment {
+    pub id: PathwaySegmentId,
+    pub from_node_id: PathwayNodeId,
+    pub to_node_id: PathwayNodeId,
+    pub sort_index: f64,
+    #[serde(default = "default_pathway_speed")]
+    pub speed_points_per_second: f64,
+    pub created_at: UnixMicros,
+    pub modified_at: UnixMicros,
+}
+
+impl PathwaySegment {
+    pub fn new(
+        id: PathwaySegmentId,
+        from_node_id: PathwayNodeId,
+        to_node_id: PathwayNodeId,
+        sort_index: f64,
+        speed_points_per_second: f64,
+        now: UnixMicros,
+    ) -> Result<Self, DomainError> {
+        validate_finite_pathway_value(sort_index, "segment sort index")?;
+        validate_finite_pathway_value(speed_points_per_second, "segment speed")?;
+        Ok(Self {
+            id,
+            from_node_id,
+            to_node_id,
+            sort_index,
+            speed_points_per_second: speed_points_per_second.max(1.0),
+            created_at: now,
+            modified_at: now,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Pathway {
+    pub id: PathwayId,
+    pub page_id: PageId,
+    pub title: String,
+    pub color_hex: String,
+    pub is_enabled: bool,
+    pub disabled_reason: Option<String>,
+    pub repeats: bool,
+    pub created_at: UnixMicros,
+    pub modified_at: UnixMicros,
+    pub nodes: BTreeMap<PathwayNodeId, PathwayNode>,
+    pub segments: BTreeMap<PathwaySegmentId, PathwaySegment>,
+}
+
+impl Pathway {
+    pub fn new(
+        id: PathwayId,
+        page_id: PageId,
+        title: impl Into<String>,
+        color_hex: impl Into<String>,
+        now: UnixMicros,
+    ) -> Result<Self, DomainError> {
+        let color_hex = color_hex.into().trim().to_owned();
+        Ok(Self {
+            id,
+            page_id,
+            title: validate_pathway_title(title)?,
+            color_hex: if color_hex.is_empty() {
+                "#0A84FF".to_owned()
+            } else {
+                color_hex
+            },
+            is_enabled: true,
+            disabled_reason: None,
+            repeats: false,
+            created_at: now,
+            modified_at: now,
+            nodes: BTreeMap::new(),
+            segments: BTreeMap::new(),
+        })
+    }
+
+    pub fn node(&self, id: PathwayNodeId) -> Option<&PathwayNode> {
+        self.nodes.get(&id)
+    }
+
+    pub fn segment(&self, id: PathwaySegmentId) -> Option<&PathwaySegment> {
+        self.segments.get(&id)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathwayAssignment {
+    pub id: PathwayAssignmentId,
+    pub pathway_id: PathwayId,
+    pub tile_id: TileId,
+    pub page_id: PageId,
+    pub state: PathwayAssignmentState,
+    pub previous_state: Option<PathwayAssignmentState>,
+    pub current_segment_id: Option<PathwaySegmentId>,
+    pub current_node_id: Option<PathwayNodeId>,
+    pub segment_started_at: Option<UnixMicros>,
+    pub segment_start_progress: f64,
+    pub wait_until: Option<UnixMicros>,
+    pub blocked_at: Option<UnixMicros>,
+    pub paused_at: Option<UnixMicros>,
+    pub path_offset: PathwayPoint,
+    pub materialized_route_point: PathwayPoint,
+    /// The durable canvas-model origin (top-left), not a tile center.
+    pub materialized_tile_point: PathwayPoint,
+    pub last_reconciled_at: UnixMicros,
+    pub needs_attention_reason: Option<String>,
+    pub created_at: UnixMicros,
+    pub modified_at: UnixMicros,
+}
+
+impl PathwayAssignment {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: PathwayAssignmentId,
+        pathway_id: PathwayId,
+        tile_id: TileId,
+        page_id: PageId,
+        state: PathwayAssignmentState,
+        path_offset: PathwayPoint,
+        materialized_route_point: PathwayPoint,
+        materialized_tile_point: PathwayPoint,
+        now: UnixMicros,
+    ) -> Result<Self, DomainError> {
+        validate_pathway_point(path_offset, "assignment path offset")?;
+        validate_pathway_point(
+            materialized_route_point,
+            "assignment materialized route point",
+        )?;
+        validate_pathway_point(
+            materialized_tile_point,
+            "assignment materialized tile point",
+        )?;
+        Ok(Self {
+            id,
+            pathway_id,
+            tile_id,
+            page_id,
+            state,
+            previous_state: None,
+            current_segment_id: None,
+            current_node_id: None,
+            segment_started_at: None,
+            segment_start_progress: 0.0,
+            wait_until: None,
+            blocked_at: None,
+            paused_at: None,
+            path_offset,
+            materialized_route_point,
+            materialized_tile_point,
+            last_reconciled_at: now,
+            needs_attention_reason: None,
+            created_at: now,
+            modified_at: now,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PathwayEventPayload {
+    pub assignment_id: Option<PathwayAssignmentId>,
+    pub tile_id: Option<TileId>,
+    pub node_id: Option<PathwayNodeId>,
+    pub segment_id: Option<PathwaySegmentId>,
+    pub pile_id: Option<PileId>,
+    pub explanation: String,
+    pub before_state: Option<PathwayAssignmentState>,
+    pub after_state: Option<PathwayAssignmentState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PathwayEvent {
+    pub id: Uuid,
+    pub sequence: u64,
+    pub operation_id: Uuid,
+    pub pathway_id: PathwayId,
+    pub at: UnixMicros,
+    pub actor: String,
+    pub kind: PathwayEventKind,
+    pub payload: PathwayEventPayload,
+}
+
+impl PathwayEvent {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: Uuid,
+        operation_id: Uuid,
+        pathway_id: PathwayId,
+        at: UnixMicros,
+        actor: impl Into<String>,
+        kind: PathwayEventKind,
+        payload: PathwayEventPayload,
+    ) -> Self {
+        Self {
+            id,
+            sequence: 0,
+            operation_id,
+            pathway_id,
+            at,
+            actor: actor.into(),
+            kind,
+            payload,
+        }
+    }
+
+    fn same_body(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.operation_id == other.operation_id
+            && self.pathway_id == other.pathway_id
+            && self.at == other.at
+            && self.actor == other.actor
+            && self.kind == other.kind
+            && self.payload == other.payload
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum PathwayMergeError {
+    #[error("pathway {0} changed incompatibly in two Adam processes")]
+    ConflictingPathway(PathwayId),
+    #[error("pathway assignment {0} changed incompatibly in two Adam processes")]
+    ConflictingAssignment(PathwayAssignmentId),
+    #[error("{log} pathway history repeats event {id}")]
+    DuplicateEvent { log: &'static str, id: Uuid },
+    #[error("{log} pathway history has a non-monotonic event sequence")]
+    NonMonotonicSequence { log: &'static str },
+    #[error("{log} pathway history dropped committed event {id}")]
+    MissingBaseEvent { log: &'static str, id: Uuid },
+    #[error("{log} pathway history reordered committed events")]
+    ReorderedBaseEvents { log: &'static str },
+    #[error("pathway event {0} has conflicting immutable contents")]
+    ConflictingEvent(Uuid),
+    #[error("pathway event histories contain incompatible causal order")]
+    EventOrderCycle,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PathwayStore {
+    pub pathways: BTreeMap<PathwayId, Pathway>,
+    pub assignments: BTreeMap<PathwayAssignmentId, PathwayAssignment>,
+    events: Vec<PathwayEvent>,
+}
+
+impl PathwayStore {
+    pub fn events(&self) -> &[PathwayEvent] {
+        &self.events
+    }
+
+    pub fn pathway(&self, id: PathwayId) -> Option<&Pathway> {
+        self.pathways.get(&id)
+    }
+
+    pub fn assignment(&self, id: PathwayAssignmentId) -> Option<&PathwayAssignment> {
+        self.assignments.get(&id)
+    }
+
+    pub fn assignments_for_pathway(
+        &self,
+        pathway_id: PathwayId,
+    ) -> impl Iterator<Item = &PathwayAssignment> {
+        self.assignments
+            .values()
+            .filter(move |assignment| assignment.pathway_id == pathway_id)
+    }
+
+    pub fn insert_pathway(&mut self, pathway: Pathway) -> Result<(), DomainError> {
+        if self.pathways.contains_key(&pathway.id) {
+            return Err(DomainError::DuplicateId(pathway.id));
+        }
+        self.pathways.insert(pathway.id, pathway);
+        Ok(())
+    }
+
+    pub fn insert_assignment(&mut self, assignment: PathwayAssignment) -> Result<(), DomainError> {
+        if self.assignments.contains_key(&assignment.id) {
+            return Err(DomainError::DuplicateId(assignment.id));
+        }
+        let pathway = self
+            .pathways
+            .get(&assignment.pathway_id)
+            .ok_or(DomainError::MissingPathway(assignment.pathway_id))?;
+        if pathway.page_id != assignment.page_id {
+            return Err(DomainError::InvalidPathway(format!(
+                "assignment {} and pathway {} are on different pages",
+                assignment.id, pathway.id
+            )));
+        }
+        self.assignments.insert(assignment.id, assignment);
+        Ok(())
+    }
+
+    pub fn append_event(&mut self, mut event: PathwayEvent) -> Result<u64, DomainError> {
+        if !self.pathways.contains_key(&event.pathway_id) {
+            return Err(DomainError::MissingPathway(event.pathway_id));
+        }
+        if self.events.iter().any(|existing| existing.id == event.id) {
+            return Err(DomainError::DuplicateId(event.id));
+        }
+        event.sequence = self
+            .events
+            .last()
+            .map(|event| event.sequence.saturating_add(1))
+            .unwrap_or(1);
+        let sequence = event.sequence;
+        self.events.push(event);
+        Ok(sequence)
+    }
+
+    pub(crate) fn merge_persisted(
+        base: &Self,
+        local: &Self,
+        remote: &Self,
+    ) -> Result<Self, PathwayMergeError> {
+        Ok(Self {
+            pathways: merge_pathway_maps(
+                &base.pathways,
+                &local.pathways,
+                &remote.pathways,
+                PathwayMergeError::ConflictingPathway,
+            )?,
+            assignments: merge_pathway_maps(
+                &base.assignments,
+                &local.assignments,
+                &remote.assignments,
+                PathwayMergeError::ConflictingAssignment,
+            )?,
+            events: merge_pathway_events(&base.events, &local.events, &remote.events)?,
+        })
+    }
+}
+
+fn validate_pathway_title(value: impl Into<String>) -> Result<String, DomainError> {
+    let value = value.into().trim().to_owned();
+    if value.is_empty() {
+        return Err(DomainError::EmptyName);
+    }
+    if value.chars().count() > 128 {
+        return Err(DomainError::NameTooLong);
+    }
+    Ok(value)
+}
+
+fn validate_pathway_point(point: PathwayPoint, name: &'static str) -> Result<(), DomainError> {
+    if point.is_finite() {
+        Ok(())
+    } else {
+        Err(DomainError::InvalidPathway(format!(
+            "{name} must be finite"
+        )))
+    }
+}
+
+fn validate_finite_pathway_value(value: f64, name: &'static str) -> Result<(), DomainError> {
+    if value.is_finite() {
+        Ok(())
+    } else {
+        Err(DomainError::InvalidPathway(format!(
+            "{name} must be finite"
+        )))
+    }
+}
+
+fn merge_pathway_maps<T: Clone + PartialEq>(
+    base: &BTreeMap<Uuid, T>,
+    local: &BTreeMap<Uuid, T>,
+    remote: &BTreeMap<Uuid, T>,
+    conflict: impl Fn(Uuid) -> PathwayMergeError,
+) -> Result<BTreeMap<Uuid, T>, PathwayMergeError> {
+    let mut ids = BTreeSet::new();
+    ids.extend(base.keys().copied());
+    ids.extend(local.keys().copied());
+    ids.extend(remote.keys().copied());
+    let mut merged = BTreeMap::new();
+    for id in ids {
+        let base_value = base.get(&id);
+        let local_value = local.get(&id);
+        let remote_value = remote.get(&id);
+        let value = if local_value == remote_value {
+            local_value
+        } else if local_value == base_value {
+            remote_value
+        } else if remote_value == base_value {
+            local_value
+        } else {
+            return Err(conflict(id));
+        };
+        if let Some(value) = value {
+            merged.insert(id, value.clone());
+        }
+    }
+    Ok(merged)
+}
+
+fn validate_pathway_event_log(
+    source: &'static str,
+    events: &[PathwayEvent],
+) -> Result<(), PathwayMergeError> {
+    let mut ids = BTreeSet::new();
+    let mut previous_sequence = None;
+    for event in events {
+        if !ids.insert(event.id) {
+            return Err(PathwayMergeError::DuplicateEvent {
+                log: source,
+                id: event.id,
+            });
+        }
+        if previous_sequence.is_some_and(|previous| event.sequence <= previous) {
+            return Err(PathwayMergeError::NonMonotonicSequence { log: source });
+        }
+        previous_sequence = Some(event.sequence);
+    }
+    Ok(())
+}
+
+fn validate_base_event_subsequence(
+    source_name: &'static str,
+    base: &[PathwayEvent],
+    source: &[PathwayEvent],
+) -> Result<(), PathwayMergeError> {
+    let source_by_id = source
+        .iter()
+        .map(|event| (event.id, event))
+        .collect::<BTreeMap<_, _>>();
+    for base_event in base {
+        let Some(source_event) = source_by_id.get(&base_event.id) else {
+            return Err(PathwayMergeError::MissingBaseEvent {
+                log: source_name,
+                id: base_event.id,
+            });
+        };
+        if !base_event.same_body(source_event) {
+            return Err(PathwayMergeError::ConflictingEvent(base_event.id));
+        }
+    }
+    let base_ids = base.iter().map(|event| event.id).collect::<Vec<_>>();
+    let source_base_ids = source
+        .iter()
+        .filter_map(|event| base_ids.contains(&event.id).then_some(event.id))
+        .collect::<Vec<_>>();
+    if source_base_ids != base_ids {
+        return Err(PathwayMergeError::ReorderedBaseEvents { log: source_name });
+    }
+    Ok(())
+}
+
+fn merge_pathway_events(
+    base: &[PathwayEvent],
+    local: &[PathwayEvent],
+    remote: &[PathwayEvent],
+) -> Result<Vec<PathwayEvent>, PathwayMergeError> {
+    for (name, events) in [("base", base), ("local", local), ("remote", remote)] {
+        validate_pathway_event_log(name, events)?;
+    }
+    validate_base_event_subsequence("local", base, local)?;
+    validate_base_event_subsequence("remote", base, remote)?;
+
+    let mut records = BTreeMap::<Uuid, PathwayEvent>::new();
+    for event in base.iter().chain(local).chain(remote) {
+        if let Some(existing) = records.get(&event.id) {
+            if !existing.same_body(event) {
+                return Err(PathwayMergeError::ConflictingEvent(event.id));
+            }
+        } else {
+            records.insert(event.id, event.clone());
+        }
+    }
+
+    let retained = records.keys().copied().collect::<BTreeSet<_>>();
+    let mut earliest_position = retained
+        .iter()
+        .copied()
+        .map(|id| (id, usize::MAX))
+        .collect::<BTreeMap<_, _>>();
+    let mut outgoing = retained
+        .iter()
+        .copied()
+        .map(|id| (id, BTreeSet::new()))
+        .collect::<BTreeMap<_, _>>();
+    let mut indegree = retained
+        .iter()
+        .copied()
+        .map(|id| (id, 0usize))
+        .collect::<BTreeMap<_, _>>();
+
+    for source in [base, local, remote] {
+        for (position, event) in source.iter().enumerate() {
+            let earliest = earliest_position
+                .get_mut(&event.id)
+                .expect("every source event was retained");
+            *earliest = (*earliest).min(position);
+        }
+        for pair in source.windows(2) {
+            let from = pair[0].id;
+            let to = pair[1].id;
+            if from != to
+                && outgoing
+                    .get_mut(&from)
+                    .expect("every source event was retained")
+                    .insert(to)
+            {
+                *indegree
+                    .get_mut(&to)
+                    .expect("every source event was retained") += 1;
+            }
+        }
+    }
+
+    let rank = |id: Uuid| (earliest_position[&id], id);
+    let mut ready = indegree
+        .iter()
+        .filter_map(|(id, degree)| (*degree == 0).then_some(rank(*id)))
+        .collect::<BTreeSet<_>>();
+    let mut ordered = Vec::with_capacity(records.len());
+    while let Some((_, id)) = ready.pop_first() {
+        let mut event = records
+            .remove(&id)
+            .expect("ready pathway event must still be retained");
+        event.sequence = ordered.len() as u64 + 1;
+        ordered.push(event);
+        for successor in outgoing.get(&id).into_iter().flatten() {
+            let degree = indegree
+                .get_mut(successor)
+                .expect("every successor was retained");
+            *degree = degree.saturating_sub(1);
+            if *degree == 0 {
+                ready.insert(rank(*successor));
+            }
+        }
+    }
+    if !records.is_empty() {
+        return Err(PathwayMergeError::EventOrderCycle);
+    }
+    Ok(ordered)
+}
+
 /// One backward-compatible persistence field can hold Adam's complete semantic
 /// layer without coupling it to canvas rendering or interaction state.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -3931,6 +4637,9 @@ pub struct DomainState {
     pub trash: TrashBin,
     pub protected_tiles: BTreeSet<TileId>,
     pub photo_records: BTreeMap<TileId, PhotoRecord>,
+    /// Route definitions, live assignments, and append-only pathway history.
+    #[serde(default)]
+    pub pathways: PathwayStore,
 }
 
 impl DomainState {
@@ -6940,6 +7649,339 @@ mod tests {
         );
     }
 
+    fn pathway_fixture() -> (PathwayStore, PathwayId) {
+        let pathway_id = id(8_000);
+        let page_id = id(8_001);
+        let mut pathway = Pathway::new(
+            pathway_id,
+            page_id,
+            "Morning route",
+            "#0A84FF",
+            UnixMicros(1_000_001),
+        )
+        .unwrap();
+        let first = PathwayNode::new(
+            id(8_002),
+            PathwayPoint::new(10.0, 20.0),
+            0.0,
+            "Start",
+            PathwayNodeKind::Waypoint,
+            0.0,
+            UnixMicros(1_000_001),
+        )
+        .unwrap();
+        let last = PathwayNode::new(
+            id(8_003),
+            PathwayPoint::new(90.0, 20.0),
+            1.0,
+            "Approve",
+            PathwayNodeKind::ApprovalGate,
+            2.5,
+            UnixMicros(1_000_002),
+        )
+        .unwrap();
+        let segment = PathwaySegment::new(
+            id(8_004),
+            first.id,
+            last.id,
+            0.0,
+            80.0,
+            UnixMicros(1_000_003),
+        )
+        .unwrap();
+        pathway.nodes.insert(first.id, first);
+        pathway.nodes.insert(last.id, last);
+        pathway.segments.insert(segment.id, segment);
+
+        let mut store = PathwayStore::default();
+        store.insert_pathway(pathway).unwrap();
+        (store, pathway_id)
+    }
+
+    fn pathway_event(
+        event_id: u128,
+        pathway_id: PathwayId,
+        at: i64,
+        kind: PathwayEventKind,
+    ) -> PathwayEvent {
+        PathwayEvent::new(
+            id(event_id),
+            id(8_100),
+            pathway_id,
+            UnixMicros(at),
+            "pathway-reconciliation",
+            kind,
+            PathwayEventPayload {
+                explanation: format!("event {event_id}"),
+                ..PathwayEventPayload::default()
+            },
+        )
+    }
+
+    #[test]
+    fn pathway_workspace_round_trip_preserves_microseconds_and_camel_case_vocabulary() {
+        let (mut store, pathway_id) = pathway_fixture();
+        let page_id = store.pathway(pathway_id).unwrap().page_id;
+        let mut assignment = PathwayAssignment::new(
+            id(8_010),
+            pathway_id,
+            id(8_011),
+            page_id,
+            PathwayAssignmentState::NeedsAttention,
+            PathwayPoint::new(3.0, 4.0),
+            PathwayPoint::new(10.0, 20.0),
+            PathwayPoint::new(7.0, 16.0),
+            UnixMicros(1_000_007),
+        )
+        .unwrap();
+        assignment.previous_state = Some(PathwayAssignmentState::Moving);
+        assignment.segment_started_at = Some(UnixMicros(1_000_011));
+        assignment.wait_until = Some(UnixMicros(1_000_013));
+        assignment.needs_attention_reason = Some("missing segment".into());
+        store.insert_assignment(assignment).unwrap();
+        store
+            .append_event(PathwayEvent::new(
+                id(8_020),
+                id(8_021),
+                pathway_id,
+                UnixMicros(1_000_017),
+                "user",
+                PathwayEventKind::SegmentStarted,
+                PathwayEventPayload {
+                    assignment_id: Some(id(8_010)),
+                    node_id: Some(id(8_002)),
+                    before_state: Some(PathwayAssignmentState::Waiting),
+                    after_state: Some(PathwayAssignmentState::Moving),
+                    explanation: "departed".into(),
+                    ..PathwayEventPayload::default()
+                },
+            ))
+            .unwrap();
+        let mut workspace = Workspace::default();
+        workspace.domain.pathways = store;
+
+        let mut json = serde_json::to_value(&workspace).unwrap();
+        let encoded = serde_json::to_string(&json).unwrap();
+        assert!(encoded.contains("\"approvalGate\""));
+        assert!(encoded.contains("\"needsAttention\""));
+        assert!(encoded.contains("\"segmentStarted\""));
+        assert!(encoded.contains("\"speedPointsPerSecond\""));
+        assert!(encoded.contains("1000017"));
+        json.pointer_mut("/domain/pathways")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("futureField".into(), json!({"keptByNewerAdam": true}));
+
+        let decoded: Workspace = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, workspace);
+    }
+
+    #[test]
+    fn pathway_enum_spellings_match_earlit() {
+        assert_eq!(
+            serde_json::to_value([
+                PathwayNodeKind::Waypoint,
+                PathwayNodeKind::Destination,
+                PathwayNodeKind::ApprovalGate,
+            ])
+            .unwrap(),
+            json!(["waypoint", "destination", "approvalGate"])
+        );
+        assert_eq!(
+            serde_json::to_value([
+                PathwayAssignmentState::Moving,
+                PathwayAssignmentState::Waiting,
+                PathwayAssignmentState::Blocked,
+                PathwayAssignmentState::Paused,
+                PathwayAssignmentState::Completed,
+                PathwayAssignmentState::Detached,
+                PathwayAssignmentState::NeedsAttention,
+            ])
+            .unwrap(),
+            json!([
+                "moving",
+                "waiting",
+                "blocked",
+                "paused",
+                "completed",
+                "detached",
+                "needsAttention"
+            ])
+        );
+        assert_eq!(
+            serde_json::to_value([
+                PathwayEventKind::Assigned,
+                PathwayEventKind::SegmentStarted,
+                PathwayEventKind::PileEntered,
+                PathwayEventKind::PileExited,
+                PathwayEventKind::DestinationReached,
+                PathwayEventKind::WaitStarted,
+                PathwayEventKind::WaitCompleted,
+                PathwayEventKind::ApprovalRequired,
+                PathwayEventKind::ApprovalGranted,
+                PathwayEventKind::Paused,
+                PathwayEventKind::Resumed,
+                PathwayEventKind::Completed,
+                PathwayEventKind::Detached,
+                PathwayEventKind::OfflineCatchUp,
+                PathwayEventKind::ConfigurationChanged,
+                PathwayEventKind::SaveFailed,
+                PathwayEventKind::SaveRecovered,
+            ])
+            .unwrap(),
+            json!([
+                "assigned",
+                "segmentStarted",
+                "pileEntered",
+                "pileExited",
+                "destinationReached",
+                "waitStarted",
+                "waitCompleted",
+                "approvalRequired",
+                "approvalGranted",
+                "paused",
+                "resumed",
+                "completed",
+                "detached",
+                "offlineCatchUp",
+                "configurationChanged",
+                "saveFailed",
+                "saveRecovered"
+            ])
+        );
+    }
+
+    #[test]
+    fn pathway_history_rejects_duplicates_and_assigns_monotonic_sequences() {
+        let (mut store, pathway_id) = pathway_fixture();
+        let operation_id = id(8_100);
+        let first = pathway_event(8_020, pathway_id, 1_000_001, PathwayEventKind::Assigned);
+        let duplicate = first.clone();
+        let mut second = pathway_event(
+            8_021,
+            pathway_id,
+            1_000_002,
+            PathwayEventKind::ConfigurationChanged,
+        );
+        second.operation_id = operation_id;
+        assert_eq!(store.append_event(first).unwrap(), 1);
+        assert_eq!(
+            store.append_event(duplicate),
+            Err(DomainError::DuplicateId(id(8_020)))
+        );
+        assert_eq!(store.events().len(), 1);
+        assert_eq!(store.append_event(second).unwrap(), 2);
+        assert_eq!(
+            store
+                .events()
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn pathway_merge_unions_concurrent_events_and_resequences_them() {
+        let (mut base, pathway_id) = pathway_fixture();
+        base.append_event(pathway_event(
+            8_020,
+            pathway_id,
+            1_000_001,
+            PathwayEventKind::Assigned,
+        ))
+        .unwrap();
+        let mut local = base.clone();
+        local
+            .append_event(pathway_event(
+                8_022,
+                pathway_id,
+                1_000_003,
+                PathwayEventKind::WaitStarted,
+            ))
+            .unwrap();
+        let mut remote = base.clone();
+        remote
+            .append_event(pathway_event(
+                8_021,
+                pathway_id,
+                1_000_002,
+                PathwayEventKind::DestinationReached,
+            ))
+            .unwrap();
+
+        let merged = PathwayStore::merge_persisted(&base, &local, &remote).unwrap();
+        let swapped = PathwayStore::merge_persisted(&base, &remote, &local).unwrap();
+        assert_eq!(merged, swapped);
+        assert_eq!(
+            merged
+                .events()
+                .iter()
+                .map(|event| (event.id, event.sequence))
+                .collect::<Vec<_>>(),
+            vec![(id(8_020), 1), (id(8_021), 2), (id(8_022), 3)]
+        );
+    }
+
+    #[test]
+    fn pathway_merge_accepts_base_as_an_ordered_subsequence() {
+        let (mut base, pathway_id) = pathway_fixture();
+        base.append_event(pathway_event(
+            8_020,
+            pathway_id,
+            1,
+            PathwayEventKind::Assigned,
+        ))
+        .unwrap();
+        base.append_event(pathway_event(
+            8_022,
+            pathway_id,
+            3,
+            PathwayEventKind::Completed,
+        ))
+        .unwrap();
+        let local = base.clone();
+        let mut remote = base.clone();
+        let mut middle = pathway_event(8_021, pathway_id, 2, PathwayEventKind::DestinationReached);
+        middle.sequence = 2;
+        remote.events.insert(1, middle);
+        remote.events[2].sequence = 3;
+
+        let merged = PathwayStore::merge_persisted(&base, &local, &remote).unwrap();
+        assert_eq!(
+            merged
+                .events()
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            vec![id(8_020), id(8_021), id(8_022)]
+        );
+    }
+
+    #[test]
+    fn pathway_merge_rejects_conflicting_immutable_event_payloads() {
+        let (base, pathway_id) = pathway_fixture();
+        let mut local = base.clone();
+        let mut remote = base.clone();
+        local
+            .append_event(pathway_event(
+                8_020,
+                pathway_id,
+                1,
+                PathwayEventKind::Assigned,
+            ))
+            .unwrap();
+        let mut conflicting = pathway_event(8_020, pathway_id, 1, PathwayEventKind::Assigned);
+        conflicting.actor = "different-actor".into();
+        remote.append_event(conflicting).unwrap();
+
+        assert_eq!(
+            PathwayStore::merge_persisted(&base, &local, &remote),
+            Err(PathwayMergeError::ConflictingEvent(id(8_020)))
+        );
+    }
+
     #[test]
     fn domain_state_defaults_cleanly_for_an_older_workspace() {
         let state: DomainState = serde_json::from_value(json!({})).unwrap();
@@ -6950,6 +7992,7 @@ mod tests {
         assert!(state.trash.items.is_empty());
         assert!(state.protected_tiles.is_empty());
         assert!(state.photo_records.is_empty());
+        assert_eq!(state.pathways, PathwayStore::default());
     }
 
     #[test]
