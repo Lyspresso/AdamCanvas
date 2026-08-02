@@ -16011,6 +16011,9 @@ fn render_ai_preflight_banner(
     };
     // Rendered from AgentsChatView.preflight; suppressed while the setup
     // screen is active because that screen carries the same affordances.
+    // One quiet line: the headline states the block, the detail rides the
+    // hover, and the action stays small — a preflight problem must not
+    // shove the transcript around (user feedback, 2026-08-02).
     Frame::NONE
         .fill(if notice.danger {
             colors
@@ -16020,33 +16023,29 @@ fn render_ai_preflight_banner(
             colors.selection_fill
         })
         .corner_radius(3)
-        .inner_margin(Margin::symmetric(12, 8))
+        .inner_margin(Margin::symmetric(10, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(&notice.headline)
-                            .strong()
-                            .color(if notice.danger {
-                                colors.danger
-                            } else {
-                                colors.text
-                            }),
-                    );
-                    ui.label(
-                        RichText::new(&notice.detail)
-                            .size(10.5)
-                            .color(colors.secondary_text),
-                    );
-                });
+                ui.label(RichText::new(&notice.headline).size(11.0).strong().color(
+                    if notice.danger {
+                        colors.danger
+                    } else {
+                        colors.text
+                    },
+                ))
+                .on_hover_text(&notice.detail);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("Open Agents").clicked() {
+                    if ui
+                        .small_button("Open Agents")
+                        .on_hover_text(&notice.detail)
+                        .clicked()
+                    {
                         action.open_agents_panel = true;
                     }
                 });
             });
         });
-    ui.add_space(6.0);
+    ui.add_space(4.0);
 }
 
 fn render_ai_chat_progress_pill(ui: &mut Ui, runtime: &AiChatRuntime, colors: Theme) {
@@ -19613,7 +19612,7 @@ mod tests {
                 ),
             ],
         };
-        let unsupported = snapshot("grok 0.2.118");
+        let unsupported = snapshot("grok 0.2.119");
         assert!(
             queued_turn_preflight_notice(&queued, &settings, None, Some(&unsupported), false)
                 .is_some_and(|notice| notice.blocks_send)
@@ -21331,7 +21330,7 @@ mod tests {
 
     #[test]
     fn unverified_parseable_cli_renderers_preserve_saved_controls() {
-        let grok_version = crate::chat_core::CliVersion::parse("grok 0.2.118").unwrap();
+        let grok_version = crate::chat_core::CliVersion::parse("grok 0.2.119").unwrap();
         let grok_tuning = crate::chat_core::runtime_tuning_profile(
             crate::chat_core::ProviderKind::Grok,
             Some(&grok_version),

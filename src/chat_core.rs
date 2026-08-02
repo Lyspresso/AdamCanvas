@@ -2924,6 +2924,15 @@ pub fn runtime_tuning_profile(
                 AgentGroupChannel::GrokAcpWorkflowV1,
                 true,
             ),
+            // Captured 2026-08-02 after the CLI self-updated mid-session:
+            // tests/fixtures/ai/grok/0.2.118 proves the scoped-child
+            // contract is unchanged (additive metadata only).
+            (ProviderKind::Grok, Some(version)) if version.is(0, 2, 118) => (
+                GROK_REASONING_0_2_111,
+                ChildEventChannel::GrokAcpScopedSessionV1,
+                AgentGroupChannel::GrokAcpWorkflowV1,
+                true,
+            ),
             (ProviderKind::Kimi, Some(version)) if version.is(1, 49, 0) => (
                 NO_REASONING,
                 ChildEventChannel::Disabled,
@@ -6597,7 +6606,7 @@ mod tests {
             GROK_REASONING_0_2_111
         );
 
-        for unverified in ["grok 0.2.116", "grok 0.2.118"] {
+        for unverified in ["grok 0.2.116", "grok 0.2.119"] {
             let version = CliVersion::parse(unverified).unwrap();
             let tuning = runtime_tuning_profile(ProviderKind::Grok, Some(&version), "grok-4.5");
             assert!(!tuning.verified_runtime, "{unverified}");
@@ -6755,6 +6764,158 @@ mod tests {
             .collect::<Vec<_>>()
             .concat();
         assert_eq!(parent_text, "PARENT_OK_4");
+        assert_eq!(
+            messages.last().unwrap()["result"]["_meta"]["sessionId"],
+            root_session_id
+        );
+    }
+
+    #[test]
+    fn captured_grok_0_2_118_scopes_child_prose_on_the_acp_session_id() {
+        fn update_kind(message: &serde_json::Value) -> Option<&str> {
+            message
+                .pointer("/params/update/sessionUpdate")
+                .and_then(serde_json::Value::as_str)
+        }
+
+        let fixture = include_str!("../tests/fixtures/ai/grok/0.2.118/acp-scoped-subagent.jsonl");
+        let messages = fixture
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        let initialize = &messages[0]["result"];
+        assert_eq!(initialize["_meta"]["agentVersion"], "0.2.118");
+        let efforts =
+            initialize["_meta"]["modelState"]["availableModels"][0]["_meta"]["reasoningEfforts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|effort| effort["value"].as_str().unwrap())
+                .collect::<Vec<_>>();
+        assert_eq!(efforts, ["high", "medium", "low"]);
+
+        let root_session_id = messages[1]["result"]["sessionId"].as_str().unwrap();
+        let spawned = messages
+            .iter()
+            .find(|message| update_kind(message) == Some("subagent_spawned"))
+            .unwrap();
+        let child_session_id = spawned
+            .pointer("/params/update/child_session_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert_eq!(spawned["method"], "_x.ai/session_notification");
+        assert_eq!(spawned["params"]["sessionId"], root_session_id);
+        assert_eq!(
+            spawned["params"]["update"]["parent_session_id"],
+            root_session_id
+        );
+        assert_eq!(spawned["params"]["update"]["subagent_id"], child_session_id);
+        assert_eq!(spawned["params"]["update"]["subagent_type"], "explore");
+        assert_eq!(spawned["params"]["update"]["role"], "explore");
+        assert!(
+            !spawned["params"]["_meta"]["eventId"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+
+        // Drift vs 0.2.117: the idless status-only model_changed now arrives
+        // on the root session rather than the child's.
+        let model_changed = messages
+            .iter()
+            .find(|message| update_kind(message) == Some("model_changed"))
+            .unwrap();
+        assert_eq!(
+            model_changed["params"]["sessionId"].as_str(),
+            Some(root_session_id)
+        );
+        assert_eq!(model_changed["params"]["update"]["model_id"], "grok-4.5");
+        assert!(
+            model_changed["params"].get("_meta").is_none(),
+            "the captured status-only update is intentionally idless"
+        );
+
+        let child_messages = messages
+            .iter()
+            .filter(|message| {
+                update_kind(message) == Some("agent_message_chunk")
+                    && message["params"]["sessionId"] == child_session_id
+            })
+            .collect::<Vec<_>>();
+        assert!(!child_messages.is_empty());
+        assert!(child_messages.iter().all(|message| {
+            message["method"] == "session/update"
+                && !message["params"]["_meta"]["eventId"]
+                    .as_str()
+                    .unwrap()
+                    .is_empty()
+        }));
+        let child_text = child_messages
+            .iter()
+            .map(|message| {
+                message["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(child_text, "CHILD_OK_4");
+
+        let finished = messages
+            .iter()
+            .find(|message| update_kind(message) == Some("subagent_finished"))
+            .unwrap();
+        assert_eq!(finished["method"], "_x.ai/session_notification");
+        assert_eq!(finished["params"]["sessionId"], root_session_id);
+        assert_eq!(
+            finished["params"]["update"]["subagent_id"],
+            child_session_id
+        );
+        assert_eq!(
+            finished["params"]["update"]["child_session_id"],
+            child_session_id
+        );
+        assert_eq!(finished["params"]["update"]["output"], "CHILD_OK_4");
+        assert_eq!(finished["params"]["update"]["status"], "completed");
+
+        // 0.2.118 emits informational kinds 0.2.117 lacked; the retained
+        // records pin them as schema-confirmed shapes the decoder may skip
+        // fail-closed but never error on.
+        assert!(
+            messages
+                .iter()
+                .any(|message| update_kind(message) == Some("turn_completed"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| update_kind(message) == Some("response_completed"))
+        );
+
+        let parent_messages = messages
+            .iter()
+            .filter(|message| {
+                update_kind(message) == Some("agent_message_chunk")
+                    && message["params"]["sessionId"] == root_session_id
+            })
+            .collect::<Vec<_>>();
+        let parent_text = parent_messages
+            .iter()
+            .map(|message| {
+                message["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        // The 0.2.118 parent announced the spawn before the sentinel; chunk
+        // boundaries are captured verbatim, so pin the whole prose.
+        assert_eq!(
+            parent_text,
+            "Spawning one foreground explore subagent as requested.PARENT_OK_4"
+        );
+        assert!(parent_text.ends_with("PARENT_OK_4"));
         assert_eq!(
             messages.last().unwrap()["result"]["_meta"]["sessionId"],
             root_session_id

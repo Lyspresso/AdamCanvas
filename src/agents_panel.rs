@@ -57,6 +57,7 @@ const TESTED_VERSIONS: &[(&str, &str)] = &[
     ("grok_cli", "0.2.111"),
     ("grok_cli", "0.2.114"),
     ("grok_cli", "0.2.117"),
+    ("grok_cli", "0.2.118"),
     ("kimi_cli", "0.31.0"),
     ("kimi_cli", "1.49.0"),
     ("ollama", "0.32.1"),
@@ -2094,7 +2095,7 @@ mod tests {
     #[test]
     fn auto_skips_an_unsupported_exact_provider_for_a_verified_later_candidate() {
         let supported_later = snapshot(&[
-            ("grok_cli", Some("/bin/grok"), Some("grok 0.2.118")),
+            ("grok_cli", Some("/bin/grok"), Some("grok 0.2.119")),
             ("kimi_cli", Some("/bin/kimi"), Some("kimi 0.31.0")),
         ]);
         assert_eq!(
@@ -2103,7 +2104,7 @@ mod tests {
         );
         assert!(preflight_notice("auto", false, Some(&supported_later), false).is_none());
 
-        let unsupported_only = snapshot(&[("grok_cli", Some("/bin/grok"), Some("grok 0.2.118"))]);
+        let unsupported_only = snapshot(&[("grok_cli", Some("/bin/grok"), Some("grok 0.2.119"))]);
         let blocked =
             preflight_notice("auto", false, Some(&unsupported_only), false).expect("blocked");
         assert!(blocked.blocks_send);
@@ -2168,7 +2169,7 @@ mod tests {
         assert!(failed_notice.blocks_send);
         assert!(failed_notice.detail.contains("timed out"));
 
-        let unsupported_banner = "grok 0.2.118 (abc123)";
+        let unsupported_banner = "grok 0.2.119 (abc123)";
         let unsupported = snapshot(&[("grok_cli", Some("/bin/grok"), Some(unsupported_banner))]);
         assert_eq!(
             exact_provider_readiness("grok_cli", Some(&unsupported), false),
@@ -2179,7 +2180,7 @@ mod tests {
         let unsupported_notice =
             preflight_notice("grok_cli", false, Some(&unsupported), false).expect("unsupported");
         assert!(unsupported_notice.blocks_send);
-        assert!(unsupported_notice.headline.contains("0.2.118"));
+        assert!(unsupported_notice.headline.contains("0.2.119"));
     }
 
     #[test]
@@ -2710,7 +2711,7 @@ mod tests {
     #[test]
     fn grok_and_kimi_patch_drift_never_claims_a_runnable_series_contract() {
         for (provider_id, binary, installed) in [
-            ("grok_cli", "/bin/grok", "0.2.118"),
+            ("grok_cli", "/bin/grok", "0.2.119"),
             ("kimi_cli", "/bin/kimi", "0.31.1"),
             ("kimi_cli", "/bin/kimi", "1.49.1"),
         ] {
