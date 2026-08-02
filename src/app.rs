@@ -15,6 +15,7 @@ use crate::{
         WorkingContext, build_prompt,
     },
     ai_state::{RecordDisposition, ResumeGate, ResumeRecord, ResumeStore},
+    artifact_library::{self, ArtifactLibraryState, LibraryTarget},
     assets::AssetStore,
     automation::{ReconcileRequest, canvas_objects_from_workspace, reconcile_workspace},
     chat_core::{
@@ -483,7 +484,6 @@ struct AiChatRuntime {
     workspace_files: Vec<AiWorkspaceFile>,
     file_preview: Option<AiFilePreview>,
     show_subagents_detail: bool,
-    show_all_outputs: bool,
 }
 
 impl Default for AiChatRuntime {
@@ -515,7 +515,6 @@ impl Default for AiChatRuntime {
             workspace_files: Vec::new(),
             file_preview: None,
             show_subagents_detail: false,
-            show_all_outputs: false,
         }
     }
 }
@@ -559,7 +558,7 @@ struct AiWorkspaceUiAction {
     close_file_preview: bool,
     open_subagents_detail: bool,
     close_subagents_detail: bool,
-    toggle_all_outputs: bool,
+    open_artifact_library: Option<LibraryTarget>,
     retry_turn: Option<RetryHint>,
     open_agents_panel: bool,
     agents_action: AgentsPanelAction,
@@ -943,6 +942,7 @@ pub struct AdamApp {
     resume_store_path: PathBuf,
     pending_ai_action: Option<AiActionRequest>,
     agents: AgentsPanelState,
+    artifact_library: ArtifactLibraryState,
     trash_open: bool,
     link_editor_open: bool,
     link_input: String,
@@ -1262,6 +1262,7 @@ impl AdamApp {
             resume_store_path,
             pending_ai_action: None,
             agents: AgentsPanelState::start(creation.egui_ctx.clone()),
+            artifact_library: ArtifactLibraryState::default(),
             trash_open: false,
             link_editor_open: false,
             link_input: String::new(),
@@ -2380,7 +2381,8 @@ impl AdamApp {
             || self.pile_settings.is_some()
             || self.open_chat.is_some()
             || self.trash_open
-            || self.agents.open;
+            || self.agents.open
+            || self.artifact_library.open;
 
         let undo = context.input(|input| {
             input.modifiers.command && !input.modifiers.shift && input.key_pressed(Key::Z)
@@ -2771,6 +2773,7 @@ impl AdamApp {
         let mut delete_page = false;
         let mut new_chat = false;
         let mut open_agent_harness = false;
+        let mut open_artifact_library = false;
         let mut switch_to = None;
         let mut reorder_page = None;
         let mut filter_to = None;
@@ -3178,6 +3181,20 @@ impl AdamApp {
                     )
                     .on_hover_text("Which AI provider CLIs are installed, verified, or installable")
                     .clicked();
+                let library_selected = self.artifact_library.open;
+                open_artifact_library = ui
+                    .add(
+                        Button::new(RichText::new("◇  Artifacts").size(12.5).color(
+                            if library_selected {
+                                colors.text
+                            } else {
+                                colors.secondary_text
+                            },
+                        ))
+                        .frame(false),
+                    )
+                    .on_hover_text("Search everything your chats have made, across conversations")
+                    .clicked();
 
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     if ui
@@ -3246,14 +3263,21 @@ impl AdamApp {
             self.page_hover = None;
         }
 
-        // Any sidebar navigation leaves the Agent Harness section.
+        // Any sidebar navigation leaves the Agent Harness section and the
+        // artifact library.
         if switch_to.is_some() || open_chat.is_some() || filter_to.is_some() || new_page || new_chat
         {
             self.agents.open = false;
+            self.artifact_library.close();
         }
         if open_agent_harness {
             self.agents.open = true;
+            self.artifact_library.close();
             self.agents.ensure_scanned();
+        }
+        if open_artifact_library {
+            self.agents.open = false;
+            self.artifact_library.open_for(LibraryTarget::All);
         }
         if let Some(page_id) = switch_to {
             self.switch_page(page_id);
@@ -6851,10 +6875,8 @@ impl AdamApp {
         {
             runtime.show_subagents_detail = false;
         }
-        if action.toggle_all_outputs
-            && let Some(runtime) = self.chat_runtimes.get_mut(&conversation_id)
-        {
-            runtime.show_all_outputs = !runtime.show_all_outputs;
+        if let Some(target) = action.open_artifact_library {
+            self.artifact_library.open_for(target);
         }
         if let Some(path) = action.preview_file {
             let preview = match self.resolve_scoped_ai_workspace_path(conversation_id, &path) {
@@ -9682,6 +9704,209 @@ impl AdamApp {
         self.apply_agents_panel_action(action, &context);
     }
 
+    fn show_artifact_library_section(&mut self, root: &mut Ui) {
+        let context = root.ctx().clone();
+        let colors = self.theme(&context);
+        // A filter pinned to a chat that no longer exists self-heals to the
+        // whole library (EarlIt's resolvedSurface rule).
+        if let Some(only) = self.artifact_library.only_conversation
+            && !self
+                .workspace
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&only)
+        {
+            self.artifact_library.only_conversation = None;
+            self.artifact_library.mark_dirty();
+        }
+        if self.artifact_library.needs_refresh() {
+            let rows = if let Some(only) = self.artifact_library.only_conversation {
+                // The scoped view must mirror the inspector rail it opened
+                // from — the per-conversation projection, including a
+                // running turn's in-flight artifacts. The global library
+                // persists only completed turns and attributes shared files
+                // to their producer, so filtering it by conversation would
+                // drop rows the rail just counted.
+                let (live_turn_id, live_events) = self
+                    .chat_runtimes
+                    .get(&only)
+                    .filter(|runtime| runtime.active_turn.is_some())
+                    .map(|runtime| {
+                        (
+                            runtime.active_turn,
+                            runtime.activity_trace.events.as_slice(),
+                        )
+                    })
+                    .unwrap_or((None, &[][..]));
+                let mut rows =
+                    self.workspace
+                        .conversation_artifacts(only, live_turn_id, live_events);
+                rows.retain(|row| {
+                    artifact_library::row_matches_query(row, &self.artifact_library.query)
+                });
+                rows
+            } else {
+                self.workspace
+                    .artifact_library(&self.artifact_library.query)
+            };
+            let conversations = &self.workspace.domain.conversations.conversations;
+            let groups = artifact_library::library_groups(&rows, unix_now(), &|editor| {
+                conversations
+                    .get(&editor)
+                    .map(|conversation| conversation.title.clone())
+            });
+            self.artifact_library.store(groups);
+        }
+        let filter_title = self.artifact_library.only_conversation.and_then(|only| {
+            self.workspace
+                .domain
+                .conversations
+                .conversations
+                .get(&only)
+                .map(|conversation| conversation.title.clone())
+        });
+        let mut action = artifact_library::ArtifactLibraryAction::default();
+        let dots_seconds = self.dots_seconds();
+        egui::CentralPanel::default()
+            .frame(Frame::NONE.fill(if dots_seconds.is_some() {
+                Color32::TRANSPARENT
+            } else {
+                colors.desk
+            }))
+            .show(root, |ui| {
+                if let Some(seconds) = dots_seconds {
+                    let rect = ui.max_rect();
+                    ui.painter().add(dots::paint_callback(
+                        rect,
+                        ChromeRects {
+                            toolbar: rect,
+                            sidebar: Rect::NOTHING,
+                        },
+                        seconds,
+                        colors.dots_tint,
+                        colors.dots_background,
+                    ));
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(30.0);
+                            ui.scope(|ui| {
+                                ui.set_max_width(640.0);
+                                artifact_library::artifact_library_ui(
+                                    ui,
+                                    &mut self.artifact_library,
+                                    filter_title.as_deref(),
+                                    &artifact_library_palette(colors),
+                                    &mut action,
+                                );
+                            });
+                            ui.add_space(24.0);
+                        });
+                    });
+            });
+        // Keep host availability and live-turn rows honest while the panel
+        // is up: changes surface within one refresh interval.
+        context.request_repaint_after(artifact_library::REFRESH_INTERVAL);
+        self.apply_artifact_library_action(action);
+    }
+
+    /// Applies library actions after the frame. File actions resolve against
+    /// the artifact's own conversation scope, never the currently open chat.
+    fn apply_artifact_library_action(&mut self, action: artifact_library::ArtifactLibraryAction) {
+        if action.close {
+            self.artifact_library.close();
+        }
+        if action.clear_filter {
+            self.artifact_library.only_conversation = None;
+            self.artifact_library.query.clear();
+            self.artifact_library.notice = None;
+            self.artifact_library.mark_dirty();
+        }
+        if action.clear_search {
+            self.artifact_library.query.clear();
+            self.artifact_library.notice = None;
+            self.artifact_library.mark_dirty();
+        }
+        if action.query_changed {
+            // A stale failure banner must not outlive the search it
+            // happened under.
+            self.artifact_library.notice = None;
+            self.artifact_library.mark_dirty();
+        }
+        if let Some(conversation_id) = action.open_conversation {
+            self.artifact_library.close();
+            self.open_conversation(conversation_id);
+        }
+        if let Some((conversation_id, path)) = action.preview_file
+            && self
+                .workspace
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&conversation_id)
+        {
+            let path = PathBuf::from(path);
+            let preview = match self.resolve_scoped_ai_workspace_path(conversation_id, &path) {
+                Ok(path) => AiFilePreview::load(path, false),
+                Err(message) => AiFilePreview::unavailable(path, false, message),
+            };
+            self.artifact_library.close();
+            self.open_conversation(conversation_id);
+            let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+            runtime.file_preview = Some(preview);
+            runtime.show_subagents_detail = false;
+            runtime.inspector_notice = None;
+            // The preview renders inside the inspector; a hidden panel
+            // would swallow the handoff silently.
+            runtime.show_inspector = true;
+        }
+        if let Some((conversation_id, path)) = action.reveal_file {
+            match self.resolve_scoped_ai_workspace_path(conversation_id, Path::new(&path)) {
+                Ok(path) if path.is_dir() => {
+                    platform::open_path(&path);
+                    self.artifact_library.notice = None;
+                }
+                Ok(path) => {
+                    platform::reveal(&path);
+                    self.artifact_library.notice = None;
+                }
+                Err(message) => self.artifact_library.notice = Some(message),
+            }
+        }
+        if let Some((page_id, tile_id)) = action.open_on_canvas {
+            self.artifact_library.close();
+            // switch_page is a no-op when the page is already active, so
+            // leave the chat explicitly before selecting the tile.
+            self.open_chat = None;
+            self.switch_page(page_id);
+            self.selection.clear();
+            self.selection.insert(tile_id);
+            self.center_camera_on_tile(tile_id);
+        }
+    }
+
+    /// Pans the active page's camera so the tile sits at the view center,
+    /// keeping the current zoom. The jump from the artifact library must
+    /// land with the tile on screen or it reads as a no-op.
+    fn center_camera_on_tile(&mut self, tile_id: Uuid) {
+        let Some(view) = self.last_canvas_rect else {
+            return;
+        };
+        let Some(tile) = self.workspace.active_page().tile(tile_id) else {
+            return;
+        };
+        let center = vec2(
+            (tile.rect.min_x() + tile.rect.max_x()) / 2.0,
+            (tile.rect.min_y() + tile.rect.max_y()) / 2.0,
+        );
+        let mut camera = self.active_camera();
+        camera.origin = center - view.size() / (2.0 * camera.zoom);
+        self.set_active_camera(camera);
+    }
+
     /// Shared handler for panel-, banner-, and setup-screen actions.
     fn apply_agents_panel_action(&mut self, action: AgentsPanelAction, context: &Context) {
         if action.refresh {
@@ -11017,11 +11242,12 @@ impl eframe::App for AdamApp {
         let dots_seconds = self.dots_seconds();
         let root_rect = ui.max_rect();
         let dots_slot = dots_seconds.map(|_| ui.painter().add(egui::Shape::Noop));
-        let toolbar_rect = if self.open_chat.is_some() && !self.agents.open {
-            self.show_ai_toolbar(ui, dots_seconds)
-        } else {
-            self.show_toolbar(ui, frame, dots_seconds)
-        };
+        let toolbar_rect =
+            if self.open_chat.is_some() && !self.agents.open && !self.artifact_library.open {
+                self.show_ai_toolbar(ui, dots_seconds)
+            } else {
+                self.show_toolbar(ui, frame, dots_seconds)
+            };
         let dots_theme = self.theme(&context);
         #[cfg(target_os = "macos")]
         self.sync_native_window_appearance(&context, frame);
@@ -11043,6 +11269,8 @@ impl eframe::App for AdamApp {
         }
         if self.agents.open {
             self.show_agents_section(ui);
+        } else if self.artifact_library.open {
+            self.show_artifact_library_section(ui);
         } else if self.open_chat.is_some() {
             self.show_ai_workspace(ui);
         } else {
@@ -14057,6 +14285,18 @@ fn agents_panel_palette(colors: Theme) -> agents_panel::AgentsPalette {
     }
 }
 
+fn artifact_library_palette(colors: Theme) -> artifact_library::ArtifactLibraryPalette {
+    artifact_library::ArtifactLibraryPalette {
+        text: colors.text,
+        secondary_text: colors.secondary_text,
+        tertiary_text: colors.tertiary_text,
+        danger: colors.danger,
+        tile: colors.tile,
+        tile_border: colors.tile_border,
+        selection_fill: colors.selection_fill,
+    }
+}
+
 fn progress_stepper_palette(colors: Theme) -> crate::progress_stepper::StepperPalette {
     crate::progress_stepper::StepperPalette {
         accent: colors.accent,
@@ -14285,12 +14525,7 @@ fn render_ai_inspector(
                             .color(colors.tertiary_text),
                         );
                     }
-                    let visible_count = if runtime.show_all_outputs {
-                        outputs.len()
-                    } else {
-                        outputs.len().min(8)
-                    };
-                    for output in outputs.iter().take(visible_count) {
+                    for output in outputs.iter().take(8) {
                         Frame::NONE
                             .fill(colors.tile)
                             .corner_radius(8)
@@ -14333,16 +14568,25 @@ fn render_ai_inspector(
                             });
                         ui.add_space(5.0);
                     }
-                    if outputs.len() > 8
-                        && ui
-                            .small_button(if runtime.show_all_outputs {
-                                "Show fewer"
-                            } else {
-                                "Show all artifacts"
-                            })
-                            .clicked()
-                    {
-                        action.toggle_all_outputs = true;
+                    // The library behind the rail: overflow opens it scoped
+                    // to this chat; otherwise it is the door to every
+                    // conversation's artifacts.
+                    let overflow = outputs.len() > 8;
+                    let (label, hover, target) = if overflow {
+                        (
+                            format!("Show all ({})", outputs.len()),
+                            "Search every artifact from this chat in the library",
+                            LibraryTarget::Conversation(conversation_id),
+                        )
+                    } else {
+                        (
+                            "Artifact library".to_owned(),
+                            "Search every conversation’s artifacts",
+                            LibraryTarget::All,
+                        )
+                    };
+                    if ui.small_button(label).on_hover_text(hover).clicked() {
+                        action.open_artifact_library = Some(target);
                     }
                 });
 
