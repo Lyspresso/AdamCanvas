@@ -1938,8 +1938,10 @@ mod tests {
         });
         assert!(rebased, "loading must rebase the foreign managed path");
         let saved_back = fs::read_to_string(&paths.library).unwrap();
+        // On a real Windows machine the CURRENT root also lives under
+        // C:\Users, so assert on the distinctive foreign user instead.
         assert!(
-            !saved_back.contains("C:\\\\Users"),
+            !saved_back.contains("lyd"),
             "the rewritten library must not retain foreign managed paths"
         );
     }
