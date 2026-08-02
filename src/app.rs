@@ -533,10 +533,12 @@ impl AiChatRuntime {
 #[derive(Default)]
 struct AiWorkspaceUiAction {
     send: bool,
-    /// Read-only render input carried with the frame's action accumulator so
-    /// the composer does not grow another positional argument.
+    /// Read-only render inputs carried with the frame's action accumulator so
+    /// the composer does not grow more positional arguments.
     preflight_blocks_send: bool,
+    conversation_hidden: bool,
     stop: bool,
+    unhide_conversation: bool,
     send_next_queued: bool,
     clear_queue: bool,
     add_attachments: bool,
@@ -1573,16 +1575,20 @@ impl AdamApp {
             .conversations
             .get_mut(&conversation_id)
         {
-            conversation.hidden = hidden;
-            conversation.updated_at = unix_now();
-            if hidden {
-                conversation.queue_paused = true;
-            }
+            update_ai_conversation_hidden_state(conversation, hidden, unix_now());
         }
         if hidden && self.open_chat == Some(conversation_id) {
             self.open_chat = None;
         }
         self.changed(false);
+        context.request_repaint();
+    }
+
+    fn notify_hidden_chat_send_blocked(&mut self, conversation_id: Uuid, context: &Context) {
+        let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+        runtime.inspector_notice = Some(HIDDEN_CHAT_SEND_NOTICE.into());
+        runtime.show_inspector = true;
+        self.toast(HIDDEN_CHAT_SEND_NOTICE, context);
         context.request_repaint();
     }
 
@@ -6556,7 +6562,10 @@ impl AdamApp {
             .as_ref()
             .filter(|request| request.conversation_id == conversation_id)
             .cloned();
-        let mut action = AiWorkspaceUiAction::default();
+        let mut action = AiWorkspaceUiAction {
+            conversation_hidden: conversation.hidden,
+            ..AiWorkspaceUiAction::default()
+        };
         let resume_provider_id = self
             .resume_store
             .record(conversation_id)
@@ -6767,6 +6776,9 @@ impl AdamApp {
             self.agents.ensure_scanned();
         }
         self.apply_agents_panel_action(action.agents_action, context);
+        if action.unhide_conversation {
+            self.set_ai_conversation_hidden(conversation_id, false, context);
+        }
         if action.add_attachments {
             self.add_ai_attachments(conversation_id);
         }
@@ -6951,16 +6963,18 @@ impl AdamApp {
             self.changed(false);
         }
         if action.send_next_queued {
-            if let Some(conversation) = self
+            let may_send = self
                 .workspace
                 .domain
                 .conversations
                 .conversations
                 .get_mut(&conversation_id)
-            {
-                conversation.queue_paused = false;
+                .is_some_and(prepare_ai_queue_for_explicit_send);
+            if may_send {
+                self.drain_ai_queue(conversation_id, context);
+            } else {
+                self.notify_hidden_chat_send_blocked(conversation_id, context);
             }
-            self.drain_ai_queue(conversation_id, context);
         }
         if action.send {
             self.start_ai_turn(conversation_id, context);
@@ -7036,6 +7050,10 @@ impl AdamApp {
         else {
             return;
         };
+        if conversation.hidden {
+            self.notify_hidden_chat_send_blocked(conversation_id, context);
+            return;
+        }
         let engine_running = self.ai_engine.is_conversation_running(conversation_id);
         let (user_text, attachments, running) = {
             let runtime = self.chat_runtimes.entry(conversation_id).or_default();
@@ -7419,6 +7437,7 @@ impl AdamApp {
                 runtime.resume_replay = None;
                 runtime.preserved_resume_retry = None;
             }
+            self.notify_hidden_chat_send_blocked(conversation_id, context);
             return false;
         }
         if self
@@ -7721,7 +7740,7 @@ impl AdamApp {
             .conversations
             .conversations
             .get(&conversation_id)
-            .filter(|conversation| !conversation.queue_paused)
+            .filter(|conversation| ai_conversation_queue_allows_drain(conversation))
             .cloned();
         let Some(conversation) = conversation else {
             return false;
@@ -7781,7 +7800,7 @@ impl AdamApp {
             .conversations
             .values()
             .filter(|conversation| {
-                !conversation.queue_paused
+                ai_conversation_queue_allows_drain(conversation)
                     && !conversation.queued_turns().is_empty()
                     && !self
                         .chat_runtimes
@@ -13721,6 +13740,30 @@ fn ai_conversation_allows_launch(conversation: &AiConversation) -> bool {
     !conversation.hidden
 }
 
+fn ai_conversation_queue_allows_drain(conversation: &AiConversation) -> bool {
+    !conversation.hidden && !conversation.queue_paused
+}
+
+fn prepare_ai_queue_for_explicit_send(conversation: &mut AiConversation) -> bool {
+    if conversation.hidden {
+        return false;
+    }
+    conversation.queue_paused = false;
+    true
+}
+
+fn update_ai_conversation_hidden_state(
+    conversation: &mut AiConversation,
+    hidden: bool,
+    updated_at: UnixMillis,
+) {
+    conversation.hidden = hidden;
+    conversation.updated_at = updated_at;
+    if hidden {
+        conversation.queue_paused = true;
+    }
+}
+
 fn should_replay_failed_native_session(
     runtime: &AiChatRuntime,
     resume_rejected: bool,
@@ -15532,12 +15575,14 @@ fn render_ai_chat_page(
     } else {
         0.0
     };
+    let hidden_notice_height = if conversation.hidden { 58.0 } else { 0.0 };
     let composer_height = if runtime.pending_attachments.is_empty() {
         174.0
     } else {
         218.0
     } + queue_height
-        + provider_notice_height;
+        + provider_notice_height
+        + hidden_notice_height;
     let transcript_height = (ui.available_height() - composer_height).max(180.0);
     egui::ScrollArea::vertical()
         .id_salt(("adam-ai-transcript", conversation.id))
@@ -15658,6 +15703,7 @@ fn render_ai_chat_page(
         ui.add_space(inset);
         ui.vertical(|ui| {
             ui.set_width((available - inset * 2.0).clamp(320.0, 880.0));
+            render_ai_hidden_chat_banner(ui, conversation.hidden, action, colors);
             render_ai_preflight_banner(ui, agents_view.preflight.as_ref(), action, colors);
             render_ai_chat_progress_pill(ui, runtime, colors);
             render_ai_queue_bar(
@@ -15679,6 +15725,33 @@ fn render_ai_chat_page(
             );
         });
     });
+}
+
+fn render_ai_hidden_chat_banner(
+    ui: &mut Ui,
+    hidden: bool,
+    action: &mut AiWorkspaceUiAction,
+    colors: Theme,
+) {
+    if !hidden {
+        return;
+    }
+    Frame::NONE
+        .fill(colors.selection_fill)
+        .corner_radius(10)
+        .inner_margin(Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("This chat is hidden — unhide it to send messages.")
+                        .color(colors.secondary_text),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    action.unhide_conversation |= ui.small_button("Unhide").clicked();
+                });
+            });
+        });
+    ui.add_space(6.0);
 }
 
 /// Pre-Send warning fed by the Agents panel's cached scan; renders nothing
@@ -15796,7 +15869,9 @@ fn render_ai_queue_bar(
                     })
                     .strong(),
                 );
-                let queue_status = if runtime.active_turn.is_some() {
+                let queue_status = if conversation.hidden {
+                    "· hidden · paused".to_owned()
+                } else if runtime.active_turn.is_some() {
                     "· sends when the agent finishes".to_owned()
                 } else if let Some(notice) = blocking_preflight {
                     format!("· {}", notice.headline)
@@ -15816,10 +15891,12 @@ fn render_ai_queue_bar(
                     }
                     if runtime.active_turn.is_none() {
                         let send_next = ui.add_enabled(
-                            blocking_preflight.is_none(),
+                            !conversation.hidden && blocking_preflight.is_none(),
                             Button::new("Send next").small(),
                         );
-                        let send_next = if let Some(notice) = blocking_preflight {
+                        let send_next = if conversation.hidden {
+                            send_next.on_disabled_hover_text(HIDDEN_CHAT_SEND_NOTICE)
+                        } else if let Some(notice) = blocking_preflight {
                             send_next.on_disabled_hover_text(&notice.detail)
                         } else {
                             send_next
@@ -16586,6 +16663,7 @@ fn render_ai_composer(
                 &runtime.draft,
                 running,
                 action.preflight_blocks_send,
+                action.conversation_hidden,
             );
             ui.horizontal(|ui| {
                 action.add_attachments |= ui
@@ -16635,12 +16713,17 @@ fn render_ai_composer(
                     if running {
                         action.stop |= ui.button("Stop").clicked();
                     }
-                    action.send |= ui
+                    let send = ui
                         .add_enabled(
                             send_enabled,
                             Button::new(if running { "Queue  ↵" } else { "Send  ↵" }),
-                        )
-                        .clicked();
+                        );
+                    let send = if action.conversation_hidden {
+                        send.on_disabled_hover_text(HIDDEN_CHAT_SEND_NOTICE)
+                    } else {
+                        send
+                    };
+                    action.send |= send.clicked();
                 });
             });
             ui.add_space(2.0);
@@ -16720,8 +16803,13 @@ fn render_ai_composer(
     }
 }
 
-fn ai_send_enabled(draft: &str, running: bool, preflight_blocks_send: bool) -> bool {
-    !draft.trim().is_empty() && (running || !preflight_blocks_send)
+fn ai_send_enabled(
+    draft: &str,
+    running: bool,
+    preflight_blocks_send: bool,
+    conversation_hidden: bool,
+) -> bool {
+    !conversation_hidden && !draft.trim().is_empty() && (running || !preflight_blocks_send)
 }
 
 fn queued_turn_provider_id<'a>(
@@ -16799,6 +16887,7 @@ const GROK_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Provider default"), ("grok-4
 const XAI_MULTI_AGENT_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Grok 4.20 · Multi-agent")];
 const DEFAULT_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Provider default")];
 const XAI_SERVER_STORAGE_DISCLOSURE: &str = "Privacy · xAI stores your messages and Grok Heavy responses for follow-up turns (30 days by default).";
+const HIDDEN_CHAT_SEND_NOTICE: &str = "This chat is hidden. Unhide it to send messages.";
 const XAI_COST_NOT_REPORTED: &str = "Cost not reported by xAI";
 
 fn ai_usage_cost_suffix(cost_usd: Option<f64>, xai_cost_unreported: bool) -> String {
@@ -19223,13 +19312,15 @@ mod tests {
 
     #[test]
     fn composer_blocks_a_cold_exact_provider_without_blocking_active_turn_queueing() {
-        assert!(!ai_send_enabled("", false, false));
-        assert!(!ai_send_enabled("research this", false, true));
-        assert!(ai_send_enabled("research this", false, false));
+        assert!(!ai_send_enabled("", false, false, false));
+        assert!(!ai_send_enabled("research this", false, true, false));
+        assert!(ai_send_enabled("research this", false, false, false));
         assert!(
-            ai_send_enabled("follow up", true, true),
+            ai_send_enabled("follow up", true, true, false),
             "an already-running turn may still accept a queued follow-up"
         );
+        assert!(!ai_send_enabled("research this", false, false, true));
+        assert!(!ai_send_enabled("follow up", true, false, true));
     }
 
     #[test]
@@ -20160,9 +20251,47 @@ mod tests {
             ai_conversation_allows_launch(&conversation),
             "queue pause must not block an explicit launch for a visible chat"
         );
+        assert!(!ai_conversation_queue_allows_drain(&conversation));
+
+        conversation.queue_paused = false;
+        assert!(ai_conversation_queue_allows_drain(&conversation));
 
         conversation.hidden = true;
         assert!(!ai_conversation_allows_launch(&conversation));
+        assert!(!ai_conversation_queue_allows_drain(&conversation));
+    }
+
+    #[test]
+    fn hidden_queue_send_and_unhide_preserve_queued_work() {
+        let mut conversation = AiConversation::new(
+            Uuid::new_v4(),
+            "Hidden queued work",
+            PermissionMode::Ask,
+            UnixMillis(1),
+        );
+        conversation
+            .enqueue_turn(AiQueuedTurn {
+                id: Uuid::new_v4(),
+                text: "Do not send yet".into(),
+                queued_at: UnixMillis(2),
+                ..AiQueuedTurn::default()
+            })
+            .unwrap();
+        update_ai_conversation_hidden_state(&mut conversation, true, UnixMillis(3));
+        let hidden_snapshot = conversation.clone();
+
+        assert!(!prepare_ai_queue_for_explicit_send(&mut conversation));
+        assert_eq!(conversation, hidden_snapshot);
+        assert!(!ai_conversation_queue_allows_drain(&conversation));
+
+        update_ai_conversation_hidden_state(&mut conversation, false, UnixMillis(4));
+        assert!(!conversation.hidden);
+        assert!(conversation.queue_paused);
+        assert_eq!(conversation.queued_turns(), hidden_snapshot.queued_turns());
+        assert!(!ai_conversation_queue_allows_drain(&conversation));
+
+        assert!(prepare_ai_queue_for_explicit_send(&mut conversation));
+        assert!(ai_conversation_queue_allows_drain(&conversation));
     }
 
     #[test]

@@ -846,11 +846,14 @@ or token cannot revive a completed run.
   as timestamped recovery copies instead of being silently overwritten.
 - Hiding a chat cancels its active turn, pauses its queue, and keeps the full
   conversation in a discoverable Hidden section until the user unhides it;
-  background activity never silently promotes it. Permanent Delete requires a
-  confirmation, removes chat tiles, sessions, task/canvas gates, checkpoints,
-  and artifact provenance, and records a durable tombstone so a stale Adam
-  window cannot resurrect the conversation. Notes, piles, and files created by
-  the chat remain on the canvas. For Grok Heavy, this removes Adam's local
+  background activity never silently promotes it. Opening a hidden chat or its
+  canvas tile shows an explicit hidden state: Send and Send next remain blocked,
+  the draft and queue stay untouched, and Unhide keeps that queue paused until
+  the user explicitly sends it. Permanent Delete requires a confirmation,
+  removes chat tiles, sessions, task/canvas gates, checkpoints, and artifact
+  provenance, and records a durable tombstone so a stale Adam window cannot
+  resurrect the conversation. Notes, piles, and files created by the chat
+  remain on the canvas. For Grok Heavy, this removes Adam's local
   response-resume link but does not erase messages or responses retained by
   xAI; the confirmation repeats that distinction.
 

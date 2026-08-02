@@ -3075,16 +3075,38 @@ impl<'de> Deserialize<'de> for HostArtifactLedger {
     where
         D: Deserializer<'de>,
     {
-        let persisted = BTreeMap::<Uuid, HostArtifactOrigin>::deserialize(deserializer)?;
+        // Decode each origin independently. A newer Adam may add an origin
+        // shape this build does not understand, and one damaged provenance
+        // record must never make the complete Workspace unreadable.
+        let persisted = JsonValue::deserialize(deserializer)?;
+        let JsonValue::Object(persisted) = persisted else {
+            log::warn!("ignored invalid host artifact ledger while loading");
+            return Ok(Self::default());
+        };
+        let persisted = persisted.into_iter().collect::<BTreeMap<_, _>>();
         let mut ledger = Self::default();
-        for (key, origin) in persisted {
+        let mut skipped = 0usize;
+        for (key, value) in persisted {
+            let Ok(key) = Uuid::parse_str(&key) else {
+                skipped = skipped.saturating_add(1);
+                continue;
+            };
+            let Ok(origin) = serde_json::from_value::<HostArtifactOrigin>(value) else {
+                skipped = skipped.saturating_add(1);
+                continue;
+            };
             if key != origin.entity_id {
-                return Err(serde::de::Error::custom(format!(
-                    "host artifact key {key} does not match origin entity {}",
-                    origin.entity_id
-                )));
+                skipped = skipped.saturating_add(1);
+                continue;
             }
-            ledger.record(origin).map_err(serde::de::Error::custom)?;
+            if ledger.record(origin).is_err() {
+                skipped = skipped.saturating_add(1);
+            }
+        }
+        if skipped > 0 {
+            log::warn!(
+                "ignored {skipped} invalid or unsupported host artifact ledger record(s) while loading"
+            );
         }
         Ok(ledger)
     }
@@ -5958,6 +5980,89 @@ mod tests {
             HostArtifactOrigin::new(id(100), id(1), id(10), update),
             Err(HostArtifactLedgerError::OriginIsNotCreate(entity)) if entity == id(100)
         ));
+    }
+
+    #[test]
+    fn workspace_skips_bad_host_artifact_origins_without_losing_valid_state() {
+        let mut workspace = crate::model::Workspace::new();
+        let page_id = workspace.active_page;
+        workspace
+            .domain
+            .conversations
+            .add(AiConversation::new(
+                id(1),
+                "Ledger recovery",
+                PermissionMode::Ask,
+                at(0),
+            ))
+            .unwrap();
+        let valid_origin = HostArtifactOrigin::new(
+            id(100),
+            id(1),
+            id(10),
+            host_create_event(id(101), id(100), "canvas_create_note", "Brief", 2),
+        )
+        .unwrap();
+        workspace
+            .domain
+            .record_host_artifact(valid_origin.clone())
+            .unwrap();
+
+        let mut encoded = serde_json::to_value(&workspace).unwrap();
+        let records = encoded["domain"]["host_artifacts"].as_object_mut().unwrap();
+        let valid_record = records.get(&id(100).to_string()).unwrap().clone();
+
+        let mut future_record = valid_record.clone();
+        future_record["entity_id"] = json!(id(200));
+        future_record["event"]["id"] = json!(id(201));
+        future_record["event"]["kind"]["entityId"] = json!(id(200).to_string());
+        future_record["event"]["kind"]["type"] = json!("futureHostMutation");
+        records.insert(id(200).to_string(), future_record);
+
+        records.insert(id(300).to_string(), valid_record.clone());
+        records.insert("not-a-uuid".into(), json!({"future": "origin"}));
+
+        let mut duplicate_event = valid_record;
+        duplicate_event["entity_id"] = json!(id(400));
+        duplicate_event["event"]["kind"]["entityId"] = json!(id(400).to_string());
+        records.insert(id(400).to_string(), duplicate_event);
+
+        let restored: crate::model::Workspace = serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored.active_page, page_id);
+        assert_eq!(restored.pages, workspace.pages);
+        assert!(
+            restored
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&id(1))
+        );
+        assert_eq!(restored.domain.host_artifacts.origins().len(), 1);
+        assert_eq!(
+            restored.domain.host_artifacts.origin(id(100)),
+            Some(&valid_origin)
+        );
+        assert!(restored.domain.host_artifacts.origin(id(200)).is_none());
+        assert!(restored.domain.host_artifacts.origin(id(300)).is_none());
+        assert!(restored.domain.host_artifacts.origin(id(400)).is_none());
+
+        let clean_round_trip: crate::model::Workspace =
+            serde_json::from_value(serde_json::to_value(&restored).unwrap()).unwrap();
+        assert_eq!(clean_round_trip, restored);
+
+        let mut malformed_ledger = serde_json::to_value(&workspace).unwrap();
+        malformed_ledger["domain"]["host_artifacts"] = json!(["future-ledger-shape"]);
+        let recovered: crate::model::Workspace = serde_json::from_value(malformed_ledger).unwrap();
+        assert_eq!(recovered.active_page, page_id);
+        assert_eq!(recovered.pages, workspace.pages);
+        assert!(
+            recovered
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&id(1))
+        );
+        assert!(recovered.domain.host_artifacts.origins().is_empty());
     }
 
     #[test]
