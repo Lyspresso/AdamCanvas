@@ -2773,6 +2773,7 @@ impl AdamApp {
         let mut delete_page = false;
         let mut new_chat = false;
         let mut open_agent_harness = false;
+        let mut open_artifact_library = false;
         let mut switch_to = None;
         let mut reorder_page = None;
         let mut filter_to = None;
@@ -3180,6 +3181,20 @@ impl AdamApp {
                     )
                     .on_hover_text("Which AI provider CLIs are installed, verified, or installable")
                     .clicked();
+                let library_selected = self.artifact_library.open;
+                open_artifact_library = ui
+                    .add(
+                        Button::new(RichText::new("◇  Artifacts").size(12.5).color(
+                            if library_selected {
+                                colors.text
+                            } else {
+                                colors.secondary_text
+                            },
+                        ))
+                        .frame(false),
+                    )
+                    .on_hover_text("Search everything your chats have made, across conversations")
+                    .clicked();
 
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     if ui
@@ -3259,6 +3274,10 @@ impl AdamApp {
             self.agents.open = true;
             self.artifact_library.close();
             self.agents.ensure_scanned();
+        }
+        if open_artifact_library {
+            self.agents.open = false;
+            self.artifact_library.open_for(LibraryTarget::All);
         }
         if let Some(page_id) = switch_to {
             self.switch_page(page_id);
@@ -9702,12 +9721,35 @@ impl AdamApp {
             self.artifact_library.mark_dirty();
         }
         if self.artifact_library.needs_refresh() {
-            let mut rows = self
-                .workspace
-                .artifact_library(&self.artifact_library.query);
-            if let Some(only) = self.artifact_library.only_conversation {
-                rows.retain(|row| row.conversation_id == only);
-            }
+            let rows = if let Some(only) = self.artifact_library.only_conversation {
+                // The scoped view must mirror the inspector rail it opened
+                // from — the per-conversation projection, including a
+                // running turn's in-flight artifacts. The global library
+                // persists only completed turns and attributes shared files
+                // to their producer, so filtering it by conversation would
+                // drop rows the rail just counted.
+                let (live_turn_id, live_events) = self
+                    .chat_runtimes
+                    .get(&only)
+                    .filter(|runtime| runtime.active_turn.is_some())
+                    .map(|runtime| {
+                        (
+                            runtime.active_turn,
+                            runtime.activity_trace.events.as_slice(),
+                        )
+                    })
+                    .unwrap_or((None, &[][..]));
+                let mut rows =
+                    self.workspace
+                        .conversation_artifacts(only, live_turn_id, live_events);
+                rows.retain(|row| {
+                    artifact_library::row_matches_query(row, &self.artifact_library.query)
+                });
+                rows
+            } else {
+                self.workspace
+                    .artifact_library(&self.artifact_library.query)
+            };
             let conversations = &self.workspace.domain.conversations.conversations;
             let groups = artifact_library::library_groups(&rows, unix_now(), &|editor| {
                 conversations
@@ -9765,9 +9807,9 @@ impl AdamApp {
                         });
                     });
             });
-        // Keep host availability honest while the panel is up: trash or
-        // canvas changes surface within one refresh interval.
-        context.request_repaint_after(Duration::from_secs(1));
+        // Keep host availability and live-turn rows honest while the panel
+        // is up: changes surface within one refresh interval.
+        context.request_repaint_after(artifact_library::REFRESH_INTERVAL);
         self.apply_artifact_library_action(action);
     }
 
@@ -9780,9 +9822,18 @@ impl AdamApp {
         if action.clear_filter {
             self.artifact_library.only_conversation = None;
             self.artifact_library.query.clear();
+            self.artifact_library.notice = None;
+            self.artifact_library.mark_dirty();
+        }
+        if action.clear_search {
+            self.artifact_library.query.clear();
+            self.artifact_library.notice = None;
             self.artifact_library.mark_dirty();
         }
         if action.query_changed {
+            // A stale failure banner must not outlive the search it
+            // happened under.
+            self.artifact_library.notice = None;
             self.artifact_library.mark_dirty();
         }
         if let Some(conversation_id) = action.open_conversation {
@@ -9808,13 +9859,20 @@ impl AdamApp {
             runtime.file_preview = Some(preview);
             runtime.show_subagents_detail = false;
             runtime.inspector_notice = None;
+            // The preview renders inside the inspector; a hidden panel
+            // would swallow the handoff silently.
+            runtime.show_inspector = true;
         }
         if let Some((conversation_id, path)) = action.reveal_file {
             match self.resolve_scoped_ai_workspace_path(conversation_id, Path::new(&path)) {
                 Ok(path) if path.is_dir() => {
                     platform::open_path(&path);
+                    self.artifact_library.notice = None;
                 }
-                Ok(path) => platform::reveal(&path),
+                Ok(path) => {
+                    platform::reveal(&path);
+                    self.artifact_library.notice = None;
+                }
                 Err(message) => self.artifact_library.notice = Some(message),
             }
         }
@@ -9826,7 +9884,27 @@ impl AdamApp {
             self.switch_page(page_id);
             self.selection.clear();
             self.selection.insert(tile_id);
+            self.center_camera_on_tile(tile_id);
         }
+    }
+
+    /// Pans the active page's camera so the tile sits at the view center,
+    /// keeping the current zoom. The jump from the artifact library must
+    /// land with the tile on screen or it reads as a no-op.
+    fn center_camera_on_tile(&mut self, tile_id: Uuid) {
+        let Some(view) = self.last_canvas_rect else {
+            return;
+        };
+        let Some(tile) = self.workspace.active_page().tile(tile_id) else {
+            return;
+        };
+        let center = vec2(
+            (tile.rect.min_x() + tile.rect.max_x()) / 2.0,
+            (tile.rect.min_y() + tile.rect.max_y()) / 2.0,
+        );
+        let mut camera = self.active_camera();
+        camera.origin = center - view.size() / (2.0 * camera.zoom);
+        self.set_active_camera(camera);
     }
 
     /// Shared handler for panel-, banner-, and setup-screen actions.

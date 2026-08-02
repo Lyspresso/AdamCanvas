@@ -18,10 +18,12 @@ use crate::chat_core::ArtifactSource;
 use crate::domain::{ConversationArtifact, HostArtifactAvailability, UnixMillis};
 
 /// How stale a stored projection may get while the panel is open. Artifacts
-/// change only when a turn persists or the canvas/trash moves under a host
-/// row, so a once-per-second recompute keeps the view honest without paying
-/// the full cross-conversation projection every immediate-mode frame.
-const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// change only when a turn persists or streams, or the canvas/trash moves
+/// under a host row, so a once-per-second recompute keeps the view honest
+/// without paying the full cross-conversation projection every
+/// immediate-mode frame. Public so the app's `request_repaint_after` and
+/// this cadence cannot drift apart.
+pub const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Where the library opens focused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +78,12 @@ pub struct ArtifactLibraryState {
     /// has no inspector notice slot to borrow.
     pub notice: Option<String>,
     focus_search: bool,
+    /// Whether the search field held focus on the previous frame. egui
+    /// clears the focused widget in `begin_pass` before any UI runs when
+    /// Escape is pressed, so `memory().focused()` cannot distinguish
+    /// "Escape surrendered the search field" from "nothing was focused" —
+    /// this one-frame memory can.
+    search_had_focus: bool,
     dirty: bool,
     groups: Vec<LibraryGroup>,
     refreshed: Option<Instant>,
@@ -83,13 +91,19 @@ pub struct ArtifactLibraryState {
 
 impl ArtifactLibraryState {
     pub fn open_for(&mut self, target: LibraryTarget) {
-        self.open = true;
-        self.query.clear();
-        self.notice = None;
-        self.only_conversation = match target {
+        let only_conversation = match target {
             LibraryTarget::All => None,
             LibraryTarget::Conversation(conversation_id) => Some(conversation_id),
         };
+        // Reopening the same scope keeps the search — a Preview or canvas
+        // jump round-trip must not force retyping — while a scope change
+        // starts fresh.
+        if self.only_conversation != only_conversation {
+            self.query.clear();
+        }
+        self.only_conversation = only_conversation;
+        self.open = true;
+        self.notice = None;
         self.dirty = true;
         self.focus_search = true;
     }
@@ -122,6 +136,7 @@ impl ArtifactLibraryState {
 pub struct ArtifactLibraryAction {
     pub close: bool,
     pub clear_filter: bool,
+    pub clear_search: bool,
     pub query_changed: bool,
     pub open_conversation: Option<Uuid>,
     /// (owning conversation, provider-reported path)
@@ -132,6 +147,7 @@ pub struct ArtifactLibraryAction {
 }
 
 /// Palette indirection so the module never imports the app `Theme`.
+#[derive(Clone, Copy, Debug)]
 pub struct ArtifactLibraryPalette {
     pub text: egui::Color32,
     pub secondary_text: egui::Color32,
@@ -243,6 +259,41 @@ fn build_row(
     }
 }
 
+/// Case-insensitive substring match over the same haystack as the domain's
+/// private `artifact_matches_query`: conversation title, artifact title and
+/// subtitle, producing and last-changing tool, and the availability word
+/// (available / trashed / missing / file). The scoped view needs it because
+/// `Workspace::conversation_artifacts` — the projection that includes a
+/// running turn's in-flight artifacts — does not take a query, while the
+/// global `artifact_library` filters domain-side.
+pub fn row_matches_query(row: &ConversationArtifact, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let availability = match row.host_availability {
+        Some(HostArtifactAvailability::Available { .. }) => "available",
+        Some(HostArtifactAvailability::Trashed) => "trashed",
+        Some(HostArtifactAvailability::Missing) => "missing",
+        None => "file",
+    };
+    format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        row.conversation_title,
+        row.artifact.title,
+        row.artifact.subtitle.as_deref().unwrap_or_default(),
+        row.artifact.produced_by.tool.as_deref().unwrap_or_default(),
+        row.artifact
+            .last_changed_by
+            .tool
+            .as_deref()
+            .unwrap_or_default(),
+        availability,
+    )
+    .to_lowercase()
+    .contains(&query)
+}
+
 /// Canvas tool names read as prose; file tools (Write, Edit) already do.
 fn pretty_tool(tool: &str) -> String {
     match tool {
@@ -257,7 +308,7 @@ fn pretty_tool(tool: &str) -> String {
 
 /// Coarse relative buckets, absolute past a week. Deterministic over the
 /// injected `now` so tests never sleep.
-pub fn relative_time_label(at: UnixMillis, now: UnixMillis) -> String {
+fn relative_time_label(at: UnixMillis, now: UnixMillis) -> String {
     let delta = (now.0 - at.0).max(0);
     const MINUTE: i64 = 60_000;
     const HOUR: i64 = 60 * MINUTE;
@@ -295,7 +346,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-pub fn truncate_middle(text: &str, max_chars: usize) -> String {
+fn truncate_middle(text: &str, max_chars: usize) -> String {
     let count = text.chars().count();
     if count <= max_chars || max_chars < 2 {
         return text.to_owned();
@@ -316,10 +367,11 @@ pub fn artifact_library_ui(
     palette: &ArtifactLibraryPalette,
     action: &mut ArtifactLibraryAction,
 ) {
-    // Escape closes, but never while a widget (the search field) holds
-    // focus — there it just surrenders focus, the standard egui behavior.
-    let something_focused = ui.memory(|memory| memory.focused().is_some());
-    if !something_focused && ui.input(|input| input.key_pressed(Key::Escape)) {
+    // Escape closes, unless the search field held focus on the previous
+    // frame — egui already cleared focus in `begin_pass` before this code
+    // runs, so that press only surrenders the field and a second press
+    // closes the panel.
+    if !state.search_had_focus && ui.input(|input| input.key_pressed(Key::Escape)) {
         action.close = true;
     }
 
@@ -354,17 +406,18 @@ pub fn artifact_library_ui(
                 .hint_text("Search artifacts")
                 .desired_width(ui.available_width() - clear_width),
         );
+        let focus_requested = state.focus_search;
         if state.focus_search {
             response.request_focus();
             state.focus_search = false;
         }
+        state.search_had_focus = response.has_focus() || focus_requested;
         if response.changed() {
             action.query_changed = true;
         }
         if !state.query.is_empty() && ui.small_button("×").on_hover_text("Clear search").clicked()
         {
-            state.query.clear();
-            action.query_changed = true;
+            action.clear_search = true;
         }
     });
 
@@ -437,7 +490,10 @@ pub fn artifact_library_ui(
                     )
                     .frame(false),
                 )
-                .on_hover_text("Open chat")
+                // A frameless button with an explicit text color gives no
+                // hover tint; the cursor is the clickability affordance.
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(format!("Open chat — “{}”", group.conversation_title))
                 .clicked()
             {
                 action.open_conversation = Some(group.conversation_id);
@@ -477,14 +533,19 @@ fn library_row_ui(
                         .size(11.5)
                         .color(palette.tertiary_text),
                 );
-                let mut title = RichText::new(truncate_middle(&row.title, 52))
+                let truncated = truncate_middle(&row.title, 52);
+                let needs_hover = truncated != row.title;
+                let mut title = RichText::new(truncated)
                     .size(11.5)
                     .strong()
                     .color(palette.secondary_text);
                 if row.is_deleted {
                     title = title.strikethrough();
                 }
-                ui.label(title);
+                let response = ui.label(title);
+                if needs_hover {
+                    response.on_hover_text(&row.title);
+                }
                 let chip = match row.status {
                     RowStatus::FileDeleted => Some(("Deleted", palette.tertiary_text)),
                     RowStatus::CanvasTrashed => Some(("In Trash", palette.tertiary_text)),
@@ -504,11 +565,17 @@ fn library_row_ui(
                 }
             });
             if let Some(subtitle) = row.subtitle.as_deref() {
-                ui.label(
-                    RichText::new(truncate_middle(subtitle, 56))
+                // Same 48-character budget as the inspector card's path line.
+                let truncated = truncate_middle(subtitle, 48);
+                let needs_hover = truncated != subtitle;
+                let response = ui.label(
+                    RichText::new(truncated)
                         .size(9.5)
                         .color(palette.tertiary_text),
                 );
+                if needs_hover {
+                    response.on_hover_text(subtitle);
+                }
             }
             if !row.provenance.is_empty() {
                 ui.label(
@@ -809,5 +876,43 @@ mod tests {
         );
         state.open_for(LibraryTarget::All);
         assert_eq!(state.only_conversation, None);
+    }
+
+    #[test]
+    fn reopening_the_same_scope_keeps_the_search_query() {
+        let mut state = ArtifactLibraryState::default();
+        state.open_for(LibraryTarget::Conversation(Uuid::from_u128(13)));
+        state.query = "report".to_owned();
+        // A Preview or canvas jump closes the panel; coming back through
+        // the same door must not force retyping.
+        state.close();
+        state.open_for(LibraryTarget::Conversation(Uuid::from_u128(13)));
+        assert_eq!(state.query, "report");
+        // A different scope is a fresh search.
+        state.open_for(LibraryTarget::All);
+        assert!(state.query.is_empty());
+    }
+
+    #[test]
+    fn row_matches_query_covers_the_domain_haystack() {
+        let chat = Uuid::from_u128(14);
+        let row = file_row(chat, "quarterly.md", "Planning chat", NOW.0);
+        assert!(row_matches_query(&row, ""));
+        assert!(row_matches_query(&row, "  QUARTERLY  "));
+        assert!(row_matches_query(&row, "planning"));
+        assert!(row_matches_query(&row, "write"), "producing tool matches");
+        assert!(
+            row_matches_query(&row, "file"),
+            "files match their availability word like the domain matcher"
+        );
+        assert!(!row_matches_query(&row, "sprocket"));
+        let trashed = host_row(
+            chat,
+            Uuid::from_u128(15),
+            Some(HostArtifactAvailability::Trashed),
+            NOW.0,
+        );
+        assert!(row_matches_query(&trashed, "trashed"));
+        assert!(!row_matches_query(&trashed, "available"));
     }
 }
