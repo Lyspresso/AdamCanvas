@@ -2023,7 +2023,7 @@ fn prepare_resolved_cli(
         }
         if !supports_grok_legacy_process(tuning.version.as_ref()) {
             return Err(AiEngineError::InvalidConfiguration(
-                "Adam supports the fixture-verified Grok CLI 0.2.111 legacy contract and 0.2.114/0.2.117 ACP contracts. This installed version is unverified, so Adam will not guess a transport or permission contract."
+                "Adam supports the fixture-verified Grok CLI 0.2.111 legacy contract and 0.2.114/0.2.117/0.2.118 ACP contracts. This installed version is unverified, so Adam will not guess a transport or permission contract."
                     .into(),
             ));
         }
@@ -2108,7 +2108,7 @@ fn supports_grok_acp_task_bridge(version: Option<&CliVersion>) -> bool {
     version.is_some_and(|version| {
         matches!(
             (version.major, version.minor, version.patch),
-            (0, 2, 114) | (0, 2, 117)
+            (0, 2, 114) | (0, 2, 117) | (0, 2, 118)
         )
     })
 }
@@ -11862,7 +11862,7 @@ mod tests {
         let task_only = CliVersion::parse("grok 0.2.114").unwrap();
         let scoped_subagents = CliVersion::parse("grok 0.2.117").unwrap();
         let old = CliVersion::parse("grok 0.2.111").unwrap();
-        let unverified_patch = CliVersion::parse("grok 0.2.118").unwrap();
+        let unverified_patch = CliVersion::parse("grok 0.2.119").unwrap();
         let future = CliVersion::parse("grok 0.3.0").unwrap();
         assert!(supports_grok_acp_task_bridge(Some(&task_only)));
         assert!(supports_grok_acp_task_bridge(Some(&scoped_subagents)));
@@ -14053,7 +14053,7 @@ send({
         ));
         assert_eq!(grok, original_grok);
 
-        let unlisted_grok = CliVersion::parse("grok 0.2.118 (94172f2aa4e5)").unwrap();
+        let unlisted_grok = CliVersion::parse("grok 0.2.119 (94172f2aa4e5)").unwrap();
         let unlisted_grok =
             runtime_tuning_profile(ProviderKind::Grok, Some(&unlisted_grok), "grok-4.5");
         assert!(!unlisted_grok.verified_runtime);
@@ -16147,9 +16147,9 @@ send({
 
         let directory = tempfile::tempdir().expect("temp dir");
         let grok = directory.path().join("unlisted-grok-stub");
-        fs::write(&grok, "#!/bin/sh\necho 'grok 0.2.118'\n").expect("write Grok stub");
+        fs::write(&grok, "#!/bin/sh\necho 'grok 0.2.119'\n").expect("write Grok stub");
         fs::set_permissions(&grok, fs::Permissions::from_mode(0o755)).expect("chmod Grok stub");
-        assert_eq!(cached_cli_version(&grok), CliVersion::parse("grok 0.2.118"));
+        assert_eq!(cached_cli_version(&grok), CliVersion::parse("grok 0.2.119"));
         assert!(!auto_cli_candidate_is_runnable("grok_cli", &grok));
         assert!(matches!(
             prepare_resolved_cli("grok_cli", grok, &request("grok_cli")),
