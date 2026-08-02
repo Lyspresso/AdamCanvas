@@ -93,6 +93,10 @@ struct Entry {
     desired_mode: Option<PreviewMode>,
     desired_edge: u32,
     retry_after: Option<Instant>,
+    /// The source file changed on disk after this texture was decoded. The
+    /// old picture keeps showing — a placeholder flash would be worse than a
+    /// briefly outdated image — while a fresh base decode is scheduled.
+    stale: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,6 +212,16 @@ impl PreviewCache {
                             entry.base_texture = Some(texture);
                             entry.base_edge = result.edge;
                             entry.base_mode = Some(result.mode);
+                            if entry.stale {
+                                // The replacement arrived. The old Retina
+                                // detail is of the old content and must not
+                                // keep covering the new base; it re-decodes
+                                // at the desired edge as usual.
+                                entry.stale = false;
+                                entry.detail_texture = None;
+                                entry.detail_edge = 0;
+                                entry.detail_bytes = 0;
+                            }
                         }
                     }
                     entry.pending = None;
@@ -320,7 +334,7 @@ impl PreviewCache {
                 .intrinsic_size
                 .map(|[width, height]| desired_edge.min(width.max(height)))
                 .unwrap_or(desired_edge);
-            if entry.base_texture.is_none() || entry.base_mode != Some(mode) {
+            if entry.stale || entry.base_texture.is_none() || entry.base_mode != Some(mode) {
                 Some(match mode {
                     PreviewMode::Image => IMAGE_BASE_EDGE,
                     PreviewMode::QuickLook => QUICK_LOOK_EDGE,
@@ -474,6 +488,39 @@ impl PreviewCache {
             .collect();
         for (id, request_id) in stale {
             self.clear_worker_demand(id, request_id);
+        }
+    }
+
+    /// The file behind a tile changed on disk. Softer than
+    /// [`invalidate`](Self::invalidate): the resident texture keeps showing
+    /// while its replacement is decoded, so an external save never flashes
+    /// the default placeholder — the old picture simply becomes the new one.
+    ///
+    /// The on-disk thumbnail cache needs no attention here: it is validated
+    /// against the source's modification time at decode, so a newer source
+    /// regenerates it.
+    pub fn mark_stale(&mut self, id: Uuid) {
+        let has_texture = self
+            .entries
+            .get(&id)
+            .is_some_and(|entry| entry.base_texture.is_some() || entry.detail_texture.is_some());
+        if !has_texture {
+            // Nothing on screen to preserve; the hard invalidation is
+            // strictly better bookkeeping.
+            self.invalidate(id);
+            return;
+        }
+        // A decode already in flight may have read the old content; cancel
+        // it rather than let it deliver outdated pixels that clear the flag.
+        if let Some(pending) = self.entries.get(&id).and_then(|entry| entry.pending) {
+            self.clear_worker_demand(id, pending.id);
+        }
+        if let Some(entry) = self.entries.get_mut(&id) {
+            entry.pending = None;
+            entry.stale = true;
+            // A file that failed to decode before may well decode now.
+            entry.failure_count = 0;
+            entry.retry_after = None;
         }
     }
 
@@ -1594,6 +1641,150 @@ mod tests {
         assert!(retry_delay_after_failure(MAX_PREVIEW_FAILURES - 1).is_some());
         assert_eq!(retry_delay_after_failure(MAX_PREVIEW_FAILURES), None);
         assert_eq!(retry_delay_after_failure(u8::MAX), None);
+    }
+
+    fn test_texture(context: &Context, name: &str) -> TextureHandle {
+        context.load_texture(
+            name,
+            ColorImage::from_rgba_unmultiplied([1, 1], &[10, 20, 30, 255]),
+            TextureOptions::LINEAR,
+        )
+    }
+
+    #[test]
+    fn a_stale_entry_keeps_serving_its_texture_while_a_fresh_decode_queues() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let source = temporary.path().join("photo.png");
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([200, 10, 10, 255]))
+            .save(&source)
+            .expect("save source");
+        let (jobs, job_receiver) = bounded(4);
+        let (_result_sender, results) = bounded(4);
+        let context = Context::default();
+        let id = Uuid::new_v4();
+        let mut cache = PreviewCache {
+            jobs,
+            results,
+            entries: HashMap::from([(
+                id,
+                Entry {
+                    base_texture: Some(test_texture(&context, "old-base")),
+                    base_edge: QUICK_LOOK_EDGE,
+                    base_mode: Some(PreviewMode::QuickLook),
+                    ..Default::default()
+                },
+            )]),
+            worker_demands: Arc::new(Mutex::new(HashMap::new())),
+            paths: AppPaths::at(temporary.path()),
+            context: context.clone(),
+            next_request_id: 1,
+            last_eviction: Instant::now(),
+        };
+
+        cache.mark_stale(id);
+        assert!(cache.entries[&id].stale);
+        assert!(
+            cache.entries[&id].base_texture.is_some(),
+            "the old picture must survive going stale — that is the point"
+        );
+
+        // The next paint keeps its texture AND schedules a fresh base decode.
+        let texture = cache.quick_look_texture(id, &source);
+        assert!(texture.is_some(), "no placeholder frame is ever shown");
+        let entry = &cache.entries[&id];
+        assert!(
+            entry.pending.is_some(),
+            "a revalidating decode must have been scheduled"
+        );
+        let queued = job_receiver.try_recv().expect("job reaches the worker");
+        assert_eq!(queued.mode, PreviewMode::QuickLook);
+        assert_eq!(queued.edge, QUICK_LOOK_EDGE);
+    }
+
+    #[test]
+    fn a_fresh_base_clears_staleness_and_drops_the_outdated_detail_layer() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (jobs, _job_receiver) = bounded(4);
+        let (result_sender, results) = bounded(4);
+        let context = Context::default();
+        let id = Uuid::new_v4();
+        let old_base = test_texture(&context, "old-base");
+        let old_base_id = old_base.id();
+        let mut cache = PreviewCache {
+            jobs,
+            results,
+            entries: HashMap::from([(
+                id,
+                Entry {
+                    base_texture: Some(old_base),
+                    base_edge: IMAGE_BASE_EDGE,
+                    base_mode: Some(PreviewMode::Image),
+                    detail_texture: Some(test_texture(&context, "old-detail")),
+                    detail_edge: 1_024,
+                    detail_bytes: 4,
+                    stale: true,
+                    pending: Some(PendingRequest {
+                        id: 7,
+                        edge: IMAGE_BASE_EDGE,
+                        mode: PreviewMode::Image,
+                        estimated_bytes: 4,
+                    }),
+                    ..Default::default()
+                },
+            )]),
+            worker_demands: Arc::new(Mutex::new(HashMap::new())),
+            paths: AppPaths::at(temporary.path()),
+            context: context.clone(),
+            next_request_id: 8,
+            last_eviction: Instant::now(),
+        };
+
+        result_sender
+            .send(PreviewResult::Ready(PreviewPixels {
+                id,
+                request_id: 7,
+                mode: PreviewMode::Image,
+                edge: IMAGE_BASE_EDGE,
+                size: [1, 1],
+                rgba: vec![5, 6, 7, 255],
+                intrinsic_size: None,
+            }))
+            .expect("deliver replacement");
+        cache.poll(&context);
+
+        let entry = &cache.entries[&id];
+        assert!(!entry.stale, "the replacement clears staleness");
+        let new_base = entry.base_texture.as_ref().expect("fresh base resident");
+        assert_ne!(new_base.id(), old_base_id, "the texture was replaced");
+        assert!(
+            entry.detail_texture.is_none() && entry.detail_edge == 0 && entry.detail_bytes == 0,
+            "the outdated detail layer must not keep covering the new base"
+        );
+    }
+
+    #[test]
+    fn marking_a_textureless_entry_stale_is_a_hard_invalidate() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let (jobs, _job_receiver) = bounded(1);
+        let (_result_sender, results) = bounded(1);
+        let id = Uuid::new_v4();
+        let mut cache = PreviewCache {
+            jobs,
+            results,
+            entries: HashMap::from([(id, Entry::default())]),
+            worker_demands: Arc::new(Mutex::new(HashMap::new())),
+            paths: AppPaths::at(temporary.path()),
+            context: Context::default(),
+            next_request_id: 1,
+            last_eviction: Instant::now(),
+        };
+        cache.mark_stale(id);
+        assert!(
+            !cache.entries.contains_key(&id),
+            "nothing to preserve means nothing to keep half-alive"
+        );
+        // And a tile never seen at all is a no-op, not a panic.
+        cache.mark_stale(Uuid::new_v4());
     }
 
     #[test]

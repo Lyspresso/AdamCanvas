@@ -14,6 +14,7 @@ path = "src/main.rs"
 anyhow = "1.0"
 arboard = { version = "3.6", features = ["image-data"] }
 bytemuck = { version = "1.24", features = ["derive"] }
+calamine = "0.36.1"
 crossbeam-channel = "0.5"
 dirs = "6.0"
 eframe = { version = "0.35", default-features = false, features = [
@@ -35,13 +36,16 @@ image = { version = "0.25", default-features = false, features = [
 libc = "0.2"
 log = "0.4"
 open = "5.3"
+quick-xml = "0.41.0"
 rfd = "0.17"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 thiserror = "2.0"
+umya-spreadsheet = "3.0.1"
 ureq = { version = "3.3", features = ["json"] }
 url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v4"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
@@ -90,6 +94,7 @@ objc2-vision = { version = "0.3", default-features = false, features = [
 winit = { version = "0.30", default-features = false }
 
 [dev-dependencies]
+rust_xlsxwriter = "0.97.0"
 tempfile = "3.20"
 
 [profile.dev]

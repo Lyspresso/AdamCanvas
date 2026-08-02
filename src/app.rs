@@ -42,6 +42,9 @@ use crate::{
         resolve_pile_memberships,
     },
     dots::{self, ChromeRects},
+    file_watch::{self, FileWatch},
+    grid_view::{self, CellShape, GridViewState, Lightbox, ZoomMode},
+    live_sheet::{self, LiveSheetMirror, MirrorOutcome},
     model::{
         CanvasPage, CanvasTileStyle, DEFAULT_TILE_SIZE, FileKind, PageViewState, Tile, TileContent,
         TileKind, Workspace, WorldRect,
@@ -57,14 +60,18 @@ use crate::{
     },
     platform,
     preview::PreviewCache,
+    sheet_view::{self, SheetFonts, SheetMetrics, SheetPalette, SheetViewState},
     spatial::{DEFAULT_CELL_SIZE, SpatialIndex},
+    spreadsheet,
     structured_preview::{StructuredPreview, StructuredPreviewCache},
 };
 use crossbeam_channel::{Receiver, Sender, bounded};
 use egui::{
     Align, Align2, Button, Color32, Context, CornerRadius, CursorIcon, FontData, FontDefinitions,
     FontFamily, FontId, Frame, Id, Key, Layout, Margin, Painter, PointerButton, Pos2, Rect,
-    Response, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2, pos2, vec2,
+    Response, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
+    epaint::text::{FontInsert, FontPriority, InsertFontFamily},
+    pos2, vec2,
 };
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use std::{
@@ -585,6 +592,7 @@ struct AiTilePreview {
 #[derive(Clone, Copy, Debug)]
 enum TileAction {
     Open(Uuid),
+    OpenInGridView(Uuid),
     QuickLook(Uuid),
     Reveal(Uuid),
     Copy(Uuid),
@@ -621,6 +629,7 @@ enum CanvasMenuAction {
     FitPage,
     FitContent,
     ToggleGrid,
+    ToggleGridView,
     ToggleSnap,
 }
 
@@ -969,10 +978,39 @@ pub struct AdamApp {
     photo_ocr_started: HashMap<Uuid, Instant>,
     photo_file_facts: HashMap<Uuid, PhotoFileFacts>,
     last_automation_tick: Instant,
+    file_watch: FileWatch,
+    last_file_watch: Instant,
+    /// Workbooks shown as live grids in the lightbox, keyed by tile.
+    /// `None` records a failed load so a broken file is not re-parsed
+    /// every frame; the file watcher evicts entries when the file on
+    /// disk changes, which is what makes an Excel save appear here.
+    sheets: HashMap<Uuid, Option<spreadsheet::Workbook>>,
+    sheet_states: HashMap<Uuid, SheetViewState>,
+    /// Mirrors the open lightbox's workbook live from Excel, unsaved
+    /// edits included. The save-watcher stays the fallback whenever the
+    /// workbook is not open there.
+    live_sheet: LiveSheetMirror,
+    last_live_poll: Instant,
+    live_in_flight: bool,
+    live_last_hash: HashMap<Uuid, u64>,
+    live_updated_at: HashMap<Uuid, Instant>,
+    live_blocked: bool,
+    /// Bounded corner snapshots drawn on spreadsheet tiles in place of the
+    /// Quick Look image whenever parsed (and possibly live) data exists —
+    /// through the same styled renderer as the lightbox, at tile scale.
+    sheet_tile_snapshots: HashMap<Uuid, (spreadsheet::Sheet, SheetFonts)>,
+    /// Fonts registered with egui by family name, resolved from files the
+    /// workbook names (Excel bundles its own). `None` records a miss.
+    sheet_font_cache: HashMap<String, Option<FontFamily>>,
+    /// Round-robin cursor over the canvas's spreadsheet tiles.
+    live_rotation: usize,
     last_automation_persist: Instant,
     automation_initialized: bool,
     semantic_reconcile_needed: bool,
     show_grid: bool,
+    /// Contact-sheet lens over the active page. `None` is the ordinary spatial
+    /// canvas; the grid never writes tile geometry, so toggling is free.
+    grid_view: Option<GridViewState>,
     snap_to_grid: bool,
     preferences: AppPreferences,
     dots_available: bool,
@@ -1203,6 +1241,7 @@ impl AdamApp {
         let saves = SaveWorker::start_with_base(paths.clone(), persistence_base);
         let previews = PreviewCache::start(paths.clone(), creation.egui_ctx.clone());
         let structured_previews = StructuredPreviewCache::start(creation.egui_ctx.clone());
+        let live_sheet = LiveSheetMirror::start(creation.egui_ctx.clone());
         let (image_paste_jobs, image_paste_results) =
             start_image_paste_worker(creation.egui_ctx.clone());
         let (asset_import_jobs, asset_import_results) =
@@ -1289,10 +1328,24 @@ impl AdamApp {
             photo_ocr_started: HashMap::new(),
             photo_file_facts: HashMap::new(),
             last_automation_tick: Instant::now(),
+            file_watch: FileWatch::default(),
+            last_file_watch: Instant::now(),
+            sheets: HashMap::new(),
+            sheet_states: HashMap::new(),
+            live_sheet,
+            last_live_poll: Instant::now(),
+            live_in_flight: false,
+            live_last_hash: HashMap::new(),
+            live_updated_at: HashMap::new(),
+            live_blocked: false,
+            sheet_tile_snapshots: HashMap::new(),
+            sheet_font_cache: HashMap::new(),
+            live_rotation: 0,
             last_automation_persist: Instant::now(),
             automation_initialized: false,
             semantic_reconcile_needed: true,
             show_grid: false,
+            grid_view: None,
             snap_to_grid: false,
             preferences,
             dots_available,
@@ -1867,6 +1920,202 @@ impl AdamApp {
         }
     }
 
+    /// Keeps the canvas live against the disk: when a file behind a tile is
+    /// saved by another application, its previews are rebuilt immediately.
+    fn poll_file_watch(&mut self, context: &Context) {
+        // egui runs frames only on events, and an untouched Adam sitting
+        // behind Excel receives none — the very moment this watcher exists
+        // for. The heartbeat guarantees a frame each interval so the poll
+        // below actually runs while the user is away.
+        context.request_repaint_after(file_watch::POLL_INTERVAL);
+        if self.last_file_watch.elapsed() < file_watch::POLL_INTERVAL {
+            return;
+        }
+        self.last_file_watch = Instant::now();
+
+        // Only the active page: it is what is on screen, and it bounds the
+        // stat count to tens rather than the whole library.
+        let files: Vec<(Uuid, PathBuf)> = self
+            .workspace
+            .active_page()
+            .tiles
+            .iter()
+            .filter_map(|tile| match &tile.content {
+                TileContent::File { path, .. } => Some((tile.id, path.clone())),
+                _ => None,
+            })
+            .collect();
+        let mut any_changed = false;
+        for (id, path) in files {
+            let mtime = file_watch::modification_time(&path);
+            if self.file_watch.observe(id, mtime) == file_watch::Observation::Changed {
+                // Stale, not invalidated: the old picture keeps showing until
+                // its replacement is decoded, so an external save updates the
+                // tile without ever flashing the default placeholder.
+                self.previews.mark_stale(id);
+                self.structured_previews.mark_stale(id);
+                // Drop the parsed workbook but keep its view state, so a
+                // sheet open in the lightbox reloads in place with the same
+                // scroll position and selected cell. Its reload is a
+                // synchronous parse, so there is no blank frame to bridge.
+                self.sheets.remove(&id);
+                any_changed = true;
+            }
+        }
+        if any_changed {
+            context.request_repaint();
+        }
+    }
+
+    /// Feeds the sheet view from Excel's in-memory workbook while its file's
+    /// lightbox is open — edits mirror as they are typed, before any save.
+    fn poll_live_sheet(&mut self, context: &Context) {
+        // Results first, whatever the request cadence.
+        while let Some(result) = self.live_sheet.poll() {
+            self.live_in_flight = false;
+            match result.outcome {
+                MirrorOutcome::Updated(boxed_sheet) => {
+                    let sheet = *boxed_sheet;
+                    let unchanged =
+                        self.live_last_hash.get(&result.tile) == Some(&result.payload_hash);
+                    if unchanged {
+                        continue;
+                    }
+                    match self.sheets.get_mut(&result.tile) {
+                        Some(Some(workbook)) => {
+                            let slot = workbook
+                                .sheets
+                                .iter_mut()
+                                .find(|candidate| candidate.name == sheet.name);
+                            if let Some(slot) = slot {
+                                // The live payload has no styling; the last
+                                // disk parse's stays on, worn by position.
+                                let styling = slot.styling.take();
+                                *slot = sheet;
+                                slot.styling = styling;
+                            } else if let Some(first) = workbook.sheets.first_mut() {
+                                let styling = first.styling.take();
+                                *first = sheet;
+                                first.styling = styling;
+                            } else {
+                                workbook.sheets.push(sheet);
+                            }
+                        }
+                        // No parse from disk yet (or evicted after a save):
+                        // the live data itself becomes the cache, wearing
+                        // styling re-read from the file — which, in the
+                        // evicted-after-save case, just changed and is
+                        // exactly the styling to wear.
+                        _ => {
+                            let mut sheet = sheet;
+                            if sheet.styling.is_none()
+                                && let Some(path) = self.tile_path(result.tile)
+                            {
+                                sheet.styling = crate::sheet_style::load(
+                                    &path,
+                                    &sheet.name,
+                                    0,
+                                    sheet.rows,
+                                    sheet.columns,
+                                );
+                            }
+                            self.sheets.insert(
+                                result.tile,
+                                Some(spreadsheet::Workbook {
+                                    sheets: vec![sheet],
+                                    truncated_sheets: false,
+                                    source_sheet_count: 1,
+                                }),
+                            );
+                        }
+                    }
+                    self.refresh_sheet_snapshot(context, result.tile);
+                    self.live_last_hash.insert(result.tile, result.payload_hash);
+                    self.live_updated_at.insert(result.tile, Instant::now());
+                    context.request_repaint();
+                }
+                MirrorOutcome::PermissionDenied => {
+                    if !self.live_blocked {
+                        self.live_blocked = true;
+                        self.toast(
+                            "Live Excel mirroring needs permission: System Settings →                              Privacy & Security → Automation → Adam → Microsoft Excel",
+                            context,
+                        );
+                    }
+                }
+                MirrorOutcome::TooBig | MirrorOutcome::Unavailable => {}
+                MirrorOutcome::Failed(error) => {
+                    log::debug!("live sheet mirror: {error}");
+                }
+            }
+        }
+
+        if self.live_blocked
+            || self.live_in_flight
+            || self.last_live_poll.elapsed() < live_sheet::POLL_INTERVAL
+        {
+            return;
+        }
+        // The expanded lightbox sheet has priority; otherwise every
+        // spreadsheet tile on the active page takes its turn, one per tick —
+        // Excel itself bounds how many can actually be open there.
+        let lightbox_tile = self.grid_view.and_then(|state| {
+            let lightbox = state.lightbox?;
+            self.workspace
+                .active_page()
+                .tiles
+                .get(lightbox.index)
+                .and_then(|tile| match &tile.content {
+                    TileContent::File { path, .. } if spreadsheet::is_spreadsheet(path) => {
+                        Some((tile.id, path.clone()))
+                    }
+                    _ => None,
+                })
+        });
+        let (tile, path) = match lightbox_tile {
+            Some(target) => target,
+            None => {
+                let candidates: Vec<(Uuid, PathBuf)> = self
+                    .workspace
+                    .active_page()
+                    .tiles
+                    .iter()
+                    .filter_map(|tile| match &tile.content {
+                        TileContent::File { path, .. } if spreadsheet::is_spreadsheet(path) => {
+                            Some((tile.id, path.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if candidates.is_empty() {
+                    return;
+                }
+                self.live_rotation = self.live_rotation.wrapping_add(1);
+                candidates[self.live_rotation % candidates.len()].clone()
+            }
+        };
+        // The cached workbook names the sheet on display; without one, Excel's
+        // own active sheet is the right guess and the script falls back to it.
+        let sheet_index = self
+            .sheet_states
+            .get(&tile)
+            .map(|state| state.sheet)
+            .unwrap_or(0);
+        let sheet_name = self
+            .sheets
+            .get(&tile)
+            .and_then(|workbook| workbook.as_ref())
+            .and_then(|workbook| workbook.sheet(sheet_index))
+            .map(|sheet| sheet.name.clone())
+            .unwrap_or_default();
+        self.last_live_poll = Instant::now();
+        self.live_in_flight = self.live_sheet.request(live_sheet::PollRequest {
+            tile,
+            path,
+            sheet_name,
+        });
+    }
+
     fn poll_automation(&mut self, context: &Context) {
         let has_running_rule = self.workspace.domain.piles.values().any(|pile| {
             pile.auto_tag_rule
@@ -2407,6 +2656,17 @@ impl AdamApp {
         }
 
         let command = context.input(|input| input.modifiers.command);
+
+        // The grid view is a modal lens: it owns the keyboard while it is up,
+        // so canvas shortcuts cannot delete or move tiles you cannot see.
+        if !command && context.input(|input| input.key_pressed(Key::G)) {
+            self.toggle_grid_view();
+        }
+        if self.grid_view.is_some() {
+            self.handle_grid_view_shortcuts(context);
+            return;
+        }
+
         let import_pressed =
             context.input(|input| input.key_pressed(Key::I) || input.key_pressed(Key::O));
         if command && import_pressed {
@@ -2505,6 +2765,9 @@ impl AdamApp {
         let mut fit_clicked = false;
         let mut fit_content_clicked = false;
         let mut reset_zoom_clicked = false;
+        let mut grid_shape_clicked = None;
+        let mut grid_mode_clicked = None;
+        let mut grid_edit_clicked = false;
 
         let toolbar = egui::Panel::top("adam-toolbar")
             .exact_size(TOOLBAR_HEIGHT)
@@ -2555,19 +2818,83 @@ impl AdamApp {
                         }
                     });
                     ui.separator();
-                    fit_clicked = ui
-                        .add(Button::new("Fit page"))
-                        .on_hover_text("Show the entire canvas (Command-0)")
-                        .clicked();
-                    fit_content_clicked = ui
-                        .add(Button::new("Fit content"))
-                        .on_hover_text("Resize the canvas around every tile")
-                        .clicked();
-                    let zoom = self.active_camera().zoom;
-                    reset_zoom_clicked = ui
-                        .add(Button::new(format!("{:.0}%", zoom * 100.0)))
-                        .on_hover_text("Reset zoom to 100%")
-                        .clicked();
+                    // In the grid view the canvas fit controls address a
+                    // camera the user cannot see, so the cell-shape toggle
+                    // takes their place.
+                    if let Some(grid) = self.grid_view {
+                        for shape in [CellShape::Square, CellShape::Portrait] {
+                            let selected = grid.shape == shape;
+                            if ui
+                                .add(Button::new(shape.label()).selected(selected))
+                                .on_hover_text(match shape {
+                                    CellShape::Square => "Crop every tile to a square",
+                                    CellShape::Portrait => "Crop every tile to 2:3 portrait",
+                                })
+                                .clicked()
+                            {
+                                grid_shape_clicked = Some(shape);
+                            }
+                        }
+                        ui.separator();
+                        if ui
+                            .add(Button::new("Edit").selected(grid.editing))
+                            .on_hover_text(if grid.editing {
+                                "On: clicking a tile edits it. Notes open a text \
+                                 field here; documents and spreadsheets open in \
+                                 the app that owns them. Click to go back to \
+                                 browsing."
+                            } else {
+                                "Off: clicking a tile opens it to look at. Click \
+                                 to edit tiles instead."
+                            })
+                            .clicked()
+                        {
+                            grid_edit_clicked = true;
+                        }
+                        ui.separator();
+                        // Two opt-in modes; clicking the active one returns to
+                        // the plain magnifying wall.
+                        for (mode, hover) in [
+                            (
+                                ZoomMode::Reflow,
+                                "Zooming out packs more columns in rather than \
+                                 shrinking the wall",
+                            ),
+                            (
+                                ZoomMode::Wall,
+                                "A fixed 20-wide wall, opening 8 across — roam it \
+                                 in any direction, or zoom out to take it all in",
+                            ),
+                        ] {
+                            let active = grid.mode == mode;
+                            if ui
+                                .add(Button::new(mode.label()).selected(active))
+                                .on_hover_text(hover)
+                                .clicked()
+                            {
+                                grid_mode_clicked =
+                                    Some(if active { ZoomMode::Magnify } else { mode });
+                            }
+                        }
+                        reset_zoom_clicked = ui
+                            .add(Button::new(format!("{:.0}%", grid.camera.zoom * 100.0)))
+                            .on_hover_text("Reset the grid to 100% (Command-0)")
+                            .clicked();
+                    } else {
+                        fit_clicked = ui
+                            .add(Button::new("Fit page"))
+                            .on_hover_text("Show the entire canvas (Command-0)")
+                            .clicked();
+                        fit_content_clicked = ui
+                            .add(Button::new("Fit content"))
+                            .on_hover_text("Resize the canvas around every tile")
+                            .clicked();
+                        let zoom = self.active_camera().zoom;
+                        reset_zoom_clicked = ui
+                            .add(Button::new(format!("{:.0}%", zoom * 100.0)))
+                            .on_hover_text("Reset zoom to 100%")
+                            .clicked();
+                    }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let page_size = self.workspace.active_page().size;
@@ -2757,10 +3084,28 @@ impl AdamApp {
         if fit_content_clicked {
             self.fit_content(&context);
         }
+        if let Some(shape) = grid_shape_clicked {
+            self.set_grid_cell_shape(shape);
+        }
+        if let Some(mode) = grid_mode_clicked {
+            self.set_grid_zoom_mode(mode);
+        }
+        if grid_edit_clicked && let Some(state) = &mut self.grid_view {
+            state.editing = !state.editing;
+            if !state.editing {
+                // Leaving edit mode abandons any open text field.
+                self.editing_note = None;
+                self.editing_focus_pending = None;
+            }
+        }
         if reset_zoom_clicked {
-            let mut camera = self.active_camera();
-            camera.zoom = 1.0;
-            self.set_active_camera(camera);
+            if self.grid_view.is_some() {
+                self.reset_grid_view_zoom();
+            } else {
+                let mut camera = self.active_camera();
+                camera.zoom = 1.0;
+                self.set_active_camera(camera);
+            }
         }
         toolbar.response.rect
     }
@@ -3365,6 +3710,10 @@ impl AdamApp {
     }
 
     fn show_canvas(&mut self, root: &mut Ui) {
+        if self.grid_view.is_some() {
+            self.show_grid_view(root);
+            return;
+        }
         let context = root.ctx().clone();
         let colors = self.theme(&context);
         egui::CentralPanel::default()
@@ -3513,6 +3862,7 @@ impl AdamApp {
                     let selection = &self.selection;
                     let previews = &mut self.previews;
                     let structured_previews = &mut self.structured_previews;
+                    let sheet_snapshots = &self.sheet_tile_snapshots;
                     for index in render_indices {
                         let Some(tile) = page.tiles.get(index) else {
                             continue;
@@ -3569,6 +3919,7 @@ impl AdamApp {
                             pile_controls_enabled,
                             previews,
                             structured_previews,
+                            sheet_snapshots.get(&tile.id),
                             &page_targets,
                             colors,
                         );
@@ -3649,6 +4000,10 @@ impl AdamApp {
                         canvas_action = Some(CanvasMenuAction::FitContent);
                         ui.close();
                     }
+                    if ui.button("Grid View").clicked() {
+                        canvas_action = Some(CanvasMenuAction::ToggleGridView);
+                        ui.close();
+                    }
                     ui.separator();
                     if ui
                         .button(if self.show_grid {
@@ -3697,10 +4052,787 @@ impl AdamApp {
                     Some(CanvasMenuAction::FitPage) => self.fit_page(),
                     Some(CanvasMenuAction::FitContent) => self.fit_content(&context),
                     Some(CanvasMenuAction::ToggleGrid) => self.show_grid = !self.show_grid,
+                    Some(CanvasMenuAction::ToggleGridView) => self.toggle_grid_view(),
                     Some(CanvasMenuAction::ToggleSnap) => self.snap_to_grid = !self.snap_to_grid,
                     None => {}
                 }
             });
+    }
+
+    /// Renders the contact-sheet lens over the active page.
+    ///
+    /// This is a read-only view of tile geometry: nothing here writes
+    /// `tile.rect`, so leaving the grid restores the spatial arrangement
+    /// untouched.
+    fn show_grid_view(&mut self, root: &mut Ui) {
+        let context = root.ctx().clone();
+        let colors = self.theme(&context);
+        let reduce_motion = self.reduce_motion;
+        egui::CentralPanel::default()
+            .frame(Frame::NONE.fill(colors.desk))
+            .show(root, |ui| {
+                let available = ui.available_size().max(Vec2::splat(1.0));
+                let (response, base_painter) =
+                    ui.allocate_painter(available, Sense::click_and_drag());
+                let view = response.rect;
+                let painter = base_painter.with_clip_rect(view);
+                self.last_canvas_rect = Some(view);
+
+                let Some(mut state) = self.grid_view else {
+                    return;
+                };
+                let count = self.workspace.active_page().tiles.len();
+
+                // Tiles can be deleted or the page switched while the grid is
+                // open. Re-anchor the lightbox rather than indexing past the
+                // end of the new page.
+                if let Some(lightbox) = &mut state.lightbox {
+                    if count == 0 {
+                        state.lightbox = None;
+                    } else if lightbox.index >= count {
+                        lightbox.index = count - 1;
+                    }
+                }
+
+                if let Some(lightbox) = &mut state.lightbox {
+                    let delta = context.input(|input| input.stable_dt);
+                    if !lightbox.advance(delta, reduce_motion) {
+                        state.lightbox = None;
+                    } else if lightbox.is_animating() {
+                        context.request_repaint();
+                    }
+                }
+
+                // Camera gestures mirror the canvas: pinch or Command-scroll
+                // zooms about the pointer, a plain scroll pans both axes, and
+                // dragging moves the wall. An open lightbox owns the input so
+                // the photo does not slide out from under itself.
+                if state.lightbox.is_none() {
+                    if response.contains_pointer() {
+                        let pointer = context
+                            .input(|input| input.pointer.hover_pos())
+                            .unwrap_or_else(|| view.center());
+                        let zoom_delta = context.input(|input| input.zoom_delta());
+                        if zoom_delta != 1.0 {
+                            state.apply_zoom(zoom_delta, pointer, view, count);
+                        } else {
+                            let scroll = context.input(|input| input.smooth_scroll_delta);
+                            if scroll != Vec2::ZERO {
+                                state.camera.offset -= scroll / state.camera.zoom;
+                            }
+                        }
+                    }
+                    if response.dragged_by(PointerButton::Primary)
+                        || response.dragged_by(PointerButton::Middle)
+                    {
+                        state.camera.offset -= response.drag_delta() / state.camera.zoom;
+                        context.set_cursor_icon(CursorIcon::Grabbing);
+                    }
+                }
+                // Zooming may have re-flowed the wall out from under the
+                // metrics above, so re-derive before clamping or hit-testing.
+                let metrics = state.metrics(view.width(), count);
+                state.camera = state.camera.clamped(metrics.content, view);
+
+                let hovered = if state.lightbox.is_some() {
+                    None
+                } else {
+                    context
+                        .input(|input| input.pointer.hover_pos())
+                        .filter(|pointer| view.contains(*pointer))
+                        .and_then(|pointer| metrics.index_at(state.camera.to_layout(pointer, view)))
+                };
+                if hovered.is_some() && !response.dragged() {
+                    context.set_cursor_icon(CursorIcon::PointingHand);
+                }
+
+                let pixels_per_point = context.pixels_per_point().max(1.0);
+                let focused = state.lightbox.map(|lightbox| lightbox.index);
+                let cell_aspect = state.shape.aspect();
+                let zoom = state.camera.zoom;
+                let top = state.camera.offset.y;
+                let visible = metrics.visible_range(top, top + state.camera.visible_size(view).y);
+
+                {
+                    let page = self.workspace.active_page();
+                    let selection = &self.selection;
+                    let previews = &mut self.previews;
+                    for index in visible {
+                        let Some(tile) = page.tiles.get(index) else {
+                            continue;
+                        };
+                        let rect = state.camera.to_screen(metrics.cell_rect(index), view);
+                        if !rect.intersects(view) {
+                            continue;
+                        }
+                        if focused == Some(index) {
+                            // The lightbox paints this tile itself. Leave the
+                            // slot showing so the wall keeps its shape.
+                            painter.rect_filled(
+                                rect,
+                                CornerRadius::same(4),
+                                color_with_alpha(colors.tile, 90),
+                            );
+                            continue;
+                        }
+                        draw_grid_cell(
+                            &painter,
+                            rect,
+                            tile,
+                            previews,
+                            pixels_per_point,
+                            cell_aspect,
+                            zoom,
+                            hovered == Some(index),
+                            selection.contains(&tile.id),
+                            colors,
+                        );
+                    }
+                }
+
+                if count == 0 {
+                    painter.text(
+                        view.center(),
+                        Align2::CENTER_CENTER,
+                        "This page has no tiles yet.",
+                        FontId::proportional(15.0),
+                        colors.tertiary_text,
+                    );
+                }
+
+                let mut pending_activation = None;
+                let mut expanded_photo = None;
+                let mut sheet_to_show = None;
+                if let Some(lightbox) = state.lightbox {
+                    let page = self.workspace.active_page();
+                    if let Some(tile) = page.tiles.get(lightbox.index) {
+                        let cell = state
+                            .camera
+                            .to_screen(metrics.cell_rect(lightbox.index), view);
+                        let photo = draw_grid_lightbox(
+                            &painter,
+                            view,
+                            cell,
+                            tile,
+                            lightbox,
+                            &mut self.previews,
+                            pixels_per_point,
+                            cell_aspect,
+                            state.editing && self.editing_note == Some(tile.id),
+                            colors,
+                        );
+                        draw_grid_lightbox_caption(&painter, photo, tile, lightbox, colors);
+                        expanded_photo = Some(photo);
+                        // A spreadsheet's expanded form is the sheet itself,
+                        // browse mode included — the file preview only bridges
+                        // the open animation.
+                        if !lightbox.is_animating()
+                            && let TileContent::File { path, .. } = &tile.content
+                            && spreadsheet::is_spreadsheet(path)
+                        {
+                            sheet_to_show = Some((tile.id, path.clone(), photo));
+                        }
+                    }
+                }
+
+                draw_grid_view_hint(
+                    &painter,
+                    view,
+                    count,
+                    state.shape,
+                    state.mode,
+                    state.editing,
+                    state.camera.zoom,
+                    state.lightbox.is_some(),
+                    colors,
+                );
+
+                if response.clicked() {
+                    if state.lightbox.is_some() {
+                        // Only the backdrop dismisses. Clicking the photo you
+                        // just opened should not close it again.
+                        let on_photo = context
+                            .input(|input| input.pointer.interact_pos())
+                            .zip(expanded_photo)
+                            .is_some_and(|(pointer, photo)| photo.contains(pointer));
+                        if !on_photo && let Some(lightbox) = &mut state.lightbox {
+                            lightbox.begin_close();
+                        }
+                    } else if let Some(index) = context
+                        .input(|input| input.pointer.interact_pos())
+                        .and_then(|pointer| metrics.index_at(state.camera.to_layout(pointer, view)))
+                    {
+                        state.lightbox = Some(Lightbox::opening(index));
+                        context.request_repaint();
+                        if state.editing {
+                            pending_activation =
+                                self.workspace.active_page().tiles.get(index).map(|tile| {
+                                    (tile.id, matches!(tile.content, TileContent::Note { .. }))
+                                });
+                        }
+                    }
+                }
+
+                // A note is edited here, in the expanded cell. Everything else
+                // is handed to whatever already owns it — Word for a .docx,
+                // Excel for a .xlsx, the pile and tag sheets for those. Adam
+                // has no rich-text or spreadsheet engine of its own.
+                if let Some((id, is_note)) = pending_activation {
+                    if is_note {
+                        self.checkpoint();
+                        self.editing_note = Some(id);
+                        self.editing_focus_pending = Some(id);
+                    } else {
+                        self.activate_tile(id);
+                        // The file may come back changed; keep showing the
+                        // old preview until the watcher notices and its
+                        // replacement is decoded.
+                        self.previews.mark_stale(id);
+                        self.structured_previews.mark_stale(id);
+                    }
+                }
+
+                if state.editing
+                    && let Some(id) = self.editing_note
+                    && let Some(photo) = expanded_photo
+                    && state
+                        .lightbox
+                        .is_some_and(|lightbox| lightbox.progress >= 1.0)
+                {
+                    self.show_grid_note_editor(ui, &context, id, photo, colors);
+                }
+
+                if let Some((id, path, photo)) = sheet_to_show {
+                    self.show_grid_sheet(ui, &context, id, &path, photo, colors);
+                }
+
+                self.grid_view = Some(state);
+            });
+    }
+
+    /// Draws a workbook as a live, scrollable grid inside the expanded
+    /// lightbox cell. Read-only by design: Excel is the editor, Adam is the
+    /// live view. The file watcher evicts the parsed workbook when the file
+    /// changes on disk, so a save in Excel appears here within a second,
+    /// keeping the same scroll position and selected cell.
+    fn show_grid_sheet(
+        &mut self,
+        ui: &mut Ui,
+        context: &Context,
+        id: Uuid,
+        path: &Path,
+        rect: Rect,
+        colors: Theme,
+    ) {
+        // Parse lazily, and cache failure so a broken file is not re-read
+        // every frame. A failed load leaves the Quick Look preview showing,
+        // with the reason in the corner.
+        let freshly_parsed = !self.sheets.contains_key(&id);
+        self.sheets
+            .entry(id)
+            .or_insert_with(|| match spreadsheet::load(path) {
+                Ok(workbook) => Some(workbook),
+                Err(error) => {
+                    log::warn!("could not read {} as a sheet: {error:#}", path.display());
+                    None
+                }
+            });
+        if freshly_parsed {
+            // The tile mirrors what the lightbox has parsed, so closing the
+            // lightbox leaves the tile showing the same data.
+            self.refresh_sheet_snapshot(context, id);
+        }
+        // Fonts are resolved before the long workbook borrow below — the
+        // resolver mutates the font cache and possibly egui's font set.
+        let font_info = self
+            .sheets
+            .get(&id)
+            .and_then(|workbook| workbook.as_ref())
+            .and_then(|workbook| {
+                let index = self
+                    .sheet_states
+                    .get(&id)
+                    .map(|state| state.sheet)
+                    .unwrap_or(0);
+                workbook.sheet(index).or_else(|| workbook.sheet(0))
+            })
+            .and_then(|sheet| sheet.styling.as_ref())
+            .map(|styling| {
+                (
+                    styling.default_font_name.clone(),
+                    styling.default_font_points,
+                )
+            });
+        let fonts = match font_info {
+            Some((name, size)) => self.resolve_fonts_by_info(context, name, size),
+            None => SheetFonts::default(),
+        };
+        let workbook = self.sheets.get(&id).expect("entry just ensured");
+        let Some(workbook) = workbook else {
+            ui.painter().text(
+                pos2(rect.left() + 8.0, rect.bottom() + 16.0),
+                Align2::LEFT_CENTER,
+                "Could not read this file as a spreadsheet — showing its preview instead",
+                FontId::proportional(11.5),
+                colors.chrome_secondary_text,
+            );
+            return;
+        };
+
+        let mut state = self.sheet_states.get(&id).copied().unwrap_or_default();
+        if state.sheet >= workbook.sheets.len() {
+            state.sheet = 0;
+        }
+        let Some(sheet) = workbook.sheet(state.sheet) else {
+            return;
+        };
+
+        // One digit of the cell font is what the metrics need to size
+        // columns without knowing about fonts.
+        let character_width = ui
+            .painter()
+            .layout_no_wrap("0".into(), FontId::proportional(12.0), Color32::WHITE)
+            .size()
+            .x;
+        let metrics = SheetMetrics::measure(sheet, character_width);
+
+        let response = ui.allocate_rect(rect, Sense::click_and_drag());
+        let body = Rect::from_min_max(
+            pos2(
+                rect.left() + metrics.row_header_width,
+                rect.top() + metrics.column_header_height,
+            ),
+            rect.max,
+        );
+        let viewport = body.size();
+
+        if response.contains_pointer() {
+            let scroll = context.input(|input| input.smooth_scroll_delta);
+            if scroll != Vec2::ZERO {
+                state.scroll -= scroll;
+            }
+        }
+        if response.dragged_by(PointerButton::Primary) {
+            state.scroll -= response.drag_delta();
+        }
+        state.scroll = metrics.clamp_scroll(state.scroll, viewport);
+
+        if response.clicked()
+            && let Some(pointer) = context.input(|input| input.pointer.interact_pos())
+            && body.contains(pointer)
+            && let Some((row, column)) =
+                metrics.cell_at((pointer - body.min + state.scroll).to_pos2())
+        {
+            state.selection = sheet_view::Selection { row, column };
+        }
+
+        // Double-click anywhere in the sheet hands the file to its editor
+        // (deferred past the workbook borrow).
+        let open_externally = response.double_clicked();
+
+        let (left, right, up, down) = context.input(|input| {
+            (
+                input.key_pressed(Key::ArrowLeft),
+                input.key_pressed(Key::ArrowRight),
+                input.key_pressed(Key::ArrowUp),
+                input.key_pressed(Key::ArrowDown),
+            )
+        });
+        if left || right || up || down {
+            state.selection.step(
+                isize::from(down) - isize::from(up),
+                isize::from(right) - isize::from(left),
+                sheet.rows,
+                sheet.columns,
+            );
+            state.scroll = metrics.scroll_to_reveal(
+                state.selection.row,
+                state.selection.column,
+                viewport,
+                state.scroll,
+            );
+        }
+
+        sheet_view::draw(
+            ui.painter(),
+            rect,
+            sheet,
+            &metrics,
+            &state,
+            SheetPalette {
+                surface: colors.tile,
+                header: colors.tile_footer,
+                grid_line: color_with_alpha(colors.tertiary_text, 60),
+                text: colors.text,
+                secondary_text: colors.secondary_text,
+                selection: color_with_alpha(colors.accent, 60),
+                accent: colors.accent,
+            },
+            &fonts,
+            sheet_view::DrawOptions::default(),
+        );
+
+        // Status: selected cell, its formula or value, load truncation, and
+        // how to edit — which is Excel, not Adam.
+        let cell = sheet.cell(state.selection.row, state.selection.column);
+        let mut status = state.selection.reference();
+        if let Some(formula) = cell.and_then(|cell| cell.formula.as_deref()) {
+            status.push_str(&format!("  ={formula}"));
+        } else if let Some(cell) = cell.filter(|cell| !cell.value.is_empty()) {
+            status.push_str(&format!("  {}", truncate(&cell.value.display(), 60)));
+        }
+        if sheet.truncated {
+            status.push_str(&format!(
+                "  ·  showing {}×{} of {}×{}",
+                sheet.rows, sheet.columns, sheet.source_rows, sheet.source_columns
+            ));
+        }
+        let mirrored_live = self
+            .live_updated_at
+            .get(&id)
+            .is_some_and(|at| at.elapsed() < live_sheet::LIVE_BADGE_TTL);
+        status.push_str(if mirrored_live {
+            "  ·  live from Excel — updates as you type"
+        } else {
+            "  ·  live view — double-click to edit; saves appear here"
+        });
+        ui.painter().text(
+            pos2(rect.left() + 8.0, rect.bottom() + 16.0),
+            Align2::LEFT_CENTER,
+            status,
+            FontId::proportional(11.5),
+            colors.chrome_secondary_text,
+        );
+
+        self.sheet_states.insert(id, state);
+        if open_externally {
+            self.open_tile(id);
+        }
+    }
+
+    /// The note text field that Edit mode opens inside the expanded cell.
+    ///
+    /// Separate from `show_note_editor`, which positions itself with the
+    /// canvas camera the grid does not use.
+    fn show_grid_note_editor(
+        &mut self,
+        ui: &mut Ui,
+        context: &Context,
+        id: Uuid,
+        photo: Rect,
+        colors: Theme,
+    ) {
+        let editor_rect = photo.shrink(20.0);
+        if editor_rect.width() < 60.0 || editor_rect.height() < 40.0 {
+            return;
+        }
+        let request_focus = self.editing_focus_pending == Some(id);
+        if request_focus {
+            self.editing_focus_pending = None;
+        }
+        let Some(Tile {
+            content: TileContent::Note { text },
+            ..
+        }) = self.workspace.active_page_mut().tile_mut(id)
+        else {
+            self.editing_note = None;
+            return;
+        };
+        let response = ui.put(
+            editor_rect,
+            TextEdit::multiline(text)
+                .desired_width(editor_rect.width())
+                .desired_rows(6)
+                .frame(Frame::NONE)
+                .hint_text("Type here…")
+                .text_color(colors.text),
+        );
+        if request_focus {
+            response.request_focus();
+        }
+        if response.changed() {
+            self.changed(false);
+        }
+        if context.input(|input| {
+            input.key_pressed(Key::Escape)
+                || (input.modifiers.command && input.key_pressed(Key::Enter))
+        }) {
+            self.editing_note = None;
+            self.editing_focus_pending = None;
+        }
+    }
+
+    /// Resolves the fonts a sheet asks for, registering font files with egui
+    /// on first use. Excel bundles its own faces (Calibri, Aptos) inside its
+    /// app bundle, so the exact family is usually available; a miss falls
+    /// back to the UI font at the right size.
+    fn resolve_sheet_fonts(&mut self, context: &Context, sheet: &spreadsheet::Sheet) -> SheetFonts {
+        let (name, size_points) = sheet
+            .styling
+            .as_ref()
+            .map(|styling| {
+                (
+                    styling.default_font_name.clone(),
+                    styling.default_font_points,
+                )
+            })
+            .unwrap_or((None, None));
+        self.resolve_fonts_by_info(context, name, size_points)
+    }
+
+    fn resolve_fonts_by_info(
+        &mut self,
+        context: &Context,
+        name: Option<String>,
+        size_points: Option<f32>,
+    ) -> SheetFonts {
+        let default_size = crate::sheet_style::typographic_to_egui(size_points.unwrap_or(11.0));
+        let Some(name) = name else {
+            return SheetFonts {
+                default_size,
+                ..SheetFonts::default()
+            };
+        };
+
+        let regular = self.ensure_font_family(context, &name, false);
+        let bold = self
+            .ensure_font_family(context, &name, true)
+            .or_else(|| regular.clone());
+        SheetFonts {
+            regular: regular.unwrap_or(FontFamily::Proportional),
+            bold: bold.unwrap_or(FontFamily::Proportional),
+            default_size,
+        }
+    }
+
+    fn ensure_font_family(
+        &mut self,
+        context: &Context,
+        name: &str,
+        bold: bool,
+    ) -> Option<FontFamily> {
+        let key = if bold {
+            format!("{name} Bold")
+        } else {
+            name.to_string()
+        };
+        if let Some(cached) = self.sheet_font_cache.get(&key) {
+            return cached.clone();
+        }
+        let resolved = find_font_file(name, bold).and_then(|path| {
+            let bytes = std::fs::read(&path).ok()?;
+            let family = FontFamily::Name(key.clone().into());
+            context.add_font(FontInsert::new(
+                &key,
+                FontData::from_owned(bytes),
+                vec![InsertFontFamily {
+                    family: family.clone(),
+                    priority: FontPriority::Highest,
+                }],
+            ));
+            Some(family)
+        });
+        self.sheet_font_cache.insert(key, resolved.clone());
+        resolved
+    }
+
+    /// Rebuilds a tile's corner snapshot from the cached workbook.
+    fn refresh_sheet_snapshot(&mut self, context: &Context, id: Uuid) {
+        const TILE_ROWS: usize = 24;
+        const TILE_COLUMNS: usize = 12;
+        let Some(Some(workbook)) = self.sheets.get(&id) else {
+            return;
+        };
+        let sheet_index = self
+            .sheet_states
+            .get(&id)
+            .map(|state| state.sheet)
+            .unwrap_or(0);
+        let Some(sheet) = workbook.sheet(sheet_index).or_else(|| workbook.sheet(0)) else {
+            return;
+        };
+        let corner = sheet.corner(TILE_ROWS, TILE_COLUMNS);
+        let fonts = self.resolve_sheet_fonts(context, &corner);
+        self.sheet_tile_snapshots.insert(id, (corner, fonts));
+    }
+
+    /// A file tile's path, wherever in the workspace it lives.
+    fn tile_path(&self, id: Uuid) -> Option<PathBuf> {
+        self.workspace.pages.iter().find_map(|page| {
+            page.tiles.iter().find_map(|tile| match &tile.content {
+                TileContent::File { path, .. } if tile.id == id => Some(path.clone()),
+                _ => None,
+            })
+        })
+    }
+
+    fn tile_id_at(&self, index: usize) -> Option<Uuid> {
+        self.workspace
+            .active_page()
+            .tiles
+            .get(index)
+            .map(|tile| tile.id)
+    }
+
+    /// Enters grid view with one tile's lightbox already expanded — the
+    /// context menu's path from a canvas spreadsheet straight to its live
+    /// sheet.
+    fn open_tile_in_grid_view(&mut self, id: Uuid) {
+        let Some(index) = self
+            .workspace
+            .active_page()
+            .tiles
+            .iter()
+            .position(|tile| tile.id == id)
+        else {
+            return;
+        };
+        let mut state = self.grid_view.unwrap_or_default();
+        // Scroll the wall to the tile first, so dismissing the lightbox
+        // leaves you looking at it rather than at the top of the page.
+        if let Some(view) = self.last_canvas_rect {
+            let metrics = state.metrics(view.width(), self.workspace.active_page().tiles.len());
+            state.camera.offset =
+                metrics.reveal_offset(index, state.camera.visible_size(view), state.camera.offset);
+            state.camera = state.camera.clamped(metrics.content, view);
+        }
+        state.lightbox = Some(Lightbox::opening(index));
+        self.grid_view = Some(state);
+    }
+
+    /// Enters or leaves the grid view. Opening always starts at the top of the
+    /// page at 100% with no photo expanded.
+    fn toggle_grid_view(&mut self) {
+        self.grid_view = match self.grid_view {
+            Some(_) => None,
+            None => Some(GridViewState::default()),
+        };
+    }
+
+    /// Switches cell shape, keeping the wall anchored on whatever row is at
+    /// the top of the viewport — otherwise a toggle throws you somewhere else
+    /// in a long page.
+    fn set_grid_cell_shape(&mut self, shape: CellShape) {
+        let Some(mut state) = self.grid_view else {
+            return;
+        };
+        let view = self.last_canvas_rect.unwrap_or(Rect::ZERO);
+        let count = self.workspace.active_page().tiles.len();
+        state.set_shape(shape, view, count);
+        self.grid_view = Some(state);
+    }
+
+    fn set_grid_zoom_mode(&mut self, mode: ZoomMode) {
+        let Some(mut state) = self.grid_view else {
+            return;
+        };
+        let view = self.last_canvas_rect.unwrap_or(Rect::ZERO);
+        let count = self.workspace.active_page().tiles.len();
+        state.set_mode(mode, view, count);
+        self.grid_view = Some(state);
+    }
+
+    fn reset_grid_view_zoom(&mut self) {
+        let Some(mut state) = self.grid_view else {
+            return;
+        };
+        state.camera.zoom = 1.0;
+        self.grid_view = Some(state);
+    }
+
+    /// Grid-view key handling. Returns `true` when the grid consumed the
+    /// frame's keys, so the ordinary canvas shortcuts stay out of the way.
+    fn handle_grid_view_shortcuts(&mut self, context: &Context) -> bool {
+        let Some(mut state) = self.grid_view else {
+            return false;
+        };
+        let count = self.workspace.active_page().tiles.len();
+        let view = self.last_canvas_rect.unwrap_or(Rect::ZERO);
+        let metrics = state.metrics(view.width(), count);
+
+        let (command, escape, left, right, up, down, enter) = context.input(|input| {
+            (
+                input.modifiers.command,
+                input.key_pressed(Key::Escape),
+                input.key_pressed(Key::ArrowLeft),
+                input.key_pressed(Key::ArrowRight),
+                input.key_pressed(Key::ArrowUp),
+                input.key_pressed(Key::ArrowDown),
+                input.key_pressed(Key::Enter),
+            )
+        });
+
+        if command {
+            if context.input(|input| input.key_pressed(Key::Plus) || input.key_pressed(Key::Equals))
+            {
+                state.apply_zoom(1.2, view.center(), view, count);
+            }
+            if context.input(|input| input.key_pressed(Key::Minus)) {
+                state.apply_zoom(1.0 / 1.2, view.center(), view, count);
+            }
+            if context.input(|input| input.key_pressed(Key::Num0)) {
+                state.camera.zoom = 1.0;
+            }
+        }
+
+        if escape {
+            // First Escape closes the photo, a second leaves the grid.
+            match &mut state.lightbox {
+                Some(lightbox) if !lightbox.closing => lightbox.begin_close(),
+                _ => {
+                    self.grid_view = None;
+                    return true;
+                }
+            }
+        }
+
+        let step = match (left, right, up, down) {
+            (true, false, _, _) => Some(-1),
+            (false, true, _, _) => Some(1),
+            (_, _, true, false) => Some(-(metrics.columns as isize)),
+            (_, _, false, true) => Some(metrics.columns as isize),
+            _ => None,
+        };
+        // While the lightbox shows a live sheet, the arrows belong to its
+        // cell selection (handled in show_grid_sheet), not to tile-stepping.
+        let sheet_owns_keys = state
+            .lightbox
+            .filter(|lightbox| !lightbox.closing)
+            .and_then(|lightbox| self.tile_id_at(lightbox.index))
+            .is_some_and(|id| self.sheets.get(&id).is_some_and(Option::is_some));
+        if let Some(step) = step
+            && count > 0
+            && !sheet_owns_keys
+        {
+            let visible = state.camera.visible_size(view);
+            match &mut state.lightbox {
+                Some(lightbox) => {
+                    lightbox.step(step, count);
+                    state.camera.offset =
+                        metrics.reveal_offset(lightbox.index, visible, state.camera.offset);
+                }
+                None => {
+                    // Without a photo open the arrows walk the wall itself.
+                    let pitch = if step.abs() == 1 {
+                        vec2(step.signum() as f32 * (metrics.cell.x + metrics.gap), 0.0)
+                    } else {
+                        vec2(0.0, step.signum() as f32 * (metrics.cell.y + metrics.gap))
+                    };
+                    state.camera.offset += pitch;
+                }
+            }
+            context.request_repaint();
+        }
+
+        if enter && state.lightbox.is_none() && count > 0 {
+            state.lightbox = Some(Lightbox::opening(0));
+        }
+
+        // Re-derive: a Command-zoom above may have re-flowed the wall.
+        let metrics = state.metrics(view.width(), count);
+        state.camera = state.camera.clamped(metrics.content, view);
+        self.grid_view = Some(state);
+        true
     }
 
     fn show_canvas_quick_bar(&mut self, context: &Context, view: Rect, colors: Theme) -> Rect {
@@ -4157,6 +5289,7 @@ impl AdamApp {
             if let Some(action) = event.action {
                 match action {
                     TileAction::Open(id) => self.activate_tile(id),
+                    TileAction::OpenInGridView(id) => self.open_tile_in_grid_view(id),
                     TileAction::QuickLook(id) => self.quick_look_tile(id),
                     TileAction::Reveal(id) => self.reveal_tile(id),
                     TileAction::Copy(id) => {
@@ -11284,6 +12417,8 @@ impl eframe::App for AdamApp {
         self.handle_shortcuts(context);
         self.handle_external_drops(context);
         self.poll_automation(context);
+        self.poll_file_watch(context);
+        self.poll_live_sheet(context);
         self.maybe_autosave();
     }
 
@@ -11516,6 +12651,7 @@ fn draw_tile(
     pile_controls_enabled: bool,
     previews: &mut PreviewCache,
     structured_previews: &mut StructuredPreviewCache,
+    live_sheet: Option<&(spreadsheet::Sheet, SheetFonts)>,
     page_targets: &[(Uuid, String)],
     colors: Theme,
 ) -> TileUiEvent {
@@ -11610,7 +12746,42 @@ fn draw_tile(
 
     match &tile.content {
         TileContent::File { path, kind } => {
-            if let Some(preview) = structured_previews.preview(tile.id, path) {
+            // Parsed sheet data outranks the Quick Look image: it is the only
+            // rendering that can show a live, unsaved workbook — and it
+            // renders through the same styled engine as the lightbox, scaled
+            // to the tile, so fills, fonts and borders match the spreadsheet.
+            if let Some((sheet, fonts)) = live_sheet {
+                let metrics = SheetMetrics::measure(sheet, 7.0);
+                let scale = if metrics.content.x > 0.0 && metrics.content.y > 0.0 {
+                    (content_rect.width() / metrics.content.x)
+                        .min(content_rect.height() / metrics.content.y)
+                        .clamp(0.25, 1.25)
+                } else {
+                    1.0
+                };
+                sheet_view::draw(
+                    painter,
+                    content_rect,
+                    sheet,
+                    &metrics,
+                    &SheetViewState::default(),
+                    SheetPalette {
+                        surface: colors.tile,
+                        header: colors.tile_footer,
+                        grid_line: color_with_alpha(colors.tertiary_text, 60),
+                        text: colors.text,
+                        secondary_text: colors.secondary_text,
+                        selection: color_with_alpha(colors.accent, 60),
+                        accent: colors.accent,
+                    },
+                    fonts,
+                    sheet_view::DrawOptions {
+                        scale,
+                        headers: false,
+                        selection: false,
+                    },
+                );
+            } else if let Some(preview) = structured_previews.preview(tile.id, path) {
                 draw_structured_preview(
                     painter,
                     content_rect,
@@ -12024,6 +13195,13 @@ fn draw_tile(
                 event.action = Some(TileAction::QuickLook(tile.id));
                 ui.close();
             }
+            if let TileContent::File { path, .. } = &tile.content
+                && spreadsheet::is_spreadsheet(path)
+                && ui.button("Open in Grid View").clicked()
+            {
+                event.action = Some(TileAction::OpenInGridView(tile.id));
+                ui.close();
+            }
             if ui.button("Reveal in Finder").clicked() {
                 event.action = Some(TileAction::Reveal(tile.id));
                 ui.close();
@@ -12231,6 +13409,378 @@ fn draw_pile_header(
         FontId::proportional(font_size),
         colors.text,
     );
+}
+
+/// Caption strip height inside a grid cell.
+const GRID_CAPTION_HEIGHT: f32 = 26.0;
+
+/// Documents read better cropped from the top — that is where the title and
+/// first lines are. Photos crop from the centre, matching the default
+/// `PhotoRecord::crop_anchor`.
+fn grid_crop_anchor(kind: FileKind) -> [f32; 2] {
+    if kind == FileKind::Image {
+        [0.5, 0.5]
+    } else {
+        [0.5, 0.0]
+    }
+}
+
+fn texture_aspect(size: Vec2) -> f32 {
+    if size.x > 0.0 && size.y > 0.0 {
+        size.x / size.y
+    } else {
+        1.0
+    }
+}
+
+/// Aspect a tile expands to in the lightbox. Photos use their source aspect so
+/// the expansion un-crops back to the real image; everything else keeps its
+/// canvas proportions so a note still looks like that note.
+fn grid_expanded_aspect(tile: &Tile, texture: Option<f32>) -> f32 {
+    texture
+        .or_else(|| tile.intrinsic_image_aspect())
+        .unwrap_or_else(|| {
+            let rect = tile.rect.normalized();
+            if rect.w > 0.0 && rect.h > 0.0 {
+                rect.w / rect.h
+            } else {
+                1.0
+            }
+        })
+}
+
+/// Paints one cell of the contact sheet.
+///
+/// `cell_aspect` is the current shape's width/height, which drives how hard
+/// the source is cropped; `zoom` scales the chrome so captions stay legible
+/// rather than shrinking into nothing as the wall is magnified.
+#[allow(clippy::too_many_arguments)]
+fn draw_grid_cell(
+    painter: &Painter,
+    rect: Rect,
+    tile: &Tile,
+    previews: &mut PreviewCache,
+    pixels_per_point: f32,
+    cell_aspect: f32,
+    zoom: f32,
+    hovered: bool,
+    selected: bool,
+    colors: Theme,
+) {
+    let scale = zoom.clamp(0.5, 2.0);
+    let caption_height = (GRID_CAPTION_HEIGHT * scale).min(rect.height() * 0.4);
+    let caption_font = (11.5 * scale).clamp(8.0, 20.0);
+    let radius = CornerRadius::same(4);
+    painter.rect_filled(rect, radius, colors.tile);
+
+    let mut painted_texture = false;
+    if let TileContent::File { path, kind } = &tile.content {
+        let projected = [
+            rect.width() * pixels_per_point,
+            rect.height() * pixels_per_point,
+        ];
+        let texture = if *kind == FileKind::Image {
+            previews.image_texture(tile.id, path, projected)
+        } else {
+            previews.quick_look_texture(tile.id, path)
+        };
+        if let Some(texture) = texture {
+            let uv = grid_view::cover_uv(
+                texture_aspect(texture.size_vec2()),
+                cell_aspect,
+                grid_crop_anchor(*kind),
+            );
+            painter.image(texture.id(), rect, uv, Color32::WHITE);
+            painted_texture = true;
+        } else {
+            draw_file_placeholder(
+                painter,
+                rect.shrink(12.0 * scale),
+                *kind,
+                path,
+                colors.accent,
+                colors,
+                scale,
+            );
+        }
+    } else {
+        let inset = 10.0 * scale;
+        let body = Rect::from_min_max(
+            rect.min + Vec2::splat(inset),
+            pos2(rect.right() - inset, rect.bottom() - caption_height),
+        );
+        let (glyph, detail) = match &tile.content {
+            TileContent::Note { text } => ("¶", truncate(&text.replace(['\n', '\r'], " "), 64)),
+            TileContent::Website { url } => ("◍", truncate(url, 48)),
+            TileContent::Pile { .. } => ("▤", String::from("Pile")),
+            TileContent::Tag { .. } => ("◆", String::from("Tag")),
+            TileContent::AiChat { .. } => ("◎", String::from("AI chat")),
+            TileContent::File { .. } => ("", String::new()),
+        };
+        if body.height() > 30.0 {
+            painter.text(
+                pos2(body.left(), body.top()),
+                Align2::LEFT_TOP,
+                glyph,
+                FontId::proportional(20.0 * scale),
+                colors.accent,
+            );
+            painter.text(
+                pos2(body.left(), body.top() + 28.0 * scale),
+                Align2::LEFT_TOP,
+                detail,
+                FontId::proportional(caption_font),
+                colors.secondary_text,
+            );
+        }
+    }
+
+    // Caption sits inside the cell so every cell keeps the exact shape.
+    let caption = Rect::from_min_max(pos2(rect.left(), rect.bottom() - caption_height), rect.max);
+    if painted_texture {
+        painter.rect_filled(
+            caption,
+            CornerRadius {
+                nw: 0,
+                ne: 0,
+                sw: radius.sw,
+                se: radius.se,
+            },
+            Color32::from_black_alpha(150),
+        );
+    }
+    let title_color = if painted_texture {
+        Color32::from_white_alpha(232)
+    } else {
+        colors.text
+    };
+    let characters = ((rect.width() - 16.0) / (6.0 * scale)).max(4.0) as usize;
+    painter.text(
+        pos2(caption.left() + 8.0, caption.center().y),
+        Align2::LEFT_CENTER,
+        truncate(&tile.title, characters),
+        FontId::proportional(caption_font),
+        title_color,
+    );
+
+    if selected {
+        painter.rect_stroke(
+            rect,
+            radius,
+            Stroke::new(2.0, colors.accent),
+            StrokeKind::Inside,
+        );
+    } else if hovered {
+        painter.rect_stroke(
+            rect,
+            radius,
+            Stroke::new(1.5, color_with_alpha(colors.text, 120)),
+            StrokeKind::Inside,
+        );
+    }
+}
+
+/// Expands the focused cell toward its natural aspect while walking the crop
+/// back out to the whole texture. Returns the rect the tile landed in.
+#[allow(clippy::too_many_arguments)]
+fn draw_grid_lightbox(
+    painter: &Painter,
+    view: Rect,
+    cell: Rect,
+    tile: &Tile,
+    lightbox: Lightbox,
+    previews: &mut PreviewCache,
+    pixels_per_point: f32,
+    cell_aspect: f32,
+    editing: bool,
+    colors: Theme,
+) -> Rect {
+    let factor = lightbox.factor();
+    painter.rect_filled(
+        view,
+        CornerRadius::ZERO,
+        Color32::from_black_alpha((216.0 * factor) as u8),
+    );
+
+    if let TileContent::File { path, kind } = &tile.content {
+        // Size the decode for the expanded photo, not the cell it grew from,
+        // or the un-crop would land on a thumbnail.
+        let target = grid_view::expanded_rect(
+            grid_expanded_aspect(tile, None),
+            view,
+            grid_view::LIGHTBOX_MARGIN,
+        );
+        let projected = [
+            target.width() * pixels_per_point,
+            target.height() * pixels_per_point,
+        ];
+        let texture = if *kind == FileKind::Image {
+            previews.image_texture(tile.id, path, projected)
+        } else {
+            previews.quick_look_texture(tile.id, path)
+        };
+        if let Some(texture) = texture {
+            let aspect = texture_aspect(texture.size_vec2());
+            let expanded = grid_view::expanded_rect(aspect, view, grid_view::LIGHTBOX_MARGIN);
+            let rect = grid_view::lerp_rect(cell, expanded, factor);
+            // Start from exactly the crop the cell was showing, whatever the
+            // current shape, so the expansion has no visible jump on frame one.
+            let cropped = grid_view::cover_uv(aspect, cell_aspect, grid_crop_anchor(*kind));
+            let uv = grid_view::lerp_rect(cropped, grid_view::full_uv(), factor);
+            painter.image(texture.id(), rect, uv, Color32::WHITE);
+            return rect;
+        }
+    }
+
+    // Non-photo tiles have nothing to un-crop; they simply grow to their
+    // canvas proportions.
+    let expanded = grid_view::expanded_rect(
+        grid_expanded_aspect(tile, None),
+        view,
+        grid_view::LIGHTBOX_MARGIN,
+    );
+    let rect = grid_view::lerp_rect(cell, expanded, factor);
+    painter.rect_filled(rect, CornerRadius::same(6), colors.tile);
+    // A live text field is about to be placed here; painting the same words
+    // underneath it would show through the editor's transparent frame.
+    if let TileContent::Note { text } = &tile.content
+        && !editing
+        && rect.height() > 60.0
+    {
+        painter.text(
+            rect.min + Vec2::splat(18.0),
+            Align2::LEFT_TOP,
+            truncate(text, 900),
+            FontId::proportional(14.0),
+            color_with_alpha(colors.text, (255.0 * factor) as u8),
+        );
+    }
+    rect
+}
+
+fn draw_grid_lightbox_caption(
+    painter: &Painter,
+    photo: Rect,
+    tile: &Tile,
+    lightbox: Lightbox,
+    colors: Theme,
+) {
+    let factor = lightbox.factor();
+    if factor < 0.35 {
+        return;
+    }
+    let alpha = (((factor - 0.35) / 0.65).clamp(0.0, 1.0) * 235.0) as u8;
+    painter.text(
+        pos2(photo.center().x, photo.bottom() + 18.0),
+        Align2::CENTER_CENTER,
+        truncate(&tile.title, 90),
+        FontId::proportional(13.0),
+        color_with_alpha(colors.chrome_text, alpha),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_grid_view_hint(
+    painter: &Painter,
+    view: Rect,
+    count: usize,
+    shape: CellShape,
+    mode: ZoomMode,
+    editing: bool,
+    zoom: f32,
+    lightbox_open: bool,
+    colors: Theme,
+) {
+    let hint = if lightbox_open {
+        if editing {
+            "Editing · Esc when done".to_string()
+        } else {
+            "← → browse · Esc back to grid".to_string()
+        }
+    } else if editing {
+        format!(
+            "Grid view · editing · {count} tile{} · {} · click a tile to edit it · Esc or G to exit",
+            if count == 1 { "" } else { "s" },
+            shape.label().to_lowercase(),
+        )
+    } else {
+        format!(
+            "Grid view · {count} tile{} · {} · {} · {:.0}% · click to open · Esc or G to exit",
+            if count == 1 { "" } else { "s" },
+            shape.label().to_lowercase(),
+            match mode {
+                ZoomMode::Magnify => "drag to pan, pinch to zoom",
+                ZoomMode::Reflow => "pinch to change how many fit",
+                ZoomMode::Wall => "drag to roam, pinch to pull back",
+            },
+            zoom * 100.0
+        )
+    };
+    // Lay the text out first so the pill can be sized to it, rather than
+    // painting the text twice and letting the first copy bleed through.
+    let galley = painter.layout_no_wrap(
+        hint,
+        FontId::proportional(11.5),
+        colors.chrome_secondary_text,
+    );
+    let text_min = pos2(
+        view.left() + 26.0,
+        view.bottom() - 25.0 - galley.size().y * 0.5,
+    );
+    let pill = Rect::from_min_size(text_min, galley.size()).expand2(vec2(10.0, 6.0));
+    painter.rect_filled(
+        pill,
+        CornerRadius::same(6),
+        color_with_alpha(colors.chrome, 224),
+    );
+    painter.galley(text_min, galley, colors.chrome_secondary_text);
+}
+
+/// Looks for a font file matching `name` in the places macOS and Office keep
+/// them. Handles both naming conventions seen in the wild: Calibri's
+/// suffix-letter files (Calibrib.ttf) and Aptos's hyphenated ones
+/// (Aptos-Bold.ttf).
+fn find_font_file(name: &str, bold: bool) -> Option<std::path::PathBuf> {
+    let directories = [
+        "/Applications/Microsoft Excel.app/Contents/Resources/DFonts",
+        "/Library/Fonts",
+        "/System/Library/Fonts/Supplemental",
+    ];
+    let home_fonts = dirs::home_dir().map(|home| home.join("Library/Fonts"));
+    let stems: Vec<String> = if bold {
+        vec![
+            format!("{name}b"),
+            format!("{name}-Bold"),
+            format!("{name} Bold"),
+        ]
+    } else {
+        vec![name.to_string(), format!("{name}-Regular")]
+    };
+    let candidates = directories
+        .iter()
+        .map(std::path::PathBuf::from)
+        .chain(home_fonts);
+    for directory in candidates {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(extension) = path.extension().and_then(|e| e.to_str()) else {
+                continue;
+            };
+            if !extension.eq_ignore_ascii_case("ttf") && !extension.eq_ignore_ascii_case("otf") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if stems.iter().any(|wanted| stem.eq_ignore_ascii_case(wanted)) {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 fn draw_file_placeholder(
