@@ -559,6 +559,7 @@ struct AiWorkspaceUiAction {
     open_subagents_detail: bool,
     close_subagents_detail: bool,
     open_artifact_library: Option<LibraryTarget>,
+    switch_workspace_mode: Option<AiWorkspaceMode>,
     retry_turn: Option<RetryHint>,
     open_agents_panel: bool,
     agents_action: AgentsPanelAction,
@@ -6879,6 +6880,21 @@ impl AdamApp {
         }
         if let Some(target) = action.open_artifact_library {
             self.artifact_library.open_for(target);
+        }
+        if let Some(mode) = action.switch_workspace_mode
+            && !run_scope_locked
+        {
+            if let Some(conversation) = self
+                .workspace
+                .domain
+                .conversations
+                .conversations
+                .get_mut(&conversation_id)
+            {
+                conversation.settings.workspace_mode = mode;
+                conversation.updated_at = unix_now();
+            }
+            self.changed(false);
         }
         if let Some(path) = action.preview_file {
             let preview = match self.resolve_scoped_ai_workspace_path(conversation_id, &path) {
@@ -15898,7 +15914,14 @@ fn render_ai_chat_page(
                 }
             }
             for message in conversation.messages() {
-                render_ai_message(ui, message, action, markdown_cache, colors);
+                render_ai_message(
+                    ui,
+                    message,
+                    conversation.settings.workspace_mode,
+                    action,
+                    markdown_cache,
+                    colors,
+                );
                 ui.add_space(16.0);
             }
             if !runtime.streamed_text.is_empty() {
@@ -15907,6 +15930,7 @@ fn render_ai_chat_page(
                     &runtime.streamed_text,
                     &runtime.activity_trace.events,
                     runtime.active_started_at,
+                    conversation.settings.workspace_mode,
                     action,
                     markdown_cache,
                     colors,
@@ -15927,6 +15951,7 @@ fn render_ai_chat_page(
                         render_ai_activity_trace(
                             ui,
                             &runtime.activity_trace.events,
+                            conversation.settings.workspace_mode,
                             Some(action),
                             colors,
                         );
@@ -16350,6 +16375,7 @@ fn render_ai_work_header(
 fn render_ai_message(
     ui: &mut Ui,
     message: &crate::domain::ConversationMessage,
+    workspace_mode: AiWorkspaceMode,
     action: &mut AiWorkspaceUiAction,
     markdown_cache: &mut CommonMarkCache,
     colors: Theme,
@@ -16379,7 +16405,13 @@ fn render_ai_message(
                 ui.vertical(|ui| {
                     ui.set_width((ui.available_width() - 48.0).max(220.0));
                     render_ai_work_header(ui, &message.activities, None, colors);
-                    render_ai_activity_trace(ui, &message.activities, Some(action), colors);
+                    render_ai_activity_trace(
+                        ui,
+                        &message.activities,
+                        workspace_mode,
+                        Some(action),
+                        colors,
+                    );
                     if !message.activities.is_empty() && !message.text.trim().is_empty() {
                         ui.add_space(8.0);
                     }
@@ -16540,6 +16572,7 @@ fn render_ai_activity_row(ui: &mut Ui, event: &HarnessActivityEvent, colors: The
 fn render_ai_activity_trace(
     ui: &mut Ui,
     events: &[HarnessActivityEvent],
+    workspace_mode: AiWorkspaceMode,
     mut action: Option<&mut AiWorkspaceUiAction>,
     colors: Theme,
 ) {
@@ -16721,6 +16754,32 @@ fn render_ai_activity_trace(
                             .size(11.0)
                             .color(colors.secondary_text),
                     );
+                    // Chat mode denies every non-read action by policy; an
+                    // unexplained denial reads as a malfunction (user
+                    // feedback, 2026-08-02).
+                    if matches!(
+                        resolution,
+                        Some(crate::chat_core::PermissionResolution::Denied)
+                    ) && workspace_mode == AiWorkspaceMode::Chat
+                    {
+                        ui.label(
+                            RichText::new(
+                                "Chat mode is read-only — files and canvas items need Cowork.",
+                            )
+                            .size(10.5)
+                            .color(colors.tertiary_text),
+                        );
+                        if let Some(action) = action.as_deref_mut()
+                            && ui
+                                .small_button("Switch to Cowork")
+                                .on_hover_text(
+                                    "Change this chat's mode, then Retry to finish the task",
+                                )
+                                .clicked()
+                        {
+                            action.switch_workspace_mode = Some(AiWorkspaceMode::Cowork);
+                        }
+                    }
                 });
         }
     }
@@ -16828,6 +16887,7 @@ fn render_streaming_ai_message(
     text: &str,
     events: &[HarnessActivityEvent],
     started_at: Option<Instant>,
+    workspace_mode: AiWorkspaceMode,
     action: &mut AiWorkspaceUiAction,
     markdown_cache: &mut CommonMarkCache,
     colors: Theme,
@@ -16838,7 +16898,7 @@ fn render_streaming_ai_message(
         ui.vertical(|ui| {
             ui.set_width((ui.available_width() - 48.0).max(220.0));
             render_ai_work_header(ui, events, started_at, colors);
-            render_ai_activity_trace(ui, events, Some(action), colors);
+            render_ai_activity_trace(ui, events, workspace_mode, Some(action), colors);
             if !events.is_empty() && !text.trim().is_empty() {
                 ui.add_space(8.0);
             }
