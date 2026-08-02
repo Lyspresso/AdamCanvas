@@ -216,7 +216,13 @@ fn copy_file_atomic(source: &Path, destination: &Path) -> std::io::Result<()> {
             .unwrap_or_default()
     ));
     fs::copy(source, &temporary)?;
-    fs::File::open(&temporary)?.sync_all()?;
+    // FlushFileBuffers needs a writable handle on Windows; a read-only
+    // handle flushes fine on unix but returns Access Denied there.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temporary)?
+        .sync_all()?;
     fs::rename(&temporary, destination)?;
     sync_parent(destination);
     Ok(())
