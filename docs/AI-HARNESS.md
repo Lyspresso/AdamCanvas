@@ -639,6 +639,14 @@ text. Provider-reported paths are canonicalized and must remain inside the
 chosen working folder; only files the user explicitly attached may be previewed
 from outside that scope.
 
+A chat that starts a turn with no chosen folder receives its own private
+sandbox folder under Adam's data directory, created at that moment and
+labeled as the sandbox in the inspector — file work always has a safe
+destination instead of being denied or aimed at the home folder. Choosing a
+folder overrides the sandbox; clearing returns the chat to it on the next
+send; the folder and its files outlive chat deletion like every other
+produced file.
+
 The working-folder browser sorts directories first, expands lazily to four
 visible levels, previews files on selection, and can reveal either files or
 folders in the system file browser. Folder changes are locked during an active
