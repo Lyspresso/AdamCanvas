@@ -9,7 +9,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
@@ -1182,21 +1181,12 @@ impl ResumeStateLock {
                 path: lock_path,
                 source,
             })?;
-        #[cfg(unix)]
-        loop {
-            // SAFETY: `file` owns this descriptor until the guard is dropped;
-            // flock borrows it and never assumes ownership.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                break;
-            }
-            let source = io::Error::last_os_error();
-            if source.kind() != io::ErrorKind::Interrupted {
-                return Err(AiStateFileError::Persist {
-                    path: sibling_with_suffix(path, ".lock"),
-                    source,
-                });
-            }
-        }
+        // Portable exclusive lock (flock on unix, LockFileEx on Windows);
+        // mirrors the library lock in persistence.rs.
+        file.lock().map_err(|source| AiStateFileError::Persist {
+            path: sibling_with_suffix(path, ".lock"),
+            source,
+        })?;
         Ok(Self {
             file,
             _process_guard: process_guard,
@@ -1206,11 +1196,8 @@ impl ResumeStateLock {
 
 impl Drop for ResumeStateLock {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            // SAFETY: the descriptor remains valid through this Drop call.
-            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        }
+        // Unlock failure is not actionable during cleanup.
+        let _ = self.file.unlock();
     }
 }
 

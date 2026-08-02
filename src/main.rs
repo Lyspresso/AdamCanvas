@@ -1,3 +1,5 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
@@ -7,7 +9,9 @@ fn main() -> eframe::Result {
     };
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
         setup.power_preference = eframe::wgpu::PowerPreference::LowPower;
-        setup.instance_descriptor.backends = eframe::wgpu::Backends::METAL;
+        // PRIMARY resolves to Metal on macOS and DX12/Vulkan on Windows;
+        // pinning Metal here left Windows with zero adapters.
+        setup.instance_descriptor.backends = eframe::wgpu::Backends::PRIMARY;
     }
 
     let options = eframe::NativeOptions {

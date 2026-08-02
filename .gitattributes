@@ -1,0 +1,6 @@
+# One codebase, two OSes: normalize line endings so a change made in a
+# Windows editor lands byte-identical on macOS and vice versa.
+* text=auto eol=lf
+*.png binary
+*.icns binary
+*.ico binary

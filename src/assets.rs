@@ -11,8 +11,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
-    os::unix::ffi::OsStrExt,
-    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     thread,
     time::{SystemTime, UNIX_EPOCH},
@@ -531,10 +529,7 @@ fn collect_tree_entries(root: &Path) -> Result<Vec<TreeEntry>, AssetError> {
     let mut entries = Vec::new();
     visit(root, root, &mut entries)?;
     entries.sort_unstable_by(|left, right| {
-        left.relative_path
-            .as_os_str()
-            .as_bytes()
-            .cmp(right.relative_path.as_os_str().as_bytes())
+        portable_path_bytes(&left.relative_path).cmp(&portable_path_bytes(&right.relative_path))
     });
     Ok(entries)
 }
@@ -575,14 +570,41 @@ fn copy_tree_entries(
     Ok(size_bytes)
 }
 
+/// Portable byte encoding of a relative path for sorting and tree hashing:
+/// components joined with '/', UTF-8. On macOS this is byte-identical to the
+/// raw path bytes for every UTF-8 name, so existing tree hashes are
+/// preserved; Windows produces the same identity for the same content, which
+/// shared cross-OS libraries depend on. Non-UTF-8 names fall back to a lossy
+/// encoding and may re-import rather than dedupe — acceptable.
+fn portable_path_bytes(path: &Path) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (index, part) in path.components().enumerate() {
+        if index > 0 {
+            bytes.push(b'/');
+        }
+        bytes.extend_from_slice(part.as_os_str().to_string_lossy().as_bytes());
+    }
+    bytes
+}
+
 fn open_regular_file_without_following(path: &Path) -> Result<File, AssetError> {
-    // O_NOFOLLOW on Darwin. Adam targets macOS; using the kernel flag also
-    // closes the small lstat/open race where a source file becomes a symlink.
-    const O_NOFOLLOW: i32 = 0x0000_0100;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        // The kernel flag also closes the small lstat/open race where a
+        // source file becomes a symlink mid-import.
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    if path.symlink_metadata()?.file_type().is_symlink() {
+        // CreateFile follows links by default; the pre-check plus the
+        // is_file verification below is the practical equivalent for an
+        // import-time copy.
+        return Err(AssetError::UnsupportedEntry(path.to_path_buf()));
+    }
+    let file = options.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(AssetError::UnsupportedEntry(path.to_path_buf()));
     }
@@ -596,7 +618,8 @@ fn hash_directory_tree(root: &Path, entries: &[TreeEntry]) -> Result<String, Ass
     let mut buffer = vec![0_u8; COPY_BUFFER_SIZE];
 
     for entry in entries {
-        let path_bytes = entry.relative_path.as_os_str().as_bytes();
+        let path_bytes = portable_path_bytes(&entry.relative_path);
+        let path_bytes = path_bytes.as_slice();
         hasher.update(match entry.kind {
             TreeEntryKind::Directory => b"D",
             TreeEntryKind::File => b"F",
@@ -1055,6 +1078,7 @@ impl Sha256 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
 
     fn store_at(temporary: &tempfile::TempDir) -> AssetStore {
@@ -1263,6 +1287,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn directory_import_rejects_symlinks_and_cleans_staging() {
         use std::os::unix::fs::symlink;

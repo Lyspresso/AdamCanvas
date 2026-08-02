@@ -24,3 +24,16 @@ jobs:
         run: cargo clippy --all-targets
       - name: Tests
         run: cargo test
+
+  windows:
+    name: Windows build + test
+    # The second first-class platform: every change must compile and pass
+    # tests here too, so a fix made on either OS carries to the other with
+    # no extra work.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test
