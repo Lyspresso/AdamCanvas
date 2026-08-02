@@ -6857,6 +6857,8 @@ impl AdamApp {
             self.refresh_ai_workspace_files(conversation_id);
             self.changed(false);
         }
+        // Clear returns the chat to its own sandbox on the next send;
+        // ensure_ai_chat_sandbox re-materializes it in start_ai_turn.
         if action.refresh_folder {
             self.refresh_ai_workspace_files(conversation_id);
         }
@@ -7061,7 +7063,39 @@ impl AdamApp {
         }
     }
 
+    /// A chat with no chosen folder gets its own private sandbox before the
+    /// first turn launches, the way hosted assistants do — file work must
+    /// land somewhere safe instead of being denied or aimed at the home
+    /// folder (user feedback, 2026-08-02). Choose Folder… still overrides;
+    /// Clear returns the chat to its sandbox on the next send. The folder
+    /// outlives chat deletion, matching the rule that produced files are
+    /// user-owned.
+    fn ensure_ai_chat_sandbox(&mut self, conversation_id: Uuid) {
+        let Some(conversation) = self
+            .workspace
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&conversation_id)
+        else {
+            return;
+        };
+        if conversation.settings.working_directory.is_some() {
+            return;
+        }
+        let sandbox = ai_chat_sandbox_directory(&self.paths.root, conversation_id);
+        if let Err(error) = std::fs::create_dir_all(&sandbox) {
+            log::error!("chat sandbox directory was not created: {error}");
+            return;
+        }
+        conversation.settings.working_directory = Some(sandbox.to_string_lossy().into_owned());
+        conversation.updated_at = unix_now();
+        self.changed(false);
+        self.refresh_ai_workspace_files(conversation_id);
+    }
+
     fn start_ai_turn(&mut self, conversation_id: Uuid, context: &Context) {
+        self.ensure_ai_chat_sandbox(conversation_id);
         let Some(conversation) = self
             .workspace
             .domain
@@ -14608,6 +14642,18 @@ fn render_ai_inspector(
                                 .monospace()
                                 .color(colors.secondary_text),
                         );
+                        if Path::new(directory)
+                            .components()
+                            .any(|part| part.as_os_str() == AI_CHAT_SANDBOX_SEGMENT)
+                        {
+                            ui.label(
+                                RichText::new(
+                                    "This chat's private sandbox — files land here until you choose a folder.",
+                                )
+                                .size(10.0)
+                                .color(colors.tertiary_text),
+                            );
+                        }
                         ui.horizontal(|ui| {
                             ui.add_enabled_ui(!running, |ui| {
                                 action.choose_folder |= ui.small_button("Change…").clicked();
@@ -17704,6 +17750,16 @@ fn capture_ai_workspace_root(root: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(canonical_root)
+}
+
+/// Directory name segment marking per-chat sandbox working folders under
+/// the app data root; the inspector uses it to caption the default.
+const AI_CHAT_SANDBOX_SEGMENT: &str = "chat-sandboxes";
+
+fn ai_chat_sandbox_directory(data_root: &Path, conversation_id: Uuid) -> PathBuf {
+    data_root
+        .join(AI_CHAT_SANDBOX_SEGMENT)
+        .join(conversation_id.to_string())
 }
 
 fn canonical_ai_workspace_root(captured_root: &Path) -> Result<PathBuf, String> {
@@ -21729,5 +21785,28 @@ mod tests {
         assert!(!visible.contains(&pile_id));
         assert!(!visible.contains(&inside_id));
         assert!(visible.contains(&outside_id));
+    }
+
+    #[test]
+    fn chat_sandbox_directories_are_stable_and_per_conversation() {
+        let root = Path::new("/data");
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        assert_eq!(
+            ai_chat_sandbox_directory(root, first),
+            ai_chat_sandbox_directory(root, first),
+            "a chat must keep the same sandbox across sends"
+        );
+        assert_ne!(
+            ai_chat_sandbox_directory(root, first),
+            ai_chat_sandbox_directory(root, second),
+            "two chats must never share a sandbox"
+        );
+        assert!(
+            ai_chat_sandbox_directory(root, first)
+                .components()
+                .any(|part| part.as_os_str() == AI_CHAT_SANDBOX_SEGMENT),
+            "the inspector caption keys off the sandbox path segment"
+        );
     }
 }
