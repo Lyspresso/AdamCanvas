@@ -46,7 +46,10 @@ use crate::{
         TileKind, Workspace, WorldRect,
     },
     ocr::{OcrQueueError, PhotoOcrRequest, PhotoOcrWorker, source_fingerprint},
-    persistence::{AppPaths, SaveOutcome, SaveWorker, backup_unreadable_library, load_workspace},
+    persistence::{
+        AppPaths, SaveOutcome, SaveWorker, backup_unreadable_library, load_workspace,
+        scrub_deleted_conversation_checkpoint_json,
+    },
     photo_details::{
         PhotoDossier, PhotoEnrichment, PhotoMetadata, PhotoOcrArtifact, PhotoRecord,
         PhotoTileDetails, PhotoVisualDescription, PhotoVisualLabel,
@@ -1412,6 +1415,19 @@ impl AdamApp {
                 .iter()
                 .copied(),
         );
+        let xai_storage_conversations = self
+            .workspace
+            .domain
+            .conversations
+            .conversations
+            .iter()
+            .filter_map(|(conversation_id, conversation)| {
+                conversation
+                    .used_xai_server_storage
+                    .then_some(*conversation_id)
+            })
+            .collect::<BTreeSet<_>>();
+        apply_xai_storage_disclosures_to_workspace(&mut workspace, &xai_storage_conversations);
         let mut host_artifacts = self.workspace.domain.host_artifacts.clone();
         for origin in workspace.domain.host_artifacts.origins().values().cloned() {
             if let Err(error) = host_artifacts.record(origin) {
@@ -1799,6 +1815,7 @@ impl AdamApp {
             match completion.outcome {
                 SaveOutcome::Saved {
                     learned_deleted_conversations,
+                    learned_xai_storage_conversations,
                 } => {
                     if self.pending_save == Some(completion.request_id) {
                         self.pending_save = None;
@@ -1806,6 +1823,15 @@ impl AdamApp {
                     let learned_deleted_conversations = learned_deleted_conversations
                         .into_iter()
                         .collect::<BTreeSet<_>>();
+                    let learned_xai_storage_conversations = learned_xai_storage_conversations
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
+                    if apply_xai_storage_disclosures_to_workspace(
+                        &mut self.workspace,
+                        &learned_xai_storage_conversations,
+                    ) {
+                        context.request_repaint();
+                    }
                     self.permanently_delete_ai_conversations(
                         &learned_deleted_conversations,
                         context,
@@ -18221,6 +18247,26 @@ fn chat_delete_retention_notice(
     )
 }
 
+fn apply_xai_storage_disclosures_to_workspace(
+    workspace: &mut Workspace,
+    conversation_ids: &BTreeSet<Uuid>,
+) -> bool {
+    let mut changed = false;
+    for conversation_id in conversation_ids {
+        if let Some(conversation) = workspace
+            .domain
+            .conversations
+            .conversations
+            .get_mut(conversation_id)
+            && !conversation.used_xai_server_storage
+        {
+            conversation.used_xai_server_storage = true;
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn newly_learned_resume_tombstones(known: &BTreeSet<Uuid>, merged: &ResumeStore) -> BTreeSet<Uuid> {
     merged
         .permanently_forgotten_conversation_ids()
@@ -18271,12 +18317,7 @@ fn purge_ai_conversation_from_workspace(
 ) -> BTreeSet<Uuid> {
     for conversation in workspace.domain.conversations.conversations.values_mut() {
         for checkpoint in conversation.checkpoints_mut() {
-            let Ok(mut snapshot) = serde_json::from_value::<Workspace>(checkpoint.snapshot.clone())
-            else {
-                continue;
-            };
-            purge_ai_conversation_tiles_only(&mut snapshot, conversation_id);
-            checkpoint.snapshot = serde_json::to_value(snapshot).unwrap_or(serde_json::Value::Null);
+            scrub_deleted_conversation_checkpoint_json(&mut checkpoint.snapshot, conversation_id);
         }
     }
     purge_ai_conversation_tiles_only(workspace, conversation_id)
@@ -18564,6 +18605,45 @@ mod tests {
     }
 
     #[test]
+    fn learned_xai_storage_disclosure_updates_only_existing_live_conversations() {
+        let mut workspace = Workspace::new();
+        let conversation_id = Uuid::new_v4();
+        let missing_id = Uuid::new_v4();
+        workspace
+            .domain
+            .conversations
+            .add(AiConversation::new(
+                conversation_id,
+                "Provider switched",
+                PermissionMode::Ask,
+                UnixMillis(10),
+            ))
+            .unwrap();
+        let updated_at = workspace.domain.conversations.conversations[&conversation_id].updated_at;
+        let ids = BTreeSet::from([conversation_id, missing_id]);
+
+        assert!(apply_xai_storage_disclosures_to_workspace(
+            &mut workspace,
+            &ids
+        ));
+        let conversation = &workspace.domain.conversations.conversations[&conversation_id];
+        assert!(conversation.used_xai_server_storage);
+        assert_eq!(conversation.updated_at, updated_at);
+        assert!(chat_delete_retention_notice(&conversation.settings.provider_id, true).is_some());
+        assert!(
+            !workspace
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&missing_id)
+        );
+        assert!(!apply_xai_storage_disclosures_to_workspace(
+            &mut workspace,
+            &ids
+        ));
+    }
+
+    #[test]
     fn resume_merge_identifies_only_newly_learned_tombstones() {
         let already_known = Uuid::new_v4();
         let learned = Uuid::new_v4();
@@ -18809,8 +18889,59 @@ mod tests {
             .conversations
             .link_tile(tile_id, deleted_conversation_id)
             .unwrap();
+
+        let middle_conversation_id = Uuid::new_v4();
+        let middle_tile_id = Uuid::new_v4();
+        let deepest_tile_id = Uuid::new_v4();
+        let mut deepest = Workspace::new();
+        let mut deepest_tile = Tile::ai_chat(
+            "Delete me deeply",
+            deleted_conversation_id,
+            WorldRect::new(20.0, 20.0, 280.0, 190.0),
+        );
+        deepest_tile.id = deepest_tile_id;
+        deepest.active_page_mut().add_tile(deepest_tile);
+        let mut deepest_snapshot = serde_json::to_value(deepest).unwrap();
+        deepest_snapshot["future_deep_field"] = serde_json::json!(["preserve", 27]);
+
+        let mut middle = Workspace::new();
+        middle
+            .domain
+            .conversations
+            .add(AiConversation::new(
+                middle_conversation_id,
+                "Checkpoint owner",
+                PermissionMode::Auto,
+                UnixMillis(1),
+            ))
+            .unwrap();
+        let mut middle_tile = Tile::ai_chat(
+            "Delete me from the middle",
+            deleted_conversation_id,
+            WorldRect::new(30.0, 30.0, 280.0, 190.0),
+        );
+        middle_tile.id = middle_tile_id;
+        middle.active_page_mut().add_tile(middle_tile);
+        let middle_page_id = middle.active_page;
+        middle
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&middle_conversation_id)
+            .unwrap()
+            .add_checkpoint(AiCheckpoint {
+                id: Uuid::new_v4(),
+                conversation_id: middle_conversation_id,
+                page_id: middle_page_id,
+                label: "Nested future snapshot".into(),
+                created_at: UnixMillis(2),
+                action_sequence: 0,
+                snapshot: deepest_snapshot,
+            })
+            .unwrap();
         let page_id = workspace.active_page;
-        let snapshot = ai_checkpoint_snapshot(&workspace);
+        let mut snapshot = serde_json::to_value(middle).unwrap();
+        snapshot["future_middle_field"] = serde_json::json!({"keep": true});
         workspace
             .domain
             .conversations
@@ -18832,12 +18963,44 @@ mod tests {
 
         let checkpoint = &workspace.domain.conversations.conversations[&retained_conversation_id]
             .checkpoints()[0];
+        assert_eq!(
+            checkpoint.snapshot["future_middle_field"],
+            serde_json::json!({"keep": true})
+        );
         let restored: Workspace = serde_json::from_value(checkpoint.snapshot.clone()).unwrap();
         assert!(
             restored
                 .pages
                 .iter()
-                .all(|page| page.tile(tile_id).is_none())
+                .all(|page| page.tile(middle_tile_id).is_none())
+        );
+        assert!(
+            restored
+                .domain
+                .conversations
+                .deleted_conversations
+                .contains(&deleted_conversation_id)
+        );
+        let nested_snapshot = &restored.domain.conversations.conversations[&middle_conversation_id]
+            .checkpoints()[0]
+            .snapshot;
+        assert_eq!(
+            nested_snapshot["future_deep_field"],
+            serde_json::json!(["preserve", 27])
+        );
+        let deepest: Workspace = serde_json::from_value(nested_snapshot.clone()).unwrap();
+        assert!(
+            deepest
+                .pages
+                .iter()
+                .all(|page| page.tile(deepest_tile_id).is_none())
+        );
+        assert!(
+            deepest
+                .domain
+                .conversations
+                .deleted_conversations
+                .contains(&deleted_conversation_id)
         );
         assert!(
             workspace
@@ -18846,6 +19009,7 @@ mod tests {
                 .conversations
                 .contains_key(&retained_conversation_id)
         );
+        assert!(workspace.active_page().tile(tile_id).is_none());
     }
 
     #[test]

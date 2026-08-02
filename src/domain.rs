@@ -3353,7 +3353,15 @@ impl ConversationStore {
                     (None, None) => None,
                 }
             };
-            if let Some(conversation) = merged {
+            if let Some(mut conversation) = merged {
+                // Server-storage disclosure is monotonic and must survive the
+                // scalar fast paths above (including local == base and
+                // remote == base). A stale/undo snapshot may never erase the
+                // fact that xAI retained an earlier Grok Heavy turn.
+                conversation.used_xai_server_storage = base_value
+                    .is_some_and(|value| value.used_xai_server_storage)
+                    || local_value.is_some_and(|value| value.used_xai_server_storage)
+                    || remote_value.is_some_and(|value| value.used_xai_server_storage);
                 conversations.insert(id, conversation);
             }
         }
@@ -3726,6 +3734,45 @@ impl TrashBin {
             .values()
             .filter(|item| item.tile_id == tile_id)
             .find(|item| self.is_active(item.id))
+    }
+
+    /// Imports one active item from another persisted Trash bin.
+    ///
+    /// The opaque snapshot and the stable MovedToTrash event identity are
+    /// preserved, while this bin assigns a locally valid sequence. Conflicting
+    /// stable identities fail closed so a stale save cannot overwrite the
+    /// newer recoverable copy.
+    pub(crate) fn import_active_item_from(
+        &mut self,
+        source: &Self,
+        item_id: Uuid,
+    ) -> Result<Option<TileId>, DomainError> {
+        let item = source
+            .items
+            .get(&item_id)
+            .ok_or(DomainError::MissingTrashItem(item_id))?;
+        if !source.is_active(item_id) {
+            return Ok(None);
+        }
+        if let Some(existing) = self.items.get(&item_id) {
+            if existing == item && self.is_active(item_id) {
+                return Ok(Some(item.tile_id));
+            }
+            return Err(DomainError::DuplicateId(item_id));
+        }
+        let moved_event = source
+            .events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.trash_item_id == item_id && event.event == TrashEventKind::MovedToTrash
+            })
+            .ok_or(DomainError::NotInTrash(item.tile_id))?;
+        if self.events.iter().any(|event| event.id == moved_event.id) {
+            return Err(DomainError::DuplicateId(moved_event.id));
+        }
+        self.move_to_trash(item.clone(), moved_event.id)?;
+        Ok(Some(item.tile_id))
     }
 
     pub fn is_active(&self, trash_item_id: Uuid) -> bool {
@@ -5338,6 +5385,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn conversation_store_xai_disclosure_is_monotonic_through_every_fast_path() {
+        for bits in 0_u8..8 {
+            let conversation_id = id(1);
+            let conversation = |used_xai_server_storage| {
+                let mut conversation =
+                    AiConversation::new(conversation_id, "Privacy", PermissionMode::Ask, at(1));
+                conversation.used_xai_server_storage = used_xai_server_storage;
+                conversation
+            };
+            let mut base = ConversationStore::default();
+            let mut local = ConversationStore::default();
+            let mut remote = ConversationStore::default();
+            base.add(conversation(bits & 0b001 != 0)).unwrap();
+            local.add(conversation(bits & 0b010 != 0)).unwrap();
+            remote.add(conversation(bits & 0b100 != 0)).unwrap();
+
+            let merged = ConversationStore::merge_persisted(&base, &local, &remote);
+            assert_eq!(
+                merged.conversations[&conversation_id].used_xai_server_storage,
+                bits != 0,
+                "marker combination {bits:03b} must reduce with logical OR"
+            );
+        }
+    }
+
     fn merge_test_message(message_id: u128, text: &str) -> ConversationMessage {
         ConversationMessage {
             id: id(message_id),
@@ -6402,6 +6475,136 @@ mod tests {
         assert_eq!(rows[0].artifact.at, at(1_000));
         assert_eq!(rows[0].artifact.produced_by.event_id, id(13));
         assert_eq!(rows[0].artifact.last_changed_by.at, at(1_000));
+    }
+
+    #[test]
+    fn persisted_artifact_transitions_preserve_cross_chat_lifetime_provenance() {
+        let path = "/tmp/interleaved-report.md";
+        let file_event = |event_id, tool: &str, kind, at_value| {
+            ActivityEvent::new(
+                event_id,
+                at(at_value),
+                ActivityKind::FileChange {
+                    id: format!("call-{event_id}"),
+                    tool: Some(tool.into()),
+                    changes: vec![crate::chat_core::FileChange {
+                        path: path.into(),
+                        kind,
+                    }],
+                    status: crate::chat_core::ActivityStatus::Completed,
+                },
+            )
+        };
+        let producer_id = id(1);
+        let deleter_id = id(2);
+        let recreator_id = id(3);
+        let first_delete_id = id(21);
+        let final_delete_id = id(22);
+        let recreate_id = id(31);
+
+        let mut deleter_trace = crate::chat_core::ActivityAccumulator::new();
+        deleter_trace.ingest_many([
+            file_event(
+                first_delete_id,
+                "Delete",
+                crate::chat_core::FileChangeKind::Delete,
+                200,
+            ),
+            file_event(
+                final_delete_id,
+                "Delete",
+                crate::chat_core::FileChangeKind::Delete,
+                400,
+            ),
+        ]);
+        let persisted_deletes = deleter_trace.events_for_persistence();
+        assert_eq!(
+            persisted_deletes
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            vec![first_delete_id, final_delete_id]
+        );
+
+        let conversation_with_events =
+            |conversation_id, title: &str, message_id, turn_id, events: Vec<ActivityEvent>| {
+                let mut conversation =
+                    AiConversation::new(conversation_id, title, PermissionMode::Ask, at(0));
+                conversation
+                    .append_message_with_activity(
+                        message_id,
+                        MessageRole::Assistant,
+                        "Changed the shared artifact",
+                        events.last().map(|event| event.at).unwrap_or_default(),
+                        Vec::new(),
+                        Vec::new(),
+                        events,
+                        Some(turn_id),
+                    )
+                    .unwrap();
+                conversation
+            };
+        let mut workspace = Workspace::new();
+        workspace
+            .domain
+            .conversations
+            .add(conversation_with_events(
+                producer_id,
+                "Producer",
+                id(11),
+                id(12),
+                vec![file_event(
+                    id(13),
+                    "Write",
+                    crate::chat_core::FileChangeKind::Add,
+                    100,
+                )],
+            ))
+            .unwrap();
+        workspace
+            .domain
+            .conversations
+            .add(conversation_with_events(
+                deleter_id,
+                "Deleter",
+                id(23),
+                id(24),
+                persisted_deletes,
+            ))
+            .unwrap();
+        workspace
+            .domain
+            .conversations
+            .add(conversation_with_events(
+                recreator_id,
+                "Recreator",
+                id(32),
+                id(33),
+                vec![file_event(
+                    recreate_id,
+                    "Edit",
+                    crate::chat_core::FileChangeKind::Update,
+                    300,
+                )],
+            ))
+            .unwrap();
+
+        let reloaded: Workspace =
+            serde_json::from_slice(&serde_json::to_vec(&workspace).unwrap()).unwrap();
+        let rows = reloaded.artifact_library("");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].artifact.is_deleted);
+        assert_eq!(
+            rows[0].artifact.produced_by.conversation_id,
+            Some(recreator_id)
+        );
+        assert_eq!(rows[0].artifact.produced_by.event_id, recreate_id);
+        assert_eq!(rows[0].artifact.produced_by.tool.as_deref(), Some("Edit"));
+        assert_eq!(
+            rows[0].artifact.last_changed_by.conversation_id,
+            Some(deleter_id)
+        );
+        assert_eq!(rows[0].artifact.last_changed_by.event_id, final_delete_id);
     }
 
     #[test]

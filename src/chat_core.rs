@@ -911,9 +911,6 @@ impl ActivityAccumulator {
     fn enforce_live_cap(&mut self) {
         while self.events.len() > self.max_events {
             let Some(eviction) = self.events.iter().position(is_live_cap_evictable) else {
-                if self.compact_artifact_state() {
-                    continue;
-                }
                 // Plans, errors, permission prompts, artifact lifecycles,
                 // child lifecycle, and scoped child prose are exempt. Their
                 // combined must-keep set may exceed the soft live cap rather
@@ -1060,28 +1057,6 @@ impl ActivityAccumulator {
         );
         self.events != before
     }
-
-    /// Drops only redundant artifact transitions while retaining the exact
-    /// events required to replay each artifact's current lifetime, creation
-    /// provenance, and newest transition. Distinct artifacts may still make
-    /// the live cap soft; no artifact identity is discarded to hit a number.
-    fn compact_artifact_state(&mut self) -> bool {
-        let witnesses = artifact_witness_indices(&self.events);
-        let before = self.events.len();
-        self.events = self
-            .events
-            .drain(..)
-            .enumerate()
-            .filter_map(|(index, event)| {
-                (!matches!(
-                    &event.kind,
-                    ActivityKind::FileChange { .. } | ActivityKind::HostMutation { .. }
-                ) || witnesses.contains(&index))
-                .then_some(event)
-            })
-            .collect();
-        self.events.len() < before
-    }
 }
 
 fn is_live_cap_evictable(event: &ActivityEvent) -> bool {
@@ -1101,9 +1076,10 @@ fn is_live_cap_evictable(event: &ActivityEvent) -> bool {
 /// Applies the persistence must-keep contract while preserving original
 /// event order.
 ///
-/// All errors, prompts, transition-equivalent file/host artifact witnesses,
-/// merged text/thinking, and the trailing plan survive. Newest ordinary events
-/// fill the remaining budget. Distinct artifact truth may exceed `cap`.
+/// All errors, prompts, file/host artifact transitions, merged text/thinking,
+/// and the trailing plan survive. Newest ordinary events fill the remaining
+/// budget. Artifact transitions may exceed `cap`: conversation-local
+/// compaction is not compositional when other chats interleave by timestamp.
 pub fn activity_events_for_persistence(events: &[ActivityEvent], cap: usize) -> Vec<ActivityEvent> {
     if events.is_empty() {
         return Vec::new();
@@ -1115,14 +1091,13 @@ pub fn activity_events_for_persistence(events: &[ActivityEvent], cap: usize) -> 
             trailing_plans.insert(event.scope.clone(), index);
         }
     }
-    let artifact_witnesses = artifact_witness_indices(events);
     let mut retained = BTreeSet::new();
     for (index, event) in events.iter().enumerate() {
         let artifact_event = matches!(
             &event.kind,
             ActivityKind::FileChange { .. } | ActivityKind::HostMutation { .. }
         );
-        if (artifact_event && artifact_witnesses.contains(&index))
+        if artifact_event
             || (!artifact_event && event.kind.is_persist_must_keep())
             || trailing_plans.get(&event.scope).copied() == Some(index)
         {
@@ -1136,13 +1111,6 @@ pub fn activity_events_for_persistence(events: &[ActivityEvent], cap: usize) -> 
             if retained.len() >= target {
                 break;
             }
-            if matches!(
-                &events[index].kind,
-                ActivityKind::FileChange { .. } | ActivityKind::HostMutation { .. }
-            ) && !artifact_witnesses.contains(&index)
-            {
-                continue;
-            }
             retained.insert(index);
         }
     }
@@ -1151,136 +1119,6 @@ pub fn activity_events_for_persistence(events: &[ActivityEvent], cap: usize) -> 
         .into_iter()
         .map(|index| events[index].clone())
         .collect()
-}
-
-/// Indices forming a transition-equivalent witness for every artifact.
-///
-/// File updates can target an artifact created in an earlier turn, so a final
-/// delete is retained even when this slice has no local add. A delete followed
-/// by an update retains both records because that pair starts a new lifetime;
-/// otherwise an older producer would incorrectly survive replay. Host entities
-/// have stable IDs and only an explicit Create starts a lifetime.
-fn artifact_witness_indices(events: &[ActivityEvent]) -> BTreeSet<usize> {
-    #[derive(Clone, Copy)]
-    enum FileLifetimeStart {
-        Direct(usize),
-        AfterDelete {
-            deleted_at: usize,
-            started_at: usize,
-        },
-    }
-
-    let mut file_transitions = BTreeMap::<String, Vec<(usize, FileChangeKind)>>::new();
-    let mut host_transitions = BTreeMap::<String, Vec<(usize, HostMutationKind)>>::new();
-    let mut witnesses = BTreeSet::new();
-
-    for (index, event) in events.iter().enumerate() {
-        match &event.kind {
-            ActivityKind::FileChange {
-                changes,
-                status: ActivityStatus::Completed,
-                ..
-            } => {
-                for change in changes {
-                    if let Some(path) = normalize_lexical_path(&change.path) {
-                        file_transitions
-                            .entry(path)
-                            .or_default()
-                            .push((index, change.kind));
-                    }
-                }
-            }
-            // An active lifecycle record carries the changes that its later
-            // id-matched completion may omit, so it is never compacted away.
-            ActivityKind::FileChange {
-                status: ActivityStatus::InProgress,
-                ..
-            } => {
-                witnesses.insert(index);
-            }
-            ActivityKind::HostMutation {
-                entity_id: Some(entity_id),
-                kind,
-                ..
-            } if !entity_id.trim().is_empty() => {
-                host_transitions
-                    .entry(entity_id.trim().to_owned())
-                    .or_default()
-                    .push((index, *kind));
-            }
-            _ => {}
-        }
-    }
-
-    for transitions in file_transitions.values() {
-        let mut lifetime_start = None;
-        let mut latest_delete = None;
-        for (index, kind) in transitions {
-            match kind {
-                FileChangeKind::Add => {
-                    lifetime_start = Some(FileLifetimeStart::Direct(*index));
-                    latest_delete = None;
-                }
-                FileChangeKind::Update => {
-                    if let Some(deleted_at) = latest_delete.take() {
-                        lifetime_start = Some(FileLifetimeStart::AfterDelete {
-                            deleted_at,
-                            started_at: *index,
-                        });
-                    } else if lifetime_start.is_none() {
-                        lifetime_start = Some(FileLifetimeStart::Direct(*index));
-                    }
-                }
-                FileChangeKind::Delete => latest_delete = Some(*index),
-            }
-        }
-        if let Some(start) = lifetime_start {
-            match start {
-                FileLifetimeStart::Direct(index) => {
-                    witnesses.insert(index);
-                }
-                FileLifetimeStart::AfterDelete {
-                    deleted_at,
-                    started_at,
-                } => {
-                    witnesses.insert(deleted_at);
-                    witnesses.insert(started_at);
-                }
-            }
-        }
-        if let Some((index, _)) = transitions.last() {
-            witnesses.insert(*index);
-        }
-    }
-
-    for transitions in host_transitions.values() {
-        if let Some((index, _)) = transitions
-            .iter()
-            .rev()
-            .find(|(_, kind)| *kind == HostMutationKind::Create)
-        {
-            witnesses.insert(*index);
-        }
-        if let Some((index, final_kind)) = transitions.last() {
-            witnesses.insert(*index);
-            // Host deletion intentionally preserves the last visible title
-            // and container. Retain the newest preceding metadata-bearing
-            // transition as well, including when the Create lives in an
-            // earlier persisted turn outside this slice.
-            if *final_kind == HostMutationKind::Delete
-                && let Some((metadata_index, _)) = transitions[..transitions.len() - 1]
-                    .iter()
-                    .rev()
-                    .find(|(_, kind)| {
-                        matches!(kind, HostMutationKind::Create | HostMutationKind::Update)
-                    })
-            {
-                witnesses.insert(*metadata_index);
-            }
-        }
-    }
-
-    witnesses
 }
 
 /// Flattens normalized assistant prose without re-reading raw provider output.
@@ -4718,7 +4556,7 @@ mod tests {
     }
 
     #[test]
-    fn persistence_compacts_repeated_file_updates_without_changing_artifact_truth() {
+    fn persistence_keeps_repeated_artifact_transitions_beyond_the_soft_cap() {
         let events = (1..=600)
             .map(|index| {
                 event(
@@ -4739,8 +4577,55 @@ mod tests {
 
         let retained = activity_events_for_persistence(&events, 8);
 
-        assert_eq!(retained.len(), 2);
+        assert_eq!(retained, events);
         assert_eq!(project_artifacts(&retained), project_artifacts(&events));
+    }
+
+    #[test]
+    fn persistence_artifact_must_keeps_displace_chatter_and_may_exceed_the_soft_cap() {
+        let artifact = |id_value, path: String| {
+            event(
+                id_value,
+                id_value as i64,
+                ActivityKind::FileChange {
+                    id: format!("file-{id_value}"),
+                    tool: Some("Write".into()),
+                    changes: vec![FileChange {
+                        path,
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            )
+        };
+        let mut mixed = vec![
+            artifact(1, "/workspace/one.md".into()),
+            artifact(2, "/workspace/two.md".into()),
+        ];
+        mixed.extend((3..=603).map(|index| {
+            event(
+                index,
+                index as i64,
+                ActivityKind::ToolCall {
+                    id: format!("tool-{index}"),
+                    name: "Read".into(),
+                    server: None,
+                    input_summary: Some("ordinary chatter".into()),
+                },
+            )
+        }));
+        let retained = activity_events_for_persistence(&mixed, PERSISTED_ACTIVITY_EVENT_CAP);
+        assert_eq!(retained.len(), PERSISTED_ACTIVITY_EVENT_CAP);
+        assert_eq!(retained[0].id, Uuid::from_u128(1));
+        assert_eq!(retained[1].id, Uuid::from_u128(2));
+
+        let artifacts = (1..=PERSISTED_ACTIVITY_EVENT_CAP as u128 + 1)
+            .map(|index| artifact(index, format!("/workspace/{index}.md")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            activity_events_for_persistence(&artifacts, PERSISTED_ACTIVITY_EVENT_CAP).len(),
+            PERSISTED_ACTIVITY_EVENT_CAP + 1
+        );
     }
 
     #[test]
@@ -4854,7 +4739,7 @@ mod tests {
     }
 
     #[test]
-    fn live_cap_compacts_repeated_artifact_updates_but_not_distinct_truth() {
+    fn live_cap_keeps_repeated_artifact_transitions_as_soft_must_keeps() {
         let mut accumulator = ActivityAccumulator::with_max_events(2);
         for index in 1..=50 {
             accumulator.ingest(event(
@@ -4872,7 +4757,7 @@ mod tests {
             ));
         }
 
-        assert_eq!(accumulator.len(), 2);
+        assert_eq!(accumulator.len(), 50);
         let artifact = project_artifacts(&accumulator.events).pop().unwrap();
         assert_eq!(artifact.produced_by.event_id, Uuid::from_u128(1));
         assert_eq!(artifact.last_changed_by.event_id, Uuid::from_u128(50));
