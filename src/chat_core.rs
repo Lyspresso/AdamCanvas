@@ -192,6 +192,46 @@ impl SubagentStatus {
     }
 }
 
+/// Provider-neutral category for a coordinated set of agents.
+///
+/// A group is deliberately distinct from a child agent. Some providers expose
+/// each member (Kimi AgentSwarm), while others expose only the leader and a
+/// declared member count (xAI multi-agent inference). Adam persists that
+/// visibility boundary instead of manufacturing child identities.
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentGroupKind {
+    #[default]
+    Swarm,
+    Delegation,
+    Workflow,
+    MultiAgentInference,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentGroupVisibility {
+    /// The provider identifies individual members and may publish their final
+    /// outcomes, but does not expose live child telemetry.
+    DelegatedMembers,
+    /// The provider exposes only a leader-facing aggregate.
+    #[default]
+    AggregateOnly,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AgentGroupMember {
+    pub id: String,
+    pub label: String,
+    pub status: SubagentStatus,
+    pub detail: Option<String>,
+}
+
 /// Normalized terminal state for a provider turn.
 ///
 /// This deliberately keeps provider cancellation categories richer than a
@@ -283,6 +323,10 @@ pub enum ActivityKind {
     FileChange {
         #[serde(default)]
         id: String,
+        /// Provider tool that produced this change when the structured
+        /// stream exposes it. Legacy events omit this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
         #[serde(default)]
         changes: Vec<FileChange>,
         #[serde(default)]
@@ -378,6 +422,26 @@ pub enum ActivityKind {
         #[serde(default)]
         tool_calls: Option<u64>,
     },
+    AgentGroup {
+        #[serde(default)]
+        id: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        aliases: Vec<String>,
+        #[serde(default)]
+        label: String,
+        #[serde(default)]
+        kind: AgentGroupKind,
+        #[serde(default)]
+        status: SubagentStatus,
+        #[serde(default)]
+        expected_count: Option<u32>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        members: Vec<AgentGroupMember>,
+        #[serde(default)]
+        visibility: AgentGroupVisibility,
+        #[serde(default)]
+        detail: Option<String>,
+    },
     Usage {
         #[serde(default)]
         input: Option<u64>,
@@ -436,6 +500,7 @@ impl ActivityKind {
             Self::HostRead { .. } => "hostRead",
             Self::PermissionPrompt { .. } => "permissionPrompt",
             Self::Subagent { .. } => "subagent",
+            Self::AgentGroup { .. } => "agentGroup",
             Self::Usage { .. } => "usage",
             Self::TurnError { .. } => "turnError",
             Self::TurnStatus { .. } => "turnStatus",
@@ -456,6 +521,7 @@ impl ActivityKind {
             Self::WebSearch { id, .. } => ("webSearch", id),
             Self::PermissionPrompt { id, .. } => ("permissionPrompt", id),
             Self::Subagent { id, .. } => ("subagent", id),
+            Self::AgentGroup { id, .. } => ("agentGroup", id),
             _ => return None,
         };
         Some(format!("{case_name}:{id}"))
@@ -495,11 +561,10 @@ impl ActivityKind {
             self,
             Self::AssistantText { .. }
                 | Self::Thinking { .. }
-                | Self::FileChange { .. }
                 | Self::TaskMutation { .. }
-                | Self::HostMutation { .. }
                 | Self::PermissionPrompt { .. }
                 | Self::Subagent { .. }
+                | Self::AgentGroup { .. }
                 | Self::TurnError { .. }
                 | Self::TurnStatus { .. }
         )
@@ -718,55 +783,116 @@ impl ActivityAccumulator {
                 .duration_ms
                 .or_else(|| Some(incoming.at.elapsed_since(original_at)));
             self.events[index].kind = incoming.kind;
-            if let (
-                ActivityKind::Subagent {
-                    aliases: previous_aliases,
-                    parent_id: previous_parent,
-                    label: previous_label,
-                    status: previous_status,
-                    model: previous_model,
-                    detail: previous_detail,
-                    tool_calls: previous_tool_calls,
-                    ..
-                },
-                ActivityKind::Subagent {
-                    aliases,
-                    parent_id,
-                    label,
-                    status,
-                    model,
-                    detail,
-                    tool_calls,
-                    ..
-                },
-            ) = (previous_kind, &mut self.events[index].kind)
-            {
-                for alias in previous_aliases {
-                    if !aliases.contains(&alias) {
-                        aliases.push(alias);
+            match (previous_kind, &mut self.events[index].kind) {
+                (
+                    ActivityKind::Subagent {
+                        aliases: previous_aliases,
+                        parent_id: previous_parent,
+                        label: previous_label,
+                        status: previous_status,
+                        model: previous_model,
+                        detail: previous_detail,
+                        tool_calls: previous_tool_calls,
+                        ..
+                    },
+                    ActivityKind::Subagent {
+                        aliases,
+                        parent_id,
+                        label,
+                        status,
+                        model,
+                        detail,
+                        tool_calls,
+                        ..
+                    },
+                ) => {
+                    for alias in previous_aliases {
+                        if !aliases.contains(&alias) {
+                            aliases.push(alias);
+                        }
+                    }
+                    if parent_id.is_none() {
+                        *parent_id = previous_parent;
+                    }
+                    if label.trim().is_empty() {
+                        *label = previous_label;
+                    }
+                    if model.is_none() {
+                        *model = previous_model;
+                    }
+                    if detail.is_none() {
+                        if status.is_terminal()
+                            || (previous_status.is_terminal() && !status.is_terminal())
+                        {
+                            *detail = None;
+                        } else {
+                            *detail = previous_detail;
+                        }
+                    }
+                    if tool_calls.is_none() {
+                        *tool_calls = previous_tool_calls;
                     }
                 }
-                if parent_id.is_none() {
-                    *parent_id = previous_parent;
-                }
-                if label.trim().is_empty() {
-                    *label = previous_label;
-                }
-                if model.is_none() {
-                    *model = previous_model;
-                }
-                if detail.is_none() {
-                    if status.is_terminal()
-                        || (previous_status.is_terminal() && !status.is_terminal())
-                    {
-                        *detail = None;
-                    } else {
-                        *detail = previous_detail;
+                (
+                    ActivityKind::AgentGroup {
+                        aliases: previous_aliases,
+                        label: previous_label,
+                        status: previous_status,
+                        expected_count: previous_expected_count,
+                        members: previous_members,
+                        detail: previous_detail,
+                        ..
+                    },
+                    ActivityKind::AgentGroup {
+                        aliases,
+                        label,
+                        status,
+                        expected_count,
+                        members,
+                        detail,
+                        ..
+                    },
+                ) => {
+                    for alias in previous_aliases {
+                        if !aliases.contains(&alias) {
+                            aliases.push(alias);
+                        }
+                    }
+                    if label.trim().is_empty() {
+                        *label = previous_label;
+                    }
+                    if expected_count.is_none() {
+                        *expected_count = previous_expected_count;
+                    }
+                    if members.is_empty() {
+                        *members = previous_members;
+                    }
+                    if detail.is_none() {
+                        if status.is_terminal()
+                            || (previous_status.is_terminal() && !status.is_terminal())
+                        {
+                            *detail = None;
+                        } else {
+                            *detail = previous_detail;
+                        }
                     }
                 }
-                if tool_calls.is_none() {
-                    *tool_calls = previous_tool_calls;
+                (
+                    ActivityKind::FileChange {
+                        tool: previous_tool,
+                        changes: previous_changes,
+                        ..
+                    },
+                    ActivityKind::FileChange { tool, changes, .. },
+                ) => {
+                    if tool.is_none() {
+                        *tool = previous_tool;
+                    }
+                    if changes.is_empty() {
+                        *changes = previous_changes;
+                    }
                 }
+                _ => {}
             }
             return;
         }
@@ -785,10 +911,10 @@ impl ActivityAccumulator {
     fn enforce_live_cap(&mut self) {
         while self.events.len() > self.max_events {
             let Some(eviction) = self.events.iter().position(is_live_cap_evictable) else {
-                // Plans, errors, permission prompts, child lifecycle, and
-                // scoped child prose are exempt. Their combined must-keep set
-                // may exceed the soft live cap rather than silently deleting
-                // authoritative state.
+                // Plans, errors, permission prompts, artifact lifecycles,
+                // child lifecycle, and scoped child prose are exempt. Their
+                // combined must-keep set may exceed the soft live cap rather
+                // than silently deleting authoritative state.
                 break;
             };
             if self.events[eviction].kind.is_task_state() {
@@ -936,7 +1062,13 @@ impl ActivityAccumulator {
 fn is_live_cap_evictable(event: &ActivityEvent) -> bool {
     event.kind.is_foldable()
         && !event.kind.is_plan_snapshot()
-        && !matches!(event.kind, ActivityKind::Subagent { .. })
+        && !matches!(
+            event.kind,
+            ActivityKind::FileChange { .. }
+                | ActivityKind::HostMutation { .. }
+                | ActivityKind::Subagent { .. }
+                | ActivityKind::AgentGroup { .. }
+        )
         && !(event.scope.child_id().is_some()
             && matches!(event.kind, ActivityKind::AssistantText { .. }))
 }
@@ -944,9 +1076,10 @@ fn is_live_cap_evictable(event: &ActivityEvent) -> bool {
 /// Applies the persistence must-keep contract while preserving original
 /// event order.
 ///
-/// All errors, prompts, file changes, host mutations (Adam's artifact-bearing
-/// domain case), merged text/thinking, and the trailing plan survive. Newest
-/// ordinary events fill the remaining budget. Must-keeps may exceed `cap`.
+/// All errors, prompts, file/host artifact transitions, merged text/thinking,
+/// and the trailing plan survive. Newest ordinary events fill the remaining
+/// budget. Artifact transitions may exceed `cap`: conversation-local
+/// compaction is not compositional when other chats interleave by timestamp.
 pub fn activity_events_for_persistence(events: &[ActivityEvent], cap: usize) -> Vec<ActivityEvent> {
     if events.is_empty() {
         return Vec::new();
@@ -960,7 +1093,12 @@ pub fn activity_events_for_persistence(events: &[ActivityEvent], cap: usize) -> 
     }
     let mut retained = BTreeSet::new();
     for (index, event) in events.iter().enumerate() {
-        if event.kind.is_persist_must_keep()
+        let artifact_event = matches!(
+            &event.kind,
+            ActivityKind::FileChange { .. } | ActivityKind::HostMutation { .. }
+        );
+        if artifact_event
+            || (!artifact_event && event.kind.is_persist_must_keep())
             || trailing_plans.get(&event.scope).copied() == Some(index)
         {
             retained.insert(index);
@@ -1337,6 +1475,149 @@ pub fn project_subagent_aggregate(subagents: &[SubagentProjection]) -> SubagentA
         }
     }
     aggregate
+}
+
+/// Newest known state for one real provider-owned group of agents.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AgentGroupProjection {
+    pub id: String,
+    pub aliases: Vec<String>,
+    pub label: String,
+    pub kind: AgentGroupKind,
+    pub status: SubagentStatus,
+    pub expected_count: Option<u32>,
+    pub members: Vec<AgentGroupMember>,
+    pub visibility: AgentGroupVisibility,
+    pub detail: Option<String>,
+    pub at: UnixMillis,
+    pub duration_ms: Option<i64>,
+}
+
+/// Folds group lifecycle events without converting opaque members into
+/// ordinary child-agent rows.
+pub fn project_agent_groups(events: &[ActivityEvent]) -> Vec<AgentGroupProjection> {
+    let mut groups = Vec::<AgentGroupProjection>::new();
+    let mut indices = BTreeMap::<String, usize>::new();
+    let aliases = project_agent_group_aliases(events);
+
+    for event in events {
+        let ActivityKind::AgentGroup {
+            id,
+            aliases: event_aliases,
+            label,
+            kind,
+            status,
+            expected_count,
+            members,
+            visibility,
+            detail,
+        } = &event.kind
+        else {
+            continue;
+        };
+        if id.trim().is_empty() {
+            continue;
+        }
+        let canonical_id = resolve_agent_group_alias(&aliases, id);
+        if let Some(index) = indices.get(&canonical_id).copied() {
+            let existing = &mut groups[index];
+            for alias in event_aliases {
+                if alias != &canonical_id && !existing.aliases.contains(alias) {
+                    existing.aliases.push(alias.clone());
+                }
+            }
+            if id != &canonical_id && !existing.aliases.contains(id) {
+                existing.aliases.push(id.clone());
+            }
+            if !label.trim().is_empty() {
+                existing.label.clone_from(label);
+            }
+            existing.kind = *kind;
+            existing.status = *status;
+            if expected_count.is_some() {
+                existing.expected_count = *expected_count;
+            }
+            if !members.is_empty() {
+                existing.members.clone_from(members);
+            }
+            existing.visibility = *visibility;
+            if detail.is_some() {
+                existing.detail.clone_from(detail);
+            } else if status.is_terminal() {
+                existing.detail = None;
+            }
+            existing.duration_ms = event.duration_ms.or(existing.duration_ms).or_else(|| {
+                status
+                    .is_terminal()
+                    .then(|| event.at.elapsed_since(existing.at))
+            });
+        } else {
+            indices.insert(canonical_id.clone(), groups.len());
+            groups.push(AgentGroupProjection {
+                id: canonical_id.clone(),
+                aliases: event_aliases
+                    .iter()
+                    .filter(|alias| !alias.trim().is_empty() && *alias != &canonical_id)
+                    .cloned()
+                    .collect(),
+                label: label.clone(),
+                kind: *kind,
+                status: *status,
+                expected_count: *expected_count,
+                members: members.clone(),
+                visibility: *visibility,
+                detail: detail.clone(),
+                at: event.at,
+                duration_ms: event.duration_ms,
+            });
+        }
+    }
+    for group in &mut groups {
+        group.aliases.sort();
+        group.aliases.dedup();
+    }
+    groups
+}
+
+fn project_agent_group_aliases(events: &[ActivityEvent]) -> BTreeMap<String, String> {
+    let mut aliases = BTreeMap::<String, String>::new();
+    for event in events {
+        let ActivityKind::AgentGroup {
+            id,
+            aliases: event_aliases,
+            ..
+        } = &event.kind
+        else {
+            continue;
+        };
+        if id.trim().is_empty() {
+            continue;
+        }
+        let canonical = resolve_agent_group_alias(&aliases, id);
+        aliases.insert(canonical.clone(), canonical.clone());
+        aliases.insert(id.clone(), canonical.clone());
+        for alias in event_aliases {
+            if !alias.trim().is_empty() {
+                aliases.insert(alias.clone(), canonical.clone());
+            }
+        }
+    }
+    aliases
+}
+
+fn resolve_agent_group_alias(aliases: &BTreeMap<String, String>, id: &str) -> String {
+    let mut current = id.to_owned();
+    for _ in 0..16 {
+        let Some(next) = aliases.get(&current) else {
+            break;
+        };
+        if next == &current {
+            break;
+        }
+        current.clone_from(next);
+    }
+    current
 }
 
 /// Last normalized provider-turn state in an event stream.
@@ -1830,7 +2111,40 @@ impl Default for ArtifactSource {
     }
 }
 
-/// One newest-wins output record for a conversation.
+/// Conversation and turn context paired with one event before artifact
+/// reduction. The borrowed event remains the single source of truth; this
+/// wrapper supplies ownership that does not belong on every activity record.
+#[derive(Clone, Copy, Debug)]
+pub struct ArtifactEventRef<'a> {
+    pub conversation_id: Option<Uuid>,
+    pub turn_id: Option<Uuid>,
+    pub event: &'a ActivityEvent,
+}
+
+impl<'a> From<&'a ActivityEvent> for ArtifactEventRef<'a> {
+    fn from(event: &'a ActivityEvent) -> Self {
+        Self {
+            conversation_id: None,
+            turn_id: None,
+            event,
+        }
+    }
+}
+
+/// Durable origin of one artifact lifecycle transition.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ArtifactProvenance {
+    pub conversation_id: Option<Uuid>,
+    pub turn_id: Option<Uuid>,
+    pub event_id: Uuid,
+    pub tool_call_id: Option<String>,
+    pub tool: Option<String>,
+    pub scope: AgentScope,
+    pub at: UnixMillis,
+}
+
+/// One newest-in-stream artifact record for a conversation.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ArtifactProjection {
@@ -1840,6 +2154,29 @@ pub struct ArtifactProjection {
     pub source: ArtifactSource,
     pub at: UnixMillis,
     pub is_deleted: bool,
+    /// The event that established the current artifact lifetime. Updates and
+    /// deletion preserve this; an explicit recreation replaces it.
+    pub produced_by: ArtifactProvenance,
+    /// The newest lifecycle event folded into this projection.
+    pub last_changed_by: ArtifactProvenance,
+}
+
+/// Timestamp at which an artifact transition actually became true.
+///
+/// Lifecycle records retain their start timestamp when they complete and put
+/// the elapsed interval in duration_ms. Cross-conversation artifact replay
+/// must compare completion instants, otherwise a long-running write can sort
+/// before a delete that happened while the write was still in flight.
+pub fn artifact_effective_at(event: &ActivityEvent) -> UnixMillis {
+    match event.kind {
+        ActivityKind::FileChange {
+            status: ActivityStatus::Completed,
+            ..
+        } => event
+            .at
+            .saturating_add(event.duration_ms.unwrap_or_default()),
+        _ => event.at,
+    }
 }
 
 impl ArtifactProjection {
@@ -1851,34 +2188,126 @@ impl ArtifactProjection {
     }
 }
 
-/// Outputs from file and host mutations, deduped within this event stream.
+/// Artifacts from file and host mutations, deduped within this event stream.
 ///
-/// Newer timestamps win; on a timestamp tie, the later event in stream order
-/// wins. Consequently a later delete replaces and strikes an earlier add.
+/// Compatibility wrapper for callers projecting one conversation without
+/// message-level turn context.
 pub fn project_artifacts(events: &[ActivityEvent]) -> Vec<ArtifactProjection> {
-    let mut by_identity = BTreeMap::<String, ArtifactProjection>::new();
+    project_artifacts_with_provenance(events.iter().map(ArtifactEventRef::from))
+}
 
-    for event in events {
+/// Projects artifact lifecycles across one or more conversations.
+///
+/// Input order, rather than provider timestamps, is authoritative. Identity
+/// is scoped by conversation so the same path or host entity in two chats
+/// remains two library records. Only completed file-change lifecycles are
+/// materialized. A delete cannot invent an artifact, and updates/deletes keep
+/// the provenance of the event that originally produced it.
+pub fn project_artifacts_with_provenance<'a>(
+    events: impl IntoIterator<Item = ArtifactEventRef<'a>>,
+) -> Vec<ArtifactProjection> {
+    project_artifacts_with_identity(events, ArtifactIdentityScope::Conversation)
+}
+
+/// Projects one workspace-global artifact record per stable path or entity.
+///
+/// Unlike [`project_artifacts_with_provenance`], conversation ownership does
+/// not participate in identity. A later update or deletion from another chat
+/// therefore changes the same physical artifact while retaining the producer
+/// and newest-change provenance from their respective turns.
+pub fn project_global_artifacts_with_provenance<'a>(
+    events: impl IntoIterator<Item = ArtifactEventRef<'a>>,
+) -> Vec<ArtifactProjection> {
+    project_artifacts_with_identity(events, ArtifactIdentityScope::Global)
+}
+
+#[derive(Clone, Copy)]
+enum ArtifactIdentityScope {
+    Conversation,
+    Global,
+}
+
+fn project_artifacts_with_identity<'a>(
+    events: impl IntoIterator<Item = ArtifactEventRef<'a>>,
+    identity_scope: ArtifactIdentityScope,
+) -> Vec<ArtifactProjection> {
+    let mut by_identity = BTreeMap::<(Option<Uuid>, String), (usize, ArtifactProjection)>::new();
+    let mut seen_events = BTreeSet::<(Option<Uuid>, Uuid)>::new();
+
+    for (stream_index, input) in events.into_iter().enumerate() {
+        let event = input.event;
+        let effective_at = artifact_effective_at(event);
+        let identity_conversation = match identity_scope {
+            ArtifactIdentityScope::Conversation => input.conversation_id,
+            ArtifactIdentityScope::Global => None,
+        };
+        // Legacy activity records can deserialize with a nil identity. They
+        // are not safe to coalesce because multiple distinct old events may
+        // share that sentinel.
+        if !event.id.is_nil() && !seen_events.insert((identity_conversation, event.id)) {
+            continue;
+        }
         match &event.kind {
             ActivityKind::FileChange {
-                changes, status, ..
-            } if *status != ActivityStatus::Failed && *status != ActivityStatus::Declined => {
+                id,
+                tool,
+                changes,
+                status,
+            } if *status == ActivityStatus::Completed => {
+                let provenance = artifact_provenance(
+                    input,
+                    nonempty_owned(id),
+                    tool.as_deref().and_then(nonempty_owned),
+                );
                 for change in changes {
-                    let id = format!("file:{}", change.path);
-                    let (title, subtitle) = split_path_label(&change.path);
-                    upsert_artifact(
-                        &mut by_identity,
-                        ArtifactProjection {
-                            id,
-                            title,
-                            subtitle,
-                            source: ArtifactSource::File {
-                                path: change.path.clone(),
-                                change: change.kind,
+                    let Some(path) = normalize_lexical_path(&change.path) else {
+                        continue;
+                    };
+                    let id = format!("file:{path}");
+                    let key = (identity_conversation, id.clone());
+                    let (title, subtitle) = split_path_label(&path);
+                    if change.kind == FileChangeKind::Delete {
+                        let Some((last_index, existing)) = by_identity.get_mut(&key) else {
+                            continue;
+                        };
+                        existing.title = title;
+                        existing.subtitle = subtitle;
+                        existing.source = ArtifactSource::File {
+                            path,
+                            change: change.kind,
+                        };
+                        existing.at = effective_at;
+                        existing.is_deleted = true;
+                        existing.last_changed_by = provenance.clone();
+                        *last_index = stream_index;
+                        continue;
+                    }
+
+                    let produced_by = by_identity
+                        .get(&key)
+                        .filter(|(_, existing)| {
+                            change.kind != FileChangeKind::Add && !existing.is_deleted
+                        })
+                        .map(|(_, existing)| existing.produced_by.clone())
+                        .unwrap_or_else(|| provenance.clone());
+                    by_identity.insert(
+                        key,
+                        (
+                            stream_index,
+                            ArtifactProjection {
+                                id,
+                                title,
+                                subtitle,
+                                source: ArtifactSource::File {
+                                    path,
+                                    change: change.kind,
+                                },
+                                at: effective_at,
+                                is_deleted: false,
+                                produced_by,
+                                last_changed_by: provenance.clone(),
                             },
-                            at: event.at,
-                            is_deleted: change.kind == FileChangeKind::Delete,
-                        },
+                        ),
                     );
                 }
             }
@@ -1889,59 +2318,154 @@ pub fn project_artifacts(events: &[ActivityEvent]) -> Vec<ArtifactProjection> {
                 container_name,
                 kind,
             } => {
-                // Only a creation invents a host output. An update or delete
-                // can revise an already-created entity when it carries the
-                // same stable id, but an operation on pre-existing host data
-                // is provenance rather than a produced artifact.
-                let id = match (kind, entity_id.as_deref()) {
-                    (HostMutationKind::Create, Some(id)) => format!("host:{id}"),
-                    (HostMutationKind::Create, None) => format!("host-event:{}", event.id),
-                    (HostMutationKind::Update | HostMutationKind::Delete, Some(id)) => {
-                        let id = format!("host:{id}");
-                        if !by_identity.contains_key(&id) {
-                            continue;
-                        }
-                        id
-                    }
-                    (HostMutationKind::Update | HostMutationKind::Delete, None) => continue,
+                // A host artifact must expose a durable entity identity. An
+                // anonymous creation cannot support later reveal/jump/dedupe
+                // actions and therefore remains activity provenance only.
+                let Some(entity_id) = entity_id.as_deref().and_then(nonempty_owned) else {
+                    continue;
                 };
-                upsert_artifact(
-                    &mut by_identity,
-                    ArtifactProjection {
-                        id,
-                        title: summary.clone(),
-                        subtitle: container_name.clone(),
-                        source: ArtifactSource::Host {
-                            tool: tool.clone(),
-                            entity_id: entity_id.clone(),
-                            container_name: container_name.clone(),
-                            mutation: *kind,
+                let id = format!("host:{entity_id}");
+                let key = (identity_conversation, id.clone());
+                let provenance = artifact_provenance(input, None, nonempty_owned(tool));
+
+                if *kind != HostMutationKind::Create && !by_identity.contains_key(&key) {
+                    continue;
+                }
+                if *kind == HostMutationKind::Delete {
+                    let Some((last_index, existing)) = by_identity.get_mut(&key) else {
+                        continue;
+                    };
+                    if let ArtifactSource::Host { mutation, .. } = &mut existing.source {
+                        *mutation = HostMutationKind::Delete;
+                    }
+                    existing.at = effective_at;
+                    existing.is_deleted = true;
+                    existing.last_changed_by = provenance;
+                    *last_index = stream_index;
+                    continue;
+                }
+                let produced_by = if *kind == HostMutationKind::Create {
+                    provenance.clone()
+                } else {
+                    by_identity
+                        .get(&key)
+                        .map(|(_, existing)| existing.produced_by.clone())
+                        .unwrap_or_else(|| provenance.clone())
+                };
+                by_identity.insert(
+                    key,
+                    (
+                        stream_index,
+                        ArtifactProjection {
+                            id,
+                            title: summary.clone(),
+                            subtitle: container_name.clone(),
+                            source: ArtifactSource::Host {
+                                tool: tool.clone(),
+                                entity_id: Some(entity_id),
+                                container_name: container_name.clone(),
+                                mutation: *kind,
+                            },
+                            at: effective_at,
+                            is_deleted: *kind == HostMutationKind::Delete,
+                            produced_by,
+                            last_changed_by: provenance,
                         },
-                        at: event.at,
-                        is_deleted: *kind == HostMutationKind::Delete,
-                    },
+                    ),
                 );
             }
             _ => {}
         }
     }
 
-    let mut outputs: Vec<_> = by_identity.into_values().collect();
-    outputs.sort_by(|left, right| right.at.cmp(&left.at).then_with(|| left.id.cmp(&right.id)));
-    outputs
+    let mut artifacts: Vec<_> = by_identity.into_values().collect();
+    artifacts.sort_by(|(left_index, left), (right_index, right)| {
+        right_index
+            .cmp(left_index)
+            .then_with(|| left.id.cmp(&right.id))
+            .then_with(|| {
+                left.produced_by
+                    .conversation_id
+                    .cmp(&right.produced_by.conversation_id)
+            })
+    });
+    artifacts
+        .into_iter()
+        .map(|(_, projection)| projection)
+        .collect()
 }
 
-fn upsert_artifact(
-    artifacts: &mut BTreeMap<String, ArtifactProjection>,
-    incoming: ArtifactProjection,
-) {
-    if artifacts
-        .get(&incoming.id)
-        .is_some_and(|existing| existing.at > incoming.at)
-    {
-        return;
+fn artifact_provenance(
+    input: ArtifactEventRef<'_>,
+    tool_call_id: Option<String>,
+    tool: Option<String>,
+) -> ArtifactProvenance {
+    ArtifactProvenance {
+        conversation_id: input.conversation_id,
+        turn_id: input.turn_id,
+        event_id: input.event.id,
+        tool_call_id,
+        tool,
+        scope: input.event.scope.clone(),
+        at: artifact_effective_at(input.event),
     }
-    artifacts.insert(incoming.id.clone(), incoming);
+}
+
+fn nonempty_owned(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// Normalizes a provider-reported path without consulting the filesystem.
+/// Both slash styles are accepted so persisted fixtures remain portable.
+fn normalize_lexical_path(path: &str) -> Option<String> {
+    let path = path.trim().replace('\\', "/");
+    if path.is_empty() {
+        return None;
+    }
+
+    let is_unc = path.starts_with("//");
+    let has_drive = path.as_bytes().get(1) == Some(&b':')
+        && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic);
+    let drive = has_drive.then(|| path[..2].to_owned());
+    let remainder = if has_drive { &path[2..] } else { &path };
+    let is_absolute = is_unc || remainder.starts_with('/');
+    let mut components = Vec::<String>::new();
+    let protected_components = if is_unc { 2 } else { 0 };
+
+    for component in remainder.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.len() > protected_components
+                    && components.last().is_some_and(|last| last != "..")
+                {
+                    components.pop();
+                } else if !is_absolute {
+                    components.push("..".into());
+                }
+            }
+            component => components.push(component.to_owned()),
+        }
+    }
+
+    let joined = components.join("/");
+    let normalized = if is_unc {
+        format!("//{joined}")
+    } else if let Some(drive) = drive {
+        if is_absolute {
+            format!("{drive}/{joined}")
+        } else {
+            format!("{drive}{joined}")
+        }
+    } else if is_absolute {
+        format!("/{joined}")
+    } else if joined.is_empty() {
+        ".".into()
+    } else {
+        joined
+    };
+    Some(normalized)
 }
 
 fn split_path_label(path: &str) -> (String, Option<String>) {
@@ -2126,6 +2650,7 @@ pub enum ProviderKind {
     Codex,
     Grok,
     Kimi,
+    Xai,
     LmStudio,
     Ollama,
     OpenAiCompatible,
@@ -2142,6 +2667,7 @@ pub enum TransportKind {
     CliProcess,
     HttpChatCompletions,
     LocalHttpChatCompletions,
+    HttpResponses,
 }
 
 #[derive(
@@ -2155,6 +2681,8 @@ pub enum StreamDialect {
     ClaudeStreamJson,
     GrokStreamingJson,
     KimiStreamJson,
+    KimiAcp,
+    XaiResponsesSse,
     OpenAiCompatibleJson,
 }
 
@@ -2178,6 +2706,8 @@ pub enum ResumeStrategy {
     None,
     CodexExecSubcommand,
     ResumeFlagPrepend,
+    AcpSessionLoad,
+    PreviousResponseId,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -2287,6 +2817,18 @@ pub enum ChildEventChannel {
     GrokAcpScopedSessionV1,
 }
 
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum AgentGroupChannel {
+    #[default]
+    Disabled,
+    GrokAcpWorkflowV1,
+    KimiAcpToolAggregateV1,
+    XaiResponsesMultiAgentV1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeTuningProfile {
     pub version: Option<CliVersion>,
@@ -2297,6 +2839,7 @@ pub struct RuntimeTuningProfile {
     /// Compatibility summary for callers that only need an on/off gate.
     pub supports_scoped_child_text: bool,
     pub child_event_channel: ChildEventChannel,
+    pub agent_group_channel: AgentGroupChannel,
 }
 
 impl RuntimeTuningProfile {
@@ -2318,6 +2861,7 @@ const CODEX_MAX_REASONING: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const CODEX_ULTRA_REASONING: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
 const CLAUDE_REASONING: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 const GROK_REASONING_0_2_111: &[&str] = &["low", "medium", "high"];
+const XAI_MULTI_AGENT_REASONING: &[&str] = &["low", "medium", "high", "xhigh"];
 const OLLAMA_REASONING_0_32_1: &[&str] = &["low", "medium", "high"];
 const NO_REASONING: &[&str] = &[];
 
@@ -2328,54 +2872,105 @@ pub fn runtime_tuning_profile(
     version: Option<&CliVersion>,
     model: &str,
 ) -> RuntimeTuningProfile {
-    let (reasoning_efforts, child_event_channel, verified_runtime) = match (family, version) {
-        (ProviderKind::Codex, Some(version)) if version.is(0, 144, 1) => {
-            let efforts = if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") {
-                CODEX_ULTRA_REASONING
-            } else if model == "gpt-5.6-luna" {
-                CODEX_MAX_REASONING
-            } else {
-                CODEX_DEFAULT_REASONING
-            };
-            (efforts, ChildEventChannel::CodexExecCollabV1, true)
-        }
-        (ProviderKind::Claude, Some(version)) if version.is(2, 1, 128) => (
-            CLAUDE_REASONING,
-            ChildEventChannel::ClaudeStreamJsonAgentV1,
-            true,
-        ),
-        (ProviderKind::Grok, Some(version)) if version.is(0, 2, 111) => {
-            // The captured multiplex stream carries parent and child prose in
-            // indistinguishable type=text envelopes. Subagents must stay off
-            // until a scoped channel is available.
-            (GROK_REASONING_0_2_111, ChildEventChannel::Disabled, true)
-        }
-        (ProviderKind::Grok, Some(version)) if version.is(0, 2, 114) => {
-            // The installed 0.2.114 model metadata still advertises exactly
-            // low/medium/high for grok-4.5. ACP makes task calls structured,
-            // but this runtime has no independently verified scoped child
-            // channel, so subagents remain disabled.
-            (GROK_REASONING_0_2_111, ChildEventChannel::Disabled, true)
-        }
-        (ProviderKind::Grok, Some(version)) if version.is(0, 2, 117) => (
-            GROK_REASONING_0_2_111,
-            ChildEventChannel::GrokAcpScopedSessionV1,
-            true,
-        ),
-        (ProviderKind::Kimi, Some(version)) if version.is(1, 49, 0) => {
-            (NO_REASONING, ChildEventChannel::Disabled, true)
-        }
-        (ProviderKind::Ollama, Some(version)) if version.is(0, 32, 1) => {
-            (OLLAMA_REASONING_0_32_1, ChildEventChannel::Disabled, true)
-        }
-        _ => (NO_REASONING, ChildEventChannel::Disabled, false),
-    };
+    let (reasoning_efforts, child_event_channel, agent_group_channel, verified_runtime) =
+        match (family, version) {
+            (ProviderKind::Codex, Some(version)) if version.is(0, 144, 1) => {
+                let efforts = if matches!(model, "gpt-5.6-sol" | "gpt-5.6-terra") {
+                    CODEX_ULTRA_REASONING
+                } else if model == "gpt-5.6-luna" {
+                    CODEX_MAX_REASONING
+                } else {
+                    CODEX_DEFAULT_REASONING
+                };
+                (
+                    efforts,
+                    ChildEventChannel::CodexExecCollabV1,
+                    AgentGroupChannel::Disabled,
+                    true,
+                )
+            }
+            (ProviderKind::Claude, Some(version)) if version.is(2, 1, 128) => (
+                CLAUDE_REASONING,
+                ChildEventChannel::ClaudeStreamJsonAgentV1,
+                AgentGroupChannel::Disabled,
+                true,
+            ),
+            (ProviderKind::Grok, Some(version)) if version.is(0, 2, 111) => {
+                // The captured multiplex stream carries parent and child prose in
+                // indistinguishable type=text envelopes. Subagents must stay off
+                // until a scoped channel is available.
+                (
+                    GROK_REASONING_0_2_111,
+                    ChildEventChannel::Disabled,
+                    AgentGroupChannel::Disabled,
+                    true,
+                )
+            }
+            (ProviderKind::Grok, Some(version)) if version.is(0, 2, 114) => {
+                // The installed 0.2.114 model metadata still advertises exactly
+                // low/medium/high for grok-4.5. ACP makes task calls structured,
+                // but this runtime has no independently verified scoped child
+                // channel, so subagents remain disabled.
+                (
+                    GROK_REASONING_0_2_111,
+                    ChildEventChannel::Disabled,
+                    AgentGroupChannel::Disabled,
+                    true,
+                )
+            }
+            (ProviderKind::Grok, Some(version)) if version.is(0, 2, 117) => (
+                GROK_REASONING_0_2_111,
+                ChildEventChannel::GrokAcpScopedSessionV1,
+                AgentGroupChannel::GrokAcpWorkflowV1,
+                true,
+            ),
+            // Captured 2026-08-02 after the CLI self-updated mid-session:
+            // tests/fixtures/ai/grok/0.2.118 proves the scoped-child
+            // contract is unchanged (additive metadata only).
+            (ProviderKind::Grok, Some(version)) if version.is(0, 2, 118) => (
+                GROK_REASONING_0_2_111,
+                ChildEventChannel::GrokAcpScopedSessionV1,
+                AgentGroupChannel::GrokAcpWorkflowV1,
+                true,
+            ),
+            (ProviderKind::Kimi, Some(version)) if version.is(1, 49, 0) => (
+                NO_REASONING,
+                ChildEventChannel::Disabled,
+                AgentGroupChannel::Disabled,
+                true,
+            ),
+            (ProviderKind::Kimi, Some(version)) if version.is(0, 31, 0) => (
+                NO_REASONING,
+                ChildEventChannel::Disabled,
+                AgentGroupChannel::KimiAcpToolAggregateV1,
+                true,
+            ),
+            (ProviderKind::Ollama, Some(version)) if version.is(0, 32, 1) => (
+                OLLAMA_REASONING_0_32_1,
+                ChildEventChannel::Disabled,
+                AgentGroupChannel::Disabled,
+                true,
+            ),
+            (ProviderKind::Xai, None) => (
+                XAI_MULTI_AGENT_REASONING,
+                ChildEventChannel::Disabled,
+                AgentGroupChannel::XaiResponsesMultiAgentV1,
+                true,
+            ),
+            _ => (
+                NO_REASONING,
+                ChildEventChannel::Disabled,
+                AgentGroupChannel::Disabled,
+                false,
+            ),
+        };
     RuntimeTuningProfile {
         version: version.cloned(),
         verified_runtime,
         reasoning_efforts,
         supports_scoped_child_text: child_event_channel != ChildEventChannel::Disabled,
         child_event_channel,
+        agent_group_channel,
     }
 }
 
@@ -2395,6 +2990,7 @@ pub struct CapabilityProfile {
     pub runtime_version: Option<CliVersion>,
     pub supported_reasoning_efforts: Vec<String>,
     pub child_event_channel: ChildEventChannel,
+    pub agent_group_channel: AgentGroupChannel,
     pub transport: TransportKind,
     pub stream_dialect: StreamDialect,
     pub plan_channel: PlanChannel,
@@ -2463,6 +3059,7 @@ pub fn capability_profile_for_runtime(
 
     let is_lm_studio_cli = runtime_family == ProviderKind::LmStudio && !basename.is_empty();
     let transport = match runtime_family {
+        ProviderKind::Xai => TransportKind::HttpResponses,
         ProviderKind::OpenAiCompatible => TransportKind::HttpChatCompletions,
         ProviderKind::LmStudio if !is_lm_studio_cli => TransportKind::LocalHttpChatCompletions,
         _ => TransportKind::CliProcess,
@@ -2473,7 +3070,9 @@ pub fn capability_profile_for_runtime(
         ProviderKind::Codex if has_argument("--json") => StreamDialect::CodexJsonLines,
         ProviderKind::Claude if has_argument("stream-json") => StreamDialect::ClaudeStreamJson,
         ProviderKind::Grok if has_argument("streaming-json") => StreamDialect::GrokStreamingJson,
+        ProviderKind::Kimi if has_argument("acp") => StreamDialect::KimiAcp,
         ProviderKind::Kimi if has_argument("stream-json") => StreamDialect::KimiStreamJson,
+        ProviderKind::Xai => StreamDialect::XaiResponsesSse,
         ProviderKind::OpenAiCompatible => StreamDialect::OpenAiCompatibleJson,
         ProviderKind::LmStudio if !is_lm_studio_cli => StreamDialect::OpenAiCompatibleJson,
         _ => StreamDialect::PlainText,
@@ -2485,13 +3084,26 @@ pub fn capability_profile_for_runtime(
             PlanChannel::AppTaskTools
         }
         ProviderKind::Grok => PlanChannel::NativeStream,
+        ProviderKind::Kimi
+            if has_argument("acp") || version.is_some_and(|version| version.is(0, 31, 0)) =>
+        {
+            PlanChannel::NativeStream
+        }
         ProviderKind::OpenAiCompatible | ProviderKind::Custom => PlanChannel::AppTaskTools,
         ProviderKind::LmStudio if !is_lm_studio_cli => PlanChannel::AppTaskTools,
-        ProviderKind::LmStudio | ProviderKind::Kimi | ProviderKind::Ollama => PlanChannel::None,
+        ProviderKind::LmStudio | ProviderKind::Kimi | ProviderKind::Ollama | ProviderKind::Xai => {
+            PlanChannel::None
+        }
     };
     let resume = match runtime_family {
         ProviderKind::Codex => ResumeStrategy::CodexExecSubcommand,
         ProviderKind::Claude | ProviderKind::Grok => ResumeStrategy::ResumeFlagPrepend,
+        ProviderKind::Kimi
+            if has_argument("acp") || version.is_some_and(|version| version.is(0, 31, 0)) =>
+        {
+            ResumeStrategy::AcpSessionLoad
+        }
+        ProviderKind::Xai => ResumeStrategy::PreviousResponseId,
         _ => ResumeStrategy::None,
     };
     let system_prompt = match runtime_family {
@@ -2504,7 +3116,7 @@ pub fn capability_profile_for_runtime(
         ProviderKind::Codex => SystemPromptChannel::ConfigOverride {
             key: "developer_instructions".into(),
         },
-        ProviderKind::OpenAiCompatible | ProviderKind::LmStudio
+        ProviderKind::OpenAiCompatible | ProviderKind::LmStudio | ProviderKind::Xai
             if transport != TransportKind::CliProcess =>
         {
             SystemPromptChannel::ApiSystemMessage
@@ -2516,7 +3128,7 @@ pub fn capability_profile_for_runtime(
         ProviderKind::Claude | ProviderKind::Grok | ProviderKind::Kimi => {
             ToolsOffStrategy::HostTokenOnly
         }
-        ProviderKind::OpenAiCompatible => ToolsOffStrategy::OmitApiTools,
+        ProviderKind::OpenAiCompatible | ProviderKind::Xai => ToolsOffStrategy::OmitApiTools,
         ProviderKind::LmStudio if transport != TransportKind::CliProcess => {
             ToolsOffStrategy::OmitApiTools
         }
@@ -2541,6 +3153,7 @@ pub fn capability_profile_for_runtime(
             .map(|effort| (*effort).to_owned())
             .collect(),
         child_event_channel: tuning.child_event_channel,
+        agent_group_channel: tuning.agent_group_channel,
         transport,
         stream_dialect,
         plan_channel,
@@ -2569,8 +3182,9 @@ fn provider_from_id(provider_id: &str) -> Option<ProviderKind> {
     match normalized.as_str() {
         "claude" | "claude_cli" | "anthropic" => Some(ProviderKind::Claude),
         "codex" | "codex_cli" | "openai_codex" => Some(ProviderKind::Codex),
-        "grok" | "grok_cli" | "xai" => Some(ProviderKind::Grok),
+        "grok" | "grok_cli" => Some(ProviderKind::Grok),
         "kimi" | "kimi_cli" | "moonshot" => Some(ProviderKind::Kimi),
+        "xai" | "xai_api" | "grok_heavy" => Some(ProviderKind::Xai),
         "lmstudio" | "lm_studio" | "lms" => Some(ProviderKind::LmStudio),
         "ollama" => Some(ProviderKind::Ollama),
         "openai" | "openai_compatible" => Some(ProviderKind::OpenAiCompatible),
@@ -2586,6 +3200,7 @@ fn provider_from_executable(basename: &str) -> Option<ProviderKind> {
         "codex" => Some(ProviderKind::Codex),
         "grok" => Some(ProviderKind::Grok),
         "kimi" => Some(ProviderKind::Kimi),
+        "xai" => Some(ProviderKind::Xai),
         "lms" | "lmstudio" => Some(ProviderKind::LmStudio),
         "ollama" => Some(ProviderKind::Ollama),
         _ => None,
@@ -3744,6 +4359,7 @@ mod tests {
                 4,
                 ActivityKind::FileChange {
                     id: "file".into(),
+                    tool: None,
                     changes: vec![FileChange {
                         path: "/work/src/lib.rs".into(),
                         kind: FileChangeKind::Update,
@@ -3912,6 +4528,7 @@ mod tests {
                 2,
                 ActivityKind::FileChange {
                     id: "f".into(),
+                    tool: None,
                     changes: vec![FileChange {
                         path: "/tmp/a.txt".into(),
                         kind: FileChangeKind::Add,
@@ -3948,13 +4565,333 @@ mod tests {
     }
 
     #[test]
-    fn artifact_projection_dedupes_and_later_delete_strikes_add() {
+    fn persistence_keeps_repeated_artifact_transitions_beyond_the_soft_cap() {
+        let events = (1..=600)
+            .map(|index| {
+                event(
+                    index,
+                    index as i64,
+                    ActivityKind::FileChange {
+                        id: format!("edit-{index}"),
+                        tool: Some("Edit".into()),
+                        changes: vec![FileChange {
+                            path: "/workspace/report.md".into(),
+                            kind: FileChangeKind::Update,
+                        }],
+                        status: ActivityStatus::Completed,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let retained = activity_events_for_persistence(&events, 8);
+
+        assert_eq!(retained, events);
+        assert_eq!(project_artifacts(&retained), project_artifacts(&events));
+    }
+
+    #[test]
+    fn persistence_artifact_must_keeps_displace_chatter_and_may_exceed_the_soft_cap() {
+        let artifact = |id_value, path: String| {
+            event(
+                id_value,
+                id_value as i64,
+                ActivityKind::FileChange {
+                    id: format!("file-{id_value}"),
+                    tool: Some("Write".into()),
+                    changes: vec![FileChange {
+                        path,
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            )
+        };
+        let mut mixed = vec![
+            artifact(1, "/workspace/one.md".into()),
+            artifact(2, "/workspace/two.md".into()),
+        ];
+        mixed.extend((3..=603).map(|index| {
+            event(
+                index,
+                index as i64,
+                ActivityKind::ToolCall {
+                    id: format!("tool-{index}"),
+                    name: "Read".into(),
+                    server: None,
+                    input_summary: Some("ordinary chatter".into()),
+                },
+            )
+        }));
+        let retained = activity_events_for_persistence(&mixed, PERSISTED_ACTIVITY_EVENT_CAP);
+        assert_eq!(retained.len(), PERSISTED_ACTIVITY_EVENT_CAP);
+        assert_eq!(retained[0].id, Uuid::from_u128(1));
+        assert_eq!(retained[1].id, Uuid::from_u128(2));
+
+        let artifacts = (1..=PERSISTED_ACTIVITY_EVENT_CAP as u128 + 1)
+            .map(|index| artifact(index, format!("/workspace/{index}.md")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            activity_events_for_persistence(&artifacts, PERSISTED_ACTIVITY_EVENT_CAP).len(),
+            PERSISTED_ACTIVITY_EVENT_CAP + 1
+        );
+    }
+
+    #[test]
+    fn persistence_keeps_delete_update_pair_that_resets_an_older_file_lifetime() {
+        let prior = event(
+            1,
+            1,
+            ActivityKind::FileChange {
+                id: "create".into(),
+                tool: Some("Write".into()),
+                changes: vec![FileChange {
+                    path: "/workspace/report.md".into(),
+                    kind: FileChangeKind::Add,
+                }],
+                status: ActivityStatus::Completed,
+            },
+        );
+        let current = vec![
+            event(
+                2,
+                2,
+                ActivityKind::FileChange {
+                    id: "delete".into(),
+                    tool: Some("Delete".into()),
+                    changes: vec![FileChange {
+                        path: "/workspace/report.md".into(),
+                        kind: FileChangeKind::Delete,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+            event(
+                3,
+                3,
+                ActivityKind::FileChange {
+                    id: "recreate".into(),
+                    tool: Some("Edit".into()),
+                    changes: vec![FileChange {
+                        path: "/workspace/report.md".into(),
+                        kind: FileChangeKind::Update,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+        ];
+        let retained = activity_events_for_persistence(&current, 1);
+        let mut full = vec![prior.clone()];
+        full.extend(current);
+        let mut compacted = vec![prior];
+        compacted.extend(retained.clone());
+
+        assert_eq!(retained.len(), 2);
+        assert_eq!(project_artifacts(&compacted), project_artifacts(&full));
+    }
+
+    #[test]
+    fn persistence_keeps_host_metadata_before_a_final_delete() {
+        let host = |tool: &str, summary: &str, container_name: Option<&str>, kind| {
+            ActivityKind::HostMutation {
+                tool: tool.into(),
+                summary: summary.into(),
+                entity_id: Some("note-1".into()),
+                container_name: container_name.map(str::to_owned),
+                kind,
+            }
+        };
+        let prior = event(
+            1,
+            1,
+            host(
+                "canvas_create_note",
+                "Original title",
+                Some("Page 1"),
+                HostMutationKind::Create,
+            ),
+        );
+        let current = vec![
+            event(
+                2,
+                2,
+                host(
+                    "canvas_update_note",
+                    "Renamed title",
+                    Some("Page 2"),
+                    HostMutationKind::Update,
+                ),
+            ),
+            event(
+                3,
+                3,
+                host(
+                    "canvas_delete_note",
+                    "Deleted note",
+                    None,
+                    HostMutationKind::Delete,
+                ),
+            ),
+        ];
+        let retained = activity_events_for_persistence(&current, 1);
+        let mut full = vec![prior.clone()];
+        full.extend(current);
+        let mut compacted = vec![prior];
+        compacted.extend(retained.clone());
+
+        assert_eq!(retained.len(), 2);
+        assert_eq!(project_artifacts(&compacted), project_artifacts(&full));
+        let artifact = project_artifacts(&compacted).pop().unwrap();
+        assert_eq!(artifact.title, "Renamed title");
+        assert_eq!(artifact.subtitle.as_deref(), Some("Page 2"));
+        assert!(artifact.is_deleted);
+    }
+
+    #[test]
+    fn live_cap_keeps_repeated_artifact_transitions_as_soft_must_keeps() {
+        let mut accumulator = ActivityAccumulator::with_max_events(2);
+        for index in 1..=50 {
+            accumulator.ingest(event(
+                index,
+                index as i64,
+                ActivityKind::FileChange {
+                    id: format!("edit-{index}"),
+                    tool: Some("Edit".into()),
+                    changes: vec![FileChange {
+                        path: "/workspace/report.md".into(),
+                        kind: FileChangeKind::Update,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ));
+        }
+
+        assert_eq!(accumulator.len(), 50);
+        let artifact = project_artifacts(&accumulator.events).pop().unwrap();
+        assert_eq!(artifact.produced_by.event_id, Uuid::from_u128(1));
+        assert_eq!(artifact.last_changed_by.event_id, Uuid::from_u128(50));
+    }
+
+    #[test]
+    fn live_cap_never_evicts_artifact_lifecycle_events() {
+        let mut accumulator = ActivityAccumulator::with_max_events(1);
+        accumulator.ingest(event(
+            1,
+            1,
+            ActivityKind::FileChange {
+                id: "file".into(),
+                tool: Some("Write".into()),
+                changes: vec![FileChange {
+                    path: "/tmp/a.txt".into(),
+                    kind: FileChangeKind::Add,
+                }],
+                status: ActivityStatus::Completed,
+            },
+        ));
+        accumulator.ingest(event(
+            2,
+            2,
+            ActivityKind::HostMutation {
+                tool: "create_note".into(),
+                summary: "Note".into(),
+                entity_id: Some("n1".into()),
+                container_name: None,
+                kind: HostMutationKind::Create,
+            },
+        ));
+        accumulator.ingest(event(3, 3, command("ordinary", ActivityStatus::Completed)));
+
+        assert_eq!(accumulator.events.len(), 2);
+        assert!(
+            accumulator
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, ActivityKind::FileChange { .. }))
+        );
+        assert!(
+            accumulator
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, ActivityKind::HostMutation { .. }))
+        );
+    }
+
+    #[test]
+    fn file_change_lifecycle_completion_preserves_tool_and_changes() {
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest(event(
+            1,
+            1,
+            ActivityKind::FileChange {
+                id: "call-1".into(),
+                tool: Some("Edit".into()),
+                changes: vec![FileChange {
+                    path: "/tmp/a.txt".into(),
+                    kind: FileChangeKind::Update,
+                }],
+                status: ActivityStatus::InProgress,
+            },
+        ));
+        accumulator.ingest(event(
+            2,
+            2,
+            ActivityKind::FileChange {
+                id: "call-1".into(),
+                tool: None,
+                changes: Vec::new(),
+                status: ActivityStatus::Completed,
+            },
+        ));
+
+        assert_eq!(accumulator.events.len(), 1);
+        let ActivityKind::FileChange {
+            tool,
+            changes,
+            status,
+            ..
+        } = &accumulator.events[0].kind
+        else {
+            panic!("expected file change");
+        };
+        assert_eq!(tool.as_deref(), Some("Edit"));
+        assert_eq!(changes.len(), 1);
+        assert_eq!(*status, ActivityStatus::Completed);
+    }
+
+    #[test]
+    fn file_change_tool_is_backward_compatible_on_the_wire() {
+        let legacy: ActivityKind = serde_json::from_str(
+            r#"{"type":"fileChange","id":"call","changes":[],"status":"completed"}"#,
+        )
+        .unwrap();
+        let ActivityKind::FileChange { tool, .. } = legacy else {
+            panic!("expected file change");
+        };
+        assert_eq!(tool, None);
+
+        let current = ActivityKind::FileChange {
+            id: "call".into(),
+            tool: Some("Write".into()),
+            changes: Vec::new(),
+            status: ActivityStatus::Completed,
+        };
+        let encoded = serde_json::to_string(&current).unwrap();
+        assert!(encoded.contains(r#""tool":"Write""#));
+        assert_eq!(
+            serde_json::from_str::<ActivityKind>(&encoded).unwrap(),
+            current
+        );
+    }
+
+    #[test]
+    fn artifact_projection_uses_stream_order_and_completed_lifecycles_only() {
         let events = vec![
             event(
                 1,
-                1,
+                100,
                 ActivityKind::FileChange {
                     id: "f1".into(),
+                    tool: Some("Write".into()),
                     changes: vec![FileChange {
                         path: "/work/report.md".into(),
                         kind: FileChangeKind::Add,
@@ -3967,6 +4904,7 @@ mod tests {
                 2,
                 ActivityKind::FileChange {
                     id: "f2".into(),
+                    tool: Some("Delete".into()),
                     changes: vec![FileChange {
                         path: "/work/report.md".into(),
                         kind: FileChangeKind::Delete,
@@ -3979,6 +4917,7 @@ mod tests {
                 3,
                 ActivityKind::FileChange {
                     id: "failed".into(),
+                    tool: None,
                     changes: vec![FileChange {
                         path: "/work/never.txt".into(),
                         kind: FileChangeKind::Add,
@@ -3986,16 +4925,49 @@ mod tests {
                     status: ActivityStatus::Failed,
                 },
             ),
+            event(
+                4,
+                4,
+                ActivityKind::FileChange {
+                    id: "running".into(),
+                    tool: None,
+                    changes: vec![FileChange {
+                        path: "/work/running.txt".into(),
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::InProgress,
+                },
+            ),
+            event(
+                5,
+                5,
+                ActivityKind::FileChange {
+                    id: "delete-only".into(),
+                    tool: None,
+                    changes: vec![FileChange {
+                        path: "/work/pre-existing.txt".into(),
+                        kind: FileChangeKind::Delete,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
         ];
-        let outputs = project_artifacts(&events);
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].title, "report.md");
-        assert!(outputs[0].is_deleted);
-        assert_eq!(outputs[0].at, UnixMillis(2));
+        let artifacts = project_artifacts(&events);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].title, "report.md");
+        assert!(artifacts[0].is_deleted);
+        assert_eq!(artifacts[0].at, UnixMillis(2));
+        assert_eq!(artifacts[0].produced_by.event_id, Uuid::from_u128(1));
+        assert_eq!(artifacts[0].produced_by.tool.as_deref(), Some("Write"));
+        assert_eq!(artifacts[0].last_changed_by.event_id, Uuid::from_u128(2));
+        assert_eq!(
+            artifacts[0].last_changed_by.tool_call_id.as_deref(),
+            Some("f2")
+        );
     }
 
     #[test]
-    fn host_outputs_dedupe_by_entity_and_unknown_creations_stay_distinct() {
+    fn host_artifacts_require_stable_ids_and_preserve_creation_provenance() {
         let host = |entity_id: Option<&str>, summary: &str, kind| ActivityKind::HostMutation {
             tool: "note".into(),
             summary: summary.into(),
@@ -4012,19 +4984,117 @@ mod tests {
             event(
                 2,
                 2,
-                host(Some("n1"), "Deleted note", HostMutationKind::Delete),
+                ActivityKind::HostMutation {
+                    tool: "delete_note".into(),
+                    summary: "Deleted note".into(),
+                    entity_id: Some("n1".into()),
+                    container_name: None,
+                    kind: HostMutationKind::Delete,
+                },
             ),
             event(3, 3, host(None, "New note A", HostMutationKind::Create)),
             event(4, 4, host(None, "New note B", HostMutationKind::Create)),
         ];
-        let outputs = project_artifacts(&events);
-        assert_eq!(outputs.len(), 3);
-        let known = outputs
+        let artifacts = project_artifacts(&events);
+        assert_eq!(artifacts.len(), 1);
+        let known = artifacts
             .iter()
-            .find(|output| output.id == "host:n1")
+            .find(|artifact| artifact.id == "host:n1")
             .unwrap();
         assert!(known.is_deleted);
-        assert_eq!(known.title, "Deleted note");
+        assert_eq!(known.title, "Created note");
+        assert_eq!(known.subtitle.as_deref(), Some("Project"));
+        assert!(matches!(
+            &known.source,
+            ArtifactSource::Host {
+                container_name: Some(container),
+                mutation: HostMutationKind::Delete,
+                ..
+            } if container == "Project"
+        ));
+        assert_eq!(known.produced_by.event_id, Uuid::from_u128(1));
+        assert_eq!(known.last_changed_by.event_id, Uuid::from_u128(2));
+        assert_eq!(known.last_changed_by.tool.as_deref(), Some("delete_note"));
+    }
+
+    #[test]
+    fn artifact_projection_dedupes_stable_event_replays_but_not_legacy_nil_ids() {
+        let file_event = |event_id, path: &str| {
+            event(
+                event_id,
+                1,
+                ActivityKind::FileChange {
+                    id: "write".into(),
+                    tool: Some("Write".into()),
+                    changes: vec![FileChange {
+                        path: path.into(),
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            )
+        };
+
+        let replayed = project_artifacts(&[
+            file_event(1, "/work/first.md"),
+            file_event(1, "/work/replayed-with-different-payload.md"),
+        ]);
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].file_path(), Some("/work/first.md"));
+
+        let legacy = project_artifacts(&[
+            file_event(0, "/work/legacy-a.md"),
+            file_event(0, "/work/legacy-b.md"),
+        ]);
+        assert_eq!(legacy.len(), 2, "nil is a legacy sentinel, not an identity");
+    }
+
+    #[test]
+    fn file_artifact_identity_uses_portable_lexical_normalization() {
+        assert_eq!(
+            normalize_lexical_path(r"C:\work\.\draft\..\report.md").as_deref(),
+            Some("C:/work/report.md")
+        );
+        assert_eq!(
+            normalize_lexical_path("//server/share/folder/../report.md").as_deref(),
+            Some("//server/share/report.md")
+        );
+
+        let events = vec![
+            event(
+                1,
+                1,
+                ActivityKind::FileChange {
+                    id: "create".into(),
+                    tool: Some("Write".into()),
+                    changes: vec![FileChange {
+                        path: "/work/./draft/../report.md".into(),
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+            event(
+                2,
+                2,
+                ActivityKind::FileChange {
+                    id: "update".into(),
+                    tool: Some("Edit".into()),
+                    changes: vec![FileChange {
+                        path: r"\work\report.md".into(),
+                        kind: FileChangeKind::Update,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+        ];
+
+        let artifacts = project_artifacts(&events);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].id, "file:/work/report.md");
+        assert_eq!(artifacts[0].file_path(), Some("/work/report.md"));
+        assert_eq!(artifacts[0].produced_by.event_id, Uuid::from_u128(1));
+        assert_eq!(artifacts[0].last_changed_by.event_id, Uuid::from_u128(2));
     }
 
     #[test]
@@ -4072,12 +5142,104 @@ mod tests {
             ),
         ];
 
-        let outputs = project_artifacts(&events);
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].id, "host:created");
-        assert_eq!(outputs[0].title, "Updated note");
-        assert!(!outputs[0].is_deleted);
-        assert_eq!(outputs[0].at, UnixMillis(5));
+        let artifacts = project_artifacts(&events);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].id, "host:created");
+        assert_eq!(artifacts[0].title, "Updated note");
+        assert!(!artifacts[0].is_deleted);
+        assert_eq!(artifacts[0].at, UnixMillis(5));
+        assert_eq!(artifacts[0].produced_by.event_id, Uuid::from_u128(4));
+        assert_eq!(artifacts[0].last_changed_by.event_id, Uuid::from_u128(5));
+    }
+
+    #[test]
+    fn explicit_recreation_resets_production_provenance() {
+        let host = |summary: &str, kind| ActivityKind::HostMutation {
+            tool: "note".into(),
+            summary: summary.into(),
+            entity_id: Some("n1".into()),
+            container_name: None,
+            kind,
+        };
+        let events = vec![
+            event(1, 1, host("First note", HostMutationKind::Create)),
+            event(2, 2, host("Deleted note", HostMutationKind::Delete)),
+            event(3, 3, host("Second note", HostMutationKind::Create)),
+        ];
+
+        let artifacts = project_artifacts(&events);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].title, "Second note");
+        assert!(!artifacts[0].is_deleted);
+        assert_eq!(artifacts[0].produced_by.event_id, Uuid::from_u128(3));
+        assert_eq!(artifacts[0].last_changed_by.event_id, Uuid::from_u128(3));
+    }
+
+    #[test]
+    fn provenance_projection_scopes_identity_by_conversation_and_turn() {
+        let first_conversation = Uuid::from_u128(101);
+        let second_conversation = Uuid::from_u128(102);
+        let first_turn = Uuid::from_u128(201);
+        let second_turn = Uuid::from_u128(202);
+        let events = [
+            child_event(
+                1,
+                1,
+                "child-a",
+                ActivityKind::FileChange {
+                    id: "call-a".into(),
+                    tool: Some("Edit".into()),
+                    changes: vec![FileChange {
+                        path: "/work/shared.md".into(),
+                        kind: FileChangeKind::Update,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+            event(
+                2,
+                2,
+                ActivityKind::FileChange {
+                    id: "call-b".into(),
+                    tool: Some("Write".into()),
+                    changes: vec![FileChange {
+                        path: "/work/shared.md".into(),
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+        ];
+        let artifacts = project_artifacts_with_provenance([
+            ArtifactEventRef {
+                conversation_id: Some(first_conversation),
+                turn_id: Some(first_turn),
+                event: &events[0],
+            },
+            ArtifactEventRef {
+                conversation_id: Some(second_conversation),
+                turn_id: Some(second_turn),
+                event: &events[1],
+            },
+        ]);
+
+        assert_eq!(artifacts.len(), 2);
+        let child_artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.produced_by.conversation_id == Some(first_conversation))
+            .unwrap();
+        assert_eq!(child_artifact.produced_by.turn_id, Some(first_turn));
+        assert_eq!(
+            child_artifact.produced_by.scope,
+            AgentScope::Child {
+                id: "child-a".into()
+            }
+        );
+        assert_eq!(
+            child_artifact.produced_by.tool_call_id.as_deref(),
+            Some("call-a")
+        );
+        assert_eq!(child_artifact.produced_by.tool.as_deref(), Some("Edit"));
     }
 
     #[test]
@@ -4596,6 +5758,91 @@ mod tests {
     }
 
     #[test]
+    fn agent_groups_fold_without_fabricating_subagents() {
+        let events = vec![
+            event(
+                1,
+                100,
+                ActivityKind::AgentGroup {
+                    id: "turn-heavy".into(),
+                    aliases: Vec::new(),
+                    label: "Grok Heavy".into(),
+                    kind: AgentGroupKind::MultiAgentInference,
+                    status: SubagentStatus::InProgress,
+                    expected_count: Some(16),
+                    members: Vec::new(),
+                    visibility: AgentGroupVisibility::AggregateOnly,
+                    detail: Some("Provider-managed research".into()),
+                },
+            ),
+            event(
+                2,
+                900,
+                ActivityKind::AgentGroup {
+                    id: "turn-heavy".into(),
+                    aliases: vec!["resp-123".into()],
+                    label: String::new(),
+                    kind: AgentGroupKind::MultiAgentInference,
+                    status: SubagentStatus::Completed,
+                    expected_count: None,
+                    members: Vec::new(),
+                    visibility: AgentGroupVisibility::AggregateOnly,
+                    detail: None,
+                },
+            ),
+        ];
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest_many(events);
+        let groups = project_agent_groups(&accumulator.events);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].id, "turn-heavy");
+        assert_eq!(groups[0].aliases, vec!["resp-123"]);
+        assert_eq!(groups[0].status, SubagentStatus::Completed);
+        assert_eq!(groups[0].expected_count, Some(16));
+        assert_eq!(groups[0].visibility, AgentGroupVisibility::AggregateOnly);
+        assert_eq!(groups[0].duration_ms, Some(800));
+        assert!(project_subagents(&accumulator.events).is_empty());
+    }
+
+    #[test]
+    fn delegated_group_members_round_trip_through_persistence() {
+        let group = event(
+            1,
+            100,
+            ActivityKind::AgentGroup {
+                id: "swarm-call".into(),
+                aliases: Vec::new(),
+                label: "Kimi AgentSwarm".into(),
+                kind: AgentGroupKind::Swarm,
+                status: SubagentStatus::Completed,
+                expected_count: Some(2),
+                members: vec![
+                    AgentGroupMember {
+                        id: "agent-0".into(),
+                        label: "Alpha".into(),
+                        status: SubagentStatus::Completed,
+                        detail: Some("A".into()),
+                    },
+                    AgentGroupMember {
+                        id: "agent-1".into(),
+                        label: "Beta".into(),
+                        status: SubagentStatus::Failed,
+                        detail: Some("B".into()),
+                    },
+                ],
+                visibility: AgentGroupVisibility::DelegatedMembers,
+                detail: Some("1 completed · 1 failed".into()),
+            },
+        );
+        let persisted = activity_events_for_persistence(&[group], 1);
+        let json = serde_json::to_string(&persisted).unwrap();
+        let decoded: Vec<ActivityEvent> = serde_json::from_str(&json).unwrap();
+        let groups = project_agent_groups(&decoded);
+        assert_eq!(groups[0].members.len(), 2);
+        assert_eq!(groups[0].members[1].status, SubagentStatus::Failed);
+    }
+
+    #[test]
     fn cap_compaction_and_persistence_keep_a_trailing_plan_per_scope() {
         let child_scope = AgentScope::Child {
             id: "child-1".into(),
@@ -4799,6 +6046,7 @@ mod tests {
             command("2", ActivityStatus::Completed),
             ActivityKind::FileChange {
                 id: "3".into(),
+                tool: None,
                 changes: vec![FileChange {
                     path: "/tmp/a".into(),
                     kind: FileChangeKind::Update,
@@ -5358,7 +6606,7 @@ mod tests {
             GROK_REASONING_0_2_111
         );
 
-        for unverified in ["grok 0.2.116", "grok 0.2.118"] {
+        for unverified in ["grok 0.2.116", "grok 0.2.119"] {
             let version = CliVersion::parse(unverified).unwrap();
             let tuning = runtime_tuning_profile(ProviderKind::Grok, Some(&version), "grok-4.5");
             assert!(!tuning.verified_runtime, "{unverified}");
@@ -5516,6 +6764,158 @@ mod tests {
             .collect::<Vec<_>>()
             .concat();
         assert_eq!(parent_text, "PARENT_OK_4");
+        assert_eq!(
+            messages.last().unwrap()["result"]["_meta"]["sessionId"],
+            root_session_id
+        );
+    }
+
+    #[test]
+    fn captured_grok_0_2_118_scopes_child_prose_on_the_acp_session_id() {
+        fn update_kind(message: &serde_json::Value) -> Option<&str> {
+            message
+                .pointer("/params/update/sessionUpdate")
+                .and_then(serde_json::Value::as_str)
+        }
+
+        let fixture = include_str!("../tests/fixtures/ai/grok/0.2.118/acp-scoped-subagent.jsonl");
+        let messages = fixture
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        let initialize = &messages[0]["result"];
+        assert_eq!(initialize["_meta"]["agentVersion"], "0.2.118");
+        let efforts =
+            initialize["_meta"]["modelState"]["availableModels"][0]["_meta"]["reasoningEfforts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|effort| effort["value"].as_str().unwrap())
+                .collect::<Vec<_>>();
+        assert_eq!(efforts, ["high", "medium", "low"]);
+
+        let root_session_id = messages[1]["result"]["sessionId"].as_str().unwrap();
+        let spawned = messages
+            .iter()
+            .find(|message| update_kind(message) == Some("subagent_spawned"))
+            .unwrap();
+        let child_session_id = spawned
+            .pointer("/params/update/child_session_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert_eq!(spawned["method"], "_x.ai/session_notification");
+        assert_eq!(spawned["params"]["sessionId"], root_session_id);
+        assert_eq!(
+            spawned["params"]["update"]["parent_session_id"],
+            root_session_id
+        );
+        assert_eq!(spawned["params"]["update"]["subagent_id"], child_session_id);
+        assert_eq!(spawned["params"]["update"]["subagent_type"], "explore");
+        assert_eq!(spawned["params"]["update"]["role"], "explore");
+        assert!(
+            !spawned["params"]["_meta"]["eventId"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+
+        // Drift vs 0.2.117: the idless status-only model_changed now arrives
+        // on the root session rather than the child's.
+        let model_changed = messages
+            .iter()
+            .find(|message| update_kind(message) == Some("model_changed"))
+            .unwrap();
+        assert_eq!(
+            model_changed["params"]["sessionId"].as_str(),
+            Some(root_session_id)
+        );
+        assert_eq!(model_changed["params"]["update"]["model_id"], "grok-4.5");
+        assert!(
+            model_changed["params"].get("_meta").is_none(),
+            "the captured status-only update is intentionally idless"
+        );
+
+        let child_messages = messages
+            .iter()
+            .filter(|message| {
+                update_kind(message) == Some("agent_message_chunk")
+                    && message["params"]["sessionId"] == child_session_id
+            })
+            .collect::<Vec<_>>();
+        assert!(!child_messages.is_empty());
+        assert!(child_messages.iter().all(|message| {
+            message["method"] == "session/update"
+                && !message["params"]["_meta"]["eventId"]
+                    .as_str()
+                    .unwrap()
+                    .is_empty()
+        }));
+        let child_text = child_messages
+            .iter()
+            .map(|message| {
+                message["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(child_text, "CHILD_OK_4");
+
+        let finished = messages
+            .iter()
+            .find(|message| update_kind(message) == Some("subagent_finished"))
+            .unwrap();
+        assert_eq!(finished["method"], "_x.ai/session_notification");
+        assert_eq!(finished["params"]["sessionId"], root_session_id);
+        assert_eq!(
+            finished["params"]["update"]["subagent_id"],
+            child_session_id
+        );
+        assert_eq!(
+            finished["params"]["update"]["child_session_id"],
+            child_session_id
+        );
+        assert_eq!(finished["params"]["update"]["output"], "CHILD_OK_4");
+        assert_eq!(finished["params"]["update"]["status"], "completed");
+
+        // 0.2.118 emits informational kinds 0.2.117 lacked; the retained
+        // records pin them as schema-confirmed shapes the decoder may skip
+        // fail-closed but never error on.
+        assert!(
+            messages
+                .iter()
+                .any(|message| update_kind(message) == Some("turn_completed"))
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| update_kind(message) == Some("response_completed"))
+        );
+
+        let parent_messages = messages
+            .iter()
+            .filter(|message| {
+                update_kind(message) == Some("agent_message_chunk")
+                    && message["params"]["sessionId"] == root_session_id
+            })
+            .collect::<Vec<_>>();
+        let parent_text = parent_messages
+            .iter()
+            .map(|message| {
+                message["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        // The 0.2.118 parent announced the spawn before the sentinel; chunk
+        // boundaries are captured verbatim, so pin the whole prose.
+        assert_eq!(
+            parent_text,
+            "Spawning one foreground explore subagent as requested.PARENT_OK_4"
+        );
+        assert!(parent_text.ends_with("PARENT_OK_4"));
         assert_eq!(
             messages.last().unwrap()["result"]["_meta"]["sessionId"],
             root_session_id

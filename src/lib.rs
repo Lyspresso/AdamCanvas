@@ -1,11 +1,13 @@
 pub mod agents_panel;
 pub mod ai;
+pub(crate) mod ai_canvas_tools;
 pub mod ai_prompt;
 pub mod ai_state;
 pub(crate) mod ai_task_bridge;
 pub(crate) mod ai_task_tools;
 pub mod ai_tool_gate;
 pub mod app;
+pub mod artifact_library;
 pub mod assets;
 pub mod automation;
 pub mod chat_core;
@@ -15,6 +17,7 @@ pub mod dots;
 pub mod file_watch;
 pub mod grid_view;
 pub(crate) mod grok_acp;
+pub(crate) mod kimi_acp;
 pub mod live_sheet;
 #[cfg(target_os = "macos")]
 pub(crate) mod macos_image_io;
@@ -34,3 +37,4 @@ pub mod sheet_view;
 pub mod spatial;
 pub mod spreadsheet;
 pub mod structured_preview;
+pub(crate) mod xai_responses;

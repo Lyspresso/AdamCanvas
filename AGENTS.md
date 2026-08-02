@@ -1,6 +1,6 @@
 # AdamCanvas — multi-harness coordination
 
-Source of truth: https://github.com/Lyspresso/AdamCanvas (private). All work converges there, gated by CI.
+Source of truth: https://github.com/Lyspresso/AdamCanvas (public). All work converges there, gated by CI.
 
 ## Branch map
 

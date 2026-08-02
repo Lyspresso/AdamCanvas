@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"<ROOT_SESSION>","update":{"sessionUpdate":"plan","entries":[{"content":"Inspect the relevant files","priority":"medium","status":"completed"},{"content":"Delegate independent checks","priority":"medium","status":"in_progress"},{"content":"Synthesize the result","priority":"medium","status":"pending"}]}}}

@@ -1,0 +1,48 @@
+{
+  "provider": "xAI Responses API",
+  "model": "grok-4.20-multi-agent",
+  "capturedAt": "2026-07-31",
+  "provenance": "official-schema-derived",
+  "sources": [
+    "https://docs.x.ai/developers/model-capabilities/text/multi-agent",
+    "https://docs.x.ai/developers/rest-api-reference/inference/chat",
+    "https://docs.x.ai/developers/cost-tracking",
+    "https://docs.x.ai/developers/tools/overview"
+  ],
+  "captures": [
+    {
+      "files": [
+        "request-low-4.json",
+        "request-medium-4.json",
+        "responses-4-agent.sse",
+        "response-4-agent.json"
+      ],
+      "expectedAgentCount": 4,
+      "reasoningEfforts": [
+        "low",
+        "medium"
+      ],
+      "note": "The REST/OpenAI Responses contract maps low and medium to four server-side agents. The SSE contains only leader-visible tool and answer events."
+    },
+    {
+      "files": [
+        "request-high-16.json",
+        "request-xhigh-16.json",
+        "responses-16-agent.sse",
+        "response-16-agent.json"
+      ],
+      "expectedAgentCount": 16,
+      "reasoningEfforts": [
+        "high",
+        "xhigh"
+      ],
+      "note": "The REST/OpenAI Responses contract maps high and xhigh to sixteen server-side agents. The stream exposes no child identity or child lifecycle."
+    }
+  ],
+  "redactions": [
+    "response, message and hosted-tool ids replaced consistently",
+    "prompts, source URLs and answer text are synthetic",
+    "token and cost counts are inert official-schema examples; no key, account, billing record or encrypted content was captured"
+  ],
+  "note": "These are not live API captures. They are deliberately marked official-schema-derived. xAI documents that only leader tool calls and the leader's final response are returned by default; Adam must not manufacture child rows from the requested 4/16 count."
+}

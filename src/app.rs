@@ -4,35 +4,42 @@ use crate::{
         agent_rows, preflight_notice,
     },
     ai::{
-        AiEngine, AiEvent, AiFailureKind, AiRunRequest, clamp_provider_preferences,
-        installed_runtime_tuning, provider_exposes_app_task_tools, resolve_effective_provider_id,
+        AiEngine, AiEngineError, AiEvent, AiFailureKind, AiRunRequest,
+        checked_installed_kimi_uses_acp, clamp_provider_preferences, installed_runtime_tuning,
+        provider_exposes_app_task_tools, resolve_effective_provider_id,
     },
+    ai_canvas_tools::{CanvasMutation, CanvasToolReceipt, CanvasToolRequest, CanvasToolResult},
     ai_prompt::{
         BuiltPrompt, HistoricalTurn, HistoryRole, PromptAttachment, PromptBudget, PromptContinuity,
         PromptInput as HarnessPromptInput, PromptNotices, SystemDelivery, SystemInstructions,
         WorkingContext, build_prompt,
     },
     ai_state::{RecordDisposition, ResumeGate, ResumeRecord, ResumeStore},
+    artifact_library::{self, ArtifactLibraryState, LibraryTarget},
     assets::AssetStore,
     automation::{ReconcileRequest, canvas_objects_from_workspace, reconcile_workspace},
     chat_core::{
-        ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, AgentScope,
-        PlanItem, PlanItemStatus, ProgressSource, RetryHint, RuntimeTuningProfile, StreamDialect,
+        ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, AgentGroupKind,
+        AgentGroupProjection, AgentGroupVisibility, AgentScope, HostMutationKind, PlanItem,
+        PlanItemStatus, ProgressSource, RetryHint, RuntimeTuningProfile, StreamDialect,
         SubagentStatus, SystemPromptChannel, TurnStatus, assistant_flat_text, capability_profile,
         current_work_label, latest_turn_status, newest_plan, newest_plan_for_scope,
-        project_artifacts, project_context, project_progress, project_subagents, project_usage,
+        project_agent_groups, project_artifacts, project_context, project_progress,
+        project_subagents, project_usage,
     },
     clipboard::{self, PasteContent},
     domain::{
-        AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_THINKING,
-        AI_FEATURE_WEB_SEARCH, AiActionKind, AiActionOutcome, AiActionRecord, AiActionRequest,
-        AiAttachmentRef, AiCheckpoint, AiConversation, AiConversationKind, AiConversationSettings,
-        AiProviderPreferences, AiQueuedTurn, AiWorkspaceMode, ApplyMode, ApprovalEvidence,
-        AuthorizationDecision, AutoTagRule, AutoTagSettings, ContainmentMode, DomainActor,
-        EarnedTagRemovalPolicy, ExistingTilesPolicy, InitialMembership, MessageRole, PaletteColor,
+        AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_SWARM,
+        AI_FEATURE_THINKING, AI_FEATURE_WEB_SEARCH, AiActionKind, AiActionOutcome, AiActionRecord,
+        AiActionRequest, AiAttachmentRef, AiCheckpoint, AiConversation, AiConversationKind,
+        AiConversationSettings, AiPermissionClass, AiPermissionVerdict, AiProviderPreferences,
+        AiQueuedTurn, AiWorkspaceMode, ApplyMode, ApprovalEvidence, AuthorizationDecision,
+        AutoTagRule, AutoTagSettings, ContainmentMode, DomainActor, EarnedTagRemovalPolicy,
+        ExistingTilesPolicy, HostArtifactOrigin, InitialMembership, MessageRole, PaletteColor,
         PermissionMode, Pile, PileHistoryKind, RuleEditProgressPolicy, RuleState, TagClaim,
         TagName, TagSource, TimeUnit, TimingMode, TrashActor, TrashItem, UnixMillis,
-        apply_rule_edit, authorize_ai_action, auto_tag_rule_sentence, resolve_pile_memberships,
+        ai_permission_verdict, apply_rule_edit, authorize_ai_action, auto_tag_rule_sentence,
+        resolve_pile_memberships,
     },
     dots::{self, ChromeRects},
     file_watch::{self, FileWatch},
@@ -43,7 +50,10 @@ use crate::{
         TileKind, Workspace, WorldRect,
     },
     ocr::{OcrQueueError, PhotoOcrRequest, PhotoOcrWorker, source_fingerprint},
-    persistence::{AppPaths, SaveOutcome, SaveWorker, backup_unreadable_library, load_workspace},
+    persistence::{
+        AppPaths, SaveOutcome, SaveWorker, backup_unreadable_library, load_workspace,
+        scrub_deleted_conversation_checkpoint_json,
+    },
     photo_details::{
         PhotoDossier, PhotoEnrichment, PhotoMetadata, PhotoOcrArtifact, PhotoRecord,
         PhotoTileDetails, PhotoVisualDescription, PhotoVisualLabel,
@@ -218,6 +228,12 @@ impl History {
         let next = self.redo.pop()?;
         self.undo.push(current.clone());
         Some(next)
+    }
+
+    fn forget_conversation(&mut self, conversation_id: Uuid) {
+        for workspace in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            purge_ai_conversation_from_workspace(workspace, conversation_id);
+        }
     }
 
     fn replace_file_path(&mut self, source: &PathBuf, managed_path: &PathBuf) {
@@ -403,12 +419,45 @@ struct AiResumeReplay {
     provider_profile: AiProviderPreferences,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreservedResumeRetry {
+    provider_id: String,
+    session_id: String,
+    user_message_sequence: u64,
+    terminal_message_sequence: u64,
+}
+
 #[derive(Debug, Default)]
 struct AiTurnLaunch {
     provider_override: Option<String>,
     model_override: Option<String>,
     provider_profile_override: Option<AiProviderPreferences>,
     user_message_already_committed: bool,
+    force_replay: bool,
+    preserved_resume_retry_sequence: Option<u64>,
+}
+
+#[derive(Default)]
+struct TemporaryApiKeys(HashMap<String, String>);
+
+impl std::fmt::Debug for TemporaryApiKeys {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("TemporaryApiKeys([REDACTED])")
+    }
+}
+
+impl TemporaryApiKeys {
+    fn trimmed(&self, provider_id: &str) -> Option<String> {
+        self.0
+            .get(provider_id)
+            .map(|key| key.trim())
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned)
+    }
+
+    fn value_mut(&mut self, provider_id: &str) -> &mut String {
+        self.0.entry(provider_id.to_owned()).or_default()
+    }
 }
 
 #[derive(Debug)]
@@ -425,6 +474,7 @@ struct AiChatRuntime {
     active_used_resume: bool,
     active_had_productive_activity: bool,
     resume_replay: Option<AiResumeReplay>,
+    preserved_resume_retry: Option<PreservedResumeRetry>,
     streamed_text: String,
     activities: Vec<String>,
     activity_trace: ActivityAccumulator,
@@ -433,12 +483,14 @@ struct AiChatRuntime {
     prompt_budget: Option<PromptBudget>,
     error: Option<String>,
     inspector_notice: Option<String>,
-    api_key: String,
+    /// Memory-only credentials keyed by the exact provider that may receive
+    /// them. A temporary xAI key must never follow a provider switch into an
+    /// OpenAI-compatible endpoint (or vice versa).
+    api_keys: TemporaryApiKeys,
     show_inspector: bool,
     workspace_files: Vec<AiWorkspaceFile>,
     file_preview: Option<AiFilePreview>,
     show_subagents_detail: bool,
-    show_all_outputs: bool,
 }
 
 impl Default for AiChatRuntime {
@@ -456,6 +508,7 @@ impl Default for AiChatRuntime {
             active_used_resume: false,
             active_had_productive_activity: false,
             resume_replay: None,
+            preserved_resume_retry: None,
             streamed_text: String::new(),
             activities: Vec::new(),
             activity_trace: ActivityAccumulator::new(),
@@ -464,20 +517,34 @@ impl Default for AiChatRuntime {
             prompt_budget: None,
             error: None,
             inspector_notice: None,
-            api_key: String::new(),
+            api_keys: TemporaryApiKeys::default(),
             show_inspector: true,
             workspace_files: Vec::new(),
             file_preview: None,
             show_subagents_detail: false,
-            show_all_outputs: false,
         }
+    }
+}
+
+impl AiChatRuntime {
+    fn temporary_api_key(&self, provider_id: &str) -> Option<String> {
+        self.api_keys.trimmed(provider_id)
+    }
+
+    fn temporary_api_key_mut(&mut self, provider_id: &str) -> &mut String {
+        self.api_keys.value_mut(provider_id)
     }
 }
 
 #[derive(Default)]
 struct AiWorkspaceUiAction {
     send: bool,
+    /// Read-only render inputs carried with the frame's action accumulator so
+    /// the composer does not grow more positional arguments.
+    preflight_blocks_send: bool,
+    conversation_hidden: bool,
     stop: bool,
+    unhide_conversation: bool,
     send_next_queued: bool,
     clear_queue: bool,
     add_attachments: bool,
@@ -498,7 +565,8 @@ struct AiWorkspaceUiAction {
     close_file_preview: bool,
     open_subagents_detail: bool,
     close_subagents_detail: bool,
-    toggle_all_outputs: bool,
+    open_artifact_library: Option<LibraryTarget>,
+    switch_workspace_mode: Option<AiWorkspaceMode>,
     retry_turn: Option<RetryHint>,
     open_agents_panel: bool,
     agents_action: AgentsPanelAction,
@@ -508,6 +576,7 @@ struct AiWorkspaceUiAction {
 /// path never borrows `AgentsPanelState` directly.
 struct AgentsChatView {
     preflight: Option<PreflightNotice>,
+    queued_preflight: Option<PreflightNotice>,
     /// Some ⇒ the empty state renders as the agents setup screen.
     setup_rows: Option<Vec<AgentRow>>,
     scanning: bool,
@@ -860,6 +929,7 @@ pub struct AdamApp {
     renaming_tile: Option<Uuid>,
     rename_input: String,
     pending_page_delete: Option<Uuid>,
+    pending_chat_delete: Option<Uuid>,
     tag_picker_tile: Option<Uuid>,
     tag_filter: Option<Uuid>,
     renaming_tag: Option<Uuid>,
@@ -870,6 +940,7 @@ pub struct AdamApp {
     pending_photo_rescan: Option<Uuid>,
     pile_settings: Option<Uuid>,
     open_chat: Option<Uuid>,
+    show_hidden_chats: bool,
     #[allow(dead_code)] // Retained for migration compatibility with the retired popup chat.
     chat_input: String,
     chat_runtimes: HashMap<Uuid, AiChatRuntime>,
@@ -881,6 +952,7 @@ pub struct AdamApp {
     resume_store_path: PathBuf,
     pending_ai_action: Option<AiActionRequest>,
     agents: AgentsPanelState,
+    artifact_library: ArtifactLibraryState,
     trash_open: bool,
     link_editor_open: bool,
     link_input: String,
@@ -1054,7 +1126,7 @@ impl AdamApp {
         let reduce_motion = platform::reduce_motion_enabled();
         let paths = AppPaths::discover();
         let resume_store_path = paths.root.join("ai-native-sessions.json");
-        let resume_store = ResumeStore::load(&resume_store_path).unwrap_or_else(|error| {
+        let mut resume_store = ResumeStore::load(&resume_store_path).unwrap_or_else(|error| {
             log::error!("could not load native AI session state: {error}");
             ResumeStore::new()
         });
@@ -1086,8 +1158,41 @@ impl AdamApp {
                 }
             }
         };
+        // The workspace and native-resume sidecar are committed separately.
+        // Keep the exact loaded workspace as the save baseline, then union the
+        // monotonic tombstones in both directions so either durable marker can
+        // finish a confirmed deletion after a crash.
         let persistence_base = workspace.clone();
         let mut ai_recovery_changed = false;
+        let mut deleted_conversations = workspace
+            .domain
+            .conversations
+            .deleted_conversations
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        deleted_conversations.extend(resume_store.permanently_forgotten_conversation_ids());
+        let mut resume_tombstones_changed = false;
+        for conversation_id in &deleted_conversations {
+            match resume_store.permanently_forget(*conversation_id) {
+                Ok(changed) => resume_tombstones_changed |= changed,
+                Err(error) => log::error!(
+                    "could not tombstone native AI session state for {conversation_id}: {error}"
+                ),
+            }
+        }
+        if resume_tombstones_changed {
+            match resume_store.save_merged(&resume_store_path) {
+                Ok(merged) => resume_store = merged,
+                Err(error) => {
+                    log::error!("could not reconcile deleted native AI sessions: {error}")
+                }
+            }
+        }
+        deleted_conversations.extend(resume_store.permanently_forgotten_conversation_ids());
+        ai_recovery_changed |=
+            apply_permanent_ai_deletions_to_workspace(&mut workspace, &deleted_conversations);
+
         let recovery_time = unix_now();
         for conversation in workspace.domain.conversations.conversations.values_mut() {
             if !conversation.queued_turns().is_empty() && !conversation.queue_paused {
@@ -1177,6 +1282,7 @@ impl AdamApp {
             renaming_tile: None,
             rename_input: String::new(),
             pending_page_delete: None,
+            pending_chat_delete: None,
             tag_picker_tile: None,
             tag_filter: None,
             renaming_tag: None,
@@ -1187,6 +1293,7 @@ impl AdamApp {
             pending_photo_rescan: None,
             pile_settings: None,
             open_chat: None,
+            show_hidden_chats: false,
             chat_input: String::new(),
             chat_runtimes: HashMap::new(),
             markdown_cache: CommonMarkCache::default(),
@@ -1195,6 +1302,7 @@ impl AdamApp {
             resume_store_path,
             pending_ai_action: None,
             agents: AgentsPanelState::start(creation.egui_ctx.clone()),
+            artifact_library: ArtifactLibraryState::default(),
             trash_open: false,
             link_editor_open: false,
             link_input: String::new(),
@@ -1352,6 +1460,49 @@ impl AdamApp {
     }
 
     fn restore_workspace(&mut self, mut workspace: Workspace) {
+        // Conversation deletion and host-artifact provenance are durable
+        // audit state, not reversible canvas layout. Undo/checkpoint restores
+        // may add older layout back, but cannot resurrect a deleted chat or
+        // discard an origin recorded after the snapshot was taken.
+        workspace.domain.conversations.deleted_conversations.extend(
+            self.workspace
+                .domain
+                .conversations
+                .deleted_conversations
+                .iter()
+                .copied(),
+        );
+        let xai_storage_conversations = self
+            .workspace
+            .domain
+            .conversations
+            .conversations
+            .iter()
+            .filter_map(|(conversation_id, conversation)| {
+                conversation
+                    .used_xai_server_storage
+                    .then_some(*conversation_id)
+            })
+            .collect::<BTreeSet<_>>();
+        apply_xai_storage_disclosures_to_workspace(&mut workspace, &xai_storage_conversations);
+        let mut host_artifacts = self.workspace.domain.host_artifacts.clone();
+        for origin in workspace.domain.host_artifacts.origins().values().cloned() {
+            if let Err(error) = host_artifacts.record(origin) {
+                log::error!("ignored conflicting restored host-artifact provenance: {error}");
+            }
+        }
+        workspace.domain.host_artifacts = host_artifacts;
+        let deleted_conversations = workspace
+            .domain
+            .conversations
+            .deleted_conversations
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for conversation_id in deleted_conversations {
+            purge_ai_conversation_from_workspace(&mut workspace, conversation_id);
+        }
+
         // OCR is machine-generated source data rather than a user layout
         // action. Preserve the newest completed scan when an unrelated canvas
         // undo restores an older workspace snapshot containing the same photo.
@@ -1450,6 +1601,187 @@ impl AdamApp {
         self.refresh_ai_workspace_files(conversation_id);
     }
 
+    fn set_ai_conversation_hidden(
+        &mut self,
+        conversation_id: Uuid,
+        hidden: bool,
+        context: &Context,
+    ) {
+        if !self
+            .workspace
+            .domain
+            .conversations
+            .conversations
+            .contains_key(&conversation_id)
+        {
+            return;
+        }
+        if hidden {
+            let _ = self.ai_engine.cancel_conversation(conversation_id);
+            if let Some(runtime) = self.chat_runtimes.get_mut(&conversation_id) {
+                runtime.resume_replay = None;
+                runtime.preserved_resume_retry = None;
+            }
+        }
+        if let Some(conversation) = self
+            .workspace
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&conversation_id)
+        {
+            update_ai_conversation_hidden_state(conversation, hidden, unix_now());
+        }
+        if hidden && self.open_chat == Some(conversation_id) {
+            self.open_chat = None;
+        }
+        self.changed(false);
+        context.request_repaint();
+    }
+
+    fn notify_hidden_chat_send_blocked(&mut self, conversation_id: Uuid, context: &Context) {
+        let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+        runtime.inspector_notice = Some(HIDDEN_CHAT_SEND_NOTICE.into());
+        runtime.show_inspector = true;
+        self.toast(HIDDEN_CHAT_SEND_NOTICE, context);
+        context.request_repaint();
+    }
+
+    fn delete_ai_conversation(&mut self, conversation_id: Uuid, context: &Context) {
+        if !self
+            .workspace
+            .domain
+            .conversations
+            .conversations
+            .contains_key(&conversation_id)
+        {
+            return;
+        }
+
+        self.permanently_delete_ai_conversations(&BTreeSet::from([conversation_id]), context);
+        self.toast("Chat deleted", context);
+    }
+
+    /// Applies confirmed, monotonic conversation tombstones to every live
+    /// app-owned carrier. This path is shared by direct deletion and markers
+    /// learned from another Adam process during a save merge.
+    fn permanently_delete_ai_conversations(
+        &mut self,
+        conversation_ids: &BTreeSet<Uuid>,
+        context: &Context,
+    ) {
+        if conversation_ids.is_empty() {
+            return;
+        }
+
+        // Tombstone the engine first: cancellation is asynchronous, and no
+        // already-buffered or late event may rebuild runtime/task state after
+        // the durable conversation has been erased.
+        let mut resume_tombstones_changed = false;
+        for conversation_id in conversation_ids {
+            self.ai_engine.delete_conversation(*conversation_id);
+            self.chat_runtimes.remove(conversation_id);
+            match self.resume_store.permanently_forget(*conversation_id) {
+                Ok(changed) => resume_tombstones_changed |= changed,
+                Err(error) => log::error!(
+                    "could not tombstone native AI session state for {conversation_id}: {error}"
+                ),
+            }
+        }
+        if resume_tombstones_changed {
+            self.save_ai_resume_store();
+        }
+
+        if self
+            .pending_ai_action
+            .as_ref()
+            .is_some_and(|request| conversation_ids.contains(&request.conversation_id))
+        {
+            self.pending_ai_action = None;
+        }
+        let deleted_open_chat = self
+            .open_chat
+            .is_some_and(|conversation_id| conversation_ids.contains(&conversation_id));
+        if deleted_open_chat {
+            self.open_chat = None;
+            self.chat_input.clear();
+        }
+        if self
+            .pending_chat_delete
+            .is_some_and(|conversation_id| conversation_ids.contains(&conversation_id))
+        {
+            self.pending_chat_delete = None;
+        }
+
+        let mut tile_ids = BTreeSet::new();
+        for conversation_id in conversation_ids {
+            tile_ids.extend(purge_ai_conversation_from_workspace(
+                &mut self.workspace,
+                *conversation_id,
+            ));
+            self.history.forget_conversation(*conversation_id);
+        }
+        for tile_id in &tile_ids {
+            self.pending_photo_ocr.remove(tile_id);
+            self.photo_ocr_errors.remove(tile_id);
+            self.photo_ocr_started.remove(tile_id);
+            self.photo_file_facts.remove(tile_id);
+            self.pending_asset_imports.remove(tile_id);
+            self.previews.invalidate(*tile_id);
+            self.structured_previews.invalidate(*tile_id);
+            if self.pending_photo_rescan == Some(*tile_id) {
+                self.pending_photo_rescan = None;
+            }
+            if self.details_tile == Some(*tile_id) {
+                self.details_tile = None;
+                self.details_edit_checkpointed = false;
+            }
+            if self.renaming_tile == Some(*tile_id) {
+                self.renaming_tile = None;
+                self.rename_input.clear();
+            }
+            if self.tag_picker_tile == Some(*tile_id) {
+                self.tag_picker_tile = None;
+            }
+            if self.editing_note == Some(*tile_id) {
+                self.editing_note = None;
+            }
+            if self.editing_focus_pending == Some(*tile_id) {
+                self.editing_focus_pending = None;
+            }
+            if self.text_note_drop_target == Some(*tile_id) {
+                self.text_note_drop_target = None;
+            }
+        }
+        self.selection.retain(|tile_id| !tile_ids.contains(tile_id));
+        if self.marquee.as_ref().is_some_and(|marquee| {
+            marquee
+                .base_selection
+                .iter()
+                .any(|id| tile_ids.contains(id))
+        }) {
+            self.marquee = None;
+        }
+        if self.drag.as_ref().is_some_and(|drag| {
+            drag.text_source.is_some_and(|id| tile_ids.contains(&id))
+                || drag.originals.keys().any(|id| tile_ids.contains(id))
+        }) {
+            self.drag = None;
+        }
+        if self
+            .resize
+            .as_ref()
+            .is_some_and(|resize| resize.originals.keys().any(|id| tile_ids.contains(id)))
+        {
+            self.resize = None;
+        }
+
+        // Even a tombstone with no currently visible carrier must be saved so
+        // this window can never render or resume the deleted chat again.
+        self.changed(!tile_ids.is_empty());
+        context.request_repaint();
+    }
+
     fn refresh_ai_workspace_files(&mut self, conversation_id: Uuid) {
         let directory = self
             .workspace
@@ -1542,10 +1874,29 @@ impl AdamApp {
     fn poll_save_completions(&mut self, context: &Context) {
         while let Some(completion) = self.saves.poll_completion() {
             match completion.outcome {
-                SaveOutcome::Saved => {
+                SaveOutcome::Saved {
+                    learned_deleted_conversations,
+                    learned_xai_storage_conversations,
+                } => {
                     if self.pending_save == Some(completion.request_id) {
                         self.pending_save = None;
                     }
+                    let learned_deleted_conversations = learned_deleted_conversations
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
+                    let learned_xai_storage_conversations = learned_xai_storage_conversations
+                        .into_iter()
+                        .collect::<BTreeSet<_>>();
+                    if apply_xai_storage_disclosures_to_workspace(
+                        &mut self.workspace,
+                        &learned_xai_storage_conversations,
+                    ) {
+                        context.request_repaint();
+                    }
+                    self.permanently_delete_ai_conversations(
+                        &learned_deleted_conversations,
+                        context,
+                    );
                 }
                 SaveOutcome::Superseded { by_request_id } => {
                     if self.pending_save == Some(completion.request_id) {
@@ -2272,6 +2623,7 @@ impl AdamApp {
             || self.renaming_tile.is_some()
             || self.link_editor_open
             || self.pending_page_delete.is_some()
+            || self.pending_chat_delete.is_some()
             || self.tag_picker_tile.is_some()
             || self.renaming_tag.is_some()
             || self.pending_tag_delete.is_some()
@@ -2279,7 +2631,8 @@ impl AdamApp {
             || self.pile_settings.is_some()
             || self.open_chat.is_some()
             || self.trash_open
-            || self.agents.open;
+            || self.agents.open
+            || self.artifact_library.open;
 
         let undo = context.input(|input| {
             input.modifiers.command && !input.modifiers.shift && input.key_pressed(Key::Z)
@@ -2766,12 +3119,15 @@ impl AdamApp {
         let mut delete_page = false;
         let mut new_chat = false;
         let mut open_agent_harness = false;
+        let mut open_artifact_library = false;
         let mut switch_to = None;
         let mut reorder_page = None;
         let mut filter_to = None;
         let mut open_chat = None;
         let mut toggle_pin_chat = None;
         let mut toggle_unread_chat = None;
+        let mut set_chat_hidden = None;
+        let mut delete_chat = None;
         let mut open_trash = false;
         let mut rename_tag = None;
         let mut delete_tag = None;
@@ -2822,6 +3178,7 @@ impl AdamApp {
                     chat.updated_at,
                     chat.pinned,
                     chat.unread,
+                    chat.hidden,
                 )
             })
             .collect();
@@ -3031,7 +3388,9 @@ impl AdamApp {
                             .clicked();
                     });
                 });
-                for (conversation_id, title, mode, provider_id, _, pinned, unread) in &chats {
+                for (conversation_id, title, mode, provider_id, _, pinned, unread, _) in
+                    chats.iter().filter(|chat| !chat.7)
+                {
                     let selected = self.open_chat == Some(*conversation_id);
                     let response = ai_chat_sidebar_row(
                         ui,
@@ -3064,7 +3423,91 @@ impl AdamApp {
                             toggle_unread_chat = Some(*conversation_id);
                             ui.close();
                         }
+                        ui.separator();
+                        if ui.button("Hide").clicked() {
+                            set_chat_hidden = Some((*conversation_id, true));
+                            ui.close();
+                        }
+                        if ui
+                            .button(RichText::new("Delete…").color(colors.danger))
+                            .clicked()
+                        {
+                            delete_chat = Some(*conversation_id);
+                            ui.close();
+                        }
                     });
+                }
+
+                let hidden_count = chats.iter().filter(|chat| chat.7).count();
+                if hidden_count > 0 {
+                    ui.add_space(4.0);
+                    if ui
+                        .add(
+                            Button::new(
+                                RichText::new(format!(
+                                    "{}  Hidden  {hidden_count}",
+                                    if self.show_hidden_chats { "▾" } else { "▸" }
+                                ))
+                                .size(11.5)
+                                .color(colors.tertiary_text),
+                            )
+                            .frame(false),
+                        )
+                        .clicked()
+                    {
+                        self.show_hidden_chats = !self.show_hidden_chats;
+                    }
+                }
+                if self.show_hidden_chats {
+                    for (conversation_id, title, mode, provider_id, _, pinned, unread, _) in
+                        chats.iter().filter(|chat| chat.7)
+                    {
+                        let selected = self.open_chat == Some(*conversation_id);
+                        let response = ai_chat_sidebar_row(
+                            ui,
+                            title,
+                            *mode,
+                            provider_id,
+                            AiChatSidebarStatus {
+                                selected,
+                                pinned: *pinned,
+                                unread: *unread,
+                            },
+                            colors,
+                        );
+                        if response.clicked() {
+                            open_chat = Some(*conversation_id);
+                        }
+                        response.context_menu(|ui| {
+                            if ui.button("Unhide").clicked() {
+                                set_chat_hidden = Some((*conversation_id, false));
+                                ui.close();
+                            }
+                            if ui.button(if *pinned { "Unpin" } else { "Pin" }).clicked() {
+                                toggle_pin_chat = Some(*conversation_id);
+                                ui.close();
+                            }
+                            if ui
+                                .button(if *unread {
+                                    "Mark as read"
+                                } else {
+                                    "Mark as unread"
+                                })
+                                .clicked()
+                            {
+                                toggle_unread_chat = Some(*conversation_id);
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui
+                                .button(RichText::new("Delete…").color(colors.danger))
+                                .clicked()
+                            {
+                                delete_chat = Some(*conversation_id);
+                                ui.close();
+                            }
+                        });
+                    }
                 }
 
                 ui.add_space(6.0);
@@ -3083,6 +3526,20 @@ impl AdamApp {
                         .frame(false),
                     )
                     .on_hover_text("Which AI provider CLIs are installed, verified, or installable")
+                    .clicked();
+                let library_selected = self.artifact_library.open;
+                open_artifact_library = ui
+                    .add(
+                        Button::new(RichText::new("◇  Artifacts").size(12.5).color(
+                            if library_selected {
+                                colors.text
+                            } else {
+                                colors.secondary_text
+                            },
+                        ))
+                        .frame(false),
+                    )
+                    .on_hover_text("Search everything your chats have made, across conversations")
                     .clicked();
 
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
@@ -3152,14 +3609,21 @@ impl AdamApp {
             self.page_hover = None;
         }
 
-        // Any sidebar navigation leaves the Agent Harness section.
+        // Any sidebar navigation leaves the Agent Harness section and the
+        // artifact library.
         if switch_to.is_some() || open_chat.is_some() || filter_to.is_some() || new_page || new_chat
         {
             self.agents.open = false;
+            self.artifact_library.close();
         }
         if open_agent_harness {
             self.agents.open = true;
+            self.artifact_library.close();
             self.agents.ensure_scanned();
+        }
+        if open_artifact_library {
+            self.agents.open = false;
+            self.artifact_library.open_for(LibraryTarget::All);
         }
         if let Some(page_id) = switch_to {
             self.switch_page(page_id);
@@ -3192,6 +3656,12 @@ impl AdamApp {
         {
             conversation.unread = !conversation.unread;
             self.changed(false);
+        }
+        if let Some((conversation_id, hidden)) = set_chat_hidden {
+            self.set_ai_conversation_hidden(conversation_id, hidden, &context);
+        }
+        if let Some(conversation_id) = delete_chat {
+            self.pending_chat_delete = Some(conversation_id);
         }
         if open_trash {
             self.trash_open = true;
@@ -7135,7 +7605,7 @@ impl AdamApp {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         toggle_inspector = ui
                             .add(Button::new("Inspector"))
-                            .on_hover_text("Show progress, outputs, working files, and context")
+                            .on_hover_text("Show progress, artifacts, working files, and context")
                             .clicked();
                         ui.add_enabled_ui(!running, |ui| {
                             let mut selected_provider = settings.provider_id.clone();
@@ -7250,11 +7720,57 @@ impl AdamApp {
             .as_ref()
             .filter(|request| request.conversation_id == conversation_id)
             .cloned();
-        let mut action = AiWorkspaceUiAction::default();
-        self.agents.ensure_scanned();
+        let mut action = AiWorkspaceUiAction {
+            conversation_hidden: conversation.hidden,
+            ..AiWorkspaceUiAction::default()
+        };
+        let resume_provider_id = self
+            .resume_store
+            .record(conversation_id)
+            .map(|record| record.provider_key.clone());
+        let selected_provider_id =
+            resume_pinned_provider_id(&settings.provider_id, resume_provider_id.as_deref())
+                .to_owned();
+        self.agents.ensure_scanned_for(&selected_provider_id);
+        let agents_scanning = self.agents.scanning();
+        let provider_scanning = self.agents.scanning_for(&selected_provider_id);
+        let provider_preflight = preflight_notice(
+            &selected_provider_id,
+            !settings.api_endpoint.trim().is_empty(),
+            self.agents.snapshot.as_ref(),
+            provider_scanning,
+        );
+        let preflight_blocks_send = provider_preflight
+            .as_ref()
+            .is_some_and(|notice| notice.blocks_send);
+        action.preflight_blocks_send = preflight_blocks_send;
+        let queued_head = conversation.queued_turns().first();
+        let queued_provider_id = queued_head.map(|queued| {
+            resume_pinned_provider_id(
+                queued_turn_provider_id(queued, &conversation.settings),
+                resume_provider_id.as_deref(),
+            )
+            .to_owned()
+        });
+        if let Some(provider_id) = queued_provider_id.as_deref() {
+            self.agents.ensure_scanned_for(provider_id);
+        }
+        let queued_preflight = queued_head.and_then(|queued| {
+            let provider_id = queued_provider_id
+                .as_deref()
+                .expect("queued provider exists with queued head");
+            queued_turn_preflight_notice(
+                queued,
+                &conversation.settings,
+                resume_provider_id.as_deref(),
+                self.agents.snapshot.as_ref(),
+                self.agents.scanning_for(provider_id),
+            )
+        });
         let setup_active = conversation.messages().is_empty()
             && runtime.streamed_text.is_empty()
             && !self.agents.setup_dismissed
+            && !agents_scanning
             && self
                 .agents
                 .snapshot
@@ -7266,12 +7782,9 @@ impl AdamApp {
             preflight: if setup_active {
                 None
             } else {
-                preflight_notice(
-                    &settings.provider_id,
-                    !settings.api_endpoint.trim().is_empty(),
-                    self.agents.snapshot.as_ref(),
-                )
+                provider_preflight
             },
+            queued_preflight,
             setup_rows: setup_active.then(|| {
                 agent_rows(
                     self.agents
@@ -7281,7 +7794,7 @@ impl AdamApp {
                     Some(&settings.provider_id),
                 )
             }),
-            scanning: self.agents.scanning(),
+            scanning: agents_scanning,
             installing: self.agents.installing(),
             last_install: self.agents.last_install().cloned(),
         };
@@ -7377,6 +7890,12 @@ impl AdamApp {
             });
 
         let running = runtime.active_turn.is_some();
+        // Defense in depth: render paths should only set `send` when the
+        // composer is enabled, but never let an alternate UI event bypass a
+        // guaranteed-failure exact-provider preflight.
+        if !running && action.preflight_blocks_send {
+            action.send = false;
+        }
         self.chat_runtimes.insert(conversation_id, runtime);
         if !running
             && (settings != conversation.settings || permission != conversation.permission_mode)
@@ -7415,6 +7934,9 @@ impl AdamApp {
             self.agents.ensure_scanned();
         }
         self.apply_agents_panel_action(action.agents_action, context);
+        if action.unhide_conversation {
+            self.set_ai_conversation_hidden(conversation_id, false, context);
+        }
         if action.add_attachments {
             self.add_ai_attachments(conversation_id);
         }
@@ -7469,6 +7991,8 @@ impl AdamApp {
             self.refresh_ai_workspace_files(conversation_id);
             self.changed(false);
         }
+        // Clear returns the chat to its own sandbox on the next send;
+        // ensure_ai_chat_sandbox re-materializes it in start_ai_turn.
         if action.refresh_folder {
             self.refresh_ai_workspace_files(conversation_id);
         }
@@ -7487,10 +8011,23 @@ impl AdamApp {
         {
             runtime.show_subagents_detail = false;
         }
-        if action.toggle_all_outputs
-            && let Some(runtime) = self.chat_runtimes.get_mut(&conversation_id)
+        if let Some(target) = action.open_artifact_library {
+            self.artifact_library.open_for(target);
+        }
+        if let Some(mode) = action.switch_workspace_mode
+            && !run_scope_locked
         {
-            runtime.show_all_outputs = !runtime.show_all_outputs;
+            if let Some(conversation) = self
+                .workspace
+                .domain
+                .conversations
+                .conversations
+                .get_mut(&conversation_id)
+            {
+                conversation.settings.workspace_mode = mode;
+                conversation.updated_at = unix_now();
+            }
+            self.changed(false);
         }
         if let Some(path) = action.preview_file {
             let preview = match self.resolve_scoped_ai_workspace_path(conversation_id, &path) {
@@ -7599,16 +8136,18 @@ impl AdamApp {
             self.changed(false);
         }
         if action.send_next_queued {
-            if let Some(conversation) = self
+            let may_send = self
                 .workspace
                 .domain
                 .conversations
                 .conversations
                 .get_mut(&conversation_id)
-            {
-                conversation.queue_paused = false;
+                .is_some_and(prepare_ai_queue_for_explicit_send);
+            if may_send {
+                self.drain_ai_queue(conversation_id, context);
+            } else {
+                self.notify_hidden_chat_send_blocked(conversation_id, context);
             }
-            self.drain_ai_queue(conversation_id, context);
         }
         if action.send {
             self.start_ai_turn(conversation_id, context);
@@ -7673,7 +8212,39 @@ impl AdamApp {
         }
     }
 
+    /// A chat with no chosen folder gets its own private sandbox before the
+    /// first turn launches, the way hosted assistants do — file work must
+    /// land somewhere safe instead of being denied or aimed at the home
+    /// folder (user feedback, 2026-08-02). Choose Folder… still overrides;
+    /// Clear returns the chat to its sandbox on the next send. The folder
+    /// outlives chat deletion, matching the rule that produced files are
+    /// user-owned.
+    fn ensure_ai_chat_sandbox(&mut self, conversation_id: Uuid) {
+        let Some(conversation) = self
+            .workspace
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&conversation_id)
+        else {
+            return;
+        };
+        if conversation.settings.working_directory.is_some() {
+            return;
+        }
+        let sandbox = ai_chat_sandbox_directory(&self.paths.root, conversation_id);
+        if let Err(error) = std::fs::create_dir_all(&sandbox) {
+            log::error!("chat sandbox directory was not created: {error}");
+            return;
+        }
+        conversation.settings.working_directory = Some(sandbox.to_string_lossy().into_owned());
+        conversation.updated_at = unix_now();
+        self.changed(false);
+        self.refresh_ai_workspace_files(conversation_id);
+    }
+
     fn start_ai_turn(&mut self, conversation_id: Uuid, context: &Context) {
+        self.ensure_ai_chat_sandbox(conversation_id);
         let Some(conversation) = self
             .workspace
             .domain
@@ -7684,6 +8255,10 @@ impl AdamApp {
         else {
             return;
         };
+        if conversation.hidden {
+            self.notify_hidden_chat_send_blocked(conversation_id, context);
+            return;
+        }
         let engine_running = self.ai_engine.is_conversation_running(conversation_id);
         let (user_text, attachments, running) = {
             let runtime = self.chat_runtimes.entry(conversation_id).or_default();
@@ -7820,6 +8395,12 @@ impl AdamApp {
         if retry == RetryHint::AllowWebAndRetry {
             provider_profile.set_feature(AI_FEATURE_WEB_SEARCH, Some(true));
         }
+        let preserved_resume_retry_sequence = self
+            .chat_runtimes
+            .get(&conversation_id)
+            .and_then(|runtime| runtime.preserved_resume_retry.as_ref())
+            .filter(|retry| retry.user_message_sequence == previous.sequence)
+            .map(|retry| retry.user_message_sequence);
         {
             let runtime = self.chat_runtimes.entry(conversation_id).or_default();
             runtime.error = None;
@@ -7839,6 +8420,8 @@ impl AdamApp {
                 model_override: Some(provider_profile.model.clone()),
                 provider_profile_override: Some(provider_profile),
                 user_message_already_committed: true,
+                force_replay: false,
+                preserved_resume_retry_sequence,
             },
             context,
         ) {
@@ -7853,7 +8436,20 @@ impl AdamApp {
         &self,
         conversation: &AiConversation,
         provider_id: &str,
-    ) -> Option<ResumeGate> {
+        verify_kimi_runtime: bool,
+    ) -> Result<Option<ResumeGate>, String> {
+        let configured_working_directory = conversation
+            .settings
+            .working_directory
+            .as_deref()
+            .map(Path::new);
+        if provider_id == "kimi_cli" && verify_kimi_runtime {
+            match checked_installed_kimi_uses_acp(configured_working_directory) {
+                Ok(true) => {}
+                Ok(false) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
         let (executable, arguments) = ai_provider_profile_inputs(
             provider_id,
             &conversation.settings.custom_command,
@@ -7862,14 +8458,17 @@ impl AdamApp {
         );
         let profile = capability_profile(provider_id, &executable, &arguments);
         if !profile.supports_native_resume() || !profile.has_structured_stream() {
-            return None;
+            return Ok(None);
         }
-        let working_directory = conversation
+        let Some(working_directory) = conversation
             .settings
             .working_directory
             .as_deref()
             .map(PathBuf::from)
-            .or_else(dirs::home_dir)?;
+            .or_else(dirs::home_dir)
+        else {
+            return Ok(None);
+        };
         let parser_dialect = ai_stream_dialect_key(profile.stream_dialect);
         let sandbox_profile = match profile.sandbox {
             crate::chat_core::SandboxStrategy::None => None,
@@ -7888,12 +8487,26 @@ impl AdamApp {
                 .last()
                 .map(|message| message.sequence),
         )
-        .ok()
+        .map(Some)
+        .map_err(|error| format!("Adam could not verify native session state: {error}"))
     }
 
-    fn save_ai_resume_store(&self) {
-        if let Err(error) = self.resume_store.save(&self.resume_store_path) {
-            log::error!("could not save native AI session state: {error}");
+    fn save_ai_resume_store(&mut self) {
+        let known_tombstones = self
+            .resume_store
+            .permanently_forgotten_conversation_ids()
+            .collect::<BTreeSet<_>>();
+        match self.resume_store.save_merged(&self.resume_store_path) {
+            Ok(merged) => {
+                let learned_tombstones =
+                    newly_learned_resume_tombstones(&known_tombstones, &merged);
+                self.resume_store = merged;
+                if !learned_tombstones.is_empty() {
+                    let context = self.egui_context.clone();
+                    self.permanently_delete_ai_conversations(&learned_tombstones, &context);
+                }
+            }
+            Err(error) => log::error!("could not save native AI session state: {error}"),
         }
     }
 
@@ -7911,12 +8524,35 @@ impl AdamApp {
             .get(&conversation_id)
             .cloned()
         else {
-            self.resume_store.forget(conversation_id);
+            if self
+                .workspace
+                .domain
+                .conversations
+                .deleted_conversations
+                .contains(&conversation_id)
+            {
+                if let Err(error) = self.resume_store.permanently_forget(conversation_id) {
+                    log::error!(
+                        "could not tombstone native AI session state for {conversation_id}: {error}"
+                    );
+                }
+            } else {
+                self.resume_store.forget(conversation_id);
+            }
             self.save_ai_resume_store();
             return;
         };
+        let resume_gate = match self.ai_resume_gate(&conversation, provider_id, false) {
+            Ok(gate) => gate,
+            Err(error) => {
+                log::error!(
+                    "could not verify native AI session compatibility for {conversation_id}: {error}"
+                );
+                return;
+            }
+        };
         let disposition = if let (Some(gate), Some(session_id)) = (
-            self.ai_resume_gate(&conversation, provider_id),
+            resume_gate,
             session_id.filter(|session_id| !session_id.trim().is_empty()),
         ) {
             ResumeRecord::from_gate(session_id, &gate, unix_now().0.max(1) as u64)
@@ -7942,6 +8578,39 @@ impl AdamApp {
         }
     }
 
+    fn arm_preserved_resume_retry(
+        &mut self,
+        conversation_id: Uuid,
+        provider_id: &str,
+        used_resume: bool,
+        sequences: Option<(u64, u64)>,
+    ) {
+        let conversation_hidden = self
+            .workspace
+            .domain
+            .conversations
+            .conversations
+            .get(&conversation_id)
+            .map(|conversation| conversation.hidden)
+            .unwrap_or(true);
+        let token = (!conversation_hidden && used_resume)
+            .then_some(sequences)
+            .flatten()
+            .and_then(|(user_message_sequence, terminal_message_sequence)| {
+                let record = self.resume_store.record(conversation_id)?;
+                (record.provider_key == provider_id).then(|| PreservedResumeRetry {
+                    provider_id: provider_id.to_owned(),
+                    session_id: record.session_id.clone(),
+                    user_message_sequence,
+                    terminal_message_sequence,
+                })
+            });
+        self.chat_runtimes
+            .entry(conversation_id)
+            .or_default()
+            .preserved_resume_retry = token;
+    }
+
     fn launch_ai_turn(
         &mut self,
         conversation_id: Uuid,
@@ -7950,6 +8619,14 @@ impl AdamApp {
         launch: AiTurnLaunch,
         context: &Context,
     ) -> bool {
+        let force_replay = launch.force_replay;
+        let user_message_already_committed = launch.user_message_already_committed;
+        let preserved_resume_retry = launch.preserved_resume_retry_sequence.and_then(|sequence| {
+            self.chat_runtimes
+                .get(&conversation_id)
+                .and_then(|runtime| runtime.preserved_resume_retry.clone())
+                .filter(|retry| retry.user_message_sequence == sequence)
+        });
         let Some(conversation) = self
             .workspace
             .domain
@@ -7960,6 +8637,14 @@ impl AdamApp {
         else {
             return false;
         };
+        if !ai_conversation_allows_launch(&conversation) {
+            if let Some(runtime) = self.chat_runtimes.get_mut(&conversation_id) {
+                runtime.resume_replay = None;
+                runtime.preserved_resume_retry = None;
+            }
+            self.notify_hidden_chat_send_blocked(conversation_id, context);
+            return false;
+        }
         if self
             .chat_runtimes
             .get(&conversation_id)
@@ -7969,15 +8654,17 @@ impl AdamApp {
             return false;
         }
 
-        let mut provider_id = launch
+        let requested_provider_id = launch
             .provider_override
             .filter(|provider| !provider.trim().is_empty())
             .unwrap_or_else(|| conversation.settings.provider_id.clone());
-        if provider_id == "auto"
-            && let Some(record) = self.resume_store.record(conversation_id)
-        {
-            provider_id = record.provider_key.clone();
-        }
+        let provider_id = resume_pinned_provider_id(
+            &requested_provider_id,
+            self.resume_store
+                .record(conversation_id)
+                .map(|record| record.provider_key.as_str()),
+        )
+        .to_owned();
         let mut provider_profile = launch
             .provider_profile_override
             .unwrap_or_else(|| conversation.settings.profile_for(&provider_id));
@@ -8021,10 +8708,54 @@ impl AdamApp {
             self.changed(false);
         }
         let model = provider_profile.model.clone();
-        let resume_gate = self.ai_resume_gate(&conversation, &provider_id);
-        let mut invalidated_resume = false;
+        let resume_gate = if force_replay {
+            None
+        } else {
+            let verify_kimi_runtime = self.resume_store.record(conversation_id).is_some();
+            match self.ai_resume_gate(&conversation, &provider_id, verify_kimi_runtime) {
+                Ok(gate) => gate,
+                Err(error) => {
+                    if matches!(provider_id.as_str(), "grok_cli" | "kimi_cli") {
+                        self.agents.request_scan_for(true, &provider_id);
+                    }
+                    let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+                    runtime.error = Some(error);
+                    runtime.inspector_notice = Some(
+                        "The provider version could not be verified. Retry the turn when the machine is less busy."
+                            .into(),
+                    );
+                    return false;
+                }
+            }
+        };
+        let mut invalidated_resume = should_forget_unavailable_kimi_resume(
+            &provider_id,
+            resume_gate.is_some(),
+            self.resume_store
+                .record(conversation_id)
+                .map(|record| record.provider_key.as_str()),
+        );
+        let exact_retry_record = preserved_resume_record_for_exact_retry(
+            preserved_resume_retry.as_ref(),
+            &provider_id,
+            &conversation,
+            &user_text,
+            &attachments,
+            self.resume_store.record(conversation_id),
+        );
         let resume_session_id = resume_gate.as_ref().and_then(|gate| {
-            match self.resume_store.eligible_record(conversation_id, gate) {
+            let mut eligibility_gate = gate.clone();
+            if let Some(record) = exact_retry_record.as_ref() {
+                // The provider is still aligned with the pre-turn sequence.
+                // Only the exact Retry action for the locally-unsent user
+                // message may bridge over Adam's local terminal message.
+                eligibility_gate.last_committed_message_sequence =
+                    record.last_committed_message_sequence;
+            }
+            match self
+                .resume_store
+                .eligible_record(conversation_id, &eligibility_gate)
+            {
                 Ok(Some(record)) => Some(record.session_id.clone()),
                 Ok(None) => None,
                 Err(error) => {
@@ -8039,39 +8770,43 @@ impl AdamApp {
         if invalidated_resume {
             self.resume_store.forget(conversation_id);
             self.save_ai_resume_store();
+            self.chat_runtimes
+                .entry(conversation_id)
+                .or_default()
+                .preserved_resume_retry = None;
         }
         let runtime = self.chat_runtimes.entry(conversation_id).or_default();
-        let api_key =
-            (!runtime.api_key.trim().is_empty()).then(|| runtime.api_key.trim().to_owned());
+        let api_key = runtime.temporary_api_key(&provider_id);
         let task_seed =
             newest_plan(&persisted_ai_activity(&conversation)).map(|progress| progress.items);
+        let effective_provider_id = resolve_effective_provider_id(
+            &provider_id,
+            conversation
+                .settings
+                .working_directory
+                .as_deref()
+                .map(Path::new),
+            &conversation.settings.api_endpoint,
+        )
+        .unwrap_or_else(|| provider_id.clone());
         let built_prompt = self.compose_ai_prompt(
             &conversation,
             &user_text,
             &attachments,
-            resolve_effective_provider_id(
-                &provider_id,
-                conversation
-                    .settings
-                    .working_directory
-                    .as_deref()
-                    .map(Path::new),
-                &conversation.settings.api_endpoint,
-            )
-            .as_deref()
-            .unwrap_or(&provider_id),
+            &effective_provider_id,
             if resume_session_id.is_some() {
                 PromptContinuity::Resume
             } else {
                 PromptContinuity::Replay
             },
-            launch.user_message_already_committed,
+            user_message_already_committed,
         );
         let prompt_budget = built_prompt.budget;
         let turn_id = Uuid::new_v4();
         let request = AiRunRequest {
             turn_id,
             conversation_id,
+            canvas_page_id: Some(self.workspace.active_page),
             provider_id: provider_id.clone(),
             workspace_mode: conversation.settings.workspace_mode,
             permission_mode: conversation.permission_mode,
@@ -8096,24 +8831,30 @@ impl AdamApp {
 
         match self.ai_engine.start(request) {
             Ok(()) => {
-                if !launch.user_message_already_committed
-                    && let Some(stored) = self
-                        .workspace
-                        .domain
-                        .conversations
-                        .conversations
-                        .get_mut(&conversation_id)
+                if let Some(stored) = self
+                    .workspace
+                    .domain
+                    .conversations
+                    .conversations
+                    .get_mut(&conversation_id)
                 {
-                    let _ = stored.append_message_with_attachments(
-                        Uuid::new_v4(),
-                        MessageRole::User,
-                        user_text,
-                        unix_now(),
-                        Vec::new(),
-                        attachments,
-                    );
-                    if stored.settings.workspace_mode != AiWorkspaceMode::Chat {
-                        stored.kind = AiConversationKind::Task;
+                    let now = unix_now();
+                    if !user_message_already_committed {
+                        let _ = stored.append_message_with_attachments(
+                            Uuid::new_v4(),
+                            MessageRole::User,
+                            user_text,
+                            now,
+                            Vec::new(),
+                            attachments,
+                        );
+                        if stored.settings.workspace_mode != AiWorkspaceMode::Chat {
+                            stored.kind = AiConversationKind::Task;
+                        }
+                    }
+                    if effective_provider_id == "xai_api" && !stored.used_xai_server_storage {
+                        stored.used_xai_server_storage = true;
+                        stored.updated_at = stored.updated_at.max(now);
                     }
                 }
                 let runtime = self.chat_runtimes.entry(conversation_id).or_default();
@@ -8129,6 +8870,7 @@ impl AdamApp {
                 runtime.active_used_resume = resume_session_id.is_some();
                 runtime.active_had_productive_activity = false;
                 runtime.resume_replay = None;
+                runtime.preserved_resume_retry = None;
                 runtime.streamed_text.clear();
                 runtime.activities.clear();
                 runtime.activity_trace = ActivityAccumulator::new();
@@ -8145,7 +8887,38 @@ impl AdamApp {
                 context.request_repaint_after(Duration::from_millis(40));
                 true
             }
+            Err(AiEngineError::NativeResumeUnavailable(message))
+                if resume_session_id.is_some() && !force_replay =>
+            {
+                log::info!(
+                    "native Kimi session for {conversation_id} changed before launch; replaying safely: {message}"
+                );
+                self.resume_store.forget(conversation_id);
+                self.save_ai_resume_store();
+                self.chat_runtimes
+                    .entry(conversation_id)
+                    .or_default()
+                    .inspector_notice =
+                    Some("Kimi changed before launch; replaying the conversation safely…".into());
+                self.launch_ai_turn(
+                    conversation_id,
+                    user_text,
+                    attachments,
+                    AiTurnLaunch {
+                        provider_override: Some(provider_id),
+                        model_override: Some(model),
+                        provider_profile_override: Some(provider_profile),
+                        user_message_already_committed,
+                        force_replay: true,
+                        preserved_resume_retry_sequence: None,
+                    },
+                    context,
+                )
+            }
             Err(error) => {
+                if matches!(provider_id.as_str(), "grok_cli" | "kimi_cli") {
+                    self.agents.request_scan_for(true, &provider_id);
+                }
                 let runtime = self.chat_runtimes.entry(conversation_id).or_default();
                 runtime.error = Some(error.to_string());
                 runtime.show_inspector = true;
@@ -8155,19 +8928,46 @@ impl AdamApp {
         }
     }
 
+    fn provider_preflight_blocks_send(&self, provider_id: &str, endpoint_configured: bool) -> bool {
+        preflight_notice(
+            provider_id,
+            endpoint_configured,
+            self.agents.snapshot.as_ref(),
+            self.agents.scanning_for(provider_id),
+        )
+        .is_some_and(|notice| notice.blocks_send)
+    }
+
     fn drain_ai_queue(&mut self, conversation_id: Uuid, context: &Context) -> bool {
-        let queued = self
+        let conversation = self
             .workspace
             .domain
             .conversations
             .conversations
             .get(&conversation_id)
-            .filter(|conversation| !conversation.queue_paused)
-            .and_then(|conversation| conversation.queued_turns().first())
+            .filter(|conversation| ai_conversation_queue_allows_drain(conversation))
             .cloned();
-        let Some(queued) = queued else {
+        let Some(conversation) = conversation else {
             return false;
         };
+        let Some(queued) = conversation.queued_turns().first().cloned() else {
+            return false;
+        };
+        let requested_provider_id = queued_turn_provider_id(&queued, &conversation.settings);
+        let provider_id = resume_pinned_provider_id(
+            requested_provider_id,
+            self.resume_store
+                .record(conversation_id)
+                .map(|record| record.provider_key.as_str()),
+        )
+        .to_owned();
+        self.agents.ensure_scanned_for(&provider_id);
+        if self.provider_preflight_blocks_send(
+            &provider_id,
+            !conversation.settings.api_endpoint.trim().is_empty(),
+        ) {
+            return false;
+        }
         if !self.launch_ai_turn(
             conversation_id,
             queued.text.clone(),
@@ -8177,6 +8977,8 @@ impl AdamApp {
                 model_override: queued.model.clone(),
                 provider_profile_override: queued.provider_profile.clone(),
                 user_message_already_committed: false,
+                force_replay: false,
+                preserved_resume_retry_sequence: None,
             },
             context,
         ) {
@@ -8203,7 +9005,7 @@ impl AdamApp {
             .conversations
             .values()
             .filter(|conversation| {
-                !conversation.queue_paused
+                ai_conversation_queue_allows_drain(conversation)
                     && !conversation.queued_turns().is_empty()
                     && !self
                         .chat_runtimes
@@ -8237,7 +9039,14 @@ impl AdamApp {
             .chat_runtimes
             .iter()
             .filter_map(|(conversation_id, runtime)| {
-                (runtime.active_turn.is_none() && runtime.resume_replay.is_some())
+                let launch_allowed = self
+                    .workspace
+                    .domain
+                    .conversations
+                    .conversations
+                    .get(conversation_id)
+                    .is_some_and(ai_conversation_allows_launch);
+                (launch_allowed && runtime.active_turn.is_none() && runtime.resume_replay.is_some())
                     .then_some(*conversation_id)
             })
             .collect::<Vec<_>>();
@@ -8265,6 +9074,8 @@ impl AdamApp {
                     model_override: Some(replay.model),
                     provider_profile_override: Some(replay.provider_profile),
                     user_message_already_committed: true,
+                    force_replay: true,
+                    preserved_resume_retry_sequence: None,
                 },
                 context,
             ) {
@@ -8433,7 +9244,7 @@ impl AdamApp {
                         let final_text = if provider_returned_text {
                             provider_text
                         } else {
-                            "_The provider completed without a text response. See the activity and outputs for what it did._".into()
+                            "_The provider completed without a text response. See the activity and artifacts for what it did._".into()
                         };
                         if assistant_flat_text(&runtime.activity_trace.events)
                             .trim()
@@ -8455,7 +9266,11 @@ impl AdamApp {
                         runtime.active_used_resume = false;
                         runtime.active_had_productive_activity = false;
                         runtime.streamed_text.clear();
-                        if let Some(session_id) = session_id.clone() {
+                        let persist_session_activity = runtime
+                            .active_provider_id
+                            .as_deref()
+                            .is_some_and(provider_session_is_portable_activity);
+                        if persist_session_activity && let Some(session_id) = session_id.clone() {
                             runtime.activity_trace.ingest(HarnessActivityEvent::new(
                                 Uuid::new_v4(),
                                 unix_now(),
@@ -8514,7 +9329,21 @@ impl AdamApp {
                     refresh_folders.insert(conversation_id);
                     drain_queues.insert(conversation_id);
                 }
-                AiEvent::Failed { kind, message, .. } => {
+                AiEvent::Failed {
+                    kind,
+                    message,
+                    resume_rejected,
+                    preserve_resume,
+                    ..
+                } => {
+                    let conversation_hidden = self
+                        .workspace
+                        .domain
+                        .conversations
+                        .conversations
+                        .get(&conversation_id)
+                        .map(|conversation| conversation.hidden)
+                        .unwrap_or(true);
                     let retry_message = self
                         .workspace
                         .domain
@@ -8526,7 +9355,12 @@ impl AdamApp {
                         .map(|last| (last.text.clone(), last.attachments.clone()));
                     let scheduled_resume_replay = {
                         let runtime = self.chat_runtimes.entry(conversation_id).or_default();
-                        let unproductive_resume = should_replay_failed_native_session(runtime);
+                        let unproductive_resume = should_replay_failed_native_session(
+                            runtime,
+                            resume_rejected,
+                            preserve_resume,
+                            conversation_hidden,
+                        );
                         if unproductive_resume {
                             retry_message.map(|(text, attachments)| {
                                 let replay = AiResumeReplay {
@@ -8568,8 +9402,9 @@ impl AdamApp {
                         continue;
                     }
 
-                    let (commit_text, activities, provider_id) = {
+                    let (commit_text, activities, provider_id, used_resume) = {
                         let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+                        let used_resume = runtime.active_used_resume;
                         runtime.active_turn = None;
                         runtime.active_model = None;
                         runtime.active_provider_profile = None;
@@ -8624,8 +9459,10 @@ impl AdamApp {
                                 .active_provider_id
                                 .take()
                                 .unwrap_or_else(|| "auto".into()),
+                            used_resume,
                         )
                     };
+                    let mut retry_sequences = None;
                     if let Some(conversation) = self
                         .workspace
                         .domain
@@ -8633,26 +9470,56 @@ impl AdamApp {
                         .conversations
                         .get_mut(&conversation_id)
                     {
-                        let _ = conversation.append_message_with_activity(
-                            Uuid::new_v4(),
-                            MessageRole::Assistant,
-                            commit_text,
-                            unix_now(),
-                            Vec::new(),
-                            Vec::new(),
-                            activities,
-                            Some(turn_id),
-                        );
+                        let user_message_sequence = conversation
+                            .messages()
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == MessageRole::User)
+                            .map(|message| message.sequence);
+                        let terminal_message_sequence = conversation
+                            .append_message_with_activity(
+                                Uuid::new_v4(),
+                                MessageRole::Assistant,
+                                commit_text,
+                                unix_now(),
+                                Vec::new(),
+                                Vec::new(),
+                                activities,
+                                Some(turn_id),
+                            )
+                            .ok();
+                        retry_sequences = user_message_sequence.zip(terminal_message_sequence);
                         conversation.unread = self.open_chat != Some(conversation_id);
                         conversation_changed = true;
                     }
-                    self.finalize_ai_resume_record(conversation_id, &provider_id, None);
+                    if kind == AiFailureKind::ProviderError
+                        && matches!(provider_id.as_str(), "grok_cli" | "kimi_cli")
+                    {
+                        self.agents.request_scan_for(true, &provider_id);
+                    }
+                    if preserve_resume {
+                        self.arm_preserved_resume_retry(
+                            conversation_id,
+                            &provider_id,
+                            used_resume,
+                            retry_sequences,
+                        );
+                    } else {
+                        self.chat_runtimes
+                            .entry(conversation_id)
+                            .or_default()
+                            .preserved_resume_retry = None;
+                        self.finalize_ai_resume_record(conversation_id, &provider_id, None);
+                    }
                     refresh_folders.insert(conversation_id);
                     drain_queues.insert(conversation_id);
                 }
-                AiEvent::Cancelled { .. } => {
-                    let (commit_text, activities, provider_id) = {
+                AiEvent::Cancelled {
+                    preserve_resume, ..
+                } => {
+                    let (commit_text, activities, provider_id, used_resume) = {
                         let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+                        let used_resume = runtime.active_used_resume;
                         runtime.active_turn = None;
                         runtime.active_model = None;
                         runtime.active_provider_profile = None;
@@ -8672,7 +9539,7 @@ impl AdamApp {
                             &mut runtime.activity_trace,
                             TurnStatus::UserCancelled,
                             Some("Stopped by the user".into()),
-                            None,
+                            preserve_resume.then_some(RetryHint::Retry),
                         );
                         push_ai_activity(runtime, "Stopped".into());
                         let partial = std::mem::take(&mut runtime.streamed_text);
@@ -8700,8 +9567,10 @@ impl AdamApp {
                                 .active_provider_id
                                 .take()
                                 .unwrap_or_else(|| "auto".into()),
+                            used_resume,
                         )
                     };
+                    let mut retry_sequences = None;
                     if let Some(conversation) = self
                         .workspace
                         .domain
@@ -8710,19 +9579,41 @@ impl AdamApp {
                         .get_mut(&conversation_id)
                     {
                         conversation.queue_paused = true;
-                        let _ = conversation.append_message_with_activity(
-                            Uuid::new_v4(),
-                            MessageRole::Assistant,
-                            commit_text,
-                            unix_now(),
-                            Vec::new(),
-                            Vec::new(),
-                            activities,
-                            Some(turn_id),
-                        );
+                        let user_message_sequence = conversation
+                            .messages()
+                            .iter()
+                            .rev()
+                            .find(|message| message.role == MessageRole::User)
+                            .map(|message| message.sequence);
+                        let terminal_message_sequence = conversation
+                            .append_message_with_activity(
+                                Uuid::new_v4(),
+                                MessageRole::Assistant,
+                                commit_text,
+                                unix_now(),
+                                Vec::new(),
+                                Vec::new(),
+                                activities,
+                                Some(turn_id),
+                            )
+                            .ok();
+                        retry_sequences = user_message_sequence.zip(terminal_message_sequence);
                         conversation_changed = true;
                     }
-                    self.finalize_ai_resume_record(conversation_id, &provider_id, None);
+                    if preserve_resume {
+                        self.arm_preserved_resume_retry(
+                            conversation_id,
+                            &provider_id,
+                            used_resume,
+                            retry_sequences,
+                        );
+                    } else {
+                        self.chat_runtimes
+                            .entry(conversation_id)
+                            .or_default()
+                            .preserved_resume_retry = None;
+                        self.finalize_ai_resume_record(conversation_id, &provider_id, None);
+                    }
                     refresh_folders.insert(conversation_id);
                 }
             }
@@ -8750,6 +9641,224 @@ impl AdamApp {
         {
             context.request_repaint_after(Duration::from_millis(40));
         }
+    }
+
+    fn poll_ai_canvas_tools(&mut self, context: &Context) {
+        while let Some(request) = self.ai_engine.try_recv_canvas_tool() {
+            let result = self.execute_ai_canvas_tool(&request, context);
+            let _ = request.respond(result);
+        }
+    }
+
+    fn execute_ai_canvas_tool(
+        &mut self,
+        request: &CanvasToolRequest,
+        context: &Context,
+    ) -> CanvasToolResult {
+        if !self.ai_engine.canvas_tool_request_is_active(request) {
+            return CanvasToolResult::Rejected(
+                "The AI run ended before canvas creation began".into(),
+            );
+        }
+        let Some((hidden, workspace_mode, permission_mode)) = self
+            .workspace
+            .domain
+            .conversations
+            .conversations
+            .get(&request.conversation_id)
+            .map(|conversation| {
+                (
+                    conversation.hidden,
+                    conversation.settings.workspace_mode,
+                    conversation.permission_mode,
+                )
+            })
+        else {
+            return CanvasToolResult::Rejected("The conversation no longer exists".into());
+        };
+        if hidden
+            || workspace_mode == AiWorkspaceMode::Chat
+            || ai_permission_verdict(permission_mode, AiPermissionClass::Mutate)
+                != AiPermissionVerdict::Allow
+        {
+            return CanvasToolResult::Rejected(
+                "Current chat permissions do not allow canvas creation".into(),
+            );
+        }
+        if !self
+            .chat_runtimes
+            .get(&request.conversation_id)
+            .is_some_and(|runtime| runtime.active_turn == Some(request.turn_id))
+        {
+            return CanvasToolResult::Rejected("The AI turn is no longer active".into());
+        }
+        if self.workspace.active_page != request.page_id {
+            return CanvasToolResult::Rejected(
+                "The target canvas is no longer the page you are viewing".into(),
+            );
+        }
+        if self.workspace.page(request.page_id).is_none() {
+            return CanvasToolResult::Rejected("The target canvas page no longer exists".into());
+        }
+
+        // Cancellation, deletion, permission changes, and page changes can
+        // race a queued provider request. Revalidate at the final UI-owner
+        // boundary; no provider thread can mutate the workspace directly.
+        if !self.ai_engine.canvas_tool_request_is_active(request) {
+            return CanvasToolResult::Rejected(
+                "The AI run ended before canvas creation was committed".into(),
+            );
+        }
+
+        let mut action_request = AiActionRequest {
+            id: request.request_id,
+            conversation_id: request.conversation_id,
+            page_id: request.page_id,
+            kind: match &request.mutation {
+                CanvasMutation::CreateNote { .. } => AiActionKind::CreateNote,
+                CanvasMutation::CreatePile { .. } => AiActionKind::CreatePile,
+            },
+            target_tile_ids: BTreeSet::new(),
+            summary: format!("Create canvas item ‘{}’", request.mutation.title()),
+        };
+        if authorize_ai_action(
+            permission_mode,
+            self.workspace.active_page,
+            &self.workspace.domain.protected_tiles,
+            &action_request,
+            ApprovalEvidence::None,
+        ) != AuthorizationDecision::Allowed
+        {
+            return CanvasToolResult::Rejected(
+                "Current chat permissions do not authorize this canvas creation".into(),
+            );
+        }
+
+        // This is the linearization point between cancellation and mutation.
+        // Do not re-check run liveness after a successful claim: the canvas
+        // change and the provider receipt must either both happen or neither
+        // happen.
+        if !self.ai_engine.claim_canvas_tool_for_commit(request) {
+            return CanvasToolResult::Rejected(
+                "The AI run ended before canvas creation was committed".into(),
+            );
+        }
+
+        let now = unix_now();
+        self.checkpoint();
+        let checkpoint_id = Uuid::new_v4();
+        let checkpoint = AiCheckpoint {
+            id: checkpoint_id,
+            conversation_id: request.conversation_id,
+            page_id: request.page_id,
+            label: format!("Before {}", action_request.summary.to_lowercase()),
+            created_at: now,
+            action_sequence: self
+                .workspace
+                .domain
+                .conversations
+                .conversations
+                .get(&request.conversation_id)
+                .map(|conversation| conversation.actions().len() as u64)
+                .unwrap_or_default(),
+            snapshot: ai_checkpoint_snapshot(&self.workspace),
+        };
+        let Some(conversation) = self
+            .workspace
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&request.conversation_id)
+        else {
+            return CanvasToolResult::Rejected("The conversation no longer exists".into());
+        };
+        if let Err(error) = conversation.add_checkpoint(checkpoint) {
+            return CanvasToolResult::Rejected(format!(
+                "Adam could not checkpoint the canvas: {error}"
+            ));
+        }
+        let entity_id = Uuid::new_v4();
+        let container_name = self
+            .workspace
+            .page(request.page_id)
+            .map(|page| page.name.clone())
+            .unwrap_or_else(|| "Canvas".into());
+        let event = HarnessActivityEvent::scoped(
+            Uuid::new_v4(),
+            unix_now(),
+            AgentScope::Main,
+            ActivityKind::HostMutation {
+                tool: request.mutation.tool().into(),
+                summary: request.mutation.title().into(),
+                entity_id: Some(entity_id.to_string()),
+                container_name: Some(container_name),
+                kind: HostMutationKind::Create,
+            },
+        );
+        let origin = match HostArtifactOrigin::new(
+            entity_id,
+            request.conversation_id,
+            request.turn_id,
+            event.clone(),
+        ) {
+            Ok(origin) => origin,
+            Err(error) => {
+                return CanvasToolResult::Rejected(format!(
+                    "Adam could not record artifact provenance: {error}"
+                ));
+            }
+        };
+        if let Err(error) = self.workspace.domain.record_host_artifact(origin) {
+            return CanvasToolResult::Rejected(format!(
+                "Adam could not record artifact provenance: {error}"
+            ));
+        }
+
+        let receipt = match commit_canvas_mutation(
+            &mut self.workspace,
+            request.page_id,
+            &request.mutation,
+            entity_id,
+            now,
+        ) {
+            Ok(receipt) => receipt,
+            Err(message) => {
+                self.workspace.domain.host_artifacts.remove(entity_id);
+                return CanvasToolResult::Rejected(message);
+            }
+        };
+        self.ensure_page_contains(request.page_id);
+        action_request.target_tile_ids.insert(receipt.entity_id);
+        if let Some(runtime) = self.chat_runtimes.get_mut(&request.conversation_id) {
+            runtime.active_had_productive_activity = true;
+            push_ai_activity(runtime, ai_activity_summary(&event.kind));
+            runtime.activity_trace.ingest(event);
+        }
+        if let Some(conversation) = self
+            .workspace
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&request.conversation_id)
+        {
+            let _ = conversation.append_action(AiActionRecord {
+                id: Uuid::new_v4(),
+                sequence: 0,
+                request: action_request,
+                permission_mode,
+                plain_language_line: format!(
+                    "Created ‘{}’ on {}.",
+                    receipt.title, receipt.container_name
+                ),
+                at: now,
+                outcome: AiActionOutcome::Applied,
+                checkpoint_id: Some(checkpoint_id),
+                undo_action_id: None,
+            });
+        }
+        self.changed(true);
+        context.request_repaint();
+        CanvasToolResult::Created(receipt)
     }
 
     fn compose_ai_prompt(
@@ -8848,11 +9957,10 @@ impl AdamApp {
             &conversation.settings.api_endpoint,
         );
         let profile = capability_profile(provider_id, &executable, &arguments);
-        let system_delivery = if matches!(profile.system_prompt, SystemPromptChannel::InPrompt) {
-            SystemDelivery::InlineFenced
-        } else {
-            SystemDelivery::Separate
-        };
+        // A previous_response_id carries conversation continuity, but not
+        // request-level instructions. CLI-owned sessions keep their existing
+        // one-time native system-prompt behavior.
+        let system_delivery = ai_system_delivery(&profile);
 
         build_prompt(&HarnessPromptInput {
             continuity,
@@ -8879,9 +9987,9 @@ impl AdamApp {
                     .then(|| "This is a task turn: work toward a verifiable outcome.".into()),
                 tools_off: Some(
                     if conversation.settings.workspace_mode == AiWorkspaceMode::Chat {
-                        "Adam canvas host tools are not connected to the provider. Do not invent canvas tool calls or use provider tools to mutate the workspace in Chat mode."
+                        "Adam canvas host tools are unavailable in Chat mode. Do not invent canvas tool calls or use provider tools to mutate the canvas."
                     } else {
-                        "Adam canvas host tools are not connected to the provider. Do not invent canvas tool calls. Provider-native workspace tools may be used only inside the chosen working folder and access stance."
+                        "Use Adam canvas host tools only when they are present in the provider's live tool list. Otherwise do not invent canvas tool calls. Provider-native workspace tools may be used only inside the chosen working folder and access stance."
                     }
                     .into(),
                 ),
@@ -9648,6 +10756,14 @@ impl AdamApp {
             && let Some(item) = self.workspace.domain.trash.items.get(&trash_id).cloned()
             && let Some(mut payload) = decode_trash_snapshot(&item.snapshot)
         {
+            if !ai_chat_tile_has_live_conversation(&self.workspace, &payload.tile) {
+                self.toast(
+                    "That chat was permanently deleted and cannot be restored",
+                    context,
+                );
+                self.trash_open = open;
+                return;
+            }
             self.checkpoint();
             let page_id = if self.workspace.page(item.original_page_id).is_some() {
                 item.original_page_id
@@ -9771,10 +10887,225 @@ impl AdamApp {
         self.apply_agents_panel_action(action, &context);
     }
 
+    fn show_artifact_library_section(&mut self, root: &mut Ui) {
+        let context = root.ctx().clone();
+        let colors = self.theme(&context);
+        // A filter pinned to a chat that no longer exists self-heals to the
+        // whole library (EarlIt's resolvedSurface rule).
+        if let Some(only) = self.artifact_library.only_conversation
+            && !self
+                .workspace
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&only)
+        {
+            self.artifact_library.only_conversation = None;
+            self.artifact_library.mark_dirty();
+        }
+        if self.artifact_library.needs_refresh() {
+            let rows = if let Some(only) = self.artifact_library.only_conversation {
+                // The scoped view must mirror the inspector rail it opened
+                // from — the per-conversation projection, including a
+                // running turn's in-flight artifacts. The global library
+                // persists only completed turns and attributes shared files
+                // to their producer, so filtering it by conversation would
+                // drop rows the rail just counted.
+                let (live_turn_id, live_events) = self
+                    .chat_runtimes
+                    .get(&only)
+                    .filter(|runtime| runtime.active_turn.is_some())
+                    .map(|runtime| {
+                        (
+                            runtime.active_turn,
+                            runtime.activity_trace.events.as_slice(),
+                        )
+                    })
+                    .unwrap_or((None, &[][..]));
+                let mut rows =
+                    self.workspace
+                        .conversation_artifacts(only, live_turn_id, live_events);
+                rows.retain(|row| {
+                    artifact_library::row_matches_query(row, &self.artifact_library.query)
+                });
+                rows
+            } else {
+                self.workspace
+                    .artifact_library(&self.artifact_library.query)
+            };
+            let conversations = &self.workspace.domain.conversations.conversations;
+            let groups = artifact_library::library_groups(&rows, unix_now(), &|editor| {
+                conversations
+                    .get(&editor)
+                    .map(|conversation| conversation.title.clone())
+            });
+            self.artifact_library.store(groups);
+        }
+        let filter_title = self.artifact_library.only_conversation.and_then(|only| {
+            self.workspace
+                .domain
+                .conversations
+                .conversations
+                .get(&only)
+                .map(|conversation| conversation.title.clone())
+        });
+        let mut action = artifact_library::ArtifactLibraryAction::default();
+        let dots_seconds = self.dots_seconds();
+        egui::CentralPanel::default()
+            .frame(Frame::NONE.fill(if dots_seconds.is_some() {
+                Color32::TRANSPARENT
+            } else {
+                colors.desk
+            }))
+            .show(root, |ui| {
+                if let Some(seconds) = dots_seconds {
+                    let rect = ui.max_rect();
+                    ui.painter().add(dots::paint_callback(
+                        rect,
+                        ChromeRects {
+                            toolbar: rect,
+                            sidebar: Rect::NOTHING,
+                        },
+                        seconds,
+                        colors.dots_tint,
+                        colors.dots_background,
+                    ));
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(30.0);
+                            ui.scope(|ui| {
+                                ui.set_max_width(640.0);
+                                artifact_library::artifact_library_ui(
+                                    ui,
+                                    &mut self.artifact_library,
+                                    filter_title.as_deref(),
+                                    &artifact_library_palette(colors),
+                                    &mut action,
+                                );
+                            });
+                            ui.add_space(24.0);
+                        });
+                    });
+            });
+        // Keep host availability and live-turn rows honest while the panel
+        // is up: changes surface within one refresh interval.
+        context.request_repaint_after(artifact_library::REFRESH_INTERVAL);
+        self.apply_artifact_library_action(action);
+    }
+
+    /// Applies library actions after the frame. File actions resolve against
+    /// the artifact's own conversation scope, never the currently open chat.
+    fn apply_artifact_library_action(&mut self, action: artifact_library::ArtifactLibraryAction) {
+        if action.close {
+            self.artifact_library.close();
+        }
+        if action.clear_filter {
+            self.artifact_library.only_conversation = None;
+            self.artifact_library.query.clear();
+            self.artifact_library.notice = None;
+            self.artifact_library.mark_dirty();
+        }
+        if action.clear_search {
+            self.artifact_library.query.clear();
+            self.artifact_library.notice = None;
+            self.artifact_library.mark_dirty();
+        }
+        if action.query_changed {
+            // A stale failure banner must not outlive the search it
+            // happened under.
+            self.artifact_library.notice = None;
+            self.artifact_library.mark_dirty();
+        }
+        if let Some(conversation_id) = action.open_conversation {
+            self.artifact_library.close();
+            self.open_conversation(conversation_id);
+        }
+        if let Some((conversation_id, path)) = action.preview_file
+            && self
+                .workspace
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&conversation_id)
+        {
+            let path = PathBuf::from(path);
+            let preview = match self.resolve_scoped_ai_workspace_path(conversation_id, &path) {
+                Ok(path) => AiFilePreview::load(path, false),
+                Err(message) => AiFilePreview::unavailable(path, false, message),
+            };
+            self.artifact_library.close();
+            self.open_conversation(conversation_id);
+            let runtime = self.chat_runtimes.entry(conversation_id).or_default();
+            runtime.file_preview = Some(preview);
+            runtime.show_subagents_detail = false;
+            runtime.inspector_notice = None;
+            // The preview renders inside the inspector; a hidden panel
+            // would swallow the handoff silently.
+            runtime.show_inspector = true;
+        }
+        if let Some((conversation_id, path)) = action.reveal_file {
+            match self.resolve_scoped_ai_workspace_path(conversation_id, Path::new(&path)) {
+                Ok(path) if path.is_dir() => {
+                    platform::open_path(&path);
+                    self.artifact_library.notice = None;
+                }
+                Ok(path) => {
+                    platform::reveal(&path);
+                    self.artifact_library.notice = None;
+                }
+                Err(message) => self.artifact_library.notice = Some(message),
+            }
+        }
+        if let Some((page_id, tile_id)) = action.open_on_canvas {
+            self.artifact_library.close();
+            // switch_page is a no-op when the page is already active, so
+            // leave the chat explicitly before selecting the tile.
+            self.open_chat = None;
+            self.switch_page(page_id);
+            self.selection.clear();
+            self.selection.insert(tile_id);
+            self.center_camera_on_tile(tile_id);
+        }
+    }
+
+    /// Pans the active page's camera so the tile sits at the view center,
+    /// keeping the current zoom. The jump from the artifact library must
+    /// land with the tile on screen or it reads as a no-op.
+    fn center_camera_on_tile(&mut self, tile_id: Uuid) {
+        let Some(view) = self.last_canvas_rect else {
+            return;
+        };
+        let Some(tile) = self.workspace.active_page().tile(tile_id) else {
+            return;
+        };
+        let center = vec2(
+            (tile.rect.min_x() + tile.rect.max_x()) / 2.0,
+            (tile.rect.min_y() + tile.rect.max_y()) / 2.0,
+        );
+        let mut camera = self.active_camera();
+        camera.origin = center - view.size() / (2.0 * camera.zoom);
+        self.set_active_camera(camera);
+    }
+
     /// Shared handler for panel-, banner-, and setup-screen actions.
     fn apply_agents_panel_action(&mut self, action: AgentsPanelAction, context: &Context) {
         if action.refresh {
-            self.agents.request_scan(true);
+            let selected_provider = self.open_chat.and_then(|conversation_id| {
+                self.workspace
+                    .domain
+                    .conversations
+                    .conversations
+                    .get(&conversation_id)
+                    .map(|conversation| conversation.settings.provider_id.clone())
+            });
+            if let Some(provider_id) = selected_provider {
+                self.agents.request_scan_for(true, &provider_id);
+            } else {
+                self.agents.request_scan(true);
+            }
         }
         if let Some(provider_id) = action.install
             && !self.agents.request_install(provider_id)
@@ -10034,6 +11365,80 @@ impl AdamApp {
                 self.toast("Page deleted — Command-Z to undo", context);
             }
             self.pending_page_delete = None;
+        }
+    }
+
+    fn show_chat_delete_confirmation(&mut self, context: &Context) {
+        let Some(conversation_id) = self.pending_chat_delete else {
+            return;
+        };
+        let Some((title, provider_id, used_xai_server_storage)) = self
+            .workspace
+            .domain
+            .conversations
+            .conversations
+            .get(&conversation_id)
+            .map(|conversation| {
+                (
+                    conversation.title.clone(),
+                    conversation.settings.provider_id.clone(),
+                    conversation.used_xai_server_storage,
+                )
+            })
+        else {
+            self.pending_chat_delete = None;
+            return;
+        };
+        let colors = self.theme(context);
+        let mut confirm = false;
+        let mut cancel = false;
+        let modal =
+            egui::Modal::new(Id::new("adam-delete-chat-confirmation")).show(context, |ui| {
+                ui.set_min_width(360.0);
+                ui.heading("Delete chat permanently?");
+                ui.add_space(4.0);
+                ui.label(format!(
+                    "“{title}” and its complete conversation history will be removed."
+                ));
+                ui.label(
+                    RichText::new(
+                        "Its AI-chat tiles, saved checkpoints, and Adam’s local provider resume link will also be removed. Notes, piles, and files it created will stay.",
+                    )
+                    .size(12.0)
+                    .color(colors.secondary_text),
+                );
+                if let Some(notice) =
+                    chat_delete_retention_notice(&provider_id, used_xai_server_storage)
+                {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(notice)
+                            .size(12.0)
+                            .color(colors.secondary_text),
+                    );
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("This cannot be undone.")
+                        .size(12.0)
+                        .strong()
+                        .color(colors.danger),
+                );
+                ui.add_space(12.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    confirm = ui
+                        .add(Button::new(
+                            RichText::new("Delete Chat").strong().color(colors.danger),
+                        ))
+                        .clicked();
+                    cancel |= ui.button("Cancel").clicked();
+                });
+            });
+        cancel |= modal.should_close();
+        if cancel {
+            self.pending_chat_delete = None;
+        } else if confirm {
+            self.delete_ai_conversation(conversation_id, context);
         }
     }
 
@@ -10577,6 +11982,13 @@ impl AdamApp {
         if source.is_empty() {
             return;
         }
+        if source
+            .iter()
+            .any(|tile| !ai_chat_tile_has_live_conversation(&self.workspace, tile))
+        {
+            self.toast("A deleted chat cannot be duplicated", context);
+            return;
+        }
         self.checkpoint();
         self.selection.clear();
         let mut copies = Vec::with_capacity(source.len());
@@ -10617,26 +12029,18 @@ impl AdamApp {
                     }
                 }
                 TileContent::AiChat { conversation_id } => {
-                    let (title, permission, settings) = self
+                    let Some(chat) = self
                         .workspace
                         .domain
                         .conversations
                         .conversations
                         .get(&conversation_id)
-                        .map(|chat| {
-                            (
-                                format!("{} copy", chat.title),
-                                chat.permission_mode,
-                                chat.settings.clone(),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            (
-                                "Adam AI copy".into(),
-                                PermissionMode::Ask,
-                                AiConversationSettings::default(),
-                            )
-                        });
+                    else {
+                        continue;
+                    };
+                    let title = format!("{} copy", chat.title);
+                    let permission = chat.permission_mode;
+                    let settings = chat.settings.clone();
                     let new_conversation_id = Uuid::new_v4();
                     let mut conversation =
                         AiConversation::new(new_conversation_id, title.clone(), permission, now);
@@ -10710,6 +12114,16 @@ impl AdamApp {
     }
 
     fn duplicate_active_page(&mut self) {
+        if self
+            .workspace
+            .active_page()
+            .tiles
+            .iter()
+            .any(|tile| !ai_chat_tile_has_live_conversation(&self.workspace, tile))
+        {
+            log::warn!("refused to duplicate a page containing an orphan AI chat tile");
+            return;
+        }
         self.checkpoint();
         let mut page = self.workspace.active_page().clone();
         page.id = Uuid::new_v4();
@@ -10751,27 +12165,18 @@ impl AdamApp {
                     }
                 }
                 TileContent::AiChat { conversation_id } => {
-                    let source = self
+                    let Some(source) = self
                         .workspace
                         .domain
                         .conversations
                         .conversations
-                        .get(&conversation_id);
-                    let (title, permission, settings) = source
-                        .map(|chat| {
-                            (
-                                format!("{} copy", chat.title),
-                                chat.permission_mode,
-                                chat.settings.clone(),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            (
-                                "Adam AI copy".into(),
-                                PermissionMode::Ask,
-                                AiConversationSettings::default(),
-                            )
-                        });
+                        .get(&conversation_id)
+                    else {
+                        continue;
+                    };
+                    let title = format!("{} copy", source.title);
+                    let permission = source.permission_mode;
+                    let settings = source.settings.clone();
                     let new_conversation_id = Uuid::new_v4();
                     let mut conversation =
                         AiConversation::new(new_conversation_id, title.clone(), permission, now);
@@ -11001,8 +12406,11 @@ impl eframe::App for AdamApp {
         self.poll_photo_ocr(context);
         self.poll_image_pastes(context);
         self.poll_asset_imports(context);
+        self.poll_ai_canvas_tools(context);
         self.poll_ai_events(context);
-        self.agents.poll();
+        if self.agents.poll() {
+            self.drain_eligible_ai_queues(context);
+        }
         if self.agents.take_install_notice().is_some() {
             self.toast("Agent installed and detected", context);
         }
@@ -11019,11 +12427,12 @@ impl eframe::App for AdamApp {
         let dots_seconds = self.dots_seconds();
         let root_rect = ui.max_rect();
         let dots_slot = dots_seconds.map(|_| ui.painter().add(egui::Shape::Noop));
-        let toolbar_rect = if self.open_chat.is_some() && !self.agents.open {
-            self.show_ai_toolbar(ui, dots_seconds)
-        } else {
-            self.show_toolbar(ui, frame, dots_seconds)
-        };
+        let toolbar_rect =
+            if self.open_chat.is_some() && !self.agents.open && !self.artifact_library.open {
+                self.show_ai_toolbar(ui, dots_seconds)
+            } else {
+                self.show_toolbar(ui, frame, dots_seconds)
+            };
         let dots_theme = self.theme(&context);
         #[cfg(target_os = "macos")]
         self.sync_native_window_appearance(&context, frame);
@@ -11045,6 +12454,8 @@ impl eframe::App for AdamApp {
         }
         if self.agents.open {
             self.show_agents_section(ui);
+        } else if self.artifact_library.open {
+            self.show_artifact_library_section(ui);
         } else if self.open_chat.is_some() {
             self.show_ai_workspace(ui);
         } else {
@@ -11052,6 +12463,7 @@ impl eframe::App for AdamApp {
         }
         self.show_link_editor(&context);
         self.show_page_delete_confirmation(&context);
+        self.show_chat_delete_confirmation(&context);
         self.show_tile_rename(&context);
         self.show_tile_details(&context);
         self.show_tag_picker(&context);
@@ -13740,6 +15152,7 @@ const AI_PROVIDER_OPTIONS: &[(&str, &str)] = &[
     ("claude_cli", "Claude CLI"),
     ("codex_cli", "Codex CLI"),
     ("grok_cli", "Grok CLI"),
+    ("xai_api", "Grok Heavy API"),
     ("kimi_cli", "Kimi CLI"),
     ("lm_studio", "LM Studio"),
     ("ollama", "Ollama"),
@@ -13838,6 +15251,48 @@ fn ai_activity_summary(kind: &ActivityKind) -> String {
                 }
             )
         }
+        ActivityKind::AgentGroup {
+            label,
+            kind,
+            status,
+            expected_count,
+            visibility,
+            ..
+        } => {
+            let count = expected_count
+                .map(|count| {
+                    format!(
+                        " · {count} {}",
+                        if *kind == AgentGroupKind::MultiAgentInference {
+                            "agents"
+                        } else {
+                            "jobs"
+                        }
+                    )
+                })
+                .unwrap_or_default();
+            let state = match status {
+                SubagentStatus::Pending => "delegated",
+                SubagentStatus::InProgress => "running",
+                SubagentStatus::Completed => "done",
+                SubagentStatus::Failed => "failed",
+                SubagentStatus::Cancelled => "cancelled",
+                SubagentStatus::PermissionBlocked => "permission needed",
+            };
+            let visibility = if *visibility == AgentGroupVisibility::AggregateOnly {
+                " · aggregate"
+            } else {
+                ""
+            };
+            format!(
+                "{}{count} · {state}{visibility}",
+                if label.trim().is_empty() {
+                    "Agent group".into()
+                } else {
+                    truncate(label, 64)
+                }
+            )
+        }
         ActivityKind::Usage { .. } => "Usage updated".into(),
         ActivityKind::TurnError { message } => format!("Error: {}", truncate(message, 72)),
         ActivityKind::TurnStatus {
@@ -13861,6 +15316,10 @@ fn ai_trace_has_productive_activity(events: &[HarnessActivityEvent]) -> bool {
         }
         ActivityKind::Usage { .. }
         | ActivityKind::SessionInfo { .. }
+        | ActivityKind::AgentGroup {
+            kind: AgentGroupKind::MultiAgentInference,
+            ..
+        }
         | ActivityKind::TurnError { .. }
         | ActivityKind::TurnStatus { .. } => false,
         ActivityKind::ToolCall { .. }
@@ -13873,8 +15332,32 @@ fn ai_trace_has_productive_activity(events: &[HarnessActivityEvent]) -> bool {
         | ActivityKind::HostMutation { .. }
         | ActivityKind::HostRead { .. }
         | ActivityKind::PermissionPrompt { .. }
-        | ActivityKind::Subagent { .. } => true,
+        | ActivityKind::Subagent { .. }
+        | ActivityKind::AgentGroup { .. } => true,
     })
+}
+
+fn provider_session_is_portable_activity(provider_id: &str) -> bool {
+    !matches!(provider_id, "kimi_cli" | "xai_api")
+}
+
+fn kimi_uses_legacy_print_transport(provider_id: &str, tuning: &RuntimeTuningProfile) -> bool {
+    provider_id == "kimi_cli"
+        && tuning.verified_runtime
+        && tuning
+            .version
+            .as_ref()
+            .is_some_and(|version| (version.major, version.minor, version.patch) == (1, 49, 0))
+}
+
+fn ai_system_delivery(profile: &crate::chat_core::CapabilityProfile) -> SystemDelivery {
+    if matches!(profile.system_prompt, SystemPromptChannel::InPrompt) {
+        SystemDelivery::InlineFenced
+    } else if profile.resume == crate::chat_core::ResumeStrategy::PreviousResponseId {
+        SystemDelivery::SeparateEveryTurn
+    } else {
+        SystemDelivery::Separate
+    }
 }
 
 fn ensure_terminal_status(
@@ -13898,15 +15381,21 @@ fn ensure_terminal_status(
     ));
 }
 
-/// Salvage resets discard malformed provider activity, but task-tool events
-/// can arrive through an independent structured channel. Fold their newest
-/// state into the seed before clearing the trace so terminal persistence does
-/// not lose a valid checklist.
+/// Salvage resets discard malformed provider activity, but Adam-owned task
+/// and canvas-tool events arrive through independent structured channels.
+/// Preserve those trusted records before clearing the provider trace.
 fn preserve_task_seed_before_stream_reset(
     runtime: &mut AiChatRuntime,
 ) -> Vec<HarnessActivityEvent> {
+    let host_mutations = runtime
+        .activity_trace
+        .events
+        .iter()
+        .filter(|event| matches!(event.kind, ActivityKind::HostMutation { .. }))
+        .cloned()
+        .collect::<Vec<_>>();
     if !runtime.task_state_changed {
-        return Vec::new();
+        return host_mutations;
     }
 
     // Row origin describes who first created a task, not which channel
@@ -13961,7 +15450,7 @@ fn preserve_task_seed_before_stream_reset(
         // more trustworthy than its text and tool records; keep the saved
         // pre-turn seed untouched and do not manufacture a terminal snapshot.
         runtime.task_state_changed = false;
-        return Vec::new();
+        return host_mutations;
     }
 
     let mut scopes = trusted_task_events
@@ -13971,7 +15460,8 @@ fn preserve_task_seed_before_stream_reset(
     if runtime.task_seed.is_some() {
         scopes.insert(AgentScope::Main);
     }
-    let mut snapshots = Vec::with_capacity(scopes.len());
+    let mut snapshots = host_mutations;
+    snapshots.reserve(scopes.len());
     for scope in scopes {
         let mut task_events = Vec::with_capacity(trusted_task_events.len() + 1);
         if scope.is_main()
@@ -14074,8 +15564,81 @@ fn turn_status_for_failure(kind: AiFailureKind) -> TurnStatus {
     }
 }
 
-fn should_replay_failed_native_session(runtime: &AiChatRuntime) -> bool {
-    runtime.active_used_resume && !runtime.active_had_productive_activity
+fn ai_conversation_allows_launch(conversation: &AiConversation) -> bool {
+    !conversation.hidden
+}
+
+fn ai_conversation_queue_allows_drain(conversation: &AiConversation) -> bool {
+    !conversation.hidden && !conversation.queue_paused
+}
+
+fn prepare_ai_queue_for_explicit_send(conversation: &mut AiConversation) -> bool {
+    if conversation.hidden {
+        return false;
+    }
+    conversation.queue_paused = false;
+    true
+}
+
+fn update_ai_conversation_hidden_state(
+    conversation: &mut AiConversation,
+    hidden: bool,
+    updated_at: UnixMillis,
+) {
+    conversation.hidden = hidden;
+    conversation.updated_at = updated_at;
+    if hidden {
+        conversation.queue_paused = true;
+    }
+}
+
+fn should_replay_failed_native_session(
+    runtime: &AiChatRuntime,
+    resume_rejected: bool,
+    preserve_resume: bool,
+    conversation_hidden: bool,
+) -> bool {
+    let requires_typed_rejection = runtime.active_provider_id.as_deref() == Some("xai_api");
+    !conversation_hidden
+        && !preserve_resume
+        && runtime.active_used_resume
+        && !runtime.active_had_productive_activity
+        && (!requires_typed_rejection || resume_rejected)
+}
+
+fn preserved_resume_record_for_exact_retry(
+    retry: Option<&PreservedResumeRetry>,
+    provider_id: &str,
+    conversation: &AiConversation,
+    user_text: &str,
+    attachments: &[AiAttachmentRef],
+    record: Option<&ResumeRecord>,
+) -> Option<ResumeRecord> {
+    let retry = retry?;
+    let record = record?;
+    let current_terminal_matches = conversation
+        .messages()
+        .last()
+        .is_some_and(|message| message.sequence == retry.terminal_message_sequence);
+    let exact_user_matches = conversation.messages().iter().any(|message| {
+        message.sequence == retry.user_message_sequence
+            && message.role == MessageRole::User
+            && message.text == user_text
+            && message.attachments == attachments
+    });
+    (retry.provider_id == provider_id
+        && retry.session_id == record.session_id
+        && current_terminal_matches
+        && exact_user_matches)
+        .then(|| record.clone())
+}
+
+fn should_forget_unavailable_kimi_resume(
+    provider_id: &str,
+    resume_available: bool,
+    recorded_provider_id: Option<&str>,
+) -> bool {
+    provider_id == "kimi_cli" && !resume_available && recorded_provider_id == Some("kimi_cli")
 }
 
 fn ai_activity_tool_markers(events: &[HarnessActivityEvent]) -> Vec<String> {
@@ -14322,6 +15885,18 @@ fn agents_panel_palette(colors: Theme) -> agents_panel::AgentsPalette {
     }
 }
 
+fn artifact_library_palette(colors: Theme) -> artifact_library::ArtifactLibraryPalette {
+    artifact_library::ArtifactLibraryPalette {
+        text: colors.text,
+        secondary_text: colors.secondary_text,
+        tertiary_text: colors.tertiary_text,
+        danger: colors.danger,
+        tile: colors.tile,
+        tile_border: colors.tile_border,
+        selection_fill: colors.selection_fill,
+    }
+}
+
 fn progress_stepper_palette(colors: Theme) -> crate::progress_stepper::StepperPalette {
     crate::progress_stepper::StepperPalette {
         accent: colors.accent,
@@ -14351,7 +15926,9 @@ fn render_ai_inspector(
     let projected_events = projected_ai_activity(conversation, runtime);
     let progress = project_progress(&persisted_events, live_events);
     let live_progress = project_progress(&[], live_events);
-    let subagents = project_subagents(&projected_ai_subagent_activity(conversation, runtime));
+    let projected_agent_events = projected_ai_subagent_activity(conversation, runtime);
+    let subagents = project_subagents(&projected_agent_events);
+    let agent_groups = project_agent_groups(&projected_agent_events);
     let terminal = if runtime.active_turn.is_some() {
         latest_turn_status(live_events)
     } else {
@@ -14360,6 +15937,12 @@ fn render_ai_inspector(
     let outputs = project_artifacts(&projected_events);
     let context_items = project_context(&projected_events);
     let usage = project_usage(&projected_events);
+    let xai_cost_unreported = conversation
+        .messages()
+        .iter()
+        .any(|message| ai_events_have_unreported_xai_cost(&message.activities))
+        || (runtime.active_turn.is_some()
+            && ai_events_have_unreported_xai_cost(&runtime.activity_trace.events));
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
@@ -14511,6 +16094,11 @@ fn render_ai_inspector(
                 }
             });
 
+            if !agent_groups.is_empty() {
+                ui.add_space(4.0);
+                render_ai_agent_groups_panel(ui, conversation_id, &agent_groups, colors);
+            }
+
             if !subagents.is_empty() {
                 ui.add_space(4.0);
                 render_ai_subagents_panel(ui, conversation_id, &subagents, action, colors);
@@ -14537,12 +16125,7 @@ fn render_ai_inspector(
                             .color(colors.tertiary_text),
                         );
                     }
-                    let visible_count = if runtime.show_all_outputs {
-                        outputs.len()
-                    } else {
-                        outputs.len().min(8)
-                    };
-                    for output in outputs.iter().take(visible_count) {
+                    for output in outputs.iter().take(8) {
                         Frame::NONE
                             .fill(colors.tile)
                             .corner_radius(8)
@@ -14585,16 +16168,25 @@ fn render_ai_inspector(
                             });
                         ui.add_space(5.0);
                     }
-                    if outputs.len() > 8
-                        && ui
-                            .small_button(if runtime.show_all_outputs {
-                                "Show fewer"
-                            } else {
-                                "Show all artifacts"
-                            })
-                            .clicked()
-                    {
-                        action.toggle_all_outputs = true;
+                    // The library behind the rail: overflow opens it scoped
+                    // to this chat; otherwise it is the door to every
+                    // conversation's artifacts.
+                    let overflow = outputs.len() > 8;
+                    let (label, hover, target) = if overflow {
+                        (
+                            format!("Show all ({})", outputs.len()),
+                            "Search every artifact from this chat in the library",
+                            LibraryTarget::Conversation(conversation_id),
+                        )
+                    } else {
+                        (
+                            "Artifact library".to_owned(),
+                            "Search every conversation’s artifacts",
+                            LibraryTarget::All,
+                        )
+                    };
+                    if ui.small_button(label).on_hover_text(hover).clicked() {
+                        action.open_artifact_library = Some(target);
                     }
                 });
 
@@ -14616,6 +16208,18 @@ fn render_ai_inspector(
                                 .monospace()
                                 .color(colors.secondary_text),
                         );
+                        if Path::new(directory)
+                            .components()
+                            .any(|part| part.as_os_str() == AI_CHAT_SANDBOX_SEGMENT)
+                        {
+                            ui.label(
+                                RichText::new(
+                                    "This chat's private sandbox — files land here until you choose a folder.",
+                                )
+                                .size(10.0)
+                                .color(colors.tertiary_text),
+                            );
+                        }
                         ui.horizontal(|ui| {
                             ui.add_enabled_ui(!running, |ui| {
                                 action.choose_folder |= ui.small_button("Change…").clicked();
@@ -14748,10 +16352,7 @@ fn render_ai_inspector(
                             usage.cached_input,
                             usage.reasoning,
                             usage.output,
-                            usage
-                                .cost_usd
-                                .map(|cost| format!(" · ${cost:.4}"))
-                                .unwrap_or_default()
+                            ai_usage_cost_suffix(usage.cost_usd, xai_cost_unreported)
                         ))
                         .size(10.0)
                         .monospace()
@@ -14926,6 +16527,133 @@ fn render_ai_workspace_entry(
             ui.close();
         }
     });
+}
+
+fn render_ai_agent_groups_panel(
+    ui: &mut Ui,
+    conversation_id: Uuid,
+    groups: &[AgentGroupProjection],
+    colors: Theme,
+) {
+    egui::CollapsingHeader::new(format!("Agent groups · {}", groups.len()))
+        .id_salt(("ai-inspector-agent-groups", conversation_id))
+        .default_open(true)
+        .show(ui, |ui| {
+            for group in groups {
+                let (glyph, state, color) = match group.status {
+                    SubagentStatus::Pending => ("○", "Delegated", colors.tertiary_text),
+                    SubagentStatus::InProgress => ("●", "Running", colors.accent),
+                    SubagentStatus::Completed => ("✓", "Completed", colors.accent),
+                    SubagentStatus::Failed => ("!", "Failed", colors.danger),
+                    SubagentStatus::Cancelled => ("×", "Cancelled", colors.tertiary_text),
+                    SubagentStatus::PermissionBlocked => ("!", "Permission needed", colors.danger),
+                };
+                Frame::NONE
+                    .fill(colors.panel_inset)
+                    .corner_radius(8)
+                    .inner_margin(Margin::symmetric(9, 7))
+                    .stroke(Stroke::new(1.0, colors.tile_border))
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            ui.label(RichText::new(glyph).size(11.0).color(color));
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    RichText::new(if group.label.trim().is_empty() {
+                                        match group.kind {
+                                            AgentGroupKind::Swarm => "Agent swarm",
+                                            AgentGroupKind::Delegation => "Agent delegation",
+                                            AgentGroupKind::Workflow => "Agent workflow",
+                                            AgentGroupKind::MultiAgentInference => {
+                                                "Multi-agent inference"
+                                            }
+                                        }
+                                    } else {
+                                        &group.label
+                                    })
+                                    .size(11.5)
+                                    .strong()
+                                    .color(colors.secondary_text),
+                                );
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(state).size(9.5).color(color));
+                                    if let Some(count) = group.expected_count {
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{count} {}",
+                                                if group.kind == AgentGroupKind::MultiAgentInference
+                                                {
+                                                    "agents"
+                                                } else {
+                                                    "jobs"
+                                                }
+                                            ))
+                                            .size(9.5)
+                                            .color(colors.tertiary_text),
+                                        );
+                                    }
+                                    if group.visibility == AgentGroupVisibility::AggregateOnly {
+                                        ui.label(
+                                            RichText::new("provider-managed · aggregate only")
+                                                .size(9.5)
+                                                .color(colors.tertiary_text),
+                                        );
+                                    } else if !group.members.is_empty() {
+                                        let completed = group
+                                            .members
+                                            .iter()
+                                            .filter(|member| {
+                                                member.status == SubagentStatus::Completed
+                                            })
+                                            .count();
+                                        let stopped = group
+                                            .members
+                                            .iter()
+                                            .filter(|member| {
+                                                matches!(
+                                                    member.status,
+                                                    SubagentStatus::Failed
+                                                        | SubagentStatus::Cancelled
+                                                        | SubagentStatus::PermissionBlocked
+                                                )
+                                            })
+                                            .count();
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "{completed} done{}",
+                                                if stopped > 0 {
+                                                    format!(" · {stopped} stopped")
+                                                } else {
+                                                    String::new()
+                                                }
+                                            ))
+                                            .size(9.5)
+                                            .color(
+                                                if stopped > 0 {
+                                                    colors.danger
+                                                } else {
+                                                    colors.tertiary_text
+                                                },
+                                            ),
+                                        );
+                                    }
+                                });
+                                if let Some(detail) = group
+                                    .detail
+                                    .as_deref()
+                                    .filter(|detail| !detail.trim().is_empty())
+                                {
+                                    ui.label(
+                                        RichText::new(truncate(detail, 100))
+                                            .size(10.0)
+                                            .color(colors.tertiary_text),
+                                    );
+                                }
+                            });
+                        });
+                    });
+                ui.add_space(4.0);
+            }
+        });
 }
 
 fn render_ai_subagents_panel(
@@ -15482,6 +17210,7 @@ fn render_ai_inspector_activity(
                     | ActivityKind::PlanUpdate { .. }
                     | ActivityKind::TaskMutation { .. }
                     | ActivityKind::Subagent { .. }
+                    | ActivityKind::AgentGroup { .. }
                     | ActivityKind::Usage { .. }
                     | ActivityKind::TurnStatus { .. }
                     | ActivityKind::SessionInfo { .. }
@@ -15697,11 +17426,19 @@ fn render_ai_chat_page(
     } else {
         64.0 + conversation.queued_turns().len().min(3) as f32 * 28.0
     };
+    let provider_notice_height = if settings.provider_id == "xai_api" {
+        36.0
+    } else {
+        0.0
+    };
+    let hidden_notice_height = if conversation.hidden { 58.0 } else { 0.0 };
     let composer_height = if runtime.pending_attachments.is_empty() {
         174.0
     } else {
         218.0
-    } + queue_height;
+    } + queue_height
+        + provider_notice_height
+        + hidden_notice_height;
     let transcript_height = (ui.available_height() - composer_height).max(180.0);
     egui::ScrollArea::vertical()
         .id_salt(("adam-ai-transcript", conversation.id))
@@ -15727,7 +17464,14 @@ fn render_ai_chat_page(
                 }
             }
             for message in conversation.messages() {
-                render_ai_message(ui, message, action, markdown_cache, colors);
+                render_ai_message(
+                    ui,
+                    message,
+                    conversation.settings.workspace_mode,
+                    action,
+                    markdown_cache,
+                    colors,
+                );
                 ui.add_space(16.0);
             }
             if !runtime.streamed_text.is_empty() {
@@ -15736,6 +17480,8 @@ fn render_ai_chat_page(
                     &runtime.streamed_text,
                     &runtime.activity_trace.events,
                     runtime.active_started_at,
+                    conversation.settings.workspace_mode,
+                    action,
                     markdown_cache,
                     colors,
                 );
@@ -15752,7 +17498,13 @@ fn render_ai_chat_page(
                             runtime.active_started_at,
                             colors,
                         );
-                        render_ai_activity_trace(ui, &runtime.activity_trace.events, colors);
+                        render_ai_activity_trace(
+                            ui,
+                            &runtime.activity_trace.events,
+                            conversation.settings.workspace_mode,
+                            Some(action),
+                            colors,
+                        );
                         ui.add_space(7.0);
                         ui.horizontal(|ui| {
                             ui.spinner();
@@ -15778,33 +17530,48 @@ fn render_ai_chat_page(
                         | TurnStatus::ProviderError => "Provider error",
                     })
                     .unwrap_or("Provider error");
-                Frame::NONE
-                    .fill(
-                        colors
-                            .danger
-                            .gamma_multiply(if colors.dark { 0.14 } else { 0.08 }),
-                    )
-                    .corner_radius(10)
-                    .inner_margin(Margin::same(12))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(error_title).strong().color(colors.danger));
-                        ui.label(RichText::new(error).color(colors.secondary_text));
+                // Indented to the assistant content edge (avatar + gap); a
+                // flush-left card reads as outside the conversation. (User
+                // feedback, 2026-08-02.)
+                ui.horizontal_top(|ui| {
+                    ui.add_space(38.0);
+                    ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() - 10.0).max(220.0));
+                        Frame::NONE
+                            .fill(colors.danger.gamma_multiply(if colors.dark {
+                                0.14
+                            } else {
+                                0.08
+                            }))
+                            .corner_radius(10)
+                            .inner_margin(Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(error_title).strong().color(colors.danger));
+                                ui.label(RichText::new(error).color(colors.secondary_text));
+                            });
                     });
+                });
                 ui.add_space(14.0);
             }
             if let Some(request) = pending_action {
-                Frame::NONE
-                    .fill(colors.selection_fill)
-                    .corner_radius(10)
-                    .inner_margin(Margin::same(12))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("Approve canvas action?").strong());
-                        ui.label(&request.summary);
-                        ui.horizontal(|ui| {
-                            action.approve_pending |= ui.button("Approve").clicked();
-                            action.cancel_pending |= ui.button("Cancel").clicked();
-                        });
+                ui.horizontal_top(|ui| {
+                    ui.add_space(38.0);
+                    ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() - 10.0).max(220.0));
+                        Frame::NONE
+                            .fill(colors.selection_fill)
+                            .corner_radius(10)
+                            .inner_margin(Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Approve canvas action?").strong());
+                                ui.label(&request.summary);
+                                ui.horizontal(|ui| {
+                                    action.approve_pending |= ui.button("Approve").clicked();
+                                    action.cancel_pending |= ui.button("Cancel").clicked();
+                                });
+                            });
                     });
+                });
             }
             ui.add_space(12.0);
         });
@@ -15816,9 +17583,17 @@ fn render_ai_chat_page(
         ui.add_space(inset);
         ui.vertical(|ui| {
             ui.set_width((available - inset * 2.0).clamp(320.0, 880.0));
+            render_ai_hidden_chat_banner(ui, conversation.hidden, action, colors);
             render_ai_preflight_banner(ui, agents_view.preflight.as_ref(), action, colors);
             render_ai_chat_progress_pill(ui, runtime, colors);
-            render_ai_queue_bar(ui, conversation, runtime, action, colors);
+            render_ai_queue_bar(
+                ui,
+                conversation,
+                runtime,
+                agents_view.queued_preflight.as_ref(),
+                action,
+                colors,
+            );
             render_ai_composer(
                 ui,
                 conversation.id,
@@ -15830,6 +17605,33 @@ fn render_ai_chat_page(
             );
         });
     });
+}
+
+fn render_ai_hidden_chat_banner(
+    ui: &mut Ui,
+    hidden: bool,
+    action: &mut AiWorkspaceUiAction,
+    colors: Theme,
+) {
+    if !hidden {
+        return;
+    }
+    Frame::NONE
+        .fill(colors.selection_fill)
+        .corner_radius(10)
+        .inner_margin(Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("This chat is hidden — unhide it to send messages.")
+                        .color(colors.secondary_text),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    action.unhide_conversation |= ui.small_button("Unhide").clicked();
+                });
+            });
+        });
+    ui.add_space(6.0);
 }
 
 /// Pre-Send warning fed by the Agents panel's cached scan; renders nothing
@@ -15845,6 +17647,9 @@ fn render_ai_preflight_banner(
     };
     // Rendered from AgentsChatView.preflight; suppressed while the setup
     // screen is active because that screen carries the same affordances.
+    // One quiet line: the headline states the block, the detail rides the
+    // hover, and the action stays small — a preflight problem must not
+    // shove the transcript around (user feedback, 2026-08-02).
     Frame::NONE
         .fill(if notice.danger {
             colors
@@ -15854,33 +17659,29 @@ fn render_ai_preflight_banner(
             colors.selection_fill
         })
         .corner_radius(3)
-        .inner_margin(Margin::symmetric(12, 8))
+        .inner_margin(Margin::symmetric(10, 4))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(
-                        RichText::new(&notice.headline)
-                            .strong()
-                            .color(if notice.danger {
-                                colors.danger
-                            } else {
-                                colors.text
-                            }),
-                    );
-                    ui.label(
-                        RichText::new(&notice.detail)
-                            .size(10.5)
-                            .color(colors.secondary_text),
-                    );
-                });
+                ui.label(RichText::new(&notice.headline).size(11.0).strong().color(
+                    if notice.danger {
+                        colors.danger
+                    } else {
+                        colors.text
+                    },
+                ))
+                .on_hover_text(&notice.detail);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.small_button("Open Agents").clicked() {
+                    if ui
+                        .small_button("Open Agents")
+                        .on_hover_text(&notice.detail)
+                        .clicked()
+                    {
                         action.open_agents_panel = true;
                     }
                 });
             });
         });
-    ui.add_space(6.0);
+    ui.add_space(4.0);
 }
 
 fn render_ai_chat_progress_pill(ui: &mut Ui, runtime: &AiChatRuntime, colors: Theme) {
@@ -15921,6 +17722,7 @@ fn render_ai_queue_bar(
     ui: &mut Ui,
     conversation: &AiConversation,
     runtime: &AiChatRuntime,
+    head_preflight: Option<&PreflightNotice>,
     action: &mut AiWorkspaceUiAction,
     colors: Theme,
 ) {
@@ -15934,6 +17736,7 @@ fn render_ai_queue_bar(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 let count = conversation.queued_turns().len();
+                let blocking_preflight = head_preflight.filter(|notice| notice.blocks_send);
                 ui.label(
                     RichText::new(if count == 1 {
                         format!(
@@ -15945,23 +17748,39 @@ fn render_ai_queue_bar(
                     })
                     .strong(),
                 );
+                let queue_status = if conversation.hidden {
+                    "· hidden · paused".to_owned()
+                } else if runtime.active_turn.is_some() {
+                    "· sends when the agent finishes".to_owned()
+                } else if let Some(notice) = blocking_preflight {
+                    format!("· {}", notice.headline)
+                } else if conversation.queue_paused {
+                    "· paused".to_owned()
+                } else {
+                    "· waiting for capacity".to_owned()
+                };
                 ui.label(
-                    RichText::new(if runtime.active_turn.is_some() {
-                        "· sends when the agent finishes"
-                    } else if conversation.queue_paused {
-                        "· paused"
-                    } else {
-                        "· waiting for capacity"
-                    })
-                    .size(10.5)
-                    .color(colors.secondary_text),
+                    RichText::new(queue_status)
+                        .size(10.5)
+                        .color(colors.secondary_text),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.small_button("Clear").clicked() {
                         action.clear_queue = true;
                     }
-                    if runtime.active_turn.is_none() && ui.small_button("Send next").clicked() {
-                        action.send_next_queued = true;
+                    if runtime.active_turn.is_none() {
+                        let send_next = ui.add_enabled(
+                            !conversation.hidden && blocking_preflight.is_none(),
+                            Button::new("Send next").small(),
+                        );
+                        let send_next = if conversation.hidden {
+                            send_next.on_disabled_hover_text(HIDDEN_CHAT_SEND_NOTICE)
+                        } else if let Some(notice) = blocking_preflight {
+                            send_next.on_disabled_hover_text(&notice.detail)
+                        } else {
+                            send_next
+                        };
+                        action.send_next_queued |= send_next.clicked();
                     }
                 });
             });
@@ -16015,8 +17834,10 @@ fn render_ai_empty_state(
             .color(colors.text),
         );
         ui.label(
-            RichText::new("Pick any installed provider above. Your conversation stays in Adam.")
-                .color(colors.secondary_text),
+            RichText::new(
+                "Your conversation is saved in Adam; connected providers receive the turns you send.",
+            )
+            .color(colors.secondary_text),
         );
         ui.add_space(18.0);
         for suggestion in match mode {
@@ -16104,6 +17925,7 @@ fn render_ai_work_header(
 fn render_ai_message(
     ui: &mut Ui,
     message: &crate::domain::ConversationMessage,
+    workspace_mode: AiWorkspaceMode,
     action: &mut AiWorkspaceUiAction,
     markdown_cache: &mut CommonMarkCache,
     colors: Theme,
@@ -16133,7 +17955,13 @@ fn render_ai_message(
                 ui.vertical(|ui| {
                     ui.set_width((ui.available_width() - 48.0).max(220.0));
                     render_ai_work_header(ui, &message.activities, None, colors);
-                    render_ai_activity_trace(ui, &message.activities, colors);
+                    render_ai_activity_trace(
+                        ui,
+                        &message.activities,
+                        workspace_mode,
+                        Some(action),
+                        colors,
+                    );
                     if !message.activities.is_empty() && !message.text.trim().is_empty() {
                         ui.add_space(8.0);
                     }
@@ -16291,9 +18119,69 @@ fn render_ai_activity_row(ui: &mut Ui, event: &HarnessActivityEvent, colors: The
     });
 }
 
-fn render_ai_activity_trace(ui: &mut Ui, events: &[HarnessActivityEvent], colors: Theme) {
+fn render_ai_activity_trace(
+    ui: &mut Ui,
+    events: &[HarnessActivityEvent],
+    workspace_mode: AiWorkspaceMode,
+    mut action: Option<&mut AiWorkspaceUiAction>,
+    colors: Theme,
+) {
     if events.is_empty() {
         return;
+    }
+
+    let agent_groups = project_agent_groups(events);
+    if !agent_groups.is_empty() {
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            for group in agent_groups.iter().take(3) {
+                let (glyph, color) = match group.status {
+                    SubagentStatus::Pending => ("○", colors.tertiary_text),
+                    SubagentStatus::InProgress => ("●", colors.accent),
+                    SubagentStatus::Completed => ("✓", colors.accent),
+                    SubagentStatus::Failed | SubagentStatus::PermissionBlocked => {
+                        ("!", colors.danger)
+                    }
+                    SubagentStatus::Cancelled => ("×", colors.tertiary_text),
+                };
+                Frame::NONE
+                    .fill(colors.panel_inset)
+                    .corner_radius(12)
+                    .inner_margin(Margin::symmetric(8, 4))
+                    .stroke(Stroke::new(1.0, colors.tile_border))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(glyph).size(9.5).color(color));
+                            ui.label(
+                                RichText::new(truncate(
+                                    if group.label.trim().is_empty() {
+                                        "Agent group"
+                                    } else {
+                                        &group.label
+                                    },
+                                    34,
+                                ))
+                                .size(10.5)
+                                .color(colors.secondary_text),
+                            );
+                            if let Some(count) = group.expected_count {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{count} {}",
+                                        if group.kind == AgentGroupKind::MultiAgentInference {
+                                            "agents"
+                                        } else {
+                                            "jobs"
+                                        }
+                                    ))
+                                    .size(9.5)
+                                    .color(colors.tertiary_text),
+                                );
+                            }
+                        });
+                    });
+            }
+        });
     }
 
     let subagents = project_subagents(events);
@@ -16358,6 +18246,7 @@ fn render_ai_activity_trace(ui: &mut Ui, events: &[HarnessActivityEvent], colors
                 ActivityKind::AssistantText { .. }
                     | ActivityKind::PlanUpdate { .. }
                     | ActivityKind::Subagent { .. }
+                    | ActivityKind::AgentGroup { .. }
                     | ActivityKind::Usage { .. }
                     | ActivityKind::SessionInfo { .. }
                     | ActivityKind::TurnError { .. }
@@ -16415,6 +18304,32 @@ fn render_ai_activity_trace(ui: &mut Ui, events: &[HarnessActivityEvent], colors
                             .size(11.0)
                             .color(colors.secondary_text),
                     );
+                    // Chat mode denies every non-read action by policy; an
+                    // unexplained denial reads as a malfunction (user
+                    // feedback, 2026-08-02).
+                    if matches!(
+                        resolution,
+                        Some(crate::chat_core::PermissionResolution::Denied)
+                    ) && workspace_mode == AiWorkspaceMode::Chat
+                    {
+                        ui.label(
+                            RichText::new(
+                                "Chat writes only inside its own sandbox — other folders and canvas items need Cowork.",
+                            )
+                            .size(10.5)
+                            .color(colors.tertiary_text),
+                        );
+                        if let Some(action) = action.as_deref_mut()
+                            && ui
+                                .small_button("Switch to Cowork")
+                                .on_hover_text(
+                                    "Change this chat's mode, then Retry to finish the task",
+                                )
+                                .clicked()
+                        {
+                            action.switch_workspace_mode = Some(AiWorkspaceMode::Cowork);
+                        }
+                    }
                 });
         }
     }
@@ -16489,8 +18404,9 @@ fn render_ai_activity_trace(ui: &mut Ui, events: &[HarnessActivityEvent], colors
                     );
                 if response.clicked()
                     && let Some(path) = output.file_path()
+                    && let Some(action) = action.as_deref_mut()
                 {
-                    platform::reveal(Path::new(path));
+                    action.reveal_file = Some(PathBuf::from(path));
                 }
             }
         });
@@ -16521,6 +18437,8 @@ fn render_streaming_ai_message(
     text: &str,
     events: &[HarnessActivityEvent],
     started_at: Option<Instant>,
+    workspace_mode: AiWorkspaceMode,
+    action: &mut AiWorkspaceUiAction,
     markdown_cache: &mut CommonMarkCache,
     colors: Theme,
 ) {
@@ -16530,7 +18448,7 @@ fn render_streaming_ai_message(
         ui.vertical(|ui| {
             ui.set_width((ui.available_width() - 48.0).max(220.0));
             render_ai_work_header(ui, events, started_at, colors);
-            render_ai_activity_trace(ui, events, colors);
+            render_ai_activity_trace(ui, events, workspace_mode, Some(action), colors);
             if !events.is_empty() && !text.trim().is_empty() {
                 ui.add_space(8.0);
             }
@@ -16655,6 +18573,12 @@ fn render_ai_composer(
                     .desired_rows(3)
                     .desired_width(f32::INFINITY),
             );
+            let send_enabled = ai_send_enabled(
+                &runtime.draft,
+                running,
+                action.preflight_blocks_send,
+                action.conversation_hidden,
+            );
             ui.horizontal(|ui| {
                 action.add_attachments |= ui
                     .add(Button::new("+").frame(false))
@@ -16703,16 +18627,17 @@ fn render_ai_composer(
                     if running {
                         action.stop |= ui.button("Stop").clicked();
                     }
-                    action.send |= ui
+                    let send = ui
                         .add_enabled(
-                            !runtime.draft.trim().is_empty(),
-                            Button::new(if running {
-                                "Queue  ↵"
-                            } else {
-                                "Send  ↵"
-                            }),
-                        )
-                        .clicked();
+                            send_enabled,
+                            Button::new(if running { "Queue  ↵" } else { "Send  ↵" }),
+                        );
+                    let send = if action.conversation_hidden {
+                        send.on_disabled_hover_text(HIDDEN_CHAT_SEND_NOTICE)
+                    } else {
+                        send
+                    };
+                    action.send |= send.clicked();
                 });
             });
             ui.add_space(2.0);
@@ -16743,6 +18668,7 @@ fn render_ai_composer(
                         render_ai_reasoning_selector(
                             ui,
                             conversation_id,
+                            &provider_id,
                             &mut provider_profile,
                             &tuning,
                         );
@@ -16756,20 +18682,27 @@ fn render_ai_composer(
                     );
                 }
             });
-            if provider_id == "kimi_cli"
+            if kimi_uses_legacy_print_transport(&provider_id, &tuning)
                 && (settings.workspace_mode == AiWorkspaceMode::Chat
                     || !matches!(*permission, PermissionMode::Auto | PermissionMode::Bypass))
             {
                 ui.label(
                     RichText::new(
-                        "Kimi CLI needs Cowork or Code with Automatic access because its print mode auto-approves tools.",
+                        "Legacy Kimi print mode needs Cowork or Code with Automatic access because it auto-approves tools. Kimi Code 0.31 ACP supports Adam's normal permission controls.",
                     )
                     .size(9.5)
                     .color(colors.danger),
                 );
             }
+            if provider_id == "xai_api" {
+                ui.label(
+                    RichText::new(XAI_SERVER_STORAGE_DISCLOSURE)
+                        .size(9.5)
+                        .color(colors.tertiary_text),
+                );
+            }
             let send_with_return = response.has_focus()
-                && !runtime.draft.trim().is_empty()
+                && send_enabled
                 && ui.input_mut(|input| {
                     input.consume_key(egui::Modifiers::NONE, Key::Enter)
                         || input.consume_key(egui::Modifiers::COMMAND, Key::Enter)
@@ -16782,6 +18715,57 @@ fn render_ai_composer(
     if provider_profile != original_profile {
         settings.set_profile_for(&provider_id, provider_profile);
     }
+}
+
+fn ai_send_enabled(
+    draft: &str,
+    running: bool,
+    preflight_blocks_send: bool,
+    conversation_hidden: bool,
+) -> bool {
+    !conversation_hidden && !draft.trim().is_empty() && (running || !preflight_blocks_send)
+}
+
+fn queued_turn_provider_id<'a>(
+    queued: &'a AiQueuedTurn,
+    settings: &'a AiConversationSettings,
+) -> &'a str {
+    queued
+        .provider_id
+        .as_deref()
+        .filter(|provider_id| !provider_id.trim().is_empty())
+        .unwrap_or(&settings.provider_id)
+}
+
+fn resume_pinned_provider_id<'a>(
+    requested_provider_id: &'a str,
+    recorded_provider_id: Option<&'a str>,
+) -> &'a str {
+    if requested_provider_id == "auto" {
+        recorded_provider_id
+            .filter(|provider_id| !provider_id.trim().is_empty())
+            .unwrap_or(requested_provider_id)
+    } else {
+        requested_provider_id
+    }
+}
+
+fn queued_turn_preflight_notice(
+    queued: &AiQueuedTurn,
+    settings: &AiConversationSettings,
+    recorded_provider_id: Option<&str>,
+    snapshot: Option<&agents_panel::AgentsScanSnapshot>,
+    scanning: bool,
+) -> Option<PreflightNotice> {
+    preflight_notice(
+        resume_pinned_provider_id(
+            queued_turn_provider_id(queued, settings),
+            recorded_provider_id,
+        ),
+        !settings.api_endpoint.trim().is_empty(),
+        snapshot,
+        scanning,
+    )
 }
 
 fn select_ai_provider(settings: &mut AiConversationSettings, provider_id: &str) {
@@ -16814,13 +18798,57 @@ const CLAUDE_MODEL_OPTIONS: &[(&str, &str)] = &[
     ("haiku", "Haiku"),
 ];
 const GROK_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Provider default"), ("grok-4.5", "Grok 4.5")];
+const XAI_MULTI_AGENT_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Grok 4.20 · Multi-agent")];
 const DEFAULT_MODEL_OPTIONS: &[(&str, &str)] = &[("", "Provider default")];
+const XAI_SERVER_STORAGE_DISCLOSURE: &str = "Privacy · xAI stores your messages and Grok Heavy responses for follow-up turns (30 days by default).";
+const HIDDEN_CHAT_SEND_NOTICE: &str = "This chat is hidden. Unhide it to send messages.";
+const XAI_COST_NOT_REPORTED: &str = "Cost not reported by xAI";
+
+fn ai_usage_cost_suffix(cost_usd: Option<f64>, xai_cost_unreported: bool) -> String {
+    let reported = match cost_usd {
+        Some(cost) => {
+            let precision = if cost != 0.0 && cost.abs() < 0.0001 {
+                8
+            } else if cost.abs() < 0.01 {
+                6
+            } else {
+                4
+            };
+            format!(" · ${cost:.precision$}")
+        }
+        None => String::new(),
+    };
+    if xai_cost_unreported {
+        format!("{reported} · {XAI_COST_NOT_REPORTED}")
+    } else {
+        reported
+    }
+}
+
+fn ai_events_have_unreported_xai_cost(events: &[HarnessActivityEvent]) -> bool {
+    let is_xai_turn = events.iter().any(|event| {
+        matches!(
+            &event.kind,
+            ActivityKind::AgentGroup {
+                id,
+                kind: AgentGroupKind::MultiAgentInference,
+                ..
+            } if id.starts_with("xai-heavy-")
+        )
+    });
+    if !is_xai_turn {
+        return false;
+    }
+    let usage = project_usage(events);
+    usage.has_data && usage.cost_usd.is_none()
+}
 
 fn ai_model_options(provider_id: &str) -> &'static [(&'static str, &'static str)] {
     match provider_id {
         "codex_cli" => CODEX_MODEL_OPTIONS,
         "claude_cli" => CLAUDE_MODEL_OPTIONS,
         "grok_cli" => GROK_MODEL_OPTIONS,
+        "xai_api" => XAI_MULTI_AGENT_MODEL_OPTIONS,
         _ => DEFAULT_MODEL_OPTIONS,
     }
 }
@@ -16853,16 +18881,18 @@ fn render_ai_model_selector(
             for (model, label) in ai_model_options(provider_id) {
                 ui.selectable_value(&mut profile.model, (*model).to_owned(), *label);
             }
-            ui.separator();
-            ui.label(RichText::new("Custom model ID").size(10.0));
-            ui.add(
-                TextEdit::singleline(&mut profile.model)
-                    .hint_text(match provider_id {
-                        "lm_studio" | "ollama" | "openai_compatible" => "Required model ID",
-                        _ => "Optional model ID",
-                    })
-                    .desired_width(220.0),
-            );
+            if provider_id != "xai_api" {
+                ui.separator();
+                ui.label(RichText::new("Custom model ID").size(10.0));
+                ui.add(
+                    TextEdit::singleline(&mut profile.model)
+                        .hint_text(match provider_id {
+                            "lm_studio" | "ollama" | "openai_compatible" => "Required model ID",
+                            _ => "Optional model ID",
+                        })
+                        .desired_width(220.0),
+                );
+            }
         });
 }
 
@@ -16883,30 +18913,62 @@ fn reasoning_effort_label(value: &str) -> String {
 fn render_ai_reasoning_selector(
     ui: &mut Ui,
     conversation_id: Uuid,
+    provider_id: &str,
     profile: &mut AiProviderPreferences,
     tuning: &RuntimeTuningProfile,
 ) {
     if tuning.reasoning_efforts.is_empty() {
+        if !tuning.verified_runtime
+            && matches!(
+                provider_id,
+                "claude_cli" | "codex_cli" | "grok_cli" | "kimi_cli" | "lm_studio" | "ollama"
+            )
+        {
+            ui.add_enabled(false, Button::new("Reasoning · refresh CLI in Agents"));
+            return;
+        }
         profile.reasoning_effort.clear();
         return;
     }
     egui::ComboBox::from_id_salt(("ai-composer-reasoning", conversation_id))
-        .selected_text(format!(
-            "Reasoning · {}",
-            reasoning_effort_label(&profile.reasoning_effort)
-        ))
+        .selected_text(if provider_id == "xai_api" {
+            match profile.reasoning_effort.as_str() {
+                "high" | "xhigh" => "Heavy · 16 agents".to_owned(),
+                "low" | "medium" => "Multi-agent · 4 agents".to_owned(),
+                _ => "Multi-agent · 4 agents".to_owned(),
+            }
+        } else {
+            format!(
+                "Reasoning · {}",
+                reasoning_effort_label(&profile.reasoning_effort)
+            )
+        })
         .width(150.0)
         .show_ui(ui, |ui| {
             ui.selectable_value(
                 &mut profile.reasoning_effort,
                 String::new(),
-                reasoning_effort_label(""),
+                if provider_id == "xai_api" {
+                    "Default · 4 agents".into()
+                } else {
+                    reasoning_effort_label("")
+                },
             );
             for effort in tuning.reasoning_efforts {
                 ui.selectable_value(
                     &mut profile.reasoning_effort,
                     (*effort).to_owned(),
-                    reasoning_effort_label(effort),
+                    if provider_id == "xai_api" {
+                        match *effort {
+                            "low" => "Low · 4 agents".into(),
+                            "medium" => "Medium · 4 agents".into(),
+                            "high" => "High · 16 agents (Heavy)".into(),
+                            "xhigh" => "Extra high · 16 agents (Heavy)".into(),
+                            _ => reasoning_effort_label(effort),
+                        }
+                    } else {
+                        reasoning_effort_label(effort)
+                    },
                 );
             }
         });
@@ -16915,14 +18977,14 @@ fn render_ai_reasoning_selector(
 fn ai_provider_has_abilities(provider_id: &str) -> bool {
     matches!(
         provider_id,
-        "claude_cli" | "codex_cli" | "grok_cli" | "kimi_cli" | "ollama"
+        "claude_cli" | "codex_cli" | "grok_cli" | "xai_api" | "kimi_cli" | "ollama"
     )
 }
 
 fn ai_provider_has_configuration(provider_id: &str) -> bool {
     matches!(
         provider_id,
-        "claude_cli" | "grok_cli" | "lm_studio" | "openai_compatible" | "custom_cli"
+        "claude_cli" | "grok_cli" | "xai_api" | "lm_studio" | "openai_compatible" | "custom_cli"
     )
 }
 
@@ -16988,7 +19050,18 @@ fn render_ai_provider_abilities(
         "grok_cli" => {
             render_ai_feature_choice(ui, profile, AI_FEATURE_WEB_SEARCH, "Web search", true, true);
             render_ai_feature_choice(ui, profile, AI_FEATURE_PLANNING, "Planning", false, true);
-            if tuning.supports_scoped_child_text() {
+            if !tuning.verified_runtime {
+                ui.label(
+                    RichText::new("Subagents · CLI version not verified")
+                        .size(10.5)
+                        .color(colors.secondary_text),
+                );
+                ui.label(
+                    RichText::new("Saved settings are unchanged. Refresh detection in Agents.")
+                        .size(9.0)
+                        .color(colors.tertiary_text),
+                );
+            } else if tuning.supports_scoped_child_text() {
                 render_ai_feature_choice(
                     ui,
                     profile,
@@ -17012,7 +19085,53 @@ fn render_ai_provider_abilities(
             }
             render_ai_feature_choice(ui, profile, AI_FEATURE_MEMORY, "Memory", true, true);
         }
-        "kimi_cli" | "ollama" => {
+        "xai_api" => {
+            render_ai_feature_choice(
+                ui,
+                profile,
+                AI_FEATURE_WEB_SEARCH,
+                "Web research",
+                true,
+                true,
+            );
+            ui.label(
+                RichText::new(
+                    "This is xAI’s server-managed multi-agent model. Low/medium uses 4 agents; high/extra-high uses 16.",
+                )
+                .size(9.0)
+                .color(colors.tertiary_text),
+            );
+        }
+        "kimi_cli" => {
+            if tuning.verified_runtime {
+                render_ai_feature_choice(ui, profile, AI_FEATURE_THINKING, "Thinking", true, true);
+            } else {
+                ui.label(
+                    RichText::new("Thinking · available after a compatible Kimi CLI is detected")
+                        .size(10.5)
+                        .color(colors.secondary_text),
+                );
+            }
+            if tuning.agent_group_channel
+                == crate::chat_core::AgentGroupChannel::KimiAcpToolAggregateV1
+            {
+                render_ai_feature_choice(ui, profile, AI_FEATURE_SWARM, "AgentSwarm", true, true);
+                ui.label(
+                    RichText::new(
+                        "AgentSwarm delegates real foreground Kimi child jobs. Kimi ACP reports final member results, not live child prose.",
+                    )
+                    .size(9.0)
+                    .color(colors.tertiary_text),
+                );
+            } else {
+                ui.label(
+                    RichText::new("AgentSwarm · requires verified Kimi Code 0.31.0")
+                        .size(10.5)
+                        .color(colors.secondary_text),
+                );
+            }
+        }
+        "ollama" => {
             render_ai_feature_choice(ui, profile, AI_FEATURE_THINKING, "Thinking", true, true);
         }
         _ => {}
@@ -17050,6 +19169,45 @@ fn render_ai_provider_configuration(
                 );
             }
         }
+        "xai_api" => {
+            ui.label(RichText::new("Authentication").size(10.5).strong());
+            ui.label(
+                RichText::new("Uses XAI_API_KEY, or the temporary key below.")
+                    .size(9.5)
+                    .color(colors.tertiary_text),
+            );
+            ui.add(
+                TextEdit::singleline(runtime.temporary_api_key_mut(provider_id))
+                    .password(true)
+                    .hint_text("Temporary xAI API key; never saved")
+                    .desired_width(280.0),
+            );
+            ui.label(
+                RichText::new(
+                    "Heavy is a separate xAI API service and does not reuse Grok CLI sign-in.",
+                )
+                .size(9.0)
+                .color(colors.tertiary_text),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Server storage and billing")
+                    .size(10.5)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(XAI_SERVER_STORAGE_DISCLOSURE)
+                    .size(9.0)
+                    .color(colors.tertiary_text),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "Request cost appears in Usage when xAI reports it; otherwise Adam shows “{XAI_COST_NOT_REPORTED}”."
+                ))
+                .size(9.0)
+                .color(colors.tertiary_text),
+            );
+        }
         "lm_studio" | "openai_compatible" => {
             ui.label(RichText::new("Server endpoint").size(10.5).strong());
             ui.add(
@@ -17067,7 +19225,7 @@ fn render_ai_provider_configuration(
             }
             ui.label(RichText::new("Temporary API key").size(10.5));
             ui.add(
-                TextEdit::singleline(&mut runtime.api_key)
+                TextEdit::singleline(runtime.temporary_api_key_mut(provider_id))
                     .password(true)
                     .hint_text("Optional; never saved")
                     .desired_width(280.0),
@@ -17202,6 +19360,14 @@ fn capture_ai_workspace_root(root: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(canonical_root)
+}
+
+use crate::ai::AI_CHAT_SANDBOX_SEGMENT;
+
+fn ai_chat_sandbox_directory(data_root: &Path, conversation_id: Uuid) -> PathBuf {
+    data_root
+        .join(AI_CHAT_SANDBOX_SEGMENT)
+        .join(conversation_id.to_string())
 }
 
 fn canonical_ai_workspace_root(captured_root: &Path) -> Result<PathBuf, String> {
@@ -17361,6 +19527,8 @@ fn ai_stream_dialect_key(dialect: StreamDialect) -> &'static str {
         StreamDialect::ClaudeStreamJson => "claude-stream-json:v1",
         StreamDialect::GrokStreamingJson => "grok-streaming-json:v1",
         StreamDialect::KimiStreamJson => "kimi-stream-json:v1",
+        StreamDialect::KimiAcp => "kimi-acp:v1",
+        StreamDialect::XaiResponsesSse => "xai-responses-sse:v1",
         StreamDialect::OpenAiCompatibleJson => "openai-compatible-json:v1",
     }
 }
@@ -17381,10 +19549,8 @@ fn ai_provider_profile_inputs(
             "grok".into(),
             vec!["--output-format".into(), "streaming-json".into()],
         ),
-        "kimi_cli" => (
-            "kimi".into(),
-            vec!["--output-format".into(), "stream-json".into()],
-        ),
+        "kimi_cli" => ("kimi".into(), vec!["acp".into()]),
+        "xai_api" => ("xai".into(), vec!["responses".into()]),
         // A configured endpoint uses LM Studio's OpenAI-compatible server;
         // clearing it intentionally selects the `lms` command-line client.
         "lm_studio" if !endpoint.trim().is_empty() => (String::new(), Vec::new()),
@@ -17968,6 +20134,237 @@ fn available_tile_rect(page: &CanvasPage, desired: WorldRect) -> WorldRect {
     page.next_available_rect(desired.size())
 }
 
+fn commit_canvas_mutation(
+    workspace: &mut Workspace,
+    page_id: Uuid,
+    mutation: &CanvasMutation,
+    entity_id: Uuid,
+    now: UnixMillis,
+) -> Result<CanvasToolReceipt, String> {
+    let page = workspace
+        .page(page_id)
+        .ok_or_else(|| "The target canvas page no longer exists".to_owned())?;
+    let page_name = page.name.clone();
+    match mutation {
+        CanvasMutation::CreateNote { title, text } => {
+            let rect = available_tile_rect(
+                page,
+                page.next_available_rect([DEFAULT_TILE_SIZE[0], DEFAULT_TILE_SIZE[1]]),
+            );
+            let mut tile = Tile::note(title.clone(), text.clone(), rect);
+            tile.id = entity_id;
+            workspace
+                .page_mut(page_id)
+                .expect("target page was validated above")
+                .add_tile(tile);
+            Ok(CanvasToolReceipt {
+                tool: mutation.tool().into(),
+                entity_id,
+                title: title.clone(),
+                container_name: page_name,
+            })
+        }
+        CanvasMutation::CreatePile { title } => {
+            let pile_id = entity_id;
+            let proposed_tag_id = Uuid::new_v4();
+            let rect = available_tile_rect(
+                page,
+                page.next_available_rect([DEFAULT_TILE_SIZE[0] * 2.0, DEFAULT_TILE_SIZE[1] * 2.0]),
+            );
+            // Validate the pile title before mutating the tag store.
+            let mut pile = Pile::new(
+                pile_id,
+                page_id,
+                rect,
+                title.clone(),
+                proposed_tag_id,
+                PaletteColor::Teal,
+            )
+            .map_err(|error| format!("Adam could not create that pile: {error}"))?;
+            let tag_id = workspace
+                .domain
+                .tags
+                .ensure_tag(proposed_tag_id, title.clone(), PaletteColor::Teal, now)
+                .map_err(|error| format!("Adam could not create the pile tag: {error}"))?;
+            pile.conferred_tag_id = tag_id;
+            workspace.domain.piles.insert(pile_id, pile);
+            workspace
+                .page_mut(page_id)
+                .expect("target page was validated above")
+                .add_tile(Tile::pile(pile_id, title.clone(), rect));
+            Ok(CanvasToolReceipt {
+                tool: mutation.tool().into(),
+                entity_id: pile_id,
+                title: title.clone(),
+                container_name: page_name,
+            })
+        }
+    }
+}
+
+fn ai_conversation_tile_ids(workspace: &Workspace, conversation_id: Uuid) -> BTreeSet<Uuid> {
+    // Tile content is the deletion authority. A stale semantic link must not
+    // cause an unrelated note or file tile to be destroyed.
+    let mut tile_ids = workspace
+        .pages
+        .iter()
+        .flat_map(|page| {
+            page.tiles.iter().filter_map(|tile| {
+                matches!(
+                    tile.content,
+                    TileContent::AiChat {
+                        conversation_id: linked
+                    } if linked == conversation_id
+                )
+                .then_some(tile.id)
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    tile_ids.extend(workspace.domain.trash.items.values().filter_map(|item| {
+        let payload = decode_trash_snapshot(&item.snapshot)?;
+        matches!(
+            payload.tile.content,
+            TileContent::AiChat {
+                conversation_id: linked
+            } if linked == conversation_id
+        )
+        .then_some(payload.tile.id)
+    }));
+    tile_ids
+}
+
+fn ai_chat_tile_has_live_conversation(workspace: &Workspace, tile: &Tile) -> bool {
+    let TileContent::AiChat { conversation_id } = &tile.content else {
+        return true;
+    };
+    !workspace
+        .domain
+        .conversations
+        .deleted_conversations
+        .contains(conversation_id)
+        && workspace
+            .domain
+            .conversations
+            .conversations
+            .contains_key(conversation_id)
+}
+
+fn chat_delete_retention_notice(
+    provider_id: &str,
+    used_xai_server_storage: bool,
+) -> Option<&'static str> {
+    (provider_id == "xai_api" || used_xai_server_storage).then_some(
+        "Grok Heavy stores the conversation with xAI for multi-turn resume. Deleting it here does not erase data retained by xAI.",
+    )
+}
+
+fn apply_xai_storage_disclosures_to_workspace(
+    workspace: &mut Workspace,
+    conversation_ids: &BTreeSet<Uuid>,
+) -> bool {
+    let mut changed = false;
+    for conversation_id in conversation_ids {
+        if let Some(conversation) = workspace
+            .domain
+            .conversations
+            .conversations
+            .get_mut(conversation_id)
+            && !conversation.used_xai_server_storage
+        {
+            conversation.used_xai_server_storage = true;
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn newly_learned_resume_tombstones(known: &BTreeSet<Uuid>, merged: &ResumeStore) -> BTreeSet<Uuid> {
+    merged
+        .permanently_forgotten_conversation_ids()
+        .filter(|conversation_id| !known.contains(conversation_id))
+        .collect()
+}
+
+fn purge_ai_conversation_tiles_only(
+    workspace: &mut Workspace,
+    conversation_id: Uuid,
+) -> BTreeSet<Uuid> {
+    let tile_ids = ai_conversation_tile_ids(workspace, conversation_id);
+    workspace.domain.conversations.remove(conversation_id);
+    workspace
+        .domain
+        .host_artifacts
+        .remove_conversation(conversation_id);
+    for page in &mut workspace.pages {
+        page.tiles.retain(|tile| {
+            !tile_ids.contains(&tile.id)
+                && !matches!(
+                    tile.content,
+                    TileContent::AiChat {
+                        conversation_id: linked
+                    } if linked == conversation_id
+                )
+        });
+    }
+    forget_tile_ids_from_piles(&mut workspace.domain.piles, &tile_ids);
+    let _ = workspace
+        .domain
+        .trash
+        .permanently_forget_tiles(&tile_ids, TrashActor::Human);
+    for tile_id in &tile_ids {
+        workspace.domain.protected_tiles.remove(tile_id);
+        workspace.domain.tags.assignments.remove(tile_id);
+        workspace.domain.photo_records.remove(tile_id);
+    }
+    tile_ids
+}
+
+/// Permanently removes a confirmed conversation from the current workspace
+/// and every AI checkpoint nested inside it. History snapshots call this same
+/// helper so undo/redo cannot reintroduce an orphan chat tile.
+fn purge_ai_conversation_from_workspace(
+    workspace: &mut Workspace,
+    conversation_id: Uuid,
+) -> BTreeSet<Uuid> {
+    for conversation in workspace.domain.conversations.conversations.values_mut() {
+        for checkpoint in conversation.checkpoints_mut() {
+            scrub_deleted_conversation_checkpoint_json(&mut checkpoint.snapshot, conversation_id);
+        }
+    }
+    purge_ai_conversation_tiles_only(workspace, conversation_id)
+}
+
+/// Applies a batch of monotonic deletion markers to the persisted workspace
+/// shape. Only AI-chat carriers and their provenance are removed; artifacts
+/// the agent created on the canvas or filesystem remain user-owned content.
+fn apply_permanent_ai_deletions_to_workspace(
+    workspace: &mut Workspace,
+    conversation_ids: &BTreeSet<Uuid>,
+) -> bool {
+    if conversation_ids.is_empty() {
+        return false;
+    }
+    let before = workspace.clone();
+    workspace
+        .domain
+        .conversations
+        .deleted_conversations
+        .extend(conversation_ids.iter().copied());
+    for conversation_id in conversation_ids {
+        purge_ai_conversation_from_workspace(workspace, *conversation_id);
+    }
+    *workspace != before
+}
+
+fn forget_tile_ids_from_piles(piles: &mut BTreeMap<Uuid, Pile>, tile_ids: &BTreeSet<Uuid>) {
+    for pile in piles.values_mut() {
+        pile.overrides
+            .retain(|tile_id, _| !tile_ids.contains(tile_id));
+        pile.progress
+            .retain(|tile_id, _| !tile_ids.contains(tile_id));
+    }
+}
+
 fn tile_bounds(tiles: &[Tile]) -> Option<WorldRect> {
     let first = tiles.first()?.rect;
     let mut min_x = first.min_x();
@@ -18206,6 +20603,622 @@ mod tests {
     use super::*;
 
     #[test]
+    fn permanent_delete_discloses_xai_retention_without_overstating_local_providers() {
+        let notice = chat_delete_retention_notice("xai_api", false).unwrap();
+        assert!(notice.contains("stores the conversation with xAI"));
+        assert!(notice.contains("does not erase data retained by xAI"));
+        assert!(
+            chat_delete_retention_notice("codex_cli", true).is_some(),
+            "switching providers must not hide a prior Grok Heavy disclosure"
+        );
+        assert!(chat_delete_retention_notice("grok_cli", false).is_none());
+        assert!(chat_delete_retention_notice("codex_cli", false).is_none());
+    }
+
+    #[test]
+    fn learned_xai_storage_disclosure_updates_only_existing_live_conversations() {
+        let mut workspace = Workspace::new();
+        let conversation_id = Uuid::new_v4();
+        let missing_id = Uuid::new_v4();
+        workspace
+            .domain
+            .conversations
+            .add(AiConversation::new(
+                conversation_id,
+                "Provider switched",
+                PermissionMode::Ask,
+                UnixMillis(10),
+            ))
+            .unwrap();
+        let updated_at = workspace.domain.conversations.conversations[&conversation_id].updated_at;
+        let ids = BTreeSet::from([conversation_id, missing_id]);
+
+        assert!(apply_xai_storage_disclosures_to_workspace(
+            &mut workspace,
+            &ids
+        ));
+        let conversation = &workspace.domain.conversations.conversations[&conversation_id];
+        assert!(conversation.used_xai_server_storage);
+        assert_eq!(conversation.updated_at, updated_at);
+        assert!(chat_delete_retention_notice(&conversation.settings.provider_id, true).is_some());
+        assert!(
+            !workspace
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&missing_id)
+        );
+        assert!(!apply_xai_storage_disclosures_to_workspace(
+            &mut workspace,
+            &ids
+        ));
+    }
+
+    #[test]
+    fn resume_merge_identifies_only_newly_learned_tombstones() {
+        let already_known = Uuid::new_v4();
+        let learned = Uuid::new_v4();
+        let mut known = BTreeSet::from([already_known]);
+        let mut merged = ResumeStore::new();
+        merged.permanently_forget(already_known).unwrap();
+        merged.permanently_forget(learned).unwrap();
+
+        assert_eq!(
+            newly_learned_resume_tombstones(&known, &merged),
+            BTreeSet::from([learned])
+        );
+        known.insert(learned);
+        assert!(newly_learned_resume_tombstones(&known, &merged).is_empty());
+    }
+
+    #[test]
+    fn semantic_chat_tiles_cannot_restore_or_duplicate_after_permanent_deletion() {
+        let mut workspace = Workspace::new();
+        let conversation_id = Uuid::new_v4();
+        workspace
+            .domain
+            .conversations
+            .add(AiConversation::new(
+                conversation_id,
+                "Temporary chat",
+                PermissionMode::Ask,
+                UnixMillis(1),
+            ))
+            .unwrap();
+        let tile = Tile::ai_chat(
+            "Temporary chat",
+            conversation_id,
+            WorldRect::new(0.0, 0.0, 280.0, 190.0),
+        );
+        assert!(ai_chat_tile_has_live_conversation(&workspace, &tile));
+
+        workspace.domain.conversations.remove(conversation_id);
+
+        assert!(!ai_chat_tile_has_live_conversation(&workspace, &tile));
+        assert!(ai_chat_tile_has_live_conversation(
+            &workspace,
+            &Tile::note(
+                "Unrelated note",
+                "Keep me",
+                WorldRect::new(0.0, 0.0, 280.0, 190.0),
+            )
+        ));
+    }
+
+    #[test]
+    fn permanent_chat_delete_scrubs_every_workspace_history_snapshot() {
+        let mut history = History::default();
+        let mut workspace = Workspace::new();
+        let conversation_id = Uuid::new_v4();
+        let conversation = AiConversation::new(
+            conversation_id,
+            "Delete me",
+            PermissionMode::Auto,
+            UnixMillis(1),
+        );
+        workspace.domain.conversations.add(conversation).unwrap();
+        let tile = Tile::ai_chat(
+            "Delete me",
+            conversation_id,
+            WorldRect::new(10.0, 10.0, 280.0, 190.0),
+        );
+        let tile_id = tile.id;
+        workspace.active_page_mut().add_tile(tile);
+        workspace
+            .domain
+            .conversations
+            .link_tile(tile_id, conversation_id)
+            .unwrap();
+        history.checkpoint(&workspace);
+        history.redo.push(workspace.clone());
+
+        history.forget_conversation(conversation_id);
+
+        assert_eq!(history.undo.len(), 1);
+        assert_eq!(history.redo.len(), 1);
+        for snapshot in history.undo.iter().chain(&history.redo) {
+            assert!(
+                !snapshot
+                    .domain
+                    .conversations
+                    .conversations
+                    .contains_key(&conversation_id)
+            );
+            assert!(
+                snapshot
+                    .pages
+                    .iter()
+                    .all(|page| page.tile(tile_id).is_none())
+            );
+        }
+    }
+
+    #[test]
+    fn resume_tombstone_finishes_chat_deletion_and_preserves_created_artifacts() {
+        let mut workspace = Workspace::new();
+        let conversation_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        workspace
+            .domain
+            .conversations
+            .add(AiConversation::new(
+                conversation_id,
+                "Delete after crash",
+                PermissionMode::Auto,
+                UnixMillis(1),
+            ))
+            .unwrap();
+
+        let chat_tile = Tile::ai_chat(
+            "Delete after crash",
+            conversation_id,
+            WorldRect::new(10.0, 10.0, 280.0, 190.0),
+        );
+        let chat_tile_id = chat_tile.id;
+        workspace.active_page_mut().add_tile(chat_tile);
+        workspace
+            .domain
+            .conversations
+            .link_tile(chat_tile_id, conversation_id)
+            .unwrap();
+
+        let note = Tile::note(
+            "Research report",
+            "Keep this result",
+            WorldRect::new(320.0, 10.0, 280.0, 190.0),
+        );
+        let note_id = note.id;
+        let spreadsheet = Tile::from_file(
+            PathBuf::from("/tmp/created-report.xlsx"),
+            WorldRect::new(630.0, 10.0, 280.0, 190.0),
+        );
+        let spreadsheet_id = spreadsheet.id;
+        let pile_id = Uuid::new_v4();
+        let pile = Pile::new(
+            pile_id,
+            workspace.active_page,
+            WorldRect::new(10.0, 230.0, 600.0, 420.0),
+            "Created pile",
+            Uuid::new_v4(),
+            PaletteColor::Teal,
+        )
+        .unwrap();
+        workspace.active_page_mut().add_tile(note);
+        workspace.active_page_mut().add_tile(spreadsheet);
+        workspace.active_page_mut().add_tile(Tile::pile(
+            pile_id,
+            "Created pile",
+            WorldRect::new(10.0, 230.0, 600.0, 420.0),
+        ));
+        workspace.domain.piles.insert(pile_id, pile);
+
+        let origin = HostArtifactOrigin::new(
+            note_id,
+            conversation_id,
+            turn_id,
+            HarnessActivityEvent::new(
+                Uuid::new_v4(),
+                UnixMillis(2),
+                ActivityKind::HostMutation {
+                    tool: "canvas_create_note".into(),
+                    summary: "Research report".into(),
+                    entity_id: Some(note_id.to_string()),
+                    container_name: Some("Canvas 1".into()),
+                    kind: HostMutationKind::Create,
+                },
+            ),
+        )
+        .unwrap();
+        workspace.domain.record_host_artifact(origin).unwrap();
+
+        let mut resume_store = ResumeStore::new();
+        resume_store.permanently_forget(conversation_id).unwrap();
+        let tombstones = resume_store
+            .permanently_forgotten_conversation_ids()
+            .collect::<BTreeSet<_>>();
+
+        assert!(apply_permanent_ai_deletions_to_workspace(
+            &mut workspace,
+            &tombstones,
+        ));
+        assert!(
+            workspace
+                .domain
+                .conversations
+                .deleted_conversations
+                .contains(&conversation_id)
+        );
+        assert!(
+            !workspace
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&conversation_id)
+        );
+        assert!(workspace.active_page().tile(chat_tile_id).is_none());
+
+        assert!(workspace.active_page().tile(note_id).is_some());
+        assert!(workspace.active_page().tile(spreadsheet_id).is_some());
+        assert!(workspace.active_page().tile(pile_id).is_some());
+        assert!(workspace.domain.piles.contains_key(&pile_id));
+        assert!(workspace.domain.host_artifacts.origin(note_id).is_none());
+        assert!(
+            !apply_permanent_ai_deletions_to_workspace(&mut workspace, &tombstones),
+            "replaying the same crash-recovery tombstone must be idempotent"
+        );
+    }
+
+    #[test]
+    fn permanent_chat_delete_scrubs_other_conversations_checkpoint_tiles() {
+        let mut workspace = Workspace::new();
+        let deleted_conversation_id = Uuid::new_v4();
+        let retained_conversation_id = Uuid::new_v4();
+        for (id, title) in [
+            (deleted_conversation_id, "Delete me"),
+            (retained_conversation_id, "Keep me"),
+        ] {
+            workspace
+                .domain
+                .conversations
+                .add(AiConversation::new(
+                    id,
+                    title,
+                    PermissionMode::Auto,
+                    UnixMillis(1),
+                ))
+                .unwrap();
+        }
+        let tile = Tile::ai_chat(
+            "Delete me",
+            deleted_conversation_id,
+            WorldRect::new(10.0, 10.0, 280.0, 190.0),
+        );
+        let tile_id = tile.id;
+        workspace.active_page_mut().add_tile(tile);
+        workspace
+            .domain
+            .conversations
+            .link_tile(tile_id, deleted_conversation_id)
+            .unwrap();
+
+        let middle_conversation_id = Uuid::new_v4();
+        let middle_tile_id = Uuid::new_v4();
+        let deepest_tile_id = Uuid::new_v4();
+        let mut deepest = Workspace::new();
+        let mut deepest_tile = Tile::ai_chat(
+            "Delete me deeply",
+            deleted_conversation_id,
+            WorldRect::new(20.0, 20.0, 280.0, 190.0),
+        );
+        deepest_tile.id = deepest_tile_id;
+        deepest.active_page_mut().add_tile(deepest_tile);
+        let mut deepest_snapshot = serde_json::to_value(deepest).unwrap();
+        deepest_snapshot["future_deep_field"] = serde_json::json!(["preserve", 27]);
+
+        let mut middle = Workspace::new();
+        middle
+            .domain
+            .conversations
+            .add(AiConversation::new(
+                middle_conversation_id,
+                "Checkpoint owner",
+                PermissionMode::Auto,
+                UnixMillis(1),
+            ))
+            .unwrap();
+        let mut middle_tile = Tile::ai_chat(
+            "Delete me from the middle",
+            deleted_conversation_id,
+            WorldRect::new(30.0, 30.0, 280.0, 190.0),
+        );
+        middle_tile.id = middle_tile_id;
+        middle.active_page_mut().add_tile(middle_tile);
+        let middle_page_id = middle.active_page;
+        middle
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&middle_conversation_id)
+            .unwrap()
+            .add_checkpoint(AiCheckpoint {
+                id: Uuid::new_v4(),
+                conversation_id: middle_conversation_id,
+                page_id: middle_page_id,
+                label: "Nested future snapshot".into(),
+                created_at: UnixMillis(2),
+                action_sequence: 0,
+                snapshot: deepest_snapshot,
+            })
+            .unwrap();
+        let page_id = workspace.active_page;
+        let mut snapshot = serde_json::to_value(middle).unwrap();
+        snapshot["future_middle_field"] = serde_json::json!({"keep": true});
+        workspace
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&retained_conversation_id)
+            .unwrap()
+            .add_checkpoint(AiCheckpoint {
+                id: Uuid::new_v4(),
+                conversation_id: retained_conversation_id,
+                page_id,
+                label: "Before unrelated work".into(),
+                created_at: UnixMillis(2),
+                action_sequence: 0,
+                snapshot,
+            })
+            .unwrap();
+
+        purge_ai_conversation_from_workspace(&mut workspace, deleted_conversation_id);
+
+        let checkpoint = &workspace.domain.conversations.conversations[&retained_conversation_id]
+            .checkpoints()[0];
+        assert_eq!(
+            checkpoint.snapshot["future_middle_field"],
+            serde_json::json!({"keep": true})
+        );
+        let restored: Workspace = serde_json::from_value(checkpoint.snapshot.clone()).unwrap();
+        assert!(
+            restored
+                .pages
+                .iter()
+                .all(|page| page.tile(middle_tile_id).is_none())
+        );
+        assert!(
+            restored
+                .domain
+                .conversations
+                .deleted_conversations
+                .contains(&deleted_conversation_id)
+        );
+        let nested_snapshot = &restored.domain.conversations.conversations[&middle_conversation_id]
+            .checkpoints()[0]
+            .snapshot;
+        assert_eq!(
+            nested_snapshot["future_deep_field"],
+            serde_json::json!(["preserve", 27])
+        );
+        let deepest: Workspace = serde_json::from_value(nested_snapshot.clone()).unwrap();
+        assert!(
+            deepest
+                .pages
+                .iter()
+                .all(|page| page.tile(deepest_tile_id).is_none())
+        );
+        assert!(
+            deepest
+                .domain
+                .conversations
+                .deleted_conversations
+                .contains(&deleted_conversation_id)
+        );
+        assert!(
+            workspace
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&retained_conversation_id)
+        );
+        assert!(workspace.active_page().tile(tile_id).is_none());
+    }
+
+    #[test]
+    fn permanent_chat_delete_forgets_tile_membership_from_every_pile() {
+        let page_id = Uuid::new_v4();
+        let pile_id = Uuid::new_v4();
+        let deleted_tile = Uuid::new_v4();
+        let retained_tile = Uuid::new_v4();
+        let tag_id = Uuid::new_v4();
+        let mut pile = Pile::new(
+            pile_id,
+            page_id,
+            WorldRect::new(0.0, 0.0, 600.0, 420.0),
+            "Pile",
+            tag_id,
+            PaletteColor::Teal,
+        )
+        .unwrap();
+        pile.overrides
+            .insert(deleted_tile, crate::domain::PileOverride::PinnedInside);
+        pile.overrides
+            .insert(retained_tile, crate::domain::PileOverride::PinnedInside);
+        let rule = AutoTagRule::new(
+            Uuid::new_v4(),
+            RuleState::On,
+            AutoTagSettings::default(),
+            UnixMillis(1),
+        )
+        .unwrap();
+        pile.progress.insert(
+            deleted_tile,
+            crate::domain::MembershipProgress::new(
+                pile_id,
+                deleted_tile,
+                &rule,
+                UnixMillis(1),
+                true,
+                InitialMembership::NewEntry,
+            ),
+        );
+        pile.progress.insert(
+            retained_tile,
+            crate::domain::MembershipProgress::new(
+                pile_id,
+                retained_tile,
+                &rule,
+                UnixMillis(1),
+                true,
+                InitialMembership::NewEntry,
+            ),
+        );
+        let mut piles = BTreeMap::from([(pile_id, pile)]);
+
+        forget_tile_ids_from_piles(&mut piles, &BTreeSet::from([deleted_tile]));
+
+        let pile = &piles[&pile_id];
+        assert!(!pile.overrides.contains_key(&deleted_tile));
+        assert!(!pile.progress.contains_key(&deleted_tile));
+        assert!(pile.overrides.contains_key(&retained_tile));
+        assert!(pile.progress.contains_key(&retained_tile));
+    }
+
+    #[test]
+    fn canvas_tool_receipt_becomes_a_durable_host_artifact() {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let conversation_id = Uuid::new_v4();
+        let turn_id = Uuid::new_v4();
+        let mut conversation = AiConversation::new(
+            conversation_id,
+            "Create a report card",
+            PermissionMode::Auto,
+            UnixMillis(1),
+        );
+        conversation.settings.workspace_mode = AiWorkspaceMode::Cowork;
+        workspace.domain.conversations.add(conversation).unwrap();
+
+        let broker = Arc::new(crate::ai_canvas_tools::CanvasToolBroker::new());
+        broker
+            .register_run(turn_id, conversation_id, page_id, true)
+            .unwrap();
+        let worker = Arc::clone(&broker);
+        let call = thread::spawn(move || {
+            worker.call_for_run(
+                turn_id,
+                crate::ai_canvas_tools::CANVAS_CREATE_NOTE,
+                &serde_json::json!({
+                    "idempotency_key": "report-card-1",
+                    "title": "Research report",
+                    "text": "Verified findings"
+                }),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+        });
+        let request = loop {
+            if let Some(request) = broker.try_recv() {
+                break request;
+            }
+            thread::yield_now();
+        };
+        assert!(broker.request_is_active(&request));
+        let receipt = commit_canvas_mutation(
+            &mut workspace,
+            request.page_id,
+            &request.mutation,
+            Uuid::from_u128(50_001),
+            UnixMillis(2),
+        )
+        .unwrap();
+        let activity = HarnessActivityEvent::scoped(
+            Uuid::new_v4(),
+            UnixMillis(2),
+            AgentScope::Main,
+            ActivityKind::HostMutation {
+                tool: receipt.tool.clone(),
+                summary: receipt.title.clone(),
+                entity_id: Some(receipt.entity_id.to_string()),
+                container_name: Some(receipt.container_name.clone()),
+                kind: HostMutationKind::Create,
+            },
+        );
+        workspace
+            .domain
+            .record_host_artifact(
+                HostArtifactOrigin::new(
+                    receipt.entity_id,
+                    conversation_id,
+                    turn_id,
+                    activity.clone(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        workspace
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&conversation_id)
+            .unwrap()
+            .append_message_with_activity(
+                Uuid::new_v4(),
+                MessageRole::Assistant,
+                "Created the report card.",
+                UnixMillis(3),
+                Vec::new(),
+                Vec::new(),
+                vec![activity],
+                Some(turn_id),
+            )
+            .unwrap();
+        assert!(request.respond(CanvasToolResult::Created(receipt.clone())));
+        assert_eq!(
+            call.join().unwrap()["structuredContent"]["entity_id"],
+            receipt.entity_id.to_string()
+        );
+        let pile_receipt = commit_canvas_mutation(
+            &mut workspace,
+            page_id,
+            &CanvasMutation::CreatePile {
+                title: "Research pile".into(),
+            },
+            Uuid::from_u128(50_002),
+            UnixMillis(4),
+        )
+        .unwrap();
+        assert!(workspace.domain.piles.contains_key(&pile_receipt.entity_id));
+        assert!(
+            workspace
+                .page(page_id)
+                .unwrap()
+                .tile(pile_receipt.entity_id)
+                .is_some()
+        );
+
+        let restored: Workspace =
+            serde_json::from_value(serde_json::to_value(&workspace).unwrap()).unwrap();
+        assert!(
+            restored
+                .page(page_id)
+                .unwrap()
+                .tile(receipt.entity_id)
+                .is_some()
+        );
+        let artifacts = restored.conversation_artifacts(conversation_id, None, &[]);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].artifact.title, "Research report");
+        assert_eq!(artifacts[0].artifact.produced_by.turn_id, Some(turn_id));
+        assert_eq!(
+            artifacts[0].artifact.produced_by.tool.as_deref(),
+            Some("canvas_create_note")
+        );
+        assert_eq!(
+            artifacts[0].host_availability,
+            Some(crate::domain::HostArtifactAvailability::Available { page_id })
+        );
+    }
+
+    #[test]
     fn agent_provider_table_matches_the_selectable_provider_options() {
         use std::collections::BTreeSet;
         let panel: BTreeSet<_> = crate::agents_panel::AGENT_PROVIDERS
@@ -18216,6 +21229,143 @@ mod tests {
         assert_eq!(
             panel, options,
             "agents_panel::AGENT_PROVIDERS must mirror AI_PROVIDER_OPTIONS"
+        );
+    }
+
+    #[test]
+    fn composer_blocks_a_cold_exact_provider_without_blocking_active_turn_queueing() {
+        assert!(!ai_send_enabled("", false, false, false));
+        assert!(!ai_send_enabled("research this", false, true, false));
+        assert!(ai_send_enabled("research this", false, false, false));
+        assert!(
+            ai_send_enabled("follow up", true, true, false),
+            "an already-running turn may still accept a queued follow-up"
+        );
+        assert!(!ai_send_enabled("research this", false, false, true));
+        assert!(!ai_send_enabled("follow up", true, false, true));
+    }
+
+    #[test]
+    fn queued_turn_preflight_uses_its_captured_provider_until_verified() {
+        let settings = AiConversationSettings {
+            provider_id: "claude_cli".into(),
+            api_endpoint: String::new(),
+            ..AiConversationSettings::default()
+        };
+        let queued = AiQueuedTurn {
+            text: "research this".into(),
+            provider_id: Some("grok_cli".into()),
+            ..AiQueuedTurn::default()
+        };
+        assert_eq!(queued_turn_provider_id(&queued, &settings), "grok_cli");
+        assert!(
+            queued_turn_preflight_notice(&queued, &settings, None, None, false)
+                .is_some_and(|notice| notice.blocks_send)
+        );
+        assert!(
+            queued_turn_preflight_notice(&queued, &settings, None, None, true)
+                .is_some_and(|notice| notice.blocks_send)
+        );
+
+        let snapshot = |version: &str| agents_panel::AgentsScanSnapshot {
+            probes: vec![
+                (
+                    "claude_cli",
+                    crate::ai::ProviderProbe {
+                        executable: Some("claude"),
+                        program: Some(PathBuf::from("/bin/claude")),
+                        version: crate::chat_core::CliVersion::parse("2.1.128"),
+                        observation: crate::ai::ProviderProbeObservation::Observed,
+                    },
+                    agents_panel::AgentAuth::Unknown,
+                ),
+                (
+                    "grok_cli",
+                    crate::ai::ProviderProbe {
+                        executable: Some("grok"),
+                        program: Some(PathBuf::from("/bin/grok")),
+                        version: crate::chat_core::CliVersion::parse(version),
+                        observation: crate::ai::ProviderProbeObservation::Observed,
+                    },
+                    agents_panel::AgentAuth::Unknown,
+                ),
+            ],
+        };
+        let unsupported = snapshot("grok 0.2.119");
+        assert!(
+            queued_turn_preflight_notice(&queued, &settings, None, Some(&unsupported), false)
+                .is_some_and(|notice| notice.blocks_send)
+        );
+        let verified = snapshot("grok 0.2.117");
+        assert!(
+            queued_turn_preflight_notice(&queued, &settings, None, Some(&verified), false)
+                .is_none()
+        );
+        assert_eq!(queued.provider_id.as_deref(), Some("grok_cli"));
+
+        let legacy = AiQueuedTurn::default();
+        assert_eq!(queued_turn_provider_id(&legacy, &settings), "claude_cli");
+
+        assert_eq!(resume_pinned_provider_id("auto", None), "auto");
+        assert_eq!(
+            resume_pinned_provider_id("auto", Some("kimi_cli")),
+            "kimi_cli"
+        );
+        assert_eq!(
+            resume_pinned_provider_id("claude_cli", Some("grok_cli")),
+            "claude_cli",
+            "an explicitly captured provider must win over the resume record"
+        );
+
+        let auto_settings = AiConversationSettings {
+            provider_id: "auto".into(),
+            api_endpoint: String::new(),
+            ..AiConversationSettings::default()
+        };
+        let auto_queued = AiQueuedTurn {
+            text: "continue research".into(),
+            ..AiQueuedTurn::default()
+        };
+        assert_eq!(
+            queued_turn_provider_id(&auto_queued, &auto_settings),
+            "auto"
+        );
+        assert!(
+            preflight_notice("auto", false, Some(&unsupported), false).is_none(),
+            "raw Auto could safely fall back to the installed Claude CLI"
+        );
+        assert!(
+            queued_turn_preflight_notice(
+                &auto_queued,
+                &auto_settings,
+                Some("grok_cli"),
+                Some(&unsupported),
+                false,
+            )
+            .is_some_and(|notice| notice.blocks_send),
+            "an Auto resume pinned to unsupported Grok must not fall back to Claude"
+        );
+        assert!(
+            queued_turn_preflight_notice(
+                &auto_queued,
+                &auto_settings,
+                Some("grok_cli"),
+                Some(&unsupported),
+                true,
+            )
+            .is_some_and(|notice| notice.blocks_send),
+            "the pinned provider remains blocked while its refresh is running"
+        );
+        assert!(
+            queued_turn_preflight_notice(
+                &auto_queued,
+                &auto_settings,
+                Some("grok_cli"),
+                Some(&verified),
+                false,
+            )
+            .is_none(),
+            "a verified pinned provider may launch"
         );
     }
 
@@ -18940,12 +22090,29 @@ mod tests {
     }
 
     #[test]
-    fn failed_native_resume_replays_only_before_any_productive_activity() {
+    fn xai_resume_replays_only_for_typed_stale_session_failure() {
         let mut runtime = AiChatRuntime {
             active_used_resume: true,
+            active_provider_id: Some("xai_api".into()),
             ..AiChatRuntime::default()
         };
-        assert!(should_replay_failed_native_session(&runtime));
+        assert!(
+            !should_replay_failed_native_session(&runtime, false, false, false),
+            "a generic provider or transport failure must not issue a second request"
+        );
+        assert!(should_replay_failed_native_session(
+            &runtime, true, false, false
+        ));
+        assert!(
+            !should_replay_failed_native_session(&runtime, true, false, true),
+            "a failure arriving after Hide must not schedule a replay"
+        );
+        runtime.active_provider_id = Some("codex_cli".into());
+        assert!(
+            should_replay_failed_native_session(&runtime, false, false, false),
+            "existing CLI adapters retain their bounded unproductive-resume fallback"
+        );
+        runtime.active_provider_id = Some("xai_api".into());
 
         let session_only = HarnessActivityEvent::new(
             Uuid::new_v4(),
@@ -18957,11 +22124,285 @@ mod tests {
         );
         assert!(!ai_trace_has_productive_activity(&[session_only]));
 
+        let opaque_group_start = HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(1),
+            ActivityKind::AgentGroup {
+                id: "xai-turn".into(),
+                aliases: Vec::new(),
+                label: "Grok Heavy".into(),
+                kind: AgentGroupKind::MultiAgentInference,
+                status: SubagentStatus::InProgress,
+                expected_count: Some(16),
+                members: Vec::new(),
+                visibility: AgentGroupVisibility::AggregateOnly,
+                detail: None,
+            },
+        );
+        assert!(
+            !ai_trace_has_productive_activity(&[opaque_group_start]),
+            "adapter-owned aggregate startup must not suppress stale-id replay"
+        );
+
         let text =
             HarnessActivityEvent::assistant_text(Uuid::new_v4(), UnixMillis(2), "provider output");
         assert!(ai_trace_has_productive_activity(&[text]));
         runtime.active_had_productive_activity = true;
-        assert!(!should_replay_failed_native_session(&runtime));
+        assert!(!should_replay_failed_native_session(
+            &runtime, true, false, false
+        ));
+        runtime.active_had_productive_activity = false;
+        assert!(
+            !should_replay_failed_native_session(&runtime, false, true, false),
+            "a transient runtime probe failure must preserve the native session"
+        );
+    }
+
+    #[test]
+    fn hidden_conversations_block_launch_without_changing_visible_pause_semantics() {
+        let mut conversation = AiConversation::new(
+            Uuid::new_v4(),
+            "Hidden launch gate",
+            PermissionMode::Ask,
+            UnixMillis(1),
+        );
+        assert!(ai_conversation_allows_launch(&conversation));
+
+        conversation.queue_paused = true;
+        assert!(
+            ai_conversation_allows_launch(&conversation),
+            "queue pause must not block an explicit launch for a visible chat"
+        );
+        assert!(!ai_conversation_queue_allows_drain(&conversation));
+
+        conversation.queue_paused = false;
+        assert!(ai_conversation_queue_allows_drain(&conversation));
+
+        conversation.hidden = true;
+        assert!(!ai_conversation_allows_launch(&conversation));
+        assert!(!ai_conversation_queue_allows_drain(&conversation));
+    }
+
+    #[test]
+    fn hidden_queue_send_and_unhide_preserve_queued_work() {
+        let mut conversation = AiConversation::new(
+            Uuid::new_v4(),
+            "Hidden queued work",
+            PermissionMode::Ask,
+            UnixMillis(1),
+        );
+        conversation
+            .enqueue_turn(AiQueuedTurn {
+                id: Uuid::new_v4(),
+                text: "Do not send yet".into(),
+                queued_at: UnixMillis(2),
+                ..AiQueuedTurn::default()
+            })
+            .unwrap();
+        update_ai_conversation_hidden_state(&mut conversation, true, UnixMillis(3));
+        let hidden_snapshot = conversation.clone();
+
+        assert!(!prepare_ai_queue_for_explicit_send(&mut conversation));
+        assert_eq!(conversation, hidden_snapshot);
+        assert!(!ai_conversation_queue_allows_drain(&conversation));
+
+        update_ai_conversation_hidden_state(&mut conversation, false, UnixMillis(4));
+        assert!(!conversation.hidden);
+        assert!(conversation.queue_paused);
+        assert_eq!(conversation.queued_turns(), hidden_snapshot.queued_turns());
+        assert!(!ai_conversation_queue_allows_drain(&conversation));
+
+        assert!(prepare_ai_queue_for_explicit_send(&mut conversation));
+        assert!(ai_conversation_queue_allows_drain(&conversation));
+    }
+
+    #[test]
+    fn preserved_resume_is_eligible_only_for_the_exact_locally_unsent_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let conversation_id = Uuid::new_v4();
+        let mut conversation = AiConversation::new(
+            conversation_id,
+            "Resume retry",
+            PermissionMode::Ask,
+            UnixMillis(1),
+        );
+        let base_sequence = conversation
+            .append_message(
+                Uuid::new_v4(),
+                MessageRole::Assistant,
+                "Earlier provider reply",
+                UnixMillis(1),
+                Vec::new(),
+            )
+            .unwrap();
+        let gate = ResumeGate::capture(
+            conversation_id,
+            true,
+            "claude_cli",
+            Path::new("claude"),
+            temporary.path(),
+            "claude-stream-json:v1",
+            Some("ask".into()),
+            Some(base_sequence),
+        )
+        .unwrap();
+        let record = ResumeRecord::from_gate("native-session", &gate, 1).unwrap();
+        let mut store = ResumeStore::new();
+        store
+            .record_or_forget(conversation_id, record.clone())
+            .unwrap();
+
+        let user_sequence = conversation
+            .append_message(
+                Uuid::new_v4(),
+                MessageRole::User,
+                "retry this exact request",
+                UnixMillis(2),
+                Vec::new(),
+            )
+            .unwrap();
+        let terminal_sequence = conversation
+            .append_message(
+                Uuid::new_v4(),
+                MessageRole::Assistant,
+                "Version verification failed locally",
+                UnixMillis(3),
+                Vec::new(),
+            )
+            .unwrap();
+        let retry = PreservedResumeRetry {
+            provider_id: "claude_cli".into(),
+            session_id: "native-session".into(),
+            user_message_sequence: user_sequence,
+            terminal_message_sequence: terminal_sequence,
+        };
+
+        let mut current_gate = gate.clone();
+        current_gate.last_committed_message_sequence = Some(terminal_sequence);
+        assert!(matches!(
+            store.eligible_record(conversation_id, &current_gate),
+            Err(crate::ai_state::ResumeIneligibility::CommittedMessageSequenceMismatch)
+        ));
+
+        let preserved = preserved_resume_record_for_exact_retry(
+            Some(&retry),
+            "claude_cli",
+            &conversation,
+            "retry this exact request",
+            &[],
+            store.record(conversation_id),
+        )
+        .expect("the exact Retry action keeps the pre-turn provider session");
+        current_gate.last_committed_message_sequence = preserved.last_committed_message_sequence;
+        assert_eq!(
+            store
+                .eligible_record(conversation_id, &current_gate)
+                .unwrap()
+                .map(|record| record.session_id.as_str()),
+            Some("native-session")
+        );
+
+        assert!(
+            preserved_resume_record_for_exact_retry(
+                Some(&retry),
+                "claude_cli",
+                &conversation,
+                "a different prompt",
+                &[],
+                store.record(conversation_id),
+            )
+            .is_none(),
+            "an arbitrary next prompt must not inherit the unsent turn's session bridge"
+        );
+        assert!(
+            preserved_resume_record_for_exact_retry(
+                Some(&retry),
+                "codex_cli",
+                &conversation,
+                "retry this exact request",
+                &[],
+                store.record(conversation_id),
+            )
+            .is_none(),
+            "a provider switch must expire the bridge"
+        );
+        let mut wrong_session = retry.clone();
+        wrong_session.session_id = "different-session".into();
+        assert!(
+            preserved_resume_record_for_exact_retry(
+                Some(&wrong_session),
+                "claude_cli",
+                &conversation,
+                "retry this exact request",
+                &[],
+                store.record(conversation_id),
+            )
+            .is_none(),
+            "a replaced resume record must expire the bridge"
+        );
+        let changed_attachment = AiAttachmentRef {
+            id: Uuid::new_v4(),
+            name: "different.txt".into(),
+            path: "/tmp/different.txt".into(),
+            size_bytes: Some(1),
+        };
+        assert!(
+            preserved_resume_record_for_exact_retry(
+                Some(&retry),
+                "claude_cli",
+                &conversation,
+                "retry this exact request",
+                &[changed_attachment],
+                store.record(conversation_id),
+            )
+            .is_none(),
+            "changed attachments must expire the bridge"
+        );
+        conversation
+            .append_message(
+                Uuid::new_v4(),
+                MessageRole::User,
+                "new conversation turn",
+                UnixMillis(4),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(
+            preserved_resume_record_for_exact_retry(
+                Some(&retry),
+                "claude_cli",
+                &conversation,
+                "retry this exact request",
+                &[],
+                store.record(conversation_id),
+            )
+            .is_none(),
+            "the bridge expires as soon as conversation history advances"
+        );
+    }
+
+    #[test]
+    fn unavailable_kimi_acp_runtime_forgets_only_its_stale_sidecar() {
+        assert!(should_forget_unavailable_kimi_resume(
+            "kimi_cli",
+            false,
+            Some("kimi_cli")
+        ));
+        assert!(!should_forget_unavailable_kimi_resume(
+            "kimi_cli",
+            true,
+            Some("kimi_cli")
+        ));
+        assert!(!should_forget_unavailable_kimi_resume(
+            "kimi_cli",
+            false,
+            Some("codex_cli")
+        ));
+        assert!(!should_forget_unavailable_kimi_resume(
+            "codex_cli",
+            false,
+            Some("kimi_cli")
+        ));
     }
 
     #[test]
@@ -19119,6 +22560,37 @@ mod tests {
             snapshot.at = UnixMillis(99);
             runtime.activity_trace.ingest(snapshot);
         }
+    }
+
+    #[test]
+    fn stream_reset_preserves_committed_adam_canvas_artifacts() {
+        let mut runtime = AiChatRuntime::default();
+        runtime.activity_trace.ingest(HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(2),
+            ActivityKind::HostMutation {
+                tool: "canvas_create_note".into(),
+                summary: "Research brief".into(),
+                entity_id: Some(Uuid::new_v4().to_string()),
+                container_name: Some("Main".into()),
+                kind: HostMutationKind::Create,
+            },
+        ));
+        runtime
+            .activity_trace
+            .ingest(HarnessActivityEvent::assistant_text(
+                Uuid::new_v4(),
+                UnixMillis(3),
+                "untrusted provider stream",
+            ));
+
+        reset_runtime_activity_for_test(&mut runtime);
+
+        assert_eq!(runtime.activity_trace.events.len(), 1);
+        assert!(matches!(
+            runtime.activity_trace.events[0].kind,
+            ActivityKind::HostMutation { .. }
+        ));
     }
 
     #[test]
@@ -19493,6 +22965,125 @@ mod tests {
     }
 
     #[test]
+    fn kimi_legacy_warning_tracks_the_actual_runtime_contract() {
+        let acp_version = crate::chat_core::CliVersion::parse("0.31.0").unwrap();
+        let unsupported_version = crate::chat_core::CliVersion::parse("0.31.1").unwrap();
+        let legacy_version = crate::chat_core::CliVersion::parse("1.49.0").unwrap();
+        let unverified_legacy_version = crate::chat_core::CliVersion::parse("1.50.0").unwrap();
+        let acp = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            Some(&acp_version),
+            "",
+        );
+        let legacy = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            Some(&legacy_version),
+            "",
+        );
+        let unsupported = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            Some(&unsupported_version),
+            "",
+        );
+        let unverified_legacy = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            Some(&unverified_legacy_version),
+            "",
+        );
+        let unknown = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            None,
+            "",
+        );
+
+        assert!(!kimi_uses_legacy_print_transport("kimi_cli", &acp));
+        assert!(!kimi_uses_legacy_print_transport("kimi_cli", &unsupported));
+        assert!(!kimi_uses_legacy_print_transport(
+            "kimi_cli",
+            &unverified_legacy
+        ));
+        assert!(!kimi_uses_legacy_print_transport("kimi_cli", &unknown));
+        assert!(kimi_uses_legacy_print_transport("kimi_cli", &legacy));
+        assert!(!kimi_uses_legacy_print_transport("codex_cli", &legacy));
+    }
+
+    #[test]
+    fn unverified_parseable_cli_renderers_preserve_saved_controls() {
+        let grok_version = crate::chat_core::CliVersion::parse("grok 0.2.119").unwrap();
+        let grok_tuning = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Grok,
+            Some(&grok_version),
+            "grok-4.5",
+        );
+        assert!(!grok_tuning.verified_runtime);
+        assert!(grok_tuning.version.is_some());
+        let mut grok_profile = AiProviderPreferences {
+            reasoning_effort: "high".into(),
+            ..AiProviderPreferences::default()
+        };
+        grok_profile.set_feature(AI_FEATURE_SUBAGENTS, Some(true));
+
+        let kimi_version = crate::chat_core::CliVersion::parse("kimi 0.31.1").unwrap();
+        let kimi_tuning = crate::chat_core::runtime_tuning_profile(
+            crate::chat_core::ProviderKind::Kimi,
+            Some(&kimi_version),
+            "",
+        );
+        assert!(!kimi_tuning.verified_runtime);
+        assert!(kimi_tuning.version.is_some());
+        let mut kimi_profile = AiProviderPreferences {
+            reasoning_effort: "high".into(),
+            ..AiProviderPreferences::default()
+        };
+        kimi_profile.set_feature(AI_FEATURE_SWARM, Some(true));
+
+        let context = Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            render_ai_reasoning_selector(
+                ui,
+                Uuid::new_v4(),
+                "grok_cli",
+                &mut grok_profile,
+                &grok_tuning,
+            );
+            render_ai_provider_abilities(
+                ui,
+                "grok_cli",
+                &mut grok_profile,
+                &grok_tuning,
+                Theme::new(true),
+            );
+            render_ai_reasoning_selector(
+                ui,
+                Uuid::new_v4(),
+                "kimi_cli",
+                &mut kimi_profile,
+                &kimi_tuning,
+            );
+            render_ai_provider_abilities(
+                ui,
+                "kimi_cli",
+                &mut kimi_profile,
+                &kimi_tuning,
+                Theme::new(true),
+            );
+        });
+
+        assert_eq!(grok_profile.reasoning_effort, "high");
+        assert_eq!(
+            grok_profile.feature(AI_FEATURE_SUBAGENTS),
+            Some(true),
+            "an unverified Grok version must not disable the saved subagent preference"
+        );
+        assert_eq!(kimi_profile.reasoning_effort, "high");
+        assert_eq!(
+            kimi_profile.feature(AI_FEATURE_SWARM),
+            Some(true),
+            "an unverified Kimi version must not disable the saved swarm preference"
+        );
+    }
+
+    #[test]
     fn provider_switch_materializes_legacy_model_and_restores_each_profile() {
         let mut settings = AiConversationSettings {
             provider_id: "codex_cli".into(),
@@ -19515,6 +23106,129 @@ mod tests {
         assert_eq!(settings.model, "gpt-5.6-sol");
         select_ai_provider(&mut settings, "claude_cli");
         assert_eq!(settings.model, "sonnet");
+    }
+
+    #[test]
+    fn response_id_resume_repeats_system_delivery_without_changing_cli_resume() {
+        let xai = capability_profile("xai_api", "", &[]);
+        let codex = capability_profile("codex_cli", "codex", &[]);
+
+        assert_eq!(ai_system_delivery(&xai), SystemDelivery::SeparateEveryTurn);
+        assert_eq!(ai_system_delivery(&codex), SystemDelivery::Separate);
+    }
+
+    #[test]
+    fn temporary_api_keys_are_scoped_to_their_exact_provider() {
+        let mut runtime = AiChatRuntime::default();
+        *runtime.temporary_api_key_mut("xai_api") = "  xai-secret  ".into();
+        *runtime.temporary_api_key_mut("openai_compatible") = "openai-secret".into();
+
+        assert_eq!(
+            runtime.temporary_api_key("xai_api").as_deref(),
+            Some("xai-secret")
+        );
+        assert_eq!(
+            runtime.temporary_api_key("openai_compatible").as_deref(),
+            Some("openai-secret")
+        );
+        assert_eq!(runtime.temporary_api_key("lm_studio"), None);
+        assert!(!provider_session_is_portable_activity("xai_api"));
+        assert!(!provider_session_is_portable_activity("kimi_cli"));
+        assert!(provider_session_is_portable_activity("codex_cli"));
+    }
+
+    #[test]
+    fn temporary_api_key_debug_is_redacted_at_the_runtime_boundary() {
+        let mut runtime = AiChatRuntime::default();
+        *runtime.temporary_api_key_mut("xai_api") = "  xai-canary-secret  ".into();
+        *runtime.temporary_api_key_mut("openai_compatible") = "openai-canary-secret".into();
+
+        for debug in [format!("{:?}", runtime.api_keys), format!("{runtime:?}")] {
+            assert!(!debug.contains("xai-canary-secret"));
+            assert!(!debug.contains("openai-canary-secret"));
+            assert!(!debug.contains("xai_api"));
+            assert!(!debug.contains("openai_compatible"));
+            assert!(debug.contains("[REDACTED]"));
+        }
+    }
+
+    #[test]
+    fn xai_usage_and_storage_disclosures_are_explicit() {
+        assert!(XAI_SERVER_STORAGE_DISCLOSURE.contains("your messages"));
+        assert!(XAI_SERVER_STORAGE_DISCLOSURE.contains("Grok Heavy responses"));
+        assert!(XAI_SERVER_STORAGE_DISCLOSURE.contains("follow-up turns"));
+        assert!(XAI_SERVER_STORAGE_DISCLOSURE.contains("30 days by default"));
+        assert_eq!(
+            ai_usage_cost_suffix(None, true),
+            format!(" · {XAI_COST_NOT_REPORTED}")
+        );
+        assert_eq!(ai_usage_cost_suffix(None, false), "");
+        assert_eq!(ai_usage_cost_suffix(Some(0.125), false), " · $0.1250");
+        assert_eq!(
+            ai_usage_cost_suffix(Some(0.00001585), false),
+            " · $0.00001585"
+        );
+        assert_eq!(
+            ai_usage_cost_suffix(Some(0.125), true),
+            format!(" · $0.1250 · {XAI_COST_NOT_REPORTED}")
+        );
+    }
+
+    #[test]
+    fn xai_cost_fallback_is_derived_per_turn_across_mixed_provider_history() {
+        let codex_events = vec![HarnessActivityEvent::new(
+            Uuid::new_v4(),
+            UnixMillis(1),
+            ActivityKind::Usage {
+                input: Some(100),
+                output: Some(20),
+                cached_input: None,
+                reasoning: None,
+                cost_usd: Some(0.10),
+            },
+        )];
+        let xai_events = vec![
+            HarnessActivityEvent::new(
+                Uuid::new_v4(),
+                UnixMillis(2),
+                ActivityKind::AgentGroup {
+                    id: "xai-heavy-persisted-turn".into(),
+                    aliases: Vec::new(),
+                    label: "Grok Heavy".into(),
+                    kind: AgentGroupKind::MultiAgentInference,
+                    status: SubagentStatus::Completed,
+                    expected_count: Some(16),
+                    members: Vec::new(),
+                    visibility: AgentGroupVisibility::AggregateOnly,
+                    detail: None,
+                },
+            ),
+            HarnessActivityEvent::new(
+                Uuid::new_v4(),
+                UnixMillis(3),
+                ActivityKind::Usage {
+                    input: Some(200),
+                    output: Some(40),
+                    cached_input: None,
+                    reasoning: Some(10),
+                    cost_usd: None,
+                },
+            ),
+        ];
+
+        assert!(!ai_events_have_unreported_xai_cost(&codex_events));
+        assert!(ai_events_have_unreported_xai_cost(&xai_events));
+        let combined = codex_events
+            .iter()
+            .chain(xai_events.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let usage = project_usage(&combined);
+        assert_eq!(usage.cost_usd, Some(0.10));
+        assert_eq!(
+            ai_usage_cost_suffix(usage.cost_usd, true),
+            format!(" · $0.1000 · {XAI_COST_NOT_REPORTED}")
+        );
     }
 
     #[test]
@@ -19679,5 +23393,28 @@ mod tests {
         assert!(!visible.contains(&pile_id));
         assert!(!visible.contains(&inside_id));
         assert!(visible.contains(&outside_id));
+    }
+
+    #[test]
+    fn chat_sandbox_directories_are_stable_and_per_conversation() {
+        let root = Path::new("/data");
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        assert_eq!(
+            ai_chat_sandbox_directory(root, first),
+            ai_chat_sandbox_directory(root, first),
+            "a chat must keep the same sandbox across sends"
+        );
+        assert_ne!(
+            ai_chat_sandbox_directory(root, first),
+            ai_chat_sandbox_directory(root, second),
+            "two chats must never share a sandbox"
+        );
+        assert!(
+            ai_chat_sandbox_directory(root, first)
+                .components()
+                .any(|part| part.as_os_str() == AI_CHAT_SANDBOX_SEGMENT),
+            "the inspector caption keys off the sandbox path segment"
+        );
     }
 }

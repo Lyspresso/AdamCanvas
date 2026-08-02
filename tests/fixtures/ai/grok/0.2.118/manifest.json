@@ -1,0 +1,25 @@
+{
+  "provider": "Grok CLI",
+  "version": "0.2.118",
+  "build": "1e1687c1cf6a",
+  "capturedAt": "2026-08-02",
+  "captures": [
+    {
+      "files": [
+        "acp-scoped-subagent.jsonl"
+      ],
+      "transport": "ACP (Agent Client Protocol)",
+      "command": "grok --cwd <TEMP_WORKSPACE> --sandbox read-only --permission-mode default --disable-web-search --no-plan --no-memory --max-turns 8 agent --no-leader --model grok-4.5 --reasoning-effort low stdio",
+      "prompt": "Use spawn_subagent exactly once. Spawn one foreground explore subagent with read-only capability to compute 2+2 without web or files and return only CHILD_OK_4. Wait for it, then reply only PARENT_OK_4.",
+      "note": "Fresh live ACP exchange completed successfully; 0.2.118 was captured hours after the CLI self-updated under a running 0.2.117 session. The scoped-child contract is unchanged: subagent_id and child_session_id share the child provider id, child prose stays on the child params.sessionId, PARENT_OK_4 stays on the root session, and subagent_finished carries the child output. Additive drift vs 0.2.117: initialize gained top-level authMethods and a currentWorkingDirectory _meta; session/new now returns models and session-detail _meta; new informational update kinds observed (hook_execution, pending_interaction, interaction_resolved, response_completed, session_info_update, session_summary_generated, turn_completed, tool_call_delta_chunk) — representative turn_completed and response_completed records are retained as schema-confirmed shapes; subagent_finished gained turns, tokens_used, output, and will_wake fields; model_changed (idless, status-only) now arrives on the root session. The parent emitted one prose chunk before PARENT_OK_4; chunk boundaries are retained exactly."
+    }
+  ],
+  "redactions": [
+    "session, prompt, request and event ids replaced consistently; subagent_id and child_session_id deliberately share <CHILD_SESSION>",
+    "temporary workspace path (initialize/session _meta currentWorkingDirectory, sessionDetail cwd) and provider instance identifiers omitted",
+    "authMethods, local MCP servers, available commands and unrelated provider extension metadata omitted",
+    "timestamps normalized to zero; provider prose chunk boundaries retained exactly",
+    "terminal cost and aggregate usage fields omitted; per-update token counts retained as inert shape examples"
+  ],
+  "note": "This fixture proves only the exact Grok 0.2.118 scoped-child contract. Neighboring and unknown versions remain disabled until independently captured."
+}

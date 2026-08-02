@@ -4,26 +4,41 @@
 //! No provider command is routed through a shell, and dangerous bypass flags
 //! are never synthesized by this module.
 
+#[cfg(not(test))]
+use crate::xai_responses::run_xai_responses_cancellable;
 use crate::{
+    ai_canvas_tools::{CanvasToolBroker, CanvasToolRequest},
     ai_task_bridge::TaskToolBridge,
     ai_task_tools::{TaskToolOutcome, TaskToolRegistry},
     chat_core::{
-        ActivityEvent, ActivityKind, ActivityStatus, AgentScope, CliVersion, FileChange,
-        FileChangeKind, PermissionResolution, PlanChannel, PlanItem, PlanItemOrigin,
-        PlanItemStatus, ProviderKind, ResumeStrategy, RetryHint, RuntimeTuningProfile,
-        SubagentStatus, SystemPromptChannel, TaskMutationKind, TurnStatus, capability_profile,
-        capability_profile_for_runtime, runtime_tuning_profile,
+        ActivityEvent, ActivityKind, ActivityStatus, AgentGroupKind, AgentGroupMember,
+        AgentGroupVisibility, AgentScope, CliVersion, FileChange, FileChangeKind,
+        PermissionResolution, PlanChannel, PlanItem, PlanItemOrigin, PlanItemStatus, ProviderKind,
+        ResumeStrategy, RetryHint, RuntimeTuningProfile, SubagentStatus, SystemPromptChannel,
+        TaskMutationKind, TurnStatus, capability_profile, capability_profile_for_runtime,
+        runtime_tuning_profile,
     },
     domain::{
-        AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_THINKING,
-        AI_FEATURE_WEB_SEARCH, AiPermissionClass, AiPermissionVerdict, AiProviderPreferences,
-        AiWorkspaceMode, PermissionMode, UnixMillis, ai_permission_verdict,
+        AI_FEATURE_MEMORY, AI_FEATURE_PLANNING, AI_FEATURE_SUBAGENTS, AI_FEATURE_SWARM,
+        AI_FEATURE_THINKING, AI_FEATURE_WEB_SEARCH, AiPermissionClass, AiPermissionVerdict,
+        AiProviderPreferences, AiWorkspaceMode, PermissionMode, UnixMillis, ai_permission_verdict,
     },
     grok_acp::{
         GrokAcpError, GrokAcpEvent, GrokAcpHttpMcpServer, GrokAcpLimits, GrokAcpPermissionDecision,
         GrokAcpPermissionRequest, GrokAcpPermissionResolution, GrokAcpPlanStatus,
         GrokAcpProgressRoute, GrokAcpRequest, GrokAcpSessionScope, GrokAcpStopReason,
         GrokAcpSubagentStatus, GrokAcpToolCall, GrokAcpToolKind, GrokAcpToolStatus, run_grok_acp,
+    },
+    kimi_acp::{
+        KIMI_ACP_RUNTIME_VERSION, KimiAcpError, KimiAcpEvent, KimiAcpLimits, KimiAcpOutcome,
+        KimiAcpPermissionDecision, KimiAcpPermissionRequest, KimiAcpPermissionResolution,
+        KimiAcpPlanStatus, KimiAcpRequest, KimiAcpStopReason, KimiAcpToolCall, KimiAcpToolKind,
+        KimiAcpToolStatus, run_kimi_acp,
+    },
+    xai_responses::{
+        XAI_API_KEY_ENV, XAI_MULTI_AGENT_MODEL, XaiGroupStatus, XaiReasoningEffort,
+        XaiResponsesError, XaiResponsesEvent, XaiResponsesLimits, XaiResponsesRequest,
+        XaiTransportAbort,
     },
 };
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
@@ -39,8 +54,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, OnceLock, TryLockError,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -64,6 +79,9 @@ const MAX_GROK_SESSION_POLL_BYTES: usize = 512 * 1024;
 const MAX_GROK_SESSION_SCAN_BYTES: u64 = 32 * 1024 * 1024;
 const GROK_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_GROK_SUBAGENTS: usize = 256;
+const MAX_KIMI_SWARM_MEMBERS: usize = 128;
+const MAX_KIMI_SWARM_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_KIMI_SWARM_MEMBER_DETAIL_BYTES: usize = 1024 * 1024;
 const MAX_HTTP_TOOL_ROUNDS: usize = 16;
 const MAX_HTTP_TOOL_CALLS_PER_ROUND: usize = 32;
 const MAX_HTTP_TOOL_ARGUMENT_BYTES: usize = 64 * 1024;
@@ -74,10 +92,17 @@ const HTTP_TASK_TOOLS_REJECTED_PREFIX: &str = "adam-http-task-tools-rejected:";
 const STDERR_TAIL_BYTES: usize = 16 * 1024;
 const CHAT_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const TASK_TIMEOUT: Duration = Duration::from_secs(60 * 60);
-const CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(1);
+const CLI_VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+const CLI_VERSION_DRAIN_GRACE: Duration = Duration::from_secs(2);
+const MAX_CLI_VERSION_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_CONCURRENT_AI_RUNS: usize = 4;
+const MAX_XAI_HTTP_WORKERS: usize = MAX_CONCURRENT_AI_RUNS * 2;
 
-static CLI_VERSION_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<CliVersion>>>> = OnceLock::new();
+static CLI_VERSION_CACHE: OnceLock<Mutex<HashMap<PathBuf, CliVersionCacheEntry>>> = OnceLock::new();
+static CLI_VERSION_PROBE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+static CLI_VERSION_PROBE_FAILURES: OnceLock<Mutex<HashMap<PathBuf, CliVersionProbeFailureEntry>>> =
+    OnceLock::new();
+static XAI_HTTP_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
 /// One provider turn. The API key value is deliberately memory-only and its
 /// custom `Debug` implementation never prints it.
@@ -85,6 +110,9 @@ static CLI_VERSION_CACHE: OnceLock<Mutex<HashMap<PathBuf, Option<CliVersion>>>> 
 pub struct AiRunRequest {
     pub turn_id: Uuid,
     pub conversation_id: Uuid,
+    /// Canvas page captured when the user starts the turn. Providers never
+    /// choose an arbitrary page identifier.
+    pub canvas_page_id: Option<Uuid>,
     pub provider_id: String,
     pub workspace_mode: AiWorkspaceMode,
     pub permission_mode: PermissionMode,
@@ -110,6 +138,7 @@ impl fmt::Debug for AiRunRequest {
             .debug_struct("AiRunRequest")
             .field("turn_id", &self.turn_id)
             .field("conversation_id", &self.conversation_id)
+            .field("canvas_page_id", &self.canvas_page_id)
             .field("provider_id", &self.provider_id)
             .field("workspace_mode", &self.workspace_mode)
             .field("permission_mode", &self.permission_mode)
@@ -186,10 +215,19 @@ pub enum AiEvent {
         conversation_id: Uuid,
         kind: AiFailureKind,
         message: String,
+        /// The provider rejected the saved native session before doing work.
+        /// Consumers may use this typed signal for one fresh replay.
+        resume_rejected: bool,
+        /// A launch/runtime verification failed without proving the saved
+        /// native session stale. Consumers must retain that session.
+        preserve_resume: bool,
     },
     Cancelled {
         turn_id: Uuid,
         conversation_id: Uuid,
+        /// Cancellation happened before the provider/session was touched.
+        /// Consumers must retain an eligible native resume record.
+        preserve_resume: bool,
     },
 }
 
@@ -243,6 +281,8 @@ pub enum AiEngineError {
     AlreadyRunning(Uuid),
     #[error("conversation {0} already has a running turn")]
     ConversationBusy(Uuid),
+    #[error("conversation {0} was permanently deleted")]
+    ConversationDeleted(Uuid),
     #[error("the AI run limit ({0}) has been reached")]
     RunLimitReached(usize),
     #[error("the prompt is empty")]
@@ -253,6 +293,8 @@ pub enum AiEngineError {
     ExecutableNotFound(String),
     #[error("invalid AI provider configuration: {0}")]
     InvalidConfiguration(String),
+    #[error("native AI session is unavailable: {0}")]
+    NativeResumeUnavailable(String),
     #[error("could not start the AI worker: {0}")]
     WorkerStart(#[source] io::Error),
 }
@@ -262,6 +304,8 @@ pub struct AiEngine {
     event_sender: Sender<AiEvent>,
     active: Arc<Mutex<HashMap<Uuid, ActiveRun>>>,
     task_tools: Arc<Mutex<TaskToolRegistry>>,
+    canvas_tools: Arc<CanvasToolBroker>,
+    deleted_conversations: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl Default for AiEngine {
@@ -278,6 +322,8 @@ impl AiEngine {
             event_sender,
             active: Arc::new(Mutex::new(HashMap::new())),
             task_tools: Arc::new(Mutex::new(TaskToolRegistry::new())),
+            canvas_tools: Arc::new(CanvasToolBroker::new()),
+            deleted_conversations: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -285,12 +331,28 @@ impl AiEngine {
         if request.prompt.trim().is_empty() {
             return Err(AiEngineError::EmptyPrompt);
         }
+        if lock_unpoison(&self.deleted_conversations).contains(&request.conversation_id) {
+            return Err(AiEngineError::ConversationDeleted(request.conversation_id));
+        }
         let prepared = prepare_run(&request)?;
         let effective_provider = prepared.provider_id().to_owned();
         let plan_channel = prepared.plan_channel();
+        let accepts_returned_session_id = prepared.accepts_returned_session_id();
+        let canvas_tools_enabled = prepared.exposes_canvas_tools()
+            && request.workspace_mode != AiWorkspaceMode::Chat
+            && ai_permission_verdict(request.permission_mode, AiPermissionClass::Mutate)
+                == AiPermissionVerdict::Allow;
         let control = Arc::new(RunControl::default());
 
         {
+            // Keep deletion and run registration in one critical section.
+            // Otherwise a concurrent permanent delete could cancel the
+            // active slot before its tool registries are installed, allowing
+            // a deleted conversation to regain a short-lived live tool gate.
+            let deleted_conversations = lock_unpoison(&self.deleted_conversations);
+            if deleted_conversations.contains(&request.conversation_id) {
+                return Err(AiEngineError::ConversationDeleted(request.conversation_id));
+            }
             let mut active = lock_unpoison(&self.active);
             if active.contains_key(&request.turn_id) {
                 return Err(AiEngineError::AlreadyRunning(request.turn_id));
@@ -311,15 +373,29 @@ impl AiEngine {
                     control: Arc::clone(&control),
                 },
             );
-        }
-        if let Err(error) = lock_unpoison(&self.task_tools).register_run(
-            request.turn_id,
-            request.conversation_id,
-            plan_channel,
-            &request.initial_tasks,
-        ) {
-            lock_unpoison(&self.active).remove(&request.turn_id);
-            return Err(AiEngineError::InvalidConfiguration(error.to_string()));
+            if let Err(error) = lock_unpoison(&self.task_tools).register_run(
+                request.turn_id,
+                request.conversation_id,
+                plan_channel,
+                &request.initial_tasks,
+            ) {
+                active.remove(&request.turn_id);
+                return Err(AiEngineError::InvalidConfiguration(error.to_string()));
+            }
+            if let Some(page_id) = request.canvas_page_id
+                && let Err(error) = self.canvas_tools.register_run(
+                    request.turn_id,
+                    request.conversation_id,
+                    page_id,
+                    canvas_tools_enabled,
+                )
+            {
+                lock_unpoison(&self.task_tools).unregister_run(request.turn_id);
+                active.remove(&request.turn_id);
+                return Err(AiEngineError::InvalidConfiguration(error.into()));
+            }
+            drop(active);
+            drop(deleted_conversations);
         }
 
         let turn_id = request.turn_id;
@@ -327,6 +403,7 @@ impl AiEngine {
         let events = self.event_sender.clone();
         let active = Arc::clone(&self.active);
         let task_tools = Arc::clone(&self.task_tools);
+        let canvas_tools = Arc::clone(&self.canvas_tools);
         let spawn = thread::Builder::new()
             .name(format!("adam-ai-{}", short_uuid(turn_id)))
             .spawn(move || {
@@ -337,7 +414,7 @@ impl AiEngine {
                 });
 
                 let outcome = if control.cancelled.load(Ordering::Acquire) {
-                    RunOutcome::Cancelled
+                    RunOutcome::CancelledBeforeLaunch
                 } else {
                     match prepared {
                         PreparedRun::Process(specification) => {
@@ -349,7 +426,14 @@ impl AiEngine {
                             &control,
                             &events,
                             &task_tools,
+                            &canvas_tools,
                         ),
+                        PreparedRun::KimiAcp(specification) => {
+                            run_kimi_acp_transport(&request, specification, &control, &events)
+                        }
+                        PreparedRun::XaiResponses(specification) => {
+                            run_xai_responses_transport(&request, specification, &control, &events)
+                        }
                         PreparedRun::Http { provider_id, url } => {
                             run_http(&request, &provider_id, url, &control, &events, &task_tools)
                         }
@@ -359,6 +443,7 @@ impl AiEngine {
                 // Tool-list and tool-call gates fail closed before the
                 // terminal event becomes observable to consumers.
                 lock_unpoison(&task_tools).unregister_run(turn_id);
+                canvas_tools.unregister_run(turn_id);
                 if let Some(status) = run_outcome_status(&outcome) {
                     let _ = events.send(AiEvent::Activity {
                         turn_id,
@@ -366,25 +451,12 @@ impl AiEngine {
                         event: activity_event(status),
                     });
                 }
-                let terminal = match outcome {
-                    RunOutcome::Completed { text, session_id } => Some(AiEvent::Completed {
-                        turn_id,
-                        conversation_id,
-                        text,
-                        session_id,
-                    }),
-                    RunOutcome::Failed { kind, message, .. } => Some(AiEvent::Failed {
-                        turn_id,
-                        conversation_id,
-                        kind,
-                        message,
-                    }),
-                    RunOutcome::Cancelled => Some(AiEvent::Cancelled {
-                        turn_id,
-                        conversation_id,
-                    }),
-                    RunOutcome::TerminalAlreadyEmitted => None,
-                };
+                let terminal = terminal_event_for_run_outcome(
+                    turn_id,
+                    conversation_id,
+                    accepts_returned_session_id,
+                    outcome,
+                );
                 if let Some(terminal) = terminal {
                     let _ = events.send(terminal);
                 }
@@ -394,6 +466,7 @@ impl AiEngine {
         if let Err(error) = spawn {
             lock_unpoison(&self.active).remove(&turn_id);
             lock_unpoison(&self.task_tools).unregister_run(turn_id);
+            self.canvas_tools.unregister_run(turn_id);
             return Err(AiEngineError::WorkerStart(error));
         }
         Ok(())
@@ -403,35 +476,87 @@ impl AiEngine {
         let control = lock_unpoison(&self.active)
             .get(&turn_id)
             .map(|run| Arc::clone(&run.control));
-        if let Some(control) = control {
-            control.cancel();
-            true
-        } else {
-            false
+        if control.is_some() {
+            // Revoke queued and future canvas calls before cooperative process
+            // cancellation can yield back to the UI.
+            self.canvas_tools.unregister_run(turn_id);
         }
+        control.is_some_and(|control| control.cancel())
+    }
+
+    pub fn cancel_conversation(&self, conversation_id: Uuid) -> bool {
+        let runs = lock_unpoison(&self.active)
+            .iter()
+            .filter(|(_, run)| run.conversation_id == conversation_id)
+            .map(|(turn_id, run)| (*turn_id, Arc::clone(&run.control)))
+            .collect::<Vec<_>>();
+        for (turn_id, _) in &runs {
+            self.canvas_tools.unregister_run(*turn_id);
+        }
+        for (_, control) in &runs {
+            let _ = control.cancel();
+        }
+        !runs.is_empty()
+    }
+
+    /// Permanently retires a conversation. Cancellation is cooperative, so a
+    /// tombstone also prevents already-buffered/late events from rebuilding
+    /// checklist state after the UI has erased it.
+    pub fn delete_conversation(&self, conversation_id: Uuid) -> bool {
+        let newly_deleted = lock_unpoison(&self.deleted_conversations).insert(conversation_id);
+        let cancelled = self.cancel_conversation(conversation_id);
+        let forgot_tasks = lock_unpoison(&self.task_tools).forget_conversation(conversation_id);
+        self.canvas_tools.forget_conversation(conversation_id);
+        newly_deleted || cancelled || forgot_tasks
+    }
+
+    pub fn try_recv_canvas_tool(&self) -> Option<CanvasToolRequest> {
+        self.canvas_tools.try_recv()
+    }
+
+    /// Final UI-thread gate for a queued canvas mutation.
+    pub(crate) fn canvas_tool_request_is_active(&self, request: &CanvasToolRequest) -> bool {
+        !lock_unpoison(&self.deleted_conversations).contains(&request.conversation_id)
+            && self.canvas_tools.request_is_active(request)
+    }
+
+    /// Atomically hands a still-live canvas request to the UI owner at the
+    /// last boundary before the workspace mutation. A successful claim is
+    /// intentionally not revocable by a later cancellation: once Adam has
+    /// changed the canvas, the provider must receive the truthful receipt.
+    pub(crate) fn claim_canvas_tool_for_commit(&self, request: &CanvasToolRequest) -> bool {
+        !lock_unpoison(&self.deleted_conversations).contains(&request.conversation_id)
+            && self.canvas_tools.claim_for_commit(request)
     }
 
     pub fn try_recv(&self) -> Option<AiEvent> {
-        let event = self.events.try_recv().ok()?;
-        if let AiEvent::Activity {
-            conversation_id,
-            event: activity,
-            ..
-        } = &event
-        {
-            lock_unpoison(&self.task_tools).observe_activity(*conversation_id, activity);
-        } else if let AiEvent::ActivityBatch {
-            conversation_id,
-            events,
-            ..
-        } = &event
-        {
-            let mut task_tools = lock_unpoison(&self.task_tools);
-            for activity in events {
-                task_tools.observe_activity(*conversation_id, activity);
+        loop {
+            let event = self.events.try_recv().ok()?;
+            let deleted = lock_unpoison(&self.deleted_conversations);
+            if deleted.contains(&event.conversation_id()) {
+                continue;
             }
+            if let AiEvent::Activity {
+                conversation_id,
+                event: activity,
+                ..
+            } = &event
+            {
+                lock_unpoison(&self.task_tools).observe_activity(*conversation_id, activity);
+            } else if let AiEvent::ActivityBatch {
+                conversation_id,
+                events,
+                ..
+            } = &event
+            {
+                let mut task_tools = lock_unpoison(&self.task_tools);
+                for activity in events {
+                    task_tools.observe_activity(*conversation_id, activity);
+                }
+            }
+            drop(deleted);
+            return Some(event);
         }
-        Some(event)
     }
 
     /// Tool-list-time exposure gate for provider adapters.
@@ -493,12 +618,15 @@ impl AiEngine {
     }
 
     pub fn cancel_all(&self) {
-        let controls: Vec<_> = lock_unpoison(&self.active)
-            .values()
-            .map(|run| Arc::clone(&run.control))
+        let runs: Vec<_> = lock_unpoison(&self.active)
+            .iter()
+            .map(|(turn_id, run)| (*turn_id, Arc::clone(&run.control)))
             .collect();
-        for control in controls {
-            control.cancel();
+        for (turn_id, _) in &runs {
+            self.canvas_tools.unregister_run(*turn_id);
+        }
+        for (_, control) in runs {
+            let _ = control.cancel();
         }
     }
 
@@ -523,14 +651,67 @@ impl Drop for AiEngine {
     }
 }
 
+fn terminal_event_for_run_outcome(
+    turn_id: Uuid,
+    conversation_id: Uuid,
+    accepts_returned_session_id: bool,
+    outcome: RunOutcome,
+) -> Option<AiEvent> {
+    match outcome {
+        RunOutcome::Completed { text, session_id } => Some(AiEvent::Completed {
+            turn_id,
+            conversation_id,
+            text,
+            session_id: accepts_returned_session_id.then_some(session_id).flatten(),
+        }),
+        RunOutcome::Failed { kind, message, .. } => Some(AiEvent::Failed {
+            turn_id,
+            conversation_id,
+            kind,
+            message,
+            resume_rejected: false,
+            preserve_resume: false,
+        }),
+        RunOutcome::ResumeRejected { message } => Some(AiEvent::Failed {
+            turn_id,
+            conversation_id,
+            kind: AiFailureKind::ProviderError,
+            message,
+            resume_rejected: true,
+            preserve_resume: false,
+        }),
+        RunOutcome::RuntimeProbeFailed { message } => Some(AiEvent::Failed {
+            turn_id,
+            conversation_id,
+            kind: AiFailureKind::ProviderError,
+            message,
+            resume_rejected: false,
+            preserve_resume: true,
+        }),
+        RunOutcome::Cancelled => Some(AiEvent::Cancelled {
+            turn_id,
+            conversation_id,
+            preserve_resume: false,
+        }),
+        RunOutcome::CancelledBeforeLaunch => Some(AiEvent::Cancelled {
+            turn_id,
+            conversation_id,
+            preserve_resume: true,
+        }),
+        RunOutcome::TerminalAlreadyEmitted => None,
+    }
+}
+
 #[derive(Default)]
 struct RunControl {
     cancelled: AtomicBool,
+    terminal_claimed: AtomicBool,
     child: Mutex<Option<Child>>,
     /// Serializes the transition to a terminal HTTP state against every model
     /// event and task-tool dispatch. Once `cancelled` is set while this gate is
     /// held, no later HTTP event or task mutation may begin.
     http_event_gate: Mutex<()>,
+    xai_transport_abort: Mutex<Option<XaiTransportAbort>>,
     #[cfg(test)]
     http_read_in_progress: AtomicBool,
 }
@@ -541,22 +722,58 @@ struct ActiveRun {
 }
 
 impl RunControl {
-    fn request_stop(&self) {
+    fn request_stop(&self) -> bool {
         let _gate = lock_unpoison(&self.http_event_gate);
+        if self.terminal_claimed.load(Ordering::Acquire) {
+            return false;
+        }
         self.cancelled.store(true, Ordering::Release);
+        self.abort_xai_transport();
+        true
     }
 
-    fn cancel(&self) {
-        self.request_stop();
+    fn cancel(&self) -> bool {
+        if !self.request_stop() {
+            return false;
+        }
         if let Some(child) = lock_unpoison(&self.child).as_mut() {
             terminate_child_tree(child);
         }
+        true
+    }
+
+    fn claim_terminal_result(&self) -> bool {
+        let _gate = lock_unpoison(&self.http_event_gate);
+        if self.cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        self.terminal_claimed.store(true, Ordering::Release);
+        true
+    }
+
+    fn install_xai_transport_abort(&self, abort: XaiTransportAbort) {
+        if self.cancelled.load(Ordering::Acquire) {
+            abort.cancel();
+        }
+        *lock_unpoison(&self.xai_transport_abort) = Some(abort);
+    }
+
+    fn abort_xai_transport(&self) {
+        if let Some(abort) = lock_unpoison(&self.xai_transport_abort).as_ref() {
+            abort.cancel();
+        }
+    }
+
+    fn clear_xai_transport_abort(&self) {
+        lock_unpoison(&self.xai_transport_abort).take();
     }
 }
 
 enum PreparedRun {
     Process(ProcessSpec),
     GrokAcp(GrokAcpSpec),
+    KimiAcp(KimiAcpSpec),
+    XaiResponses(XaiResponsesSpec),
     Http { provider_id: String, url: Url },
 }
 
@@ -565,6 +782,8 @@ impl PreparedRun {
         match self {
             Self::Process(specification) => &specification.provider_id,
             Self::GrokAcp(_) => "grok_cli",
+            Self::KimiAcp(_) => "kimi_cli",
+            Self::XaiResponses(_) => "xai_api",
             Self::Http { provider_id, .. } => provider_id,
         }
     }
@@ -591,7 +810,29 @@ impl PreparedRun {
                 .plan_channel
             }
             Self::GrokAcp(specification) => specification.plan_channel,
+            Self::KimiAcp(_) => PlanChannel::NativeStream,
+            Self::XaiResponses(_) => PlanChannel::None,
             Self::Http { .. } => PlanChannel::AppTaskTools,
+        }
+    }
+
+    fn accepts_returned_session_id(&self) -> bool {
+        !matches!(
+            self,
+            Self::Process(specification) if specification.provider_id == "kimi_cli"
+        )
+    }
+
+    /// Canvas mutations are exposed only when the transport proves every
+    /// call belongs to the foreground agent. Grok ACP is root-safe only when
+    /// child sessions are disabled. Unknown/custom/API transports fail
+    /// closed until their caller identity is equally explicit.
+    fn exposes_canvas_tools(&self) -> bool {
+        match self {
+            Self::GrokAcp(specification) => specification.canvas_tools_supported,
+            Self::Process(_) | Self::KimiAcp(_) | Self::XaiResponses(_) | Self::Http { .. } => {
+                false
+            }
         }
     }
 }
@@ -618,6 +859,7 @@ struct ProcessSpec {
     prompt_input: PromptInput,
     output_mode: OutputMode,
     grok_session_id: Option<String>,
+    expected_runtime_version: Option<CliVersion>,
 }
 
 #[derive(Debug)]
@@ -627,6 +869,23 @@ struct GrokAcpSpec {
     runtime_version: CliVersion,
     plan_channel: PlanChannel,
     subagents_enabled: bool,
+    /// A freshly-created foreground session can attach the canvas-only MCP
+    /// subset even when its Main Progress authority remains provider-native.
+    canvas_tools_supported: bool,
+}
+
+#[derive(Debug)]
+struct KimiAcpSpec {
+    program: PathBuf,
+    cwd: PathBuf,
+    runtime_version: CliVersion,
+}
+
+#[derive(Debug)]
+struct XaiResponsesSpec {
+    url: Url,
+    #[cfg(test)]
+    disconnect_worker: bool,
 }
 
 fn built_in_cli_executable(provider_id: &str) -> Option<&'static str> {
@@ -648,6 +907,9 @@ pub fn installed_runtime_tuning(
     model: &str,
     cwd: Option<&Path>,
 ) -> RuntimeTuningProfile {
+    if provider_id.trim().eq_ignore_ascii_case("xai_api") {
+        return runtime_tuning_profile(ProviderKind::Xai, None, XAI_MULTI_AGENT_MODEL);
+    }
     let Some(executable) = built_in_cli_executable(provider_id) else {
         return runtime_tuning_profile(ProviderKind::Custom, None, model);
     };
@@ -655,7 +917,35 @@ pub fn installed_runtime_tuning(
         let profile = capability_profile(provider_id, executable, &[]);
         return runtime_tuning_profile(profile.runtime_family, None, model);
     };
-    runtime_tuning_for_program(provider_id, &program, model)
+    cached_runtime_tuning_for_program(provider_id, &program, model)
+}
+
+/// Lossy compatibility predicate for callers that only need a display hint.
+/// `false` includes probe failures and unverified versions; launch and resume
+/// decisions must use the checked internal path below so failure can never be
+/// mistaken for permission to select the auto-approving legacy adapter.
+pub fn installed_kimi_uses_acp(cwd: Option<&Path>) -> bool {
+    resolve_executable("kimi", cwd)
+        .and_then(|program| fresh_runtime_tuning_for_program("kimi_cli", &program, "").ok())
+        .is_some_and(|tuning| supports_kimi_acp_transport(tuning.version.as_ref()))
+}
+
+pub(crate) fn checked_installed_kimi_uses_acp(cwd: Option<&Path>) -> Result<bool, String> {
+    let Some(program) = resolve_executable("kimi", cwd) else {
+        return Err(
+            "Adam could not find the installed Kimi Code executable. The saved Kimi session was preserved; restore the executable or choose another provider."
+                .into(),
+        );
+    };
+    let tuning = cached_verified_runtime_tuning_for_program("kimi_cli", &program, "")
+        .map_err(|failure| cli_version_probe_message("kimi_cli", &failure))?;
+    if let Some(uses_acp) = verified_kimi_resume_compatibility(tuning.version.as_ref()) {
+        return Ok(uses_acp);
+    }
+    Err(
+        "Adam found an unverified Kimi version, so the saved Kimi session was preserved. Install the fixture-verified Kimi Code 0.31.0 contract or refresh Agents after changing versions."
+            .into(),
+    )
 }
 
 /// Clamp saved controls to the verified runtime table. Returns true when the
@@ -665,6 +955,18 @@ pub fn clamp_provider_preferences(
     preferences: &mut AiProviderPreferences,
     tuning: &RuntimeTuningProfile,
 ) -> bool {
+    if built_in_cli_executable(provider_id).is_some() && !tuning.verified_runtime {
+        // A missing observation may be a transient probe failure, so preserve
+        // saved controls. Grok and Kimi also retain their exact-contract
+        // settings for unlisted versions because their transport and
+        // permission semantics are version-selected and launch remains
+        // fail-closed. Generic providers can safely heal only their
+        // version-sensitive controls to provider defaults after a successful,
+        // parseable but unlisted observation.
+        if tuning.version.is_none() || matches!(provider_id, "grok_cli" | "kimi_cli") {
+            return false;
+        }
+    }
     let original = preferences.clone();
     let requested = preferences.reasoning_effort.trim();
     if requested.is_empty() {
@@ -674,8 +976,19 @@ pub fn clamp_provider_preferences(
     } else {
         preferences.reasoning_effort.clear();
     }
+    if provider_id == "ollama" && !tuning.verified_runtime {
+        preferences.set_feature(AI_FEATURE_THINKING, None);
+    }
     if provider_id == "grok_cli" && !tuning.supports_scoped_child_text() {
         preferences.set_feature(AI_FEATURE_SUBAGENTS, Some(false));
+    }
+    if provider_id == "kimi_cli"
+        && tuning.agent_group_channel != crate::chat_core::AgentGroupChannel::KimiAcpToolAggregateV1
+    {
+        preferences.set_feature(AI_FEATURE_SWARM, Some(false));
+    }
+    if provider_id.eq_ignore_ascii_case("xai_api") {
+        preferences.model.clear();
     }
     *preferences != original
 }
@@ -688,11 +1001,55 @@ pub struct ProviderProbe {
     pub executable: Option<&'static str>,
     pub program: Option<PathBuf>,
     pub version: Option<CliVersion>,
+    pub observation: ProviderProbeObservation,
+}
+
+/// Whether the installed provider was observed, has not been checked, or
+/// failed its latest explicit refresh. A failed refresh may retain a
+/// previously verified version only while the executable identity still
+/// matches.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ProviderProbeObservation {
+    #[default]
+    NotObserved,
+    Observed,
+    Failed {
+        message: String,
+        retained_last_good: bool,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CliExecutableIdentity {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanoseconds: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CliVersionCacheEntry {
+    version: CliVersion,
+    identity: CliExecutableIdentity,
+    observed_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct CliVersionProbeFailureEntry {
+    failure: CliVersionProbeFailure,
+    identity: CliExecutableIdentity,
+    completed_at: Instant,
 }
 
 /// Resolve and version-probe a built-in provider CLI without launching a
-/// turn. `refresh` drops the resolved path's cached version first so an
-/// upgraded binary at the same path re-probes; plain calls stay cache-cheap.
+/// turn. `refresh` forces a new observation without discarding an
+/// identity-matched last-good version; plain calls stay cache-cheap.
 pub fn probe_installed_provider(provider_id: &str, refresh: bool) -> ProviderProbe {
     let Some(executable) = built_in_cli_executable(provider_id) else {
         return ProviderProbe::default();
@@ -702,31 +1059,148 @@ pub fn probe_installed_provider(provider_id: &str, refresh: bool) -> ProviderPro
             executable: Some(executable),
             program: None,
             version: None,
+            observation: ProviderProbeObservation::NotObserved,
         };
     };
-    if refresh {
-        invalidate_cached_cli_version(&program);
-    }
-    let version = cached_cli_version(&program);
-    ProviderProbe {
-        executable: Some(executable),
-        program: Some(program),
-        version,
+    provider_probe_for_program(executable, program, refresh)
+}
+
+fn provider_probe_for_program(
+    executable: &'static str,
+    program: PathBuf,
+    refresh: bool,
+) -> ProviderProbe {
+    let result = if refresh {
+        refresh_cli_version(&program)
+    } else {
+        verified_cli_version(&program)
+    };
+    match result {
+        Ok(version) => ProviderProbe {
+            executable: Some(executable),
+            program: Some(program),
+            version: Some(version),
+            observation: ProviderProbeObservation::Observed,
+        },
+        Err(failure) => {
+            let retained = cached_verified_cli_version(&program).ok();
+            ProviderProbe {
+                executable: Some(executable),
+                program: Some(program),
+                version: retained.clone(),
+                observation: ProviderProbeObservation::Failed {
+                    message: sanitized_cli_version_probe_failure(&failure),
+                    retained_last_good: retained.is_some(),
+                },
+            }
+        }
     }
 }
 
-fn invalidate_cached_cli_version(program: &Path) {
+fn sanitized_cli_version_probe_failure(failure: &CliVersionProbeFailure) -> String {
+    const MAX_FAILURE_BYTES: usize = 512;
+
+    let mut message = String::new();
+    let mut pending_space = false;
+    for character in failure.to_string().chars() {
+        if character.is_control() || character.is_whitespace() {
+            pending_space = !message.is_empty();
+            continue;
+        }
+        if pending_space {
+            message.push(' ');
+            pending_space = false;
+        }
+        message.push(character);
+    }
+    truncate_utf8(message.trim(), MAX_FAILURE_BYTES).to_owned()
+}
+
+fn refresh_cli_version(program: &Path) -> Result<CliVersion, CliVersionProbeFailure> {
+    let requested_at = Instant::now();
+    let lock_deadline = requested_at + CLI_VERSION_TIMEOUT;
     let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let probe_lock = cli_version_probe_lock(&key);
+    let _probe_guard = lock_cli_version_probe(&probe_lock, lock_deadline, None)?;
+    let identity = cli_executable_identity(&key)?;
     let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    lock_unpoison(cache).remove(&key);
+    {
+        let mut cache = lock_unpoison(cache);
+        match cache.get(&key) {
+            Some(entry) if entry.identity == identity && entry.observed_at >= requested_at => {
+                return Ok(entry.version.clone());
+            }
+            Some(entry) if entry.identity != identity => {
+                cache.remove(&key);
+            }
+            _ => {}
+        }
+    }
+    let failures = CLI_VERSION_PROBE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let failures = lock_unpoison(failures);
+        if let Some(entry) = failures.get(&key)
+            && entry.identity == identity
+            && entry.completed_at >= requested_at
+        {
+            return Err(entry.failure.clone());
+        }
+    }
+    let Some(probe_timeout) = lock_deadline.checked_duration_since(Instant::now()) else {
+        return Err(CliVersionProbeFailure::TimedOut);
+    };
+    let entry = match probe_cli_version_entry_with_timeout(&key, probe_timeout, None) {
+        Ok(entry) => entry,
+        Err(failure) => {
+            record_cli_version_probe_failure(&key, identity, &failure);
+            return Err(failure);
+        }
+    };
+    let version = entry.version.clone();
+    lock_unpoison(failures).remove(&key);
+    lock_unpoison(cache).insert(key, entry);
+    Ok(version)
 }
 
-fn runtime_tuning_for_program(
+fn cli_version_probe_lock(program: &Path) -> Arc<Mutex<()>> {
+    let locks = CLI_VERSION_PROBE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    Arc::clone(
+        lock_unpoison(locks)
+            .entry(program.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
+fn cached_runtime_tuning_for_program(
     provider_id: &str,
     program: &Path,
     model: &str,
 ) -> RuntimeTuningProfile {
-    let version = cached_cli_version(program);
+    let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let identity = match cli_executable_identity(&key) {
+        Ok(identity) => identity,
+        Err(_) => return runtime_tuning_for_version(provider_id, program, model, None),
+    };
+    let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = lock_unpoison(cache);
+    let version = match cache.get(&key) {
+        Some(entry) if entry.identity == identity => Some(entry.version.clone()),
+        Some(_) => {
+            cache.remove(&key);
+            None
+        }
+        None => None,
+    };
+    runtime_tuning_for_version(provider_id, program, model, version)
+}
+
+fn runtime_tuning_for_version(
+    provider_id: &str,
+    program: &Path,
+    model: &str,
+    version: Option<CliVersion>,
+) -> RuntimeTuningProfile {
+    let version = version.filter(|version| version_banner_matches_provider(provider_id, version));
     let profile = capability_profile_for_runtime(
         provider_id,
         &program.to_string_lossy(),
@@ -745,58 +1219,613 @@ fn fresh_runtime_tuning_for_program(
     provider_id: &str,
     program: &Path,
     model: &str,
-) -> RuntimeTuningProfile {
-    invalidate_cached_cli_version(program);
-    runtime_tuning_for_program(provider_id, program, model)
+) -> Result<RuntimeTuningProfile, CliVersionProbeFailure> {
+    fresh_runtime_tuning_for_program_cancellable(provider_id, program, model, None)
 }
 
-fn cached_cli_version(program: &Path) -> Option<CliVersion> {
+fn fresh_runtime_tuning_for_program_cancellable(
+    provider_id: &str,
+    program: &Path,
+    model: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<RuntimeTuningProfile, CliVersionProbeFailure> {
+    let requested_at = Instant::now();
+    let lock_deadline = requested_at + CLI_VERSION_TIMEOUT;
     let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let probe_lock = cli_version_probe_lock(&key);
+    let _probe_guard = lock_cli_version_probe(&probe_lock, lock_deadline, cancelled)?;
+    let identity = cli_executable_identity(&key)?;
     let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(version) = lock_unpoison(cache).get(&key).cloned() {
-        return version;
+    {
+        let cache = lock_unpoison(cache);
+        if let Some(entry) = cache.get(&key)
+            && entry.identity == identity
+            && entry.observed_at >= requested_at
+        {
+            return Ok(runtime_tuning_for_version(
+                provider_id,
+                program,
+                model,
+                Some(entry.version.clone()),
+            ));
+        }
     }
-    let version = probe_cli_version(&key);
-    lock_unpoison(cache).insert(key, version.clone());
-    version
+    let failures = CLI_VERSION_PROBE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let failures = lock_unpoison(failures);
+        if let Some(entry) = failures.get(&key)
+            && entry.identity == identity
+            && entry.completed_at >= requested_at
+        {
+            return Err(entry.failure.clone());
+        }
+    }
+    let Some(probe_timeout) = lock_deadline.checked_duration_since(Instant::now()) else {
+        return Err(CliVersionProbeFailure::TimedOut);
+    };
+    let entry = match probe_cli_version_entry_with_timeout(&key, probe_timeout, cancelled) {
+        Ok(entry) => entry,
+        Err(failure) => {
+            record_cli_version_probe_failure(&key, identity, &failure);
+            return Err(failure);
+        }
+    };
+    lock_unpoison(failures).remove(&key);
+    lock_unpoison(cache).insert(key, entry.clone());
+    Ok(runtime_tuning_for_version(
+        provider_id,
+        program,
+        model,
+        Some(entry.version),
+    ))
 }
 
-fn probe_cli_version(program: &Path) -> Option<CliVersion> {
-    let mut child = Command::new(program)
+fn lock_cli_version_probe<'a>(
+    probe_lock: &'a Mutex<()>,
+    deadline: Instant,
+    cancelled: Option<&AtomicBool>,
+) -> Result<std::sync::MutexGuard<'a, ()>, CliVersionProbeFailure> {
+    loop {
+        match probe_lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::Poisoned(poisoned)) => return Ok(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    return Err(CliVersionProbeFailure::Cancelled);
+                }
+                if Instant::now() >= deadline {
+                    return Err(CliVersionProbeFailure::TimedOut);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// Read a successful identity-matched observation without starting a process.
+/// UI-side resume gating uses this path; the run worker owns fresh probes.
+fn cached_verified_runtime_tuning_for_program(
+    provider_id: &str,
+    program: &Path,
+    model: &str,
+) -> Result<RuntimeTuningProfile, CliVersionProbeFailure> {
+    let version = cached_verified_cli_version(program)?;
+    Ok(runtime_tuning_for_version(
+        provider_id,
+        program,
+        model,
+        Some(version),
+    ))
+}
+
+#[cfg(test)]
+fn cached_cli_version(program: &Path) -> Option<CliVersion> {
+    verified_cli_version(program).ok()
+}
+
+fn verified_cli_version(program: &Path) -> Result<CliVersion, CliVersionProbeFailure> {
+    let requested_at = Instant::now();
+    let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let probe_lock = cli_version_probe_lock(&key);
+    let _probe_guard = lock_unpoison(&probe_lock);
+    let identity = cli_executable_identity(&key)?;
+    let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let mut cache = lock_unpoison(cache);
+        if let Some(entry) = cache.get(&key) {
+            if entry.identity == identity {
+                return Ok(entry.version.clone());
+            }
+            cache.remove(&key);
+        }
+    }
+    let failures = CLI_VERSION_PROBE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let failures = lock_unpoison(failures);
+        if let Some(entry) = failures.get(&key)
+            && entry.identity == identity
+            && entry.completed_at >= requested_at
+        {
+            return Err(entry.failure.clone());
+        }
+    }
+    let entry = match probe_cli_version_entry(&key) {
+        Ok(entry) => entry,
+        Err(failure) => {
+            record_cli_version_probe_failure(&key, identity, &failure);
+            return Err(failure);
+        }
+    };
+    let version = entry.version.clone();
+    lock_unpoison(failures).remove(&key);
+    lock_unpoison(cache).insert(key, entry);
+    Ok(version)
+}
+
+fn record_cli_version_probe_failure(
+    key: &Path,
+    identity: CliExecutableIdentity,
+    failure: &CliVersionProbeFailure,
+) {
+    // Cancellation belongs only to the run whose Stop token fired. Sharing
+    // it with another overlapping caller would incorrectly cancel that run.
+    if matches!(failure, CliVersionProbeFailure::Cancelled) {
+        return;
+    }
+    let failures = CLI_VERSION_PROBE_FAILURES.get_or_init(|| Mutex::new(HashMap::new()));
+    lock_unpoison(failures).insert(
+        key.to_path_buf(),
+        CliVersionProbeFailureEntry {
+            failure: failure.clone(),
+            identity,
+            completed_at: Instant::now(),
+        },
+    );
+}
+
+fn cached_verified_cli_version(program: &Path) -> Result<CliVersion, CliVersionProbeFailure> {
+    let key = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
+    let identity = cli_executable_identity(&key)?;
+    let cache = CLI_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = lock_unpoison(cache);
+    if let Some(entry) = cache.get(&key) {
+        if entry.identity == identity {
+            return Ok(entry.version.clone());
+        }
+        cache.remove(&key);
+    }
+    Err(CliVersionProbeFailure::NotObserved)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CliVersionProbeFailure {
+    NotObserved,
+    Cancelled,
+    Metadata(String),
+    Spawn(String),
+    TimedOut,
+    Wait(String),
+    NonZero(String),
+    Output(String),
+    Unparseable,
+    Ambiguous,
+    Changed,
+}
+
+impl fmt::Display for CliVersionProbeFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotObserved => formatter.write_str(
+                "no current version observation is available; detection runs in the Agents panel",
+            ),
+            Self::Cancelled => formatter.write_str("version detection was cancelled"),
+            Self::Metadata(error) => write!(formatter, "could not inspect the executable: {error}"),
+            Self::Spawn(error) => write!(formatter, "could not start `--version`: {error}"),
+            Self::TimedOut => write!(
+                formatter,
+                "`--version` did not finish within {} seconds",
+                CLI_VERSION_TIMEOUT.as_secs()
+            ),
+            Self::Wait(error) => write!(formatter, "could not wait for `--version`: {error}"),
+            Self::NonZero(status) => write!(formatter, "`--version` exited {status}"),
+            Self::Output(error) => write!(formatter, "could not read `--version` output: {error}"),
+            Self::Unparseable => {
+                formatter.write_str("`--version` returned no recognizable version")
+            }
+            Self::Ambiguous => formatter
+                .write_str("`--version` returned ambiguous, multiple, or prerelease version text"),
+            Self::Changed => formatter.write_str("the executable changed during version detection"),
+        }
+    }
+}
+
+fn cli_executable_identity(
+    program: &Path,
+) -> Result<CliExecutableIdentity, CliVersionProbeFailure> {
+    let metadata = fs::metadata(program)
+        .map_err(|error| CliVersionProbeFailure::Metadata(error.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(CliExecutableIdentity {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            change_seconds: metadata.ctime(),
+            change_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(CliExecutableIdentity {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+fn probe_cli_version_entry(program: &Path) -> Result<CliVersionCacheEntry, CliVersionProbeFailure> {
+    probe_cli_version_entry_with_timeout(program, CLI_VERSION_TIMEOUT, None)
+}
+
+fn probe_cli_version_entry_with_timeout(
+    program: &Path,
+    timeout: Duration,
+    cancelled: Option<&AtomicBool>,
+) -> Result<CliVersionCacheEntry, CliVersionProbeFailure> {
+    let before = cli_executable_identity(program)?;
+    let version = probe_cli_version_with_timeout(program, timeout, cancelled)?;
+    let after = cli_executable_identity(program)?;
+    if before != after {
+        return Err(CliVersionProbeFailure::Changed);
+    }
+    Ok(CliVersionCacheEntry {
+        version,
+        identity: after,
+        observed_at: Instant::now(),
+    })
+}
+
+fn cli_version_probe_message(provider_id: &str, failure: &CliVersionProbeFailure) -> String {
+    let provider = match provider_id {
+        "grok_cli" => "Grok CLI",
+        "kimi_cli" => "Kimi Code",
+        "claude_cli" => "Claude Code",
+        "codex_cli" => "Codex CLI",
+        _ => "AI provider CLI",
+    };
+    format!(
+        "Adam could not verify the installed {provider} version because {failure}. Open Agents and press Refresh, then retry the turn; Adam will not silently switch provider adapters without a verified version."
+    )
+}
+
+#[derive(Debug)]
+struct CliVersionOutput {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn drain_cli_version_output<R: Read>(mut reader: R) -> Result<CliVersionOutput, String> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 4 * 1024];
+    let mut truncated = false;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_CLI_VERSION_OUTPUT_BYTES.saturating_sub(bytes.len());
+        let retained = remaining.min(read);
+        bytes.extend_from_slice(&buffer[..retained]);
+        truncated |= retained < read;
+    }
+    Ok(CliVersionOutput { bytes, truncated })
+}
+
+fn collect_cli_version_output(
+    receiver: &Receiver<(&'static str, Result<CliVersionOutput, String>)>,
+) -> Result<(CliVersionOutput, CliVersionOutput), CliVersionProbeFailure> {
+    let deadline = Instant::now() + CLI_VERSION_DRAIN_GRACE;
+    let mut stdout = None;
+    let mut stderr = None;
+    while stdout.is_none() || stderr.is_none() {
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(CliVersionProbeFailure::Output(
+                "the version process left an output pipe open after it exited".into(),
+            ));
+        };
+        let (name, output) = receiver.recv_timeout(remaining).map_err(|_| {
+            CliVersionProbeFailure::Output(
+                "the version process left an output pipe open after it exited".into(),
+            )
+        })?;
+        let output = output.map_err(CliVersionProbeFailure::Output)?;
+        if name == "stdout" {
+            stdout = Some(output);
+        } else {
+            stderr = Some(output);
+        }
+    }
+    Ok((
+        stdout.expect("stdout output is present"),
+        stderr.expect("stderr output is present"),
+    ))
+}
+
+fn parse_unambiguous_cli_version(output: &str) -> Result<CliVersion, CliVersionProbeFailure> {
+    fn component(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+        let start = *cursor;
+        while bytes.get(*cursor).is_some_and(u8::is_ascii_digit) {
+            *cursor += 1;
+        }
+        (start != *cursor)
+            .then(|| {
+                std::str::from_utf8(&bytes[start..*cursor])
+                    .ok()?
+                    .parse()
+                    .ok()
+            })
+            .flatten()
+    }
+
+    let bytes = output.as_bytes();
+    let mut versions = HashSet::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit()
+            || index
+                .checked_sub(1)
+                .and_then(|previous| bytes.get(previous))
+                .is_some_and(|previous| previous.is_ascii_digit() || *previous == b'.')
+        {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index;
+        let Some(major) = component(bytes, &mut cursor) else {
+            index += 1;
+            continue;
+        };
+        if bytes.get(cursor) != Some(&b'.') {
+            index = cursor.max(index + 1);
+            continue;
+        }
+        cursor += 1;
+        let Some(minor) = component(bytes, &mut cursor) else {
+            index += 1;
+            continue;
+        };
+        if bytes.get(cursor) != Some(&b'.') {
+            index = cursor.max(index + 1);
+            continue;
+        }
+        cursor += 1;
+        let Some(patch) = component(bytes, &mut cursor) else {
+            index += 1;
+            continue;
+        };
+        if bytes
+            .get(cursor)
+            .is_some_and(|next| next.is_ascii_digit() || matches!(*next, b'.'))
+        {
+            index = cursor.max(index + 1);
+            continue;
+        }
+        if bytes
+            .get(cursor)
+            .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(*next, b'_' | b'-' | b'+'))
+        {
+            return Err(CliVersionProbeFailure::Ambiguous);
+        }
+        versions.insert((major, minor, patch));
+        index = cursor.max(index + 1);
+    }
+    let mut versions = versions.into_iter();
+    let Some((major, minor, patch)) = versions.next() else {
+        return Err(CliVersionProbeFailure::Unparseable);
+    };
+    if versions.next().is_some() {
+        return Err(CliVersionProbeFailure::Ambiguous);
+    }
+    Ok(CliVersion {
+        major,
+        minor,
+        patch,
+        raw: output.trim().to_owned(),
+    })
+}
+
+fn same_cli_contract_version(left: &CliVersion, right: &CliVersion) -> bool {
+    (left.major, left.minor, left.patch) == (right.major, right.minor, right.patch)
+}
+
+/// Exact transport gates need evidence that the parsed number belongs to the
+/// provider, rather than an unrelated runtime mentioned in a warning. Kimi
+/// Code 0.31.0 has also shipped a captured bare-numeric banner, so that one
+/// provider accepts an otherwise-empty line containing only the version.
+pub(crate) fn version_banner_matches_provider(provider_id: &str, version: &CliVersion) -> bool {
+    if !matches!(provider_id, "grok_cli" | "kimi_cli") {
+        return true;
+    }
+    let numeric = format!("{}.{}.{}", version.major, version.minor, version.patch);
+    version.raw.lines().any(|line| {
+        let line = line.trim();
+        let lowercase = line.to_ascii_lowercase();
+        let tail = if provider_id == "grok_cli" {
+            lowercase.strip_prefix("grok ")
+        } else if (version.major, version.minor, version.patch) == (0, 31, 0) && line == numeric {
+            Some(line)
+        } else {
+            lowercase
+                .strip_prefix("kimi, version ")
+                .or_else(|| lowercase.strip_prefix("kimi "))
+        };
+        tail.is_some_and(|tail| {
+            if tail == numeric {
+                return true;
+            }
+            if provider_id != "grok_cli" {
+                return false;
+            }
+            let Some(rest) = tail
+                .strip_prefix(&numeric)
+                .and_then(|suffix| suffix.strip_prefix(" ("))
+            else {
+                return false;
+            };
+            let Some((build, after)) = rest.split_once(')') else {
+                return false;
+            };
+            // Grok 0.2.117 started appending a release-channel tag after
+            // the build hash: "grok 0.2.117 (f1c06093089f) [stable]".
+            // Accept exactly one bracketed alphanumeric tag; anything else
+            // trailing still fails closed.
+            let channel_ok = after.is_empty()
+                || after
+                    .strip_prefix(" [")
+                    .and_then(|suffix| suffix.strip_suffix(']'))
+                    .is_some_and(|tag| {
+                        !tag.is_empty() && tag.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                    });
+            channel_ok && !build.is_empty() && build.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    })
+}
+
+#[cfg(test)]
+fn probe_cli_version(program: &Path) -> Result<CliVersion, CliVersionProbeFailure> {
+    probe_cli_version_with_timeout(program, CLI_VERSION_TIMEOUT, None)
+}
+
+fn probe_cli_version_with_timeout(
+    program: &Path,
+    timeout: Duration,
+    cancelled: Option<&AtomicBool>,
+) -> Result<CliVersion, CliVersionProbeFailure> {
+    probe_cli_version_with_timeout_observer(program, timeout, cancelled, None)
+}
+
+fn probe_cli_version_with_timeout_observer(
+    program: &Path,
+    timeout: Duration,
+    cancelled: Option<&AtomicBool>,
+    spawned: Option<&Sender<u32>>,
+) -> Result<CliVersion, CliVersionProbeFailure> {
+    let mut command = Command::new(program);
+    command
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
         .spawn()
-        .ok()?;
-    let deadline = Instant::now() + CLI_VERSION_TIMEOUT;
-    loop {
+        .map_err(|error| CliVersionProbeFailure::Spawn(error.to_string()))?;
+    if let Some(spawned) = spawned {
+        let _ = spawned.send(child.id());
+    }
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_child_tree(&mut child);
+            let _ = child.wait();
+            return Err(CliVersionProbeFailure::Output(
+                "the version process had no stdout pipe".into(),
+            ));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_child_tree(&mut child);
+            let _ = child.wait();
+            return Err(CliVersionProbeFailure::Output(
+                "the version process had no stderr pipe".into(),
+            ));
+        }
+    };
+    let (output_sender, output_receiver) = bounded(2);
+    let stdout_sender = output_sender.clone();
+    thread::spawn(move || {
+        let _ = stdout_sender.send(("stdout", drain_cli_version_output(stdout)));
+    });
+    thread::spawn(move || {
+        let _ = output_sender.send(("stderr", drain_cli_version_output(stderr)));
+    });
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            terminate_child_tree(&mut child);
+            let _ = child.wait();
+            let _ = collect_cli_version_output(&output_receiver);
+            return Err(CliVersionProbeFailure::Cancelled);
+        }
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => {
+                // A version command is never allowed to leave helper
+                // processes behind, even when it returned a usable banner.
+                terminate_child_tree(&mut child);
+                break status;
+            }
             Ok(None) if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Ok(None) | Err(_) => {
-                let _ = child.kill();
+            Ok(None) => {
+                terminate_child_tree(&mut child);
                 let _ = child.wait();
-                return None;
+                let _ = collect_cli_version_output(&output_receiver);
+                return Err(CliVersionProbeFailure::TimedOut);
+            }
+            Err(error) => {
+                terminate_child_tree(&mut child);
+                let _ = child.wait();
+                let _ = collect_cli_version_output(&output_receiver);
+                return Err(CliVersionProbeFailure::Wait(error.to_string()));
             }
         }
+    };
+    let (stdout, stderr) = match collect_cli_version_output(&output_receiver) {
+        Ok(output) => output,
+        Err(error) => {
+            terminate_child_tree(&mut child);
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    if stdout.truncated || stderr.truncated {
+        return Err(CliVersionProbeFailure::Output(format!(
+            "output exceeded {MAX_CLI_VERSION_OUTPUT_BYTES} bytes"
+        )));
     }
-    let output = child.wait_with_output().ok()?;
-    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-    if !output.stderr.is_empty() {
+    let mut combined = String::from_utf8_lossy(&stdout.bytes).into_owned();
+    if !stderr.bytes.is_empty() {
         if !combined.is_empty() {
             combined.push('\n');
         }
-        combined.push_str(&String::from_utf8_lossy(&output.stderr));
+        combined.push_str(&String::from_utf8_lossy(&stderr.bytes));
     }
-    CliVersion::parse(&combined)
+    if !status.success() {
+        return Err(CliVersionProbeFailure::NonZero(status.to_string()));
+    }
+    parse_unambiguous_cli_version(&combined)
 }
 
 fn prepare_run(request: &AiRunRequest) -> Result<PreparedRun, AiEngineError> {
     let provider = request.provider_id.trim().to_ascii_lowercase();
     match provider.as_str() {
+        "xai_api" => Ok(PreparedRun::XaiResponses(XaiResponsesSpec {
+            url: Url::parse("https://api.x.ai/v1/responses")
+                .expect("the compiled-in xAI Responses endpoint is valid"),
+            #[cfg(test)]
+            disconnect_worker: false,
+        })),
         "openai_compatible" => prepare_http(&provider, request),
         "lm_studio" if !request.endpoint.trim().is_empty() => prepare_http(&provider, request),
         "auto" => {
@@ -806,7 +1835,9 @@ fn prepare_run(request: &AiRunRequest) -> Result<PreparedRun, AiEngineError> {
                 ("grok_cli", "grok"),
                 ("kimi_cli", "kimi"),
             ] {
-                if let Some(program) = resolve_executable(executable, request.cwd.as_deref()) {
+                if let Some(program) = resolve_executable(executable, request.cwd.as_deref())
+                    && auto_cli_candidate_is_runnable(provider_id, &program)
+                {
                     return prepare_resolved_cli(provider_id, program, request);
                 }
             }
@@ -848,6 +1879,25 @@ fn prepare_run(request: &AiRunRequest) -> Result<PreparedRun, AiEngineError> {
     }
 }
 
+/// Automatic may safely use generic CLI defaults, but Grok and Kimi select
+/// their transport and permission contract by exact observed version. Skip
+/// an installed exact provider until its identity-matched cached contract is
+/// runnable, allowing a later supported CLI or endpoint to take over.
+fn auto_cli_candidate_is_runnable(provider_id: &str, program: &Path) -> bool {
+    let tuning = cached_runtime_tuning_for_program(provider_id, program, "");
+    match provider_id {
+        "grok_cli" => {
+            supports_grok_acp_task_bridge(tuning.version.as_ref())
+                || supports_grok_legacy_process(tuning.version.as_ref())
+        }
+        "kimi_cli" => {
+            supports_kimi_acp_transport(tuning.version.as_ref())
+                || supports_kimi_legacy_process(tuning.version.as_ref())
+        }
+        _ => true,
+    }
+}
+
 /// Resolve the provider family Adam's `auto` launch will select without
 /// starting a process. Prompt shaping uses this same order so a first auto
 /// turn receives task-tool guidance only when the selected adapter exposes
@@ -867,7 +1917,9 @@ pub fn resolve_effective_provider_id(
         ("grok_cli", "grok"),
         ("kimi_cli", "kimi"),
     ] {
-        if resolve_executable(executable, cwd).is_some() {
+        if let Some(program) = resolve_executable(executable, cwd)
+            && auto_cli_candidate_is_runnable(provider_id, &program)
+        {
             return Some(provider_id.into());
         }
     }
@@ -892,7 +1944,7 @@ pub fn provider_exposes_app_task_tools(
         "lm_studio" => !endpoint.trim().is_empty(),
         "custom_cli" => true,
         "grok_cli" => resolve_executable("grok", cwd)
-            .map(|program| fresh_runtime_tuning_for_program("grok_cli", &program, ""))
+            .map(|program| cached_runtime_tuning_for_program("grok_cli", &program, ""))
             .is_some_and(|tuning| {
                 supports_grok_acp_task_bridge(tuning.version.as_ref())
                     && grok_acp_plan_channel(&tuning, resuming) == PlanChannel::AppTaskTools
@@ -929,10 +1981,17 @@ fn prepare_resolved_cli(
     request: &AiRunRequest,
 ) -> Result<PreparedRun, AiEngineError> {
     if provider_id == "grok_cli" {
-        // Re-probe every launch. A same-path provider upgrade or downgrade
-        // must not inherit a cached capability contract from an earlier turn.
-        let tuning =
-            fresh_runtime_tuning_for_program(provider_id, &program, effective_model(request));
+        // Preparation consumes the latest successful background observation
+        // without blocking the UI. The worker freshly re-probes at the
+        // process boundary before it exposes tools or starts the provider.
+        let tuning = cached_verified_runtime_tuning_for_program(
+            provider_id,
+            &program,
+            effective_model(request),
+        )
+        .map_err(|failure| {
+            AiEngineError::InvalidConfiguration(cli_version_probe_message(provider_id, &failure))
+        })?;
         if supports_grok_acp_task_bridge(tuning.version.as_ref()) {
             let runtime_version = tuning
                 .version
@@ -942,6 +2001,7 @@ fn prepare_resolved_cli(
                 request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) != Some(false);
             let plan_channel = grok_acp_plan_channel(&tuning, request.resume_session_id.is_some());
             let subagents_enabled = tuning.supports_scoped_child_text() && subagents_requested;
+            let canvas_tools_supported = request.resume_session_id.is_none() && !subagents_enabled;
             let cwd = match canonical_working_directory(request.cwd.as_deref())? {
                 Some(cwd) => cwd,
                 None => env::current_dir()
@@ -958,8 +2018,72 @@ fn prepare_resolved_cli(
                 runtime_version,
                 plan_channel,
                 subagents_enabled,
+                canvas_tools_supported,
             }));
         }
+        if !supports_grok_legacy_process(tuning.version.as_ref()) {
+            return Err(AiEngineError::InvalidConfiguration(
+                "Adam supports the fixture-verified Grok CLI 0.2.111 legacy contract and 0.2.114/0.2.117/0.2.118 ACP contracts. This installed version is unverified, so Adam will not guess a transport or permission contract."
+                    .into(),
+            ));
+        }
+        return Ok(PreparedRun::Process(preset_process_spec_with_tuning(
+            provider_id,
+            program,
+            request,
+            &tuning,
+        )?));
+    }
+    if provider_id == "kimi_cli" {
+        // Kimi Code replaced the unrelated legacy kimi-cli while retaining
+        // the same executable name. Select from the current background
+        // observation here; the worker rechecks the exact fixture-backed
+        // runtime at the process boundary.
+        let tuning = cached_verified_runtime_tuning_for_program(
+            provider_id,
+            &program,
+            effective_model(request),
+        )
+        .map_err(|failure| {
+            AiEngineError::InvalidConfiguration(cli_version_probe_message(provider_id, &failure))
+        })?;
+        if supports_kimi_acp_transport(tuning.version.as_ref()) {
+            let cwd = match canonical_working_directory(request.cwd.as_deref())? {
+                Some(cwd) => cwd,
+                None => env::current_dir()
+                    .and_then(fs::canonicalize)
+                    .map_err(|error| {
+                        AiEngineError::InvalidConfiguration(format!(
+                            "could not resolve the Kimi working directory: {error}"
+                        ))
+                    })?,
+            };
+            return Ok(PreparedRun::KimiAcp(KimiAcpSpec {
+                program,
+                cwd,
+                runtime_version: tuning
+                    .version
+                    .expect("verified Kimi ACP runtime has a parsed version"),
+            }));
+        }
+        if !supports_kimi_legacy_process(tuning.version.as_ref()) {
+            return Err(AiEngineError::InvalidConfiguration(
+                "Adam supports the fixture-verified Kimi Code 0.31.0 ACP contract and legacy Kimi CLI 1.49.0 contract. This installed version is unverified, so Adam will not select the auto-approving legacy adapter."
+                    .into(),
+            ));
+        }
+        if request.resume_session_id.is_some() {
+            return Err(AiEngineError::NativeResumeUnavailable(
+                "the installed Kimi runtime no longer matches the 0.31.0 ACP session contract"
+                    .into(),
+            ));
+        }
+        return Ok(PreparedRun::Process(preset_process_spec_with_tuning(
+            provider_id,
+            program,
+            request,
+            &tuning,
+        )?));
     }
     Ok(PreparedRun::Process(preset_process_spec(
         provider_id,
@@ -984,9 +2108,31 @@ fn supports_grok_acp_task_bridge(version: Option<&CliVersion>) -> bool {
     version.is_some_and(|version| {
         matches!(
             (version.major, version.minor, version.patch),
-            (0, 2, 114) | (0, 2, 117)
+            (0, 2, 114) | (0, 2, 117) | (0, 2, 118)
         )
     })
+}
+
+fn supports_grok_legacy_process(version: Option<&CliVersion>) -> bool {
+    version.is_some_and(|version| (version.major, version.minor, version.patch) == (0, 2, 111))
+}
+
+fn supports_kimi_acp_transport(version: Option<&CliVersion>) -> bool {
+    version.is_some_and(|version| (version.major, version.minor, version.patch) == (0, 31, 0))
+}
+
+fn supports_kimi_legacy_process(version: Option<&CliVersion>) -> bool {
+    version.is_some_and(|version| (version.major, version.minor, version.patch) == (1, 49, 0))
+}
+
+fn verified_kimi_resume_compatibility(version: Option<&CliVersion>) -> Option<bool> {
+    if supports_kimi_acp_transport(version) {
+        Some(true)
+    } else if supports_kimi_legacy_process(version) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 fn effective_model(request: &AiRunRequest) -> &str {
@@ -1003,7 +2149,7 @@ fn preset_process_spec(
     program: PathBuf,
     request: &AiRunRequest,
 ) -> Result<ProcessSpec, AiEngineError> {
-    let tuning = runtime_tuning_for_program(provider_id, &program, effective_model(request));
+    let tuning = cached_runtime_tuning_for_program(provider_id, &program, effective_model(request));
     preset_process_spec_with_tuning(provider_id, program, request, &tuning)
 }
 
@@ -1129,7 +2275,12 @@ fn preset_process_spec_with_tuning(
                 request.permission_mode,
                 PermissionMode::Auto | PermissionMode::Bypass
             ) && request.workspace_mode != AiWorkspaceMode::Chat
+                || cwd.as_deref().is_some_and(is_chat_sandbox_root)
             {
+                // A chat-sandbox working folder gets the CLI's own
+                // workspace sandbox in every mode: the OS layer confines
+                // writes to the Adam-owned folder, which is exactly the
+                // containment the sandbox exists to provide.
                 "workspace"
             } else {
                 "read-only"
@@ -1179,21 +2330,17 @@ fn preset_process_spec_with_tuning(
             (PromptInput::SecureFile, OutputMode::JsonLines)
         }
         "kimi_cli" => {
-            // Kimi Code CLI (0.x) supersedes the legacy kimi-cli (1.x) and is
-            // what the vendor installer now delivers, but it is a different
-            // interface: the prompt moves to `-p <text>` (no stdin form —
-            // Commander has no dash convention, so `-p -` would send a literal
-            // dash), `--thinking` is gone, and its stream-json shape is
-            // uncaptured. The arguments below drive the legacy CLI only.
-            // Refuse clearly instead of launching a command we cannot drive.
-            // Port target: its `kimi acp` subcommand, alongside the Grok ACP work.
+            // Exact Kimi Code 0.31.0 is selected above and driven through ACP.
+            // Other 0.x releases must be fixture-verified before Adam launches
+            // them; the arguments below are only for the unrelated legacy 1.x
+            // CLI that used the same executable name.
             if tuning
                 .version
                 .as_ref()
                 .is_some_and(|version| version.major == 0)
             {
                 return Err(AiEngineError::InvalidConfiguration(
-                    "This is Kimi Code CLI, which replaced the legacy kimi-cli and uses a different command interface. Adam cannot drive it yet — pick another provider, or connect Kimi as an OpenAI-compatible endpoint."
+                    "Adam supports the fixture-verified Kimi Code CLI 0.31.0 ACP contract; this installed 0.x version has a different, unverified interface. Install 0.31.0, or connect Kimi through an OpenAI-compatible endpoint."
                         .into(),
                 ));
             }
@@ -1248,15 +2395,17 @@ fn preset_process_spec_with_tuning(
                 ));
             }
             push_args(&mut arguments, &["run", model]);
-            if let Some(effort) =
-                tuning.normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
-            {
-                push_args(&mut arguments, &["--think", effort]);
-            } else {
-                match request.provider_preferences.feature(AI_FEATURE_THINKING) {
-                    Some(true) => push_args(&mut arguments, &["--think", "true"]),
-                    Some(false) => push_args(&mut arguments, &["--think", "false"]),
-                    None => {}
+            if tuning.verified_runtime {
+                if let Some(effort) = tuning
+                    .normalized_reasoning_effort(&request.provider_preferences.reasoning_effort)
+                {
+                    push_args(&mut arguments, &["--think", effort]);
+                } else {
+                    match request.provider_preferences.feature(AI_FEATURE_THINKING) {
+                        Some(true) => push_args(&mut arguments, &["--think", "true"]),
+                        Some(false) => push_args(&mut arguments, &["--think", "false"]),
+                        None => {}
+                    }
                 }
             }
             (PromptInput::Stdin, OutputMode::PlainText)
@@ -1284,6 +2433,15 @@ fn preset_process_spec_with_tuning(
         prompt_input,
         output_mode,
         grok_session_id,
+        expected_runtime_version: match provider_id {
+            "grok_cli" if supports_grok_legacy_process(tuning.version.as_ref()) => {
+                tuning.version.clone()
+            }
+            "kimi_cli" if supports_kimi_legacy_process(tuning.version.as_ref()) => {
+                tuning.version.clone()
+            }
+            _ => None,
+        },
     })
 }
 
@@ -1418,6 +2576,11 @@ fn apply_resume_arguments(
             arguments.insert(0, session_id.into());
             arguments.insert(0, "--resume".into());
         }
+        ResumeStrategy::AcpSessionLoad | ResumeStrategy::PreviousResponseId => {
+            return Err(AiEngineError::InvalidConfiguration(format!(
+                "{provider_id} resume is owned by its structured transport"
+            )));
+        }
         ResumeStrategy::None => {
             return Err(AiEngineError::InvalidConfiguration(format!(
                 "{provider_id} does not support native session resume"
@@ -1467,6 +2630,7 @@ fn custom_process_spec(
         },
         output_mode: OutputMode::PlainText,
         grok_session_id: None,
+        expected_runtime_version: None,
     })
 }
 
@@ -1622,7 +2786,14 @@ enum RunOutcome {
         tool: Option<String>,
         retry: Option<RetryHint>,
     },
+    ResumeRejected {
+        message: String,
+    },
+    RuntimeProbeFailed {
+        message: String,
+    },
     Cancelled,
+    CancelledBeforeLaunch,
     /// The runner sent its user-facing terminal event before its underlying
     /// worker exited, then retained the engine slot until cleanup completed.
     TerminalAlreadyEmitted,
@@ -1644,6 +2815,12 @@ impl RunOutcome {
             message: message.into(),
             tool: None,
             retry: Some(RetryHint::Retry),
+        }
+    }
+
+    fn runtime_probe_failed(message: impl Into<String>) -> Self {
+        Self::RuntimeProbeFailed {
+            message: message.into(),
         }
     }
 }
@@ -1680,7 +2857,18 @@ fn run_outcome_status(outcome: &RunOutcome) -> Option<ActivityKind> {
                 retry,
             });
         }
+        RunOutcome::ResumeRejected { message } | RunOutcome::RuntimeProbeFailed { message } => {
+            return Some(ActivityKind::TurnStatus {
+                status: TurnStatus::ProviderError,
+                message: Some(message.clone()),
+                tool: None,
+                retry: Some(RetryHint::Retry),
+            });
+        }
         RunOutcome::Cancelled => (TurnStatus::UserCancelled, None, None),
+        RunOutcome::CancelledBeforeLaunch => {
+            (TurnStatus::UserCancelled, None, Some(RetryHint::Retry))
+        }
         RunOutcome::TerminalAlreadyEmitted => return None,
     };
     Some(ActivityKind::TurnStatus {
@@ -1760,8 +2948,11 @@ struct GrokAcpProjectionState {
     root_session_id: Option<String>,
     child_scope_by_session: HashMap<String, GrokAcpSessionScope>,
     emitted_tool_calls: HashSet<(String, String)>,
+    emitted_file_changes: HashSet<(String, String)>,
     permission_tools: HashMap<(String, String), String>,
     child_permission_blocks: HashMap<String, GrokPermissionBlock>,
+    workflow_members: HashMap<String, Vec<AgentGroupMember>>,
+    workflow_by_child_session: HashMap<String, String>,
 }
 
 impl GrokAcpProjectionState {
@@ -1811,6 +3002,48 @@ impl GrokAcpProjectionState {
             }),
         }
     }
+
+    fn upsert_workflow_member(
+        &mut self,
+        workflow_id: &str,
+        child_session_id: &str,
+        label: Option<&str>,
+        status: SubagentStatus,
+        detail: Option<String>,
+    ) -> Vec<AgentGroupMember> {
+        let members = self
+            .workflow_members
+            .entry(workflow_id.to_owned())
+            .or_default();
+        if let Some(member) = members
+            .iter_mut()
+            .find(|member| member.id == child_session_id)
+        {
+            if label.is_some_and(|label| !label.trim().is_empty()) {
+                member.label = label.unwrap_or_default().to_owned();
+            }
+            member.status = status;
+            if detail.is_some() || status.is_terminal() {
+                member.detail = detail;
+            }
+        } else {
+            members.push(AgentGroupMember {
+                id: child_session_id.to_owned(),
+                label: label.unwrap_or_default().to_owned(),
+                status,
+                detail,
+            });
+        }
+        self.workflow_by_child_session
+            .insert(child_session_id.to_owned(), workflow_id.to_owned());
+        members.clone()
+    }
+
+    fn workflow_for_child(&self, child_session_id: &str) -> Option<String> {
+        self.workflow_by_child_session
+            .get(child_session_id)
+            .cloned()
+    }
 }
 
 fn run_grok_acp_transport(
@@ -1819,25 +3052,50 @@ fn run_grok_acp_transport(
     control: &Arc<RunControl>,
     event_sender: &Sender<AiEvent>,
     task_tools: &Arc<Mutex<TaskToolRegistry>>,
+    canvas_tools: &Arc<CanvasToolBroker>,
 ) -> RunOutcome {
     // Prepared runs can wait in Adam's queue while a CLI updates in place.
     // Re-probe at the process boundary and fail closed instead of launching a
     // binary under a different child/tool contract than the registered run.
-    let tuning = fresh_runtime_tuning_for_program(
+    if control.cancelled.load(Ordering::Acquire) {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
+    let tuning = match fresh_runtime_tuning_for_program_cancellable(
         "grok_cli",
         &specification.program,
         effective_model(request),
-    );
+        Some(&control.cancelled),
+    ) {
+        Ok(tuning) => tuning,
+        Err(CliVersionProbeFailure::Cancelled) => return RunOutcome::CancelledBeforeLaunch,
+        Err(failure) => {
+            if control.cancelled.load(Ordering::Acquire) {
+                return RunOutcome::CancelledBeforeLaunch;
+            }
+            return RunOutcome::runtime_probe_failed(cli_version_probe_message(
+                "grok_cli", &failure,
+            ));
+        }
+    };
+    if control.cancelled.load(Ordering::Acquire) {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
     let subagents_requested =
         request.provider_preferences.feature(AI_FEATURE_SUBAGENTS) != Some(false);
     let current_plan_channel = grok_acp_plan_channel(&tuning, request.resume_session_id.is_some());
     let current_subagents_enabled = tuning.supports_scoped_child_text() && subagents_requested;
-    if tuning.version.as_ref() != Some(&specification.runtime_version)
+    let current_canvas_tools_supported =
+        request.resume_session_id.is_none() && !current_subagents_enabled;
+    if !tuning
+        .version
+        .as_ref()
+        .is_some_and(|version| same_cli_contract_version(version, &specification.runtime_version))
         || !supports_grok_acp_task_bridge(tuning.version.as_ref())
         || current_plan_channel != specification.plan_channel
         || current_subagents_enabled != specification.subagents_enabled
+        || current_canvas_tools_supported != specification.canvas_tools_supported
     {
-        return RunOutcome::provider_error(
+        return RunOutcome::runtime_probe_failed(
             "the installed Grok runtime changed after this turn was prepared; retry the turn so Adam can apply the current capability contract",
         );
     }
@@ -1854,8 +3112,10 @@ fn run_grok_acp_transport(
     let bridge_events = event_sender.clone();
     let turn_id = request.turn_id;
     let conversation_id = request.conversation_id;
-    let mut bridge = if specification.plan_channel == PlanChannel::AppTaskTools {
-        match TaskToolBridge::start(
+    let has_canvas_tools = !canvas_tools.descriptors_for_run(turn_id).is_empty();
+    let mut bridge = if specification.plan_channel == PlanChannel::AppTaskTools || has_canvas_tools
+    {
+        match TaskToolBridge::start_with_canvas(
             turn_id,
             Arc::clone(task_tools),
             Arc::new(move |events| {
@@ -1867,6 +3127,7 @@ fn run_grok_acp_transport(
                     })
                     .expect("AI event receiver must remain available while task bridge is active");
             }),
+            Some(Arc::clone(canvas_tools)),
         ) {
             Ok(bridge) => Some(bridge),
             Err(error) => {
@@ -1885,6 +3146,14 @@ fn run_grok_acp_transport(
         .map(str::to_owned);
     let subagents_enabled = specification.subagents_enabled;
     let mut rules = request.system_prompt.clone().unwrap_or_default();
+    if has_canvas_tools {
+        if !rules.is_empty() {
+            rules.push_str("\n\n");
+        }
+        rules.push_str(
+            "Adam has attached canvas_create_note and canvas_create_pile for deliberate canvas output. Use them only when the user asks for a canvas deliverable, supply a unique idempotency_key for each intended entity, and treat a returned receipt as the only proof that creation succeeded.",
+        );
+    }
     if !subagents_enabled {
         if !rules.is_empty() {
             rules.push_str("\n\n");
@@ -1898,13 +3167,20 @@ fn run_grok_acp_transport(
             rules.push_str("\n\n");
         }
         rules.push_str(
-            "Keep the foreground session's provider-native plan current as the main task checklist. Child plans belong only to their child sessions. Adam's task-tool MCP server is intentionally not attached to this run because Grok resume records do not preserve the session's original child capability.",
+            "Keep the foreground session's provider-native plan current as the main task checklist. Child plans belong only to their child sessions. Adam's checklist tools are intentionally not attached to this run. A fresh foreground-only run may still receive Adam's separately gated canvas tools.",
         );
     }
+    let task_tools_enabled = specification.plan_channel == PlanChannel::AppTaskTools;
     let acp_request = GrokAcpRequest {
         executable: specification.program,
         cwd: specification.cwd,
         prompt: request.prompt.clone(),
+        verified_runtime_version: format!(
+            "{}.{}.{}",
+            specification.runtime_version.major,
+            specification.runtime_version.minor,
+            specification.runtime_version.patch
+        ),
         rules,
         sandbox: if matches!(
             request.permission_mode,
@@ -1931,6 +3207,8 @@ fn run_grok_acp_transport(
         reasoning_effort,
         resume_session_id: request.resume_session_id.clone(),
         progress_route,
+        task_tools_enabled,
+        canvas_tools_enabled: has_canvas_tools,
         http_mcp_server: bridge.as_ref().map(|bridge| {
             GrokAcpHttpMcpServer::bearer("adam_tasks", bridge.endpoint(), bridge.bearer_token())
         }),
@@ -1945,16 +3223,20 @@ fn run_grok_acp_transport(
         root_plan_channel: specification.plan_channel,
         ..GrokAcpProjectionState::default()
     });
-    let root_task_tools_enabled = specification.plan_channel == PlanChannel::AppTaskTools;
+    let root_task_tools_enabled = task_tools_enabled;
+    let root_canvas_tools_enabled = has_canvas_tools;
+    let sandbox_cwd = is_chat_sandbox_root(&acp_request.cwd).then(|| acp_request.cwd.clone());
     let result = run_grok_acp(
         &acp_request,
         &control.cancelled,
         |permission| {
-            grok_acp_permission_decision_with_subagents(
+            grok_acp_permission_decision_scoped(
                 permission,
                 request.permission_mode,
                 request.workspace_mode,
                 root_task_tools_enabled,
+                root_canvas_tools_enabled,
+                sandbox_cwd.as_deref(),
                 &permission_block,
             )
         },
@@ -1966,8 +3248,12 @@ fn run_grok_acp_transport(
             emit_grok_acp_event(request, event_sender, event, &projection);
         },
     );
+    let cancelled_before_launch = matches!(result, Err(GrokAcpError::CancelledBeforeLaunch));
     let bridge_stop = bridge.as_mut().map(TaskToolBridge::stop).transpose();
 
+    if cancelled_before_launch {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
     if control.cancelled.load(Ordering::Acquire) {
         return RunOutcome::Cancelled;
     }
@@ -2015,6 +3301,13 @@ fn grok_acp_error_outcome(
     permission_block: Option<GrokPermissionBlock>,
 ) -> RunOutcome {
     match error {
+        GrokAcpError::CancelledBeforeLaunch => RunOutcome::CancelledBeforeLaunch,
+        GrokAcpError::RuntimeVersionMismatch {
+            verified,
+            advertised,
+        } => RunOutcome::runtime_probe_failed(format!(
+            "Grok changed from runtime {verified} to {advertised} after Adam's executable probe; retry the turn so Adam can verify the current contract"
+        )),
         GrokAcpError::TimedOut { seconds } => {
             RunOutcome::timed_out(format!("Grok timed out after {seconds} seconds"))
         }
@@ -2042,6 +3335,56 @@ fn grok_permission_blocked_outcome(tool: String) -> RunOutcome {
     }
 }
 
+/// Path segment marking per-chat sandbox working folders under the app data
+/// root. Shared with the app layer, which creates the folders and captions
+/// them in the inspector.
+pub(crate) const AI_CHAT_SANDBOX_SEGMENT: &str = "chat-sandboxes";
+
+fn is_chat_sandbox_root(root: &Path) -> bool {
+    root.components()
+        .any(|part| part.as_os_str() == AI_CHAT_SANDBOX_SEGMENT)
+}
+
+/// Lexically resolves `.`/`..` so a target that does not exist yet can be
+/// scope-checked; a traversal that escapes the root fails closed.
+fn path_stays_within(root: &Path, candidate: &Path) -> bool {
+    if !candidate.is_absolute() {
+        return false;
+    }
+    let mut resolved = PathBuf::new();
+    for part in candidate.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                if !resolved.pop() {
+                    return false;
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => resolved.push(other),
+        }
+    }
+    resolved.starts_with(root)
+}
+
+/// A file edit in a chat-sandbox run is as safe as replying with text:
+/// Adam created that folder so the agent can hand the user files (user
+/// decision, 2026-08-02), and the CLI is launched with its own workspace
+/// sandbox rooted there, so the OS layer already confines writes to the
+/// folder. A request that reports locations must keep every one inside the
+/// root — explicit evidence of escape is still denied — while a request
+/// that names none rides the enforced containment.
+fn sandbox_scoped_file_edit<'a>(
+    sandbox_root: Option<&Path>,
+    locations: impl Iterator<Item = &'a str>,
+) -> bool {
+    let Some(root) = sandbox_root else {
+        return false;
+    };
+    locations
+        .into_iter()
+        .all(|location| path_stays_within(root, Path::new(location)))
+}
+
 #[cfg(test)]
 fn grok_acp_permission_decision(
     permission: &GrokAcpPermissionRequest,
@@ -2049,7 +3392,14 @@ fn grok_acp_permission_decision(
     workspace_mode: AiWorkspaceMode,
     blocked: &RefCell<GrokPermissionBlockState>,
 ) -> GrokAcpPermissionDecision {
-    grok_acp_permission_decision_with_subagents(permission, mode, workspace_mode, false, blocked)
+    grok_acp_permission_decision_with_subagents(
+        permission,
+        mode,
+        workspace_mode,
+        false,
+        false,
+        blocked,
+    )
 }
 
 fn grok_acp_permission_decision_with_subagents(
@@ -2057,6 +3407,28 @@ fn grok_acp_permission_decision_with_subagents(
     mode: PermissionMode,
     workspace_mode: AiWorkspaceMode,
     root_task_tools_enabled: bool,
+    root_canvas_tools_enabled: bool,
+    blocked: &RefCell<GrokPermissionBlockState>,
+) -> GrokAcpPermissionDecision {
+    grok_acp_permission_decision_scoped(
+        permission,
+        mode,
+        workspace_mode,
+        root_task_tools_enabled,
+        root_canvas_tools_enabled,
+        None,
+        blocked,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grok_acp_permission_decision_scoped(
+    permission: &GrokAcpPermissionRequest,
+    mode: PermissionMode,
+    workspace_mode: AiWorkspaceMode,
+    root_task_tools_enabled: bool,
+    root_canvas_tools_enabled: bool,
+    sandbox_root: Option<&Path>,
     blocked: &RefCell<GrokPermissionBlockState>,
 ) -> GrokAcpPermissionDecision {
     let tool = grok_acp_tool_label(&permission.tool_call);
@@ -2084,6 +3456,10 @@ fn grok_acp_permission_decision_with_subagents(
         canonical,
         "adam_tasks__task_create" | "adam_tasks__task_update" | "adam_tasks__task_list"
     );
+    let is_exact_canvas_tool = matches!(
+        canonical,
+        "adam_tasks__canvas_create_note" | "adam_tasks__canvas_create_pile"
+    );
     let is_task_lookalike = [&normalized_title, &normalized_canonical]
         .into_iter()
         .any(|name| {
@@ -2097,6 +3473,9 @@ fn grok_acp_permission_decision_with_subagents(
                     | "adamtaskstasklist"
             )
         });
+    let is_canvas_lookalike = [&normalized_title, &normalized_canonical]
+        .into_iter()
+        .any(|name| name.contains("canvascreatenote") || name.contains("canvascreatepile"));
     let asks_for_child = [&normalized_title, &normalized_canonical]
         .into_iter()
         .any(|name| {
@@ -2117,11 +3496,14 @@ fn grok_acp_permission_decision_with_subagents(
         | None => AiPermissionClass::Destructive,
         _ => AiPermissionClass::Mutate,
     };
-    // Exact task tools are available only in a root-only AppTaskTools run.
-    // Scoped-child runs use NativeStream and the inherited MCP endpoint stays
-    // inert at list and call time. Title lookalikes and child calls never
-    // establish authority.
-    let verdict = if asks_for_child || (is_task_lookalike && !is_exact_task_tool) {
+    // Exact task tools are available only in a root-owned AppTaskTools run.
+    // Canvas tools are independently enabled for a fresh foreground-only run,
+    // including 0.2.117's native Progress route. Title lookalikes and child
+    // calls never establish either authority.
+    let verdict = if asks_for_child
+        || (is_task_lookalike && !is_exact_task_tool)
+        || (is_canvas_lookalike && !is_exact_canvas_tool)
+    {
         // The verified 0.2.117 child path is a lifecycle notification, not a
         // permission-gated tool call. Treat provider-controlled spellings
         // only as a reason to deny; they never establish authority.
@@ -2132,6 +3514,25 @@ fn grok_acp_permission_decision_with_subagents(
         } else {
             AiPermissionVerdict::Deny
         }
+    } else if is_exact_canvas_tool {
+        if is_root && root_canvas_tools_enabled && workspace_mode != AiWorkspaceMode::Chat {
+            ai_permission_verdict(mode, AiPermissionClass::Mutate)
+        } else {
+            AiPermissionVerdict::Deny
+        }
+    } else if matches!(permission.tool_call.kind, Some(GrokAcpToolKind::Edit))
+        && sandbox_scoped_file_edit(
+            sandbox_root,
+            permission
+                .tool_call
+                .locations
+                .iter()
+                .map(|location| location.path.as_str()),
+        )
+    {
+        // Sandbox file edits skip the Chat-mode wall and the Ask prompt
+        // alike; everything outside the sandbox keeps the standing policy.
+        AiPermissionVerdict::Allow
     } else if workspace_mode == AiWorkspaceMode::Chat && class != AiPermissionClass::Read {
         AiPermissionVerdict::Deny
     } else {
@@ -2381,6 +3782,12 @@ fn emit_grok_acp_event(
             );
         }
         GrokAcpEvent::SubagentSpawned { subagent } => {
+            let workflow_id = subagent.workflow_run_id.clone();
+            let child_label = if subagent.description.trim().is_empty() {
+                subagent.subagent_type.clone()
+            } else {
+                subagent.description.clone()
+            };
             let child_scope = GrokAcpSessionScope::Child {
                 subagent_id: subagent.subagent_id.clone(),
                 parent_session_id: subagent.parent_session_id.clone(),
@@ -2388,6 +3795,24 @@ fn emit_grok_acp_event(
             projection
                 .borrow_mut()
                 .remember_child(&subagent.child_session_id, child_scope);
+            if let Some(workflow_id) = workflow_id.as_deref() {
+                let members = projection.borrow_mut().upsert_workflow_member(
+                    workflow_id,
+                    &subagent.child_session_id,
+                    Some(&child_label),
+                    SubagentStatus::InProgress,
+                    None,
+                );
+                send_grok_workflow_group(
+                    request,
+                    event_sender,
+                    workflow_id,
+                    SubagentStatus::InProgress,
+                    None,
+                    members,
+                    None,
+                );
+            }
             send_grok_acp_activity(
                 request,
                 event_sender,
@@ -2399,11 +3824,7 @@ fn emit_grok_acp_event(
                         &subagent.subagent_id,
                     ),
                     parent_id: Some(subagent.parent_session_id),
-                    label: if subagent.description.trim().is_empty() {
-                        subagent.subagent_type
-                    } else {
-                        subagent.description
-                    },
+                    label: child_label,
                     status: SubagentStatus::InProgress,
                     model: subagent.model,
                     detail: subagent.capability_mode.or(subagent.role),
@@ -2431,6 +3852,27 @@ fn emit_grok_acp_event(
                         )
                     })
                 });
+            if let Some(workflow_id) = projection
+                .borrow()
+                .workflow_for_child(&progress.child_session_id)
+            {
+                let members = projection.borrow_mut().upsert_workflow_member(
+                    &workflow_id,
+                    &progress.child_session_id,
+                    None,
+                    SubagentStatus::InProgress,
+                    detail.clone(),
+                );
+                send_grok_workflow_group(
+                    request,
+                    event_sender,
+                    &workflow_id,
+                    SubagentStatus::InProgress,
+                    None,
+                    members,
+                    None,
+                );
+            }
             send_grok_acp_activity(
                 request,
                 event_sender,
@@ -2463,6 +3905,46 @@ fn emit_grok_acp_event(
             let detail = result.error.or_else(|| {
                 permission_block.map(|block| format!("Permission unavailable for {}", block.tool))
             });
+            if let Some(workflow_id) = projection
+                .borrow()
+                .workflow_for_child(&result.child_session_id)
+            {
+                let members = projection.borrow_mut().upsert_workflow_member(
+                    &workflow_id,
+                    &result.child_session_id,
+                    None,
+                    status,
+                    detail.clone(),
+                );
+                let group_status = if members.iter().all(|member| member.status.is_terminal()) {
+                    if members.iter().any(|member| {
+                        matches!(
+                            member.status,
+                            SubagentStatus::Failed | SubagentStatus::PermissionBlocked
+                        )
+                    }) {
+                        SubagentStatus::Failed
+                    } else if members
+                        .iter()
+                        .any(|member| member.status == SubagentStatus::Cancelled)
+                    {
+                        SubagentStatus::Cancelled
+                    } else {
+                        SubagentStatus::Completed
+                    }
+                } else {
+                    SubagentStatus::InProgress
+                };
+                send_grok_workflow_group(
+                    request,
+                    event_sender,
+                    &workflow_id,
+                    group_status,
+                    None,
+                    members,
+                    None,
+                );
+            }
             send_grok_acp_activity(
                 request,
                 event_sender,
@@ -2480,8 +3962,69 @@ fn emit_grok_acp_event(
                 Some(grok_duration_ms(result.duration_ms)),
             );
         }
-        GrokAcpEvent::Terminal { .. } => {}
+        GrokAcpEvent::Terminal { .. } => {
+            let groups = projection
+                .borrow()
+                .workflow_members
+                .iter()
+                .map(|(id, members)| (id.clone(), members.clone()))
+                .collect::<Vec<_>>();
+            for (workflow_id, members) in groups {
+                let status = if members.iter().any(|member| {
+                    matches!(
+                        member.status,
+                        SubagentStatus::Failed | SubagentStatus::PermissionBlocked
+                    )
+                }) {
+                    SubagentStatus::Failed
+                } else if members
+                    .iter()
+                    .any(|member| member.status == SubagentStatus::Cancelled)
+                {
+                    SubagentStatus::Cancelled
+                } else {
+                    SubagentStatus::Completed
+                };
+                send_grok_workflow_group(
+                    request,
+                    event_sender,
+                    &workflow_id,
+                    status,
+                    u32::try_from(members.len()).ok(),
+                    members,
+                    Some("Grok Build workflow finished.".into()),
+                );
+            }
+        }
     }
+}
+
+fn send_grok_workflow_group(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    workflow_id: &str,
+    status: SubagentStatus,
+    expected_count: Option<u32>,
+    members: Vec<AgentGroupMember>,
+    detail: Option<String>,
+) {
+    send_grok_acp_activity(
+        request,
+        event_sender,
+        AgentScope::Main,
+        ActivityKind::AgentGroup {
+            id: workflow_id.to_owned(),
+            aliases: Vec::new(),
+            label: "Grok Build workflow".into(),
+            kind: AgentGroupKind::Workflow,
+            status,
+            expected_count,
+            members,
+            visibility: AgentGroupVisibility::DelegatedMembers,
+            detail,
+        },
+        None,
+    );
 }
 
 fn send_grok_acp_activity(
@@ -2511,6 +4054,7 @@ fn emit_grok_acp_tool_call(
     let Some(scope) = projection.borrow().adam_scope_for_session(session_id) else {
         return;
     };
+    let tool = grok_acp_tool_label(tool_call);
     if !scope.is_main() {
         let clears_denial = projection
             .borrow()
@@ -2538,7 +4082,7 @@ fn emit_grok_acp_tool_call(
             scope.clone(),
             ActivityKind::ToolCall {
                 id: tool_call.id.clone(),
-                name: grok_acp_tool_label(tool_call),
+                name: tool.clone(),
                 server: Some("grok".into()),
                 input_summary: tool_call
                     .locations
@@ -2547,6 +4091,50 @@ fn emit_grok_acp_tool_call(
             },
             None,
         );
+    }
+    let file_status = match tool_call.status {
+        Some(GrokAcpToolStatus::Completed) => Some(ActivityStatus::Completed),
+        Some(GrokAcpToolStatus::Failed) => Some(ActivityStatus::Failed),
+        _ => None,
+    };
+    if let Some(status) = file_status
+        && matches!(
+            tool_call.kind,
+            Some(GrokAcpToolKind::Edit | GrokAcpToolKind::Delete)
+        )
+    {
+        let kind = if tool_call.kind == Some(GrokAcpToolKind::Delete) {
+            FileChangeKind::Delete
+        } else {
+            FileChangeKind::Update
+        };
+        let changes = structured_file_changes(
+            request.cwd.as_deref(),
+            tool_call
+                .locations
+                .iter()
+                .map(|location| location.path.as_str()),
+            kind,
+        );
+        if !changes.is_empty()
+            && projection
+                .borrow_mut()
+                .emitted_file_changes
+                .insert((session_id.to_owned(), tool_call.id.clone()))
+        {
+            send_grok_acp_activity(
+                request,
+                event_sender,
+                scope.clone(),
+                ActivityKind::FileChange {
+                    id: tool_call.id.clone(),
+                    tool: Some(tool),
+                    changes,
+                    status,
+                },
+                None,
+            );
+        }
     }
     if is_update
         && matches!(
@@ -2628,13 +4216,1774 @@ fn grok_acp_tool_output(tool_call: &GrokAcpToolCall) -> Option<String> {
     tail_text(Some(&content))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum KimiDelegationKind {
+    Agent,
+    Swarm,
+}
+
+#[derive(Clone, Debug)]
+struct KimiDelegationState {
+    kind: KimiDelegationKind,
+    label: String,
+    expected_count: Option<u32>,
+    members: Vec<AgentGroupMember>,
+    terminal: bool,
+}
+
+#[derive(Debug, Default)]
+struct KimiAcpProjectionState {
+    emitted_tool_calls: HashSet<String>,
+    emitted_tool_results: HashSet<String>,
+    emitted_file_changes: HashSet<String>,
+    permission_tools: HashMap<String, String>,
+    delegations: HashMap<String, KimiDelegationState>,
+}
+
+#[derive(Clone, Debug)]
+struct KimiDelegatedResult {
+    agent_id: Option<String>,
+    label: String,
+    status: SubagentStatus,
+    detail: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct KimiPermissionBlockState {
+    pending: Option<GrokPermissionBlock>,
+}
+
+fn run_kimi_acp_transport(
+    request: &AiRunRequest,
+    specification: KimiAcpSpec,
+    control: &Arc<RunControl>,
+    event_sender: &Sender<AiEvent>,
+) -> RunOutcome {
+    if control.cancelled.load(Ordering::Acquire) {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
+    let tuning = match fresh_runtime_tuning_for_program_cancellable(
+        "kimi_cli",
+        &specification.program,
+        effective_model(request),
+        Some(&control.cancelled),
+    ) {
+        Ok(tuning) => tuning,
+        Err(CliVersionProbeFailure::Cancelled) => return RunOutcome::CancelledBeforeLaunch,
+        Err(failure) => {
+            if control.cancelled.load(Ordering::Acquire) {
+                return RunOutcome::CancelledBeforeLaunch;
+            }
+            return RunOutcome::runtime_probe_failed(cli_version_probe_message(
+                "kimi_cli", &failure,
+            ));
+        }
+    };
+    if control.cancelled.load(Ordering::Acquire) {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
+    if !tuning
+        .version
+        .as_ref()
+        .is_some_and(|version| same_cli_contract_version(version, &specification.runtime_version))
+        || !tuning.verified_runtime
+        || tuning.agent_group_channel != crate::chat_core::AgentGroupChannel::KimiAcpToolAggregateV1
+    {
+        return RunOutcome::runtime_probe_failed(
+            "the installed Kimi runtime changed after this turn was prepared; retry the turn so Adam can apply the current capability contract",
+        );
+    }
+
+    let model = (!effective_model(request).is_empty()).then(|| effective_model(request).to_owned());
+    let thinking = match request.provider_preferences.feature(AI_FEATURE_THINKING) {
+        Some(true) => Some("on".into()),
+        Some(false) => Some("off".into()),
+        None => None,
+    };
+    let mode = match (request.workspace_mode, request.permission_mode) {
+        (AiWorkspaceMode::Chat, _) | (_, PermissionMode::Plan) => Some("plan".into()),
+        (
+            AiWorkspaceMode::Cowork | AiWorkspaceMode::Code,
+            PermissionMode::Sandbox
+            | PermissionMode::Ask
+            | PermissionMode::Auto
+            | PermissionMode::Bypass,
+        ) => Some("default".into()),
+    };
+    let acp_request = KimiAcpRequest {
+        executable: specification.program,
+        cwd: specification.cwd,
+        prompt: kimi_acp_prompt(request),
+        verified_runtime_version: KIMI_ACP_RUNTIME_VERSION.into(),
+        model,
+        thinking,
+        mode,
+        resume_session_id: request.resume_session_id.clone(),
+        limits: KimiAcpLimits {
+            wall_timeout: run_timeout(request.workspace_mode),
+            ..KimiAcpLimits::default()
+        },
+    };
+
+    let permission_block = RefCell::new(KimiPermissionBlockState::default());
+    let projection = RefCell::new(KimiAcpProjectionState::default());
+    let swarm_enabled = request.provider_preferences.feature(AI_FEATURE_SWARM) != Some(false);
+    let kimi_sandbox_cwd = is_chat_sandbox_root(&acp_request.cwd).then(|| acp_request.cwd.clone());
+    let result = run_kimi_acp(
+        &acp_request,
+        &control.cancelled,
+        |permission| {
+            kimi_acp_permission_decision_scoped(
+                permission,
+                request.permission_mode,
+                request.workspace_mode,
+                swarm_enabled,
+                kimi_sandbox_cwd.as_deref(),
+                &permission_block,
+            )
+        },
+        |event| {
+            observe_kimi_permission_progress(&event, &permission_block);
+            emit_kimi_acp_event(request, event_sender, event, &projection);
+        },
+    );
+
+    let cancelled_before_launch = matches!(result, Err(KimiAcpError::CancelledBeforeLaunch));
+    let cancellation_requested = control.cancelled.load(Ordering::Acquire);
+    finalize_kimi_delegations_after_adapter_return(
+        request,
+        event_sender,
+        &result,
+        cancellation_requested,
+        &projection,
+    );
+    if cancelled_before_launch {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
+    if cancellation_requested {
+        return RunOutcome::Cancelled;
+    }
+    let permission_block = permission_block.into_inner().pending;
+    match result {
+        Err(error) => kimi_acp_error_outcome(error, permission_block),
+        Ok(outcome) => match outcome.stop_reason {
+            KimiAcpStopReason::EndTurn => RunOutcome::Completed {
+                text: outcome.response_text,
+                session_id: Some(outcome.session_id),
+            },
+            KimiAcpStopReason::Cancelled | KimiAcpStopReason::Refusal
+                if permission_block.is_some() =>
+            {
+                let block = permission_block.expect("guarded by is_some");
+                kimi_permission_blocked_outcome(block.tool)
+            }
+            KimiAcpStopReason::Cancelled => RunOutcome::Cancelled,
+            KimiAcpStopReason::MaxTokens | KimiAcpStopReason::MaxTurnRequests => {
+                RunOutcome::Failed {
+                    kind: AiFailureKind::MaxTurnsReached,
+                    message: "Kimi reached its turn or token limit before completing.".into(),
+                    tool: None,
+                    retry: Some(RetryHint::Retry),
+                }
+            }
+            KimiAcpStopReason::Refusal => {
+                RunOutcome::provider_error("Kimi refused the requested turn")
+            }
+            KimiAcpStopReason::Other(reason) => RunOutcome::provider_error(format!(
+                "Kimi stopped with an unsupported terminal reason: {reason}"
+            )),
+        },
+    }
+}
+
+fn finalize_kimi_delegations_after_adapter_return(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    result: &Result<KimiAcpOutcome, KimiAcpError>,
+    cancellation_requested: bool,
+    projection: &RefCell<KimiAcpProjectionState>,
+) {
+    let stop_reason = if cancellation_requested {
+        KimiAcpStopReason::Cancelled
+    } else {
+        match result {
+            Ok(outcome) => outcome.stop_reason.clone(),
+            Err(KimiAcpError::ProviderCancelled) => KimiAcpStopReason::Cancelled,
+            Err(_) => KimiAcpStopReason::Other("adapter_error".into()),
+        }
+    };
+    // A normal ACP terminal event already closes these groups. Repeating the
+    // operation here is intentional and idempotent: protocol/IO/timeout/EOF
+    // failures can return without a terminal event, and must not strand an
+    // in-progress Agent or AgentSwarm in persisted conversation state.
+    finalize_open_kimi_delegations(request, event_sender, stop_reason, projection);
+}
+
+fn kimi_acp_prompt(request: &AiRunRequest) -> String {
+    let mut sections = Vec::new();
+    if let Some(system_prompt) = request
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+    {
+        sections.push(format!("System instructions:\n{system_prompt}"));
+    }
+    match request.provider_preferences.feature(AI_FEATURE_SWARM) {
+        Some(true) => sections.push(
+            "Delegation preference: when the request contains independent work that benefits from parallelism, use Kimi's native foreground AgentSwarm tool. For read-only research, set subagent_type to explore explicitly. Agent and AgentSwarm otherwise default to coder and may edit files or run commands; coder/default/unknown delegations require an Auto or Bypass run and are not silently granted in Ask or Sandbox. Do not launch Agent with run_in_background=true: Adam's per-turn ACP host cannot receive its later notification. Report only the real agent IDs and outcomes returned by Kimi; do not claim live child telemetry that the ACP session does not expose."
+                .into(),
+        ),
+        Some(false) => sections.push(
+            "Delegation restriction: do not use Kimi's Agent or AgentSwarm tools in this run."
+                .into(),
+        ),
+        None => {}
+    }
+    sections.push(format!("User request:\n{}", request.prompt));
+    sections.join("\n\n")
+}
+
+fn kimi_acp_error_outcome(
+    error: KimiAcpError,
+    permission_block: Option<GrokPermissionBlock>,
+) -> RunOutcome {
+    match error {
+        KimiAcpError::CancelledBeforeLaunch => RunOutcome::CancelledBeforeLaunch,
+        KimiAcpError::UnsupportedRuntime { found } => RunOutcome::runtime_probe_failed(format!(
+            "Kimi changed to runtime {found} after Adam's executable probe; retry the turn so Adam can verify the current contract"
+        )),
+        KimiAcpError::TimedOut { seconds } => {
+            RunOutcome::timed_out(format!("Kimi timed out after {seconds} seconds"))
+        }
+        KimiAcpError::ProviderCancelled if permission_block.is_some() => {
+            kimi_permission_blocked_outcome(permission_block.expect("guarded by is_some").tool)
+        }
+        error => RunOutcome::provider_error(format!("Kimi ACP failed: {error}")),
+    }
+}
+
+fn kimi_permission_blocked_outcome(tool: String) -> RunOutcome {
+    let retry = if is_explicit_web_tool(Some(&tool)) {
+        RetryHint::AllowWebAndRetry
+    } else {
+        RetryHint::Retry
+    };
+    RunOutcome::Failed {
+        kind: AiFailureKind::PermissionBlocked,
+        message: format!("Kimi could not continue after permission to use {tool} was unavailable."),
+        tool: Some(tool),
+        retry: Some(retry),
+    }
+}
+
+fn kimi_acp_permission_decision(
+    permission: &KimiAcpPermissionRequest,
+    mode: PermissionMode,
+    workspace_mode: AiWorkspaceMode,
+    swarm_enabled: bool,
+    blocked: &RefCell<KimiPermissionBlockState>,
+) -> KimiAcpPermissionDecision {
+    kimi_acp_permission_decision_scoped(
+        permission,
+        mode,
+        workspace_mode,
+        swarm_enabled,
+        None,
+        blocked,
+    )
+}
+
+fn kimi_acp_permission_decision_scoped(
+    permission: &KimiAcpPermissionRequest,
+    mode: PermissionMode,
+    workspace_mode: AiWorkspaceMode,
+    swarm_enabled: bool,
+    sandbox_root: Option<&Path>,
+    blocked: &RefCell<KimiPermissionBlockState>,
+) -> KimiAcpPermissionDecision {
+    // Kimi 0.31 reuses session/request_permission for AskUserQuestion because
+    // ACP has no question RPC. Adam does not yet have an interactive question
+    // surface, so choose Kimi's explicit Skip option in every stance. In
+    // particular, Bypass must never turn the first allow_once choice into an
+    // answer the user did not provide. This is a graceful tool dismissal, not
+    // a blocked capability, so do not set the permission terminal cause.
+    if let Some(skip) = permission.ask_user_question_skip_option() {
+        return KimiAcpPermissionDecision::Reject {
+            option_id: skip.id.clone(),
+        };
+    }
+
+    let tool = kimi_acp_tool_label(&permission.tool_call);
+    let tool_call_id = permission.tool_call.id.clone();
+    let delegation = kimi_delegation_kind(&permission.tool_call);
+    let background_agent = delegation == Some(KimiDelegationKind::Agent)
+        && permission
+            .tool_call
+            .raw_input
+            .as_ref()
+            .and_then(|input| input.get("run_in_background"))
+            .and_then(Value::as_bool)
+            == Some(true);
+    let class = if delegation.is_some() {
+        kimi_delegation_permission_class(&permission.tool_call)
+    } else {
+        match permission.tool_call.kind {
+            Some(
+                KimiAcpToolKind::Read
+                | KimiAcpToolKind::Search
+                | KimiAcpToolKind::Fetch
+                | KimiAcpToolKind::Think,
+            ) => AiPermissionClass::Read,
+            Some(
+                KimiAcpToolKind::Delete | KimiAcpToolKind::SwitchMode | KimiAcpToolKind::Other(_),
+            )
+            | None => AiPermissionClass::Destructive,
+            Some(KimiAcpToolKind::Edit | KimiAcpToolKind::Move | KimiAcpToolKind::Execute) => {
+                AiPermissionClass::Mutate
+            }
+        }
+    };
+    // Unlike Grok, Kimi's launch does not pin an OS sandbox to the working
+    // folder, so a location-less edit earns no trust here: explicit in-root
+    // locations remain required.
+    let sandbox_edit = delegation.is_none()
+        && matches!(permission.tool_call.kind, Some(KimiAcpToolKind::Edit))
+        && !permission.tool_call.locations.is_empty()
+        && sandbox_scoped_file_edit(
+            sandbox_root,
+            permission
+                .tool_call
+                .locations
+                .iter()
+                .map(|location| location.path.as_str()),
+        );
+    let verdict = if background_agent || (delegation.is_some() && !swarm_enabled) {
+        AiPermissionVerdict::Deny
+    } else if sandbox_edit {
+        // Sandbox file edits skip the Chat-mode wall and the Ask prompt
+        // alike; everything outside the sandbox keeps the standing policy.
+        AiPermissionVerdict::Allow
+    } else if workspace_mode == AiWorkspaceMode::Chat && class != AiPermissionClass::Read {
+        AiPermissionVerdict::Deny
+    } else {
+        ai_permission_verdict(mode, class)
+    };
+
+    match verdict {
+        AiPermissionVerdict::Allow => {
+            if let Some(option) = permission.first_allow_once_option() {
+                blocked.borrow_mut().pending = None;
+                KimiAcpPermissionDecision::Allow {
+                    option_id: option.id.clone(),
+                }
+            } else {
+                blocked.borrow_mut().pending = Some(GrokPermissionBlock { tool, tool_call_id });
+                KimiAcpPermissionDecision::Cancel
+            }
+        }
+        AiPermissionVerdict::Prompt | AiPermissionVerdict::Deny => {
+            blocked.borrow_mut().pending = Some(GrokPermissionBlock { tool, tool_call_id });
+            permission
+                .first_reject_once_option()
+                .map(|option| KimiAcpPermissionDecision::Reject {
+                    option_id: option.id.clone(),
+                })
+                .unwrap_or(KimiAcpPermissionDecision::Cancel)
+        }
+    }
+}
+
+fn kimi_delegation_permission_class(tool_call: &KimiAcpToolCall) -> AiPermissionClass {
+    let subagent_type = tool_call
+        .raw_input
+        .as_ref()
+        .and_then(|input| input.get("subagent_type"))
+        .and_then(Value::as_str)
+        .map(normalized_token);
+    if subagent_type.as_deref() == Some("explore") {
+        AiPermissionClass::Read
+    } else {
+        // Kimi 0.31 defaults Agent/AgentSwarm to `coder`. That profile can
+        // Edit, Write, and Bash, and Kimi may internally approve writes in
+        // the git cwd. Missing or unfamiliar subagent types therefore cannot
+        // inherit Adam's read-only delegation shortcut.
+        AiPermissionClass::Mutate
+    }
+}
+
+fn observe_kimi_permission_progress(
+    event: &KimiAcpEvent,
+    blocked: &RefCell<KimiPermissionBlockState>,
+) {
+    let should_clear = match event {
+        KimiAcpEvent::ToolCall { tool_call, .. }
+        | KimiAcpEvent::ToolCallUpdate { tool_call, .. } => {
+            blocked.borrow().pending.as_ref().is_some_and(|pending| {
+                pending.tool_call_id != tool_call.id
+                    || tool_call.status == Some(KimiAcpToolStatus::Completed)
+            })
+        }
+        KimiAcpEvent::PlanSnapshot { .. } => true,
+        KimiAcpEvent::PermissionResolved { resolution, .. } => {
+            matches!(resolution, KimiAcpPermissionResolution::Allowed { .. })
+        }
+        _ => false,
+    };
+    if should_clear {
+        blocked.borrow_mut().pending = None;
+    }
+}
+
+fn emit_kimi_acp_event(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    event: KimiAcpEvent,
+    projection: &RefCell<KimiAcpProjectionState>,
+) {
+    match event {
+        KimiAcpEvent::SessionStarted { .. } => send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::SessionInfo {
+                model: (!effective_model(request).is_empty())
+                    .then(|| effective_model(request).to_owned()),
+                // Provider session IDs are machine-local sidecar data. The
+                // completed outcome still carries the ID to ResumeStore, but
+                // portable conversation activity keeps only display metadata.
+                session_id: None,
+            },
+        ),
+        KimiAcpEvent::SessionInfo { .. } => {}
+        KimiAcpEvent::AgentMessageChunk { text, .. } => {
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::AssistantText { text: text.clone() },
+            );
+            let _ = event_sender.send(AiEvent::Delta {
+                turn_id: request.turn_id,
+                conversation_id: request.conversation_id,
+                text,
+            });
+        }
+        KimiAcpEvent::AgentThoughtChunk { text, .. } => {
+            send_provider_activity(request, event_sender, ActivityKind::Thinking { text })
+        }
+        KimiAcpEvent::ToolCall { tool_call, .. }
+        | KimiAcpEvent::ToolCallUpdate { tool_call, .. } => {
+            emit_kimi_acp_tool_call(request, event_sender, &tool_call, projection);
+        }
+        KimiAcpEvent::PlanSnapshot { entries, .. } => {
+            let tasks = entries
+                .into_iter()
+                .map(|entry| PlanItem {
+                    content: entry.content,
+                    active_form: None,
+                    status: kimi_acp_plan_status(entry.status),
+                    task_id: (!entry.id.trim().is_empty()).then_some(entry.id),
+                    origin: PlanItemOrigin::Native,
+                })
+                .collect();
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::PlanUpdate {
+                    tasks,
+                    authoritative: false,
+                    compacted: false,
+                    replaces_native: true,
+                },
+            );
+        }
+        KimiAcpEvent::PermissionRequested {
+            request: permission,
+        } => {
+            let tool = kimi_acp_tool_label(&permission.tool_call);
+            projection
+                .borrow_mut()
+                .permission_tools
+                .insert(permission.tool_call.id.clone(), tool.clone());
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::PermissionPrompt {
+                    id: permission.tool_call.id,
+                    tool: tool.clone(),
+                    summary: format!("Kimi requested permission to use {tool}."),
+                    resolution: None,
+                },
+            );
+        }
+        KimiAcpEvent::PermissionResolved {
+            tool_call_id,
+            resolution,
+            ..
+        } => {
+            let tool = projection
+                .borrow_mut()
+                .permission_tools
+                .remove(&tool_call_id)
+                .unwrap_or_else(|| "Kimi tool".into());
+            let resolution = match resolution {
+                KimiAcpPermissionResolution::Allowed { .. } => PermissionResolution::Allowed,
+                KimiAcpPermissionResolution::Rejected { .. }
+                | KimiAcpPermissionResolution::Cancelled => PermissionResolution::Denied,
+            };
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::PermissionPrompt {
+                    id: tool_call_id,
+                    tool: tool.clone(),
+                    summary: format!("Kimi permission request for {tool} resolved."),
+                    resolution: Some(resolution),
+                },
+            );
+        }
+        KimiAcpEvent::Terminal { stop_reason, .. } => {
+            finalize_open_kimi_delegations(request, event_sender, stop_reason, projection);
+        }
+    }
+}
+
+fn emit_kimi_acp_tool_call(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    tool_call: &KimiAcpToolCall,
+    projection: &RefCell<KimiAcpProjectionState>,
+) {
+    let tool = kimi_acp_tool_label(tool_call);
+    let first = projection
+        .borrow_mut()
+        .emitted_tool_calls
+        .insert(tool_call.id.clone());
+    if first {
+        send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::ToolCall {
+                id: tool_call.id.clone(),
+                name: tool.clone(),
+                server: Some("kimi".into()),
+                input_summary: tool_call
+                    .raw_input
+                    .as_ref()
+                    .and_then(compact_input_summary)
+                    .or_else(|| {
+                        tool_call
+                            .locations
+                            .first()
+                            .map(|location| location.path.clone())
+                    }),
+            },
+        );
+    }
+
+    if let Some(kind) = kimi_delegation_kind(tool_call) {
+        emit_kimi_delegation(request, event_sender, tool_call, kind, projection);
+    }
+
+    let terminal = matches!(
+        tool_call.status,
+        Some(KimiAcpToolStatus::Completed | KimiAcpToolStatus::Failed)
+    );
+    let first_terminal = terminal
+        && projection
+            .borrow_mut()
+            .emitted_tool_results
+            .insert(tool_call.id.clone());
+    if terminal
+        && matches!(
+            tool_call.kind,
+            Some(KimiAcpToolKind::Edit | KimiAcpToolKind::Delete)
+        )
+    {
+        let kind = if tool_call.kind == Some(KimiAcpToolKind::Delete) {
+            FileChangeKind::Delete
+        } else {
+            FileChangeKind::Update
+        };
+        let changes = structured_file_changes(
+            request.cwd.as_deref(),
+            tool_call
+                .locations
+                .iter()
+                .map(|location| location.path.as_str()),
+            kind,
+        );
+        if !changes.is_empty()
+            && projection
+                .borrow_mut()
+                .emitted_file_changes
+                .insert(tool_call.id.clone())
+        {
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::FileChange {
+                    id: tool_call.id.clone(),
+                    tool: Some(tool),
+                    changes,
+                    status: if tool_call.status == Some(KimiAcpToolStatus::Failed) {
+                        ActivityStatus::Failed
+                    } else {
+                        ActivityStatus::Completed
+                    },
+                },
+            );
+        }
+    }
+    if first_terminal {
+        send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::ToolResult {
+                id: tool_call.id.clone(),
+                output: kimi_acp_tool_output(tool_call),
+                is_error: tool_call.status == Some(KimiAcpToolStatus::Failed),
+            },
+        );
+    }
+}
+
+fn emit_kimi_delegation(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    tool_call: &KimiAcpToolCall,
+    kind: KimiDelegationKind,
+    projection: &RefCell<KimiAcpProjectionState>,
+) {
+    let mut state = {
+        let mut projection = projection.borrow_mut();
+        projection
+            .delegations
+            .entry(tool_call.id.clone())
+            .or_insert_with(|| kimi_delegation_state(tool_call, kind))
+            .clone()
+    };
+    if state.terminal {
+        return;
+    }
+
+    let terminal = matches!(
+        tool_call.status,
+        Some(KimiAcpToolStatus::Completed | KimiAcpToolStatus::Failed)
+    );
+    if !terminal {
+        send_kimi_group(
+            request,
+            event_sender,
+            &tool_call.id,
+            &state,
+            SubagentStatus::InProgress,
+            Some(kimi_delegation_progress_detail(&state)),
+        );
+        return;
+    }
+
+    let parsed = tool_call
+        .raw_output
+        .as_ref()
+        .and_then(Value::as_str)
+        .and_then(|output| match kind {
+            KimiDelegationKind::Agent => parse_kimi_agent_result(output).map(|member| vec![member]),
+            KimiDelegationKind::Swarm => {
+                parse_kimi_agent_swarm_result(output, state.expected_count)
+            }
+        });
+    let background_result = kind == KimiDelegationKind::Agent
+        && parsed.as_ref().is_some_and(|results| {
+            results
+                .iter()
+                .any(|result| result.status == SubagentStatus::InProgress)
+        });
+    let parsed = (!background_result).then_some(parsed).flatten();
+    if let Some(results) = parsed.as_ref() {
+        for result in results {
+            let Some(agent_id) = result.agent_id.as_deref() else {
+                continue;
+            };
+            let label = if kind == KimiDelegationKind::Agent
+                && result.label == "Kimi agent"
+                && !state.label.trim().is_empty()
+            {
+                state.label.clone()
+            } else {
+                result.label.clone()
+            };
+            state.members.push(AgentGroupMember {
+                id: agent_id.into(),
+                label: label.clone(),
+                status: result.status,
+                detail: result.detail.as_deref().and_then(kimi_member_detail),
+            });
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::Subagent {
+                    id: agent_id.into(),
+                    aliases: Vec::new(),
+                    parent_id: Some(tool_call.id.clone()),
+                    label,
+                    status: result.status,
+                    model: None,
+                    detail: result.detail.as_deref().and_then(kimi_member_detail),
+                    tool_calls: None,
+                },
+            );
+            if let Some(text) = result
+                .detail
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            {
+                let text = truncate_owned_utf8(text, MAX_SUBAGENT_MESSAGE_BYTES);
+                let _ = event_sender.send(AiEvent::Activity {
+                    turn_id: request.turn_id,
+                    conversation_id: request.conversation_id,
+                    event: scoped_activity_event(
+                        AgentScope::Child {
+                            id: agent_id.into(),
+                        },
+                        ActivityKind::AssistantText { text },
+                    ),
+                });
+            }
+        }
+        state.members.sort_by(|left, right| left.id.cmp(&right.id));
+        state.members.dedup_by(|left, right| left.id == right.id);
+    }
+
+    let result_statuses = parsed
+        .as_ref()
+        .map(|results| {
+            results
+                .iter()
+                .map(|result| result.status)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let group_status = if background_result
+        || tool_call.status == Some(KimiAcpToolStatus::Failed)
+        || result_statuses.contains(&SubagentStatus::Failed)
+    {
+        SubagentStatus::Failed
+    } else if result_statuses.contains(&SubagentStatus::Cancelled) {
+        SubagentStatus::Cancelled
+    } else if result_statuses.contains(&SubagentStatus::InProgress) {
+        SubagentStatus::InProgress
+    } else {
+        SubagentStatus::Completed
+    };
+    state.terminal = true;
+    let detail = if background_result {
+        "Kimi returned a background Agent job, which Adam cannot keep alive after this turn. Run the delegation in the foreground instead."
+            .into()
+    } else if let Some(results) = parsed.as_ref() {
+        kimi_delegation_terminal_detail(&state, results)
+    } else {
+        "Kimi finished the delegation, but its individual result list was unavailable or ambiguous."
+            .into()
+    };
+    send_kimi_group(
+        request,
+        event_sender,
+        &tool_call.id,
+        &state,
+        group_status,
+        Some(detail),
+    );
+    projection
+        .borrow_mut()
+        .delegations
+        .insert(tool_call.id.clone(), state);
+}
+
+fn finalize_open_kimi_delegations(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    stop_reason: KimiAcpStopReason,
+    projection: &RefCell<KimiAcpProjectionState>,
+) {
+    let open = projection
+        .borrow()
+        .delegations
+        .iter()
+        .filter(|(_, state)| !state.terminal)
+        .map(|(id, state)| (id.clone(), state.clone()))
+        .collect::<Vec<_>>();
+    for (id, mut state) in open {
+        let status = match stop_reason {
+            KimiAcpStopReason::Cancelled => SubagentStatus::Cancelled,
+            _ => SubagentStatus::Failed,
+        };
+        state.terminal = true;
+        send_kimi_group(
+            request,
+            event_sender,
+            &id,
+            &state,
+            status,
+            Some("Kimi ended the turn without a terminal delegation result.".into()),
+        );
+        projection.borrow_mut().delegations.insert(id, state);
+    }
+}
+
+fn send_kimi_group(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    id: &str,
+    state: &KimiDelegationState,
+    status: SubagentStatus,
+    detail: Option<String>,
+) {
+    send_provider_activity(
+        request,
+        event_sender,
+        ActivityKind::AgentGroup {
+            id: id.into(),
+            aliases: Vec::new(),
+            label: state.label.clone(),
+            kind: match state.kind {
+                KimiDelegationKind::Agent => AgentGroupKind::Delegation,
+                KimiDelegationKind::Swarm => AgentGroupKind::Swarm,
+            },
+            status,
+            expected_count: state.expected_count,
+            members: state.members.clone(),
+            visibility: if state.terminal && state.members.is_empty() {
+                AgentGroupVisibility::AggregateOnly
+            } else {
+                AgentGroupVisibility::DelegatedMembers
+            },
+            detail,
+        },
+    );
+}
+
+fn kimi_delegation_state(
+    tool_call: &KimiAcpToolCall,
+    kind: KimiDelegationKind,
+) -> KimiDelegationState {
+    let input = tool_call.raw_input.as_ref();
+    let label = input
+        .and_then(|value| value.get("description"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| match kind {
+            KimiDelegationKind::Agent => "Kimi delegated agent".into(),
+            KimiDelegationKind::Swarm => "Kimi AgentSwarm".into(),
+        });
+    let expected_count = match kind {
+        KimiDelegationKind::Agent => Some(1),
+        KimiDelegationKind::Swarm => input.and_then(kimi_swarm_expected_count),
+    };
+    KimiDelegationState {
+        kind,
+        label,
+        expected_count,
+        members: Vec::new(),
+        terminal: false,
+    }
+}
+
+fn kimi_swarm_expected_count(input: &Value) -> Option<u32> {
+    let items = input
+        .get("items")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let resumed = input
+        .get("resume_agent_ids")
+        .and_then(Value::as_object)
+        .map_or(0, Map::len);
+    let total = items.saturating_add(resumed);
+    (total > 0 && total <= MAX_KIMI_SWARM_MEMBERS)
+        .then(|| u32::try_from(total).expect("Kimi swarm limit fits u32"))
+}
+
+fn kimi_delegation_progress_detail(state: &KimiDelegationState) -> String {
+    match (state.kind, state.expected_count) {
+        (KimiDelegationKind::Swarm, Some(count)) => format!(
+            "Kimi delegated {count} job{}; member results appear when AgentSwarm returns.",
+            if count == 1 { "" } else { "s" }
+        ),
+        (KimiDelegationKind::Swarm, None) => {
+            "Kimi delegated a swarm; member results appear when AgentSwarm returns.".into()
+        }
+        (KimiDelegationKind::Agent, _) => {
+            "Kimi delegated one agent; its result appears when the Agent tool returns.".into()
+        }
+    }
+}
+
+fn kimi_delegation_terminal_detail(
+    state: &KimiDelegationState,
+    results: &[KimiDelegatedResult],
+) -> String {
+    let completed = results
+        .iter()
+        .filter(|result| result.status == SubagentStatus::Completed)
+        .count();
+    let failed = results
+        .iter()
+        .filter(|result| result.status == SubagentStatus::Failed)
+        .count();
+    let cancelled = results
+        .iter()
+        .filter(|result| result.status == SubagentStatus::Cancelled)
+        .count();
+    let running = results
+        .iter()
+        .filter(|result| result.status == SubagentStatus::InProgress)
+        .count();
+    format!(
+        "Kimi returned {} result{} ({}/{} with stable agent IDs): {completed} completed, {failed} failed, {cancelled} aborted, {running} running.",
+        results.len(),
+        if results.len() == 1 { "" } else { "s" },
+        state.members.len(),
+        results.len(),
+    )
+}
+
+fn kimi_delegation_kind(tool_call: &KimiAcpToolCall) -> Option<KimiDelegationKind> {
+    match tool_call.kind.as_ref() {
+        Some(KimiAcpToolKind::Other(name)) => {
+            if let Some(kind) = kimi_exact_delegation_identity(name) {
+                return Some(kind);
+            }
+        }
+        None => {}
+        // A structured ACP kind is authoritative. Filenames such as
+        // AGENTS.md and search queries containing "agent" must retain their
+        // native Read/Search/Edit permission class.
+        Some(_) => return None,
+    }
+    tool_call
+        .title
+        .as_deref()
+        .and_then(kimi_exact_delegation_identity)
+}
+
+fn kimi_exact_delegation_identity(value: &str) -> Option<KimiDelegationKind> {
+    let value = value.trim().to_ascii_lowercase();
+    match normalized_token(&value).as_str() {
+        "agent" => return Some(KimiDelegationKind::Agent),
+        "agentswarm" => return Some(KimiDelegationKind::Swarm),
+        _ => {}
+    }
+    if value == "launching agent swarm" || value.starts_with("launching agent swarm:") {
+        return Some(KimiDelegationKind::Swarm);
+    }
+    let identity = value
+        .split_once(':')
+        .map_or(value.as_str(), |(identity, _)| identity.trim());
+    (identity.starts_with("launching ") && identity.ends_with(" agent"))
+        .then_some(KimiDelegationKind::Agent)
+}
+
+fn kimi_acp_tool_label(tool_call: &KimiAcpToolCall) -> String {
+    tool_call
+        .title
+        .clone()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| match &tool_call.kind {
+            Some(KimiAcpToolKind::Other(name)) if !name.trim().is_empty() => name.clone(),
+            Some(kind) => format!("{kind:?}"),
+            None => "Kimi tool".into(),
+        })
+}
+
+fn kimi_acp_tool_output(tool_call: &KimiAcpToolCall) -> Option<String> {
+    if let Some(output) = tool_call.raw_output.as_ref() {
+        if let Some(text) = output.as_str() {
+            return tail_text(Some(text));
+        }
+        if let Ok(serialized) = serde_json::to_string(output) {
+            return tail_text(Some(&serialized));
+        }
+    }
+    let content = serde_json::to_string(&tool_call.content).ok()?;
+    tail_text(Some(&content))
+}
+
+fn kimi_acp_plan_status(status: KimiAcpPlanStatus) -> PlanItemStatus {
+    match status {
+        KimiAcpPlanStatus::Pending => PlanItemStatus::Pending,
+        KimiAcpPlanStatus::InProgress => PlanItemStatus::InProgress,
+        KimiAcpPlanStatus::Completed => PlanItemStatus::Completed,
+        KimiAcpPlanStatus::Other(status)
+            if matches!(normalized_token(&status).as_str(), "cancelled" | "canceled") =>
+        {
+            PlanItemStatus::Cancelled
+        }
+        KimiAcpPlanStatus::Other(_) => PlanItemStatus::Pending,
+    }
+}
+
+fn parse_kimi_agent_result(output: &str) -> Option<KimiDelegatedResult> {
+    if output.len() > MAX_KIMI_SWARM_OUTPUT_BYTES {
+        return None;
+    }
+    let (header, body) = output.split_once("\n\n").unwrap_or((output, ""));
+    let mut agent_id = None;
+    let mut status = None;
+    for line in header.lines() {
+        let (key, value) = line.split_once(':')?;
+        match key.trim() {
+            "agent_id" => agent_id = kimi_valid_agent_id(value.trim()).map(str::to_owned),
+            "status" => status = kimi_result_status(value.trim()),
+            _ => {}
+        }
+    }
+    Some(KimiDelegatedResult {
+        agent_id,
+        label: "Kimi agent".into(),
+        status: status?,
+        detail: bounded_kimi_result_body(body),
+    })
+}
+
+fn parse_kimi_agent_swarm_result(
+    output: &str,
+    expected_count: Option<u32>,
+) -> Option<Vec<KimiDelegatedResult>> {
+    if output.len() > MAX_KIMI_SWARM_OUTPUT_BYTES
+        || !output.contains("<agent_swarm_result>")
+        || !output.contains("</agent_swarm_result>")
+    {
+        return None;
+    }
+    let start_count = output.match_indices("<subagent ").count();
+    if start_count == 0 || start_count > MAX_KIMI_SWARM_MEMBERS {
+        return None;
+    }
+    if expected_count.is_some_and(|expected| start_count != expected as usize) {
+        return None;
+    }
+
+    let mut cursor = output.find("<subagent ")?;
+    let mut results = Vec::with_capacity(start_count);
+    while results.len() < start_count {
+        let open_start = cursor;
+        let open_end = output[open_start..].find('>')? + open_start;
+        let attributes = &output[open_start + "<subagent ".len()..open_end];
+        let close_start = output[open_end + 1..].find("</subagent>")? + open_end + 1;
+        let body = &output[open_end + 1..close_start];
+        let close_end = close_start + "</subagent>".len();
+        let next_start = output[close_end..]
+            .find("<subagent ")
+            .map(|offset| close_end + offset);
+        let boundary = next_start.unwrap_or_else(|| {
+            output[close_end..]
+                .find("</agent_swarm_result>")
+                .map(|offset| close_end + offset)
+                .unwrap_or(output.len())
+        });
+        if !output[close_end..boundary].trim().is_empty() {
+            return None;
+        }
+
+        let outcome = kimi_xml_attribute(attributes, "outcome")?;
+        let status = kimi_result_status(&outcome)?;
+        let agent_id = kimi_xml_attribute(attributes, "agent_id")
+            .and_then(|value| kimi_valid_agent_id(&value).map(str::to_owned));
+        let label = kimi_xml_attribute(attributes, "item")
+            .map(|value| truncate_owned_utf8(value.trim(), MAX_SUBAGENT_DETAIL_BYTES))
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "Kimi swarm member".into());
+        results.push(KimiDelegatedResult {
+            agent_id,
+            label,
+            status,
+            detail: bounded_kimi_result_body(body),
+        });
+        let Some(next_start) = next_start else {
+            break;
+        };
+        cursor = next_start;
+    }
+    let mut stable_ids = HashSet::new();
+    if results
+        .iter()
+        .filter_map(|result| result.agent_id.as_ref())
+        .any(|agent_id| !stable_ids.insert(agent_id.clone()))
+    {
+        return None;
+    }
+    (results.len() == start_count).then_some(results)
+}
+
+fn kimi_xml_attribute(attributes: &str, name: &str) -> Option<String> {
+    let needle = format!("{name}=\"");
+    let mut search_start = 0;
+    let start = loop {
+        let relative = attributes[search_start..].find(&needle)?;
+        let candidate = search_start + relative;
+        if candidate == 0
+            || attributes.as_bytes()[candidate.saturating_sub(1)].is_ascii_whitespace()
+        {
+            break candidate + needle.len();
+        }
+        search_start = candidate.saturating_add(1);
+    };
+    let end = attributes[start..].find('"')? + start;
+    let value = &attributes[start..end];
+    Some(
+        value
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
+fn kimi_result_status(value: &str) -> Option<SubagentStatus> {
+    match value.trim() {
+        "completed" => Some(SubagentStatus::Completed),
+        "failed" => Some(SubagentStatus::Failed),
+        "aborted" | "cancelled" | "canceled" => Some(SubagentStatus::Cancelled),
+        "running" => Some(SubagentStatus::InProgress),
+        _ => None,
+    }
+}
+
+fn kimi_valid_agent_id(value: &str) -> Option<&str> {
+    (!value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')))
+    .then_some(value)
+}
+
+fn bounded_kimi_result_body(body: &str) -> Option<String> {
+    let body = body.trim();
+    (!body.is_empty()).then(|| truncate_owned_utf8(body, MAX_KIMI_SWARM_MEMBER_DETAIL_BYTES))
+}
+
+fn kimi_member_detail(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| truncate_owned_utf8(text, MAX_SUBAGENT_DETAIL_BYTES))
+}
+
+fn truncate_owned_utf8(value: &str, maximum_bytes: usize) -> String {
+    if value.len() <= maximum_bytes {
+        return value.to_owned();
+    }
+    let mut end = maximum_bytes;
+    while !value.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    format!("{}…", &value[..end])
+}
+
+struct XaiHttpWorkerPermit;
+
+impl XaiHttpWorkerPermit {
+    fn try_acquire() -> Option<Self> {
+        let mut current = XAI_HTTP_WORKERS.load(Ordering::Acquire);
+        loop {
+            if current >= MAX_XAI_HTTP_WORKERS {
+                return None;
+            }
+            match XAI_HTTP_WORKERS.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for XaiHttpWorkerPermit {
+    fn drop(&mut self) {
+        XAI_HTTP_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn run_xai_responses_transport(
+    request: &AiRunRequest,
+    specification: XaiResponsesSpec,
+    control: &Arc<RunControl>,
+    event_sender: &Sender<AiEvent>,
+) -> RunOutcome {
+    #[cfg(test)]
+    let disconnect_worker = specification.disconnect_worker;
+    let Some(worker_permit) = XaiHttpWorkerPermit::try_acquire() else {
+        return RunOutcome::provider_error(
+            "Grok Heavy is still cleaning up too many stopped network requests; retry after one finishes",
+        );
+    };
+    let bearer_key = request
+        .api_key
+        .clone()
+        .or_else(|| env::var(XAI_API_KEY_ENV).ok())
+        .filter(|key| !key.trim().is_empty());
+    let Some(bearer_key) = bearer_key else {
+        return RunOutcome::provider_error(
+            "Grok Heavy needs XAI_API_KEY or a temporary xAI API key in Configure",
+        );
+    };
+    let effort = if request
+        .provider_preferences
+        .reasoning_effort
+        .trim()
+        .is_empty()
+    {
+        XaiReasoningEffort::Medium
+    } else {
+        match XaiReasoningEffort::parse(&request.provider_preferences.reasoning_effort) {
+            Ok(effort) => effort,
+            Err(error) => return RunOutcome::provider_error(error.to_string()),
+        }
+    };
+    let mut xai_request = XaiResponsesRequest::new(
+        bearer_key,
+        request.prompt.clone(),
+        XAI_MULTI_AGENT_MODEL,
+        effort,
+        format!("xai-heavy-{}", request.turn_id),
+    );
+    xai_request.endpoint = specification.url;
+    xai_request.instructions = request.system_prompt.clone();
+    xai_request.previous_response_id = request.resume_session_id.clone();
+    xai_request.web_search =
+        request.provider_preferences.feature(AI_FEATURE_WEB_SEARCH) == Some(true);
+    xai_request.limits = XaiResponsesLimits {
+        wall_timeout: run_timeout(request.workspace_mode),
+        ..XaiResponsesLimits::default()
+    };
+
+    let transport_abort = XaiTransportAbort::default();
+    control.install_xai_transport_abort(transport_abort.clone());
+    let (result_sender, result_receiver) = bounded(1);
+    let worker_request = request.clone();
+    let worker_xai_request = xai_request.clone();
+    let worker_control = Arc::clone(control);
+    let worker_transport_abort = transport_abort;
+    let worker_events = event_sender.clone();
+    let worker = match thread::Builder::new()
+        .name(format!("adam-ai-xai-{}", short_uuid(request.turn_id)))
+        .spawn(move || {
+            let _worker_permit = worker_permit;
+            #[cfg(test)]
+            if disconnect_worker {
+                return;
+            }
+            // The adapter produces GroupFinished immediately before returning,
+            // but completion must first win the same gate used by Stop and the
+            // wall-clock timeout. Buffer just that terminal group event until
+            // the provider result owns the terminal transition.
+            let terminal_group = RefCell::new(None::<XaiResponsesEvent>);
+            #[cfg(test)]
+            let result = crate::xai_responses::run_xai_responses_observed(
+                &worker_xai_request,
+                &worker_control.cancelled,
+                &worker_transport_abort,
+                &worker_control.http_read_in_progress,
+                |event| {
+                    if matches!(event, XaiResponsesEvent::GroupFinished { .. }) {
+                        *terminal_group.borrow_mut() = Some(event);
+                        return;
+                    }
+                    let _event_gate = lock_unpoison(&worker_control.http_event_gate);
+                    if !worker_control.cancelled.load(Ordering::Acquire)
+                        || xai_event_is_error_cleanup(&event)
+                    {
+                        emit_xai_responses_event(&worker_request, &worker_events, event);
+                    }
+                },
+            );
+            #[cfg(not(test))]
+            let result = run_xai_responses_cancellable(
+                &worker_xai_request,
+                &worker_control.cancelled,
+                &worker_transport_abort,
+                |event| {
+                    if matches!(event, XaiResponsesEvent::GroupFinished { .. }) {
+                        *terminal_group.borrow_mut() = Some(event);
+                        return;
+                    }
+                    let _event_gate = lock_unpoison(&worker_control.http_event_gate);
+                    if !worker_control.cancelled.load(Ordering::Acquire)
+                        || xai_event_is_error_cleanup(&event)
+                    {
+                        emit_xai_responses_event(&worker_request, &worker_events, event);
+                    }
+                },
+            );
+            let result_claimed = {
+                let _event_gate = lock_unpoison(&worker_control.http_event_gate);
+                if worker_control.cancelled.load(Ordering::Acquire)
+                    || worker_control.terminal_claimed.load(Ordering::Acquire)
+                {
+                    false
+                } else {
+                    worker_control
+                        .terminal_claimed
+                        .store(true, Ordering::Release);
+                    if let Some(event) = terminal_group.borrow_mut().take() {
+                        emit_xai_responses_event(&worker_request, &worker_events, event);
+                    }
+                    true
+                }
+            };
+            let _ = result_sender.send((result, result_claimed));
+        }) {
+        Ok(worker) => worker,
+        Err(error) => {
+            control.clear_xai_transport_abort();
+            return RunOutcome::provider_error(format!(
+                "could not start the Grok Heavy API worker: {error}"
+            ));
+        }
+    };
+
+    let timeout = run_timeout(request.workspace_mode);
+    let started_at = Instant::now();
+    let expected_count = effort.agent_count();
+    loop {
+        if control.cancelled.load(Ordering::Acquire) {
+            control.abort_xai_transport();
+            let _ = worker.join();
+            control.clear_xai_transport_abort();
+            emit_xai_cancel_terminal(request, control, event_sender, expected_count);
+            return RunOutcome::TerminalAlreadyEmitted;
+        }
+        if started_at.elapsed() >= timeout {
+            let message = timeout_failure_message(timeout);
+            let (timeout_won, completion_already_won) = {
+                let _event_gate = lock_unpoison(&control.http_event_gate);
+                if control.cancelled.load(Ordering::Acquire) {
+                    (false, false)
+                } else if control.terminal_claimed.load(Ordering::Acquire) {
+                    (false, true)
+                } else {
+                    control.terminal_claimed.store(true, Ordering::Release);
+                    control.cancelled.store(true, Ordering::Release);
+                    control.abort_xai_transport();
+                    (true, false)
+                }
+            };
+            if timeout_won {
+                let _ = worker.join();
+                control.clear_xai_transport_abort();
+                emit_xai_early_group_terminal(
+                    request,
+                    event_sender,
+                    expected_count,
+                    SubagentStatus::Failed,
+                    &message,
+                );
+                let _ = event_sender.send(AiEvent::Activity {
+                    turn_id: request.turn_id,
+                    conversation_id: request.conversation_id,
+                    event: activity_event(ActivityKind::TurnStatus {
+                        status: TurnStatus::TimedOut,
+                        message: Some(message.clone()),
+                        tool: None,
+                        retry: Some(RetryHint::Retry),
+                    }),
+                });
+                let _ = event_sender.send(AiEvent::Failed {
+                    turn_id: request.turn_id,
+                    conversation_id: request.conversation_id,
+                    kind: AiFailureKind::TimedOut,
+                    message,
+                    resume_rejected: false,
+                    preserve_resume: false,
+                });
+                return RunOutcome::TerminalAlreadyEmitted;
+            }
+            if !completion_already_won {
+                control.abort_xai_transport();
+                let _ = worker.join();
+                control.clear_xai_transport_abort();
+                emit_xai_cancel_terminal(request, control, event_sender, expected_count);
+                return RunOutcome::TerminalAlreadyEmitted;
+            }
+            // The network worker completed before the timeout gate. It sends
+            // the claimed result immediately after releasing that gate, so let
+            // the receive path below publish the matching turn terminal.
+        }
+        match result_receiver.recv_timeout(Duration::from_millis(40)) {
+            Ok((result, result_claimed)) => {
+                let _ = worker.join();
+                control.clear_xai_transport_abort();
+                if result_claimed
+                    && control.terminal_claimed.load(Ordering::Acquire)
+                    && !control.cancelled.load(Ordering::Acquire)
+                {
+                    return xai_result_outcome(result);
+                }
+                emit_xai_cancel_terminal(request, control, event_sender, expected_count);
+                return RunOutcome::TerminalAlreadyEmitted;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = worker.join();
+                control.clear_xai_transport_abort();
+                if control.claim_terminal_result() {
+                    let message = "the Grok Heavy API worker stopped unexpectedly";
+                    emit_xai_early_group_terminal(
+                        request,
+                        event_sender,
+                        expected_count,
+                        SubagentStatus::Failed,
+                        message,
+                    );
+                    return RunOutcome::provider_error(message);
+                }
+                emit_xai_cancel_terminal(request, control, event_sender, expected_count);
+                return RunOutcome::TerminalAlreadyEmitted;
+            }
+        }
+    }
+}
+
+fn emit_xai_cancel_terminal(
+    request: &AiRunRequest,
+    control: &RunControl,
+    event_sender: &Sender<AiEvent>,
+    expected_count: u32,
+) {
+    let _event_gate = lock_unpoison(&control.http_event_gate);
+    if control.terminal_claimed.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    emit_xai_early_group_terminal(
+        request,
+        event_sender,
+        expected_count,
+        SubagentStatus::Cancelled,
+        "Grok Heavy was stopped by the user.",
+    );
+    let _ = event_sender.send(AiEvent::Activity {
+        turn_id: request.turn_id,
+        conversation_id: request.conversation_id,
+        event: activity_event(ActivityKind::TurnStatus {
+            status: TurnStatus::UserCancelled,
+            message: None,
+            tool: None,
+            retry: None,
+        }),
+    });
+    let _ = event_sender.send(AiEvent::Cancelled {
+        turn_id: request.turn_id,
+        conversation_id: request.conversation_id,
+        preserve_resume: false,
+    });
+}
+
+fn xai_result_outcome(
+    result: Result<crate::xai_responses::XaiResponsesOutcome, XaiResponsesError>,
+) -> RunOutcome {
+    match result {
+        Ok(outcome) => RunOutcome::Completed {
+            text: outcome.text,
+            session_id: Some(outcome.response_id),
+        },
+        Err(XaiResponsesError::Cancelled) => RunOutcome::Cancelled,
+        Err(XaiResponsesError::TimedOut) => RunOutcome::timed_out("Grok Heavy timed out"),
+        Err(XaiResponsesError::PreviousResponseNotFound { message }) => {
+            RunOutcome::ResumeRejected {
+                message: format!("Grok Heavy could not resume its saved response: {message}"),
+            }
+        }
+        Err(XaiResponsesError::Incomplete { reason, .. })
+            if reason.trim() == "max_output_tokens" =>
+        {
+            RunOutcome::Failed {
+                kind: AiFailureKind::MaxTurnsReached,
+                message: "Grok Heavy reached its output-token limit before completing.".into(),
+                tool: None,
+                retry: Some(RetryHint::Retry),
+            }
+        }
+        Err(XaiResponsesError::Incomplete { reason, .. }) => RunOutcome::provider_error(format!(
+            "Grok Heavy returned an incomplete response: {reason}"
+        )),
+        Err(error) => RunOutcome::provider_error(format!("Grok Heavy failed: {error}")),
+    }
+}
+
+fn emit_xai_early_group_terminal(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    expected_count: u32,
+    status: SubagentStatus,
+    detail: &str,
+) {
+    send_provider_activity(
+        request,
+        event_sender,
+        ActivityKind::AgentGroup {
+            id: format!("xai-heavy-{}", request.turn_id),
+            aliases: Vec::new(),
+            label: "Grok Heavy".into(),
+            kind: AgentGroupKind::MultiAgentInference,
+            status,
+            expected_count: Some(expected_count),
+            members: Vec::new(),
+            visibility: AgentGroupVisibility::AggregateOnly,
+            detail: Some(detail.into()),
+        },
+    );
+}
+
+fn xai_event_is_error_cleanup(event: &XaiResponsesEvent) -> bool {
+    matches!(
+        event,
+        XaiResponsesEvent::LeaderToolFinished { is_error: true, .. }
+    )
+}
+
+fn emit_xai_responses_event(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    event: XaiResponsesEvent,
+) {
+    match event {
+        XaiResponsesEvent::GroupStarted {
+            group_id,
+            model,
+            effort,
+            expected_count,
+        } => send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::AgentGroup {
+                id: group_id,
+                aliases: Vec::new(),
+                label: format!("Grok Heavy · {expected_count} agents"),
+                kind: AgentGroupKind::MultiAgentInference,
+                status: SubagentStatus::InProgress,
+                expected_count: Some(expected_count),
+                members: Vec::new(),
+                visibility: AgentGroupVisibility::AggregateOnly,
+                detail: Some(format!(
+                    "xAI server-side multi-agent inference started with {model} at {} effort.",
+                    effort.as_str(),
+                )),
+            },
+        ),
+        XaiResponsesEvent::GroupUpdated { group_id, detail } => send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::AgentGroup {
+                id: group_id,
+                aliases: Vec::new(),
+                label: "Grok Heavy".into(),
+                kind: AgentGroupKind::MultiAgentInference,
+                status: SubagentStatus::InProgress,
+                expected_count: None,
+                members: Vec::new(),
+                visibility: AgentGroupVisibility::AggregateOnly,
+                detail: Some(detail),
+            },
+        ),
+        XaiResponsesEvent::GroupFinished {
+            group_id,
+            status,
+            detail,
+        } => {
+            let status = match status {
+                XaiGroupStatus::Completed => SubagentStatus::Completed,
+                XaiGroupStatus::Cancelled => SubagentStatus::Cancelled,
+                XaiGroupStatus::Incomplete | XaiGroupStatus::Failed => SubagentStatus::Failed,
+            };
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::AgentGroup {
+                    id: group_id,
+                    aliases: Vec::new(),
+                    label: "Grok Heavy".into(),
+                    kind: AgentGroupKind::MultiAgentInference,
+                    status,
+                    expected_count: None,
+                    members: Vec::new(),
+                    visibility: AgentGroupVisibility::AggregateOnly,
+                    detail,
+                },
+            );
+        }
+        // The response id is returned through RunOutcome and committed only to
+        // the machine-local resume sidecar. Do not mirror it into the portable
+        // conversation activity stream.
+        XaiResponsesEvent::Session { .. } => {}
+        XaiResponsesEvent::TextDelta { text } => {
+            send_provider_activity(
+                request,
+                event_sender,
+                ActivityKind::AssistantText { text: text.clone() },
+            );
+            let _ = event_sender.send(AiEvent::Delta {
+                turn_id: request.turn_id,
+                conversation_id: request.conversation_id,
+                text,
+            });
+        }
+        XaiResponsesEvent::LeaderToolStarted {
+            id,
+            name,
+            input_summary,
+        } => send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::ToolCall {
+                id,
+                name,
+                server: Some("xai".into()),
+                input_summary,
+            },
+        ),
+        XaiResponsesEvent::LeaderToolUpdated { .. } => {}
+        XaiResponsesEvent::LeaderToolFinished {
+            id,
+            is_error,
+            detail,
+            ..
+        } => send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::ToolResult {
+                id,
+                output: detail,
+                is_error,
+            },
+        ),
+        XaiResponsesEvent::Usage(usage) => send_provider_activity(
+            request,
+            event_sender,
+            ActivityKind::Usage {
+                input: usage.input_tokens,
+                output: usage.output_tokens,
+                cached_input: usage.cached_input_tokens,
+                reasoning: usage.reasoning_tokens,
+                cost_usd: usage.cost_usd(),
+            },
+        ),
+    }
+}
+
+fn send_provider_activity(
+    request: &AiRunRequest,
+    event_sender: &Sender<AiEvent>,
+    kind: ActivityKind,
+) {
+    let _ = event_sender.send(AiEvent::Activity {
+        turn_id: request.turn_id,
+        conversation_id: request.conversation_id,
+        event: activity_event(kind),
+    });
+}
+
 fn run_process(
     request: &AiRunRequest,
-    specification: ProcessSpec,
+    mut specification: ProcessSpec,
     control: &Arc<RunControl>,
     event_sender: &Sender<AiEvent>,
     task_tools: &Arc<Mutex<TaskToolRegistry>>,
 ) -> RunOutcome {
+    if version_sensitive_process_controls_requested(&specification.provider_id, request) {
+        if control.cancelled.load(Ordering::Acquire) {
+            return RunOutcome::CancelledBeforeLaunch;
+        }
+        let tuning = match fresh_runtime_tuning_for_program_cancellable(
+            &specification.provider_id,
+            &specification.program,
+            effective_model(request),
+            Some(&control.cancelled),
+        ) {
+            Ok(tuning) => tuning,
+            Err(CliVersionProbeFailure::Cancelled) => {
+                return RunOutcome::CancelledBeforeLaunch;
+            }
+            Err(failure) => {
+                if control.cancelled.load(Ordering::Acquire) {
+                    return RunOutcome::CancelledBeforeLaunch;
+                }
+                return RunOutcome::runtime_probe_failed(cli_version_probe_message(
+                    &specification.provider_id,
+                    &failure,
+                ));
+            }
+        };
+        if tuning.version.is_none() {
+            return RunOutcome::runtime_probe_failed(format!(
+                "Adam could not verify that the observed {} version belongs to that provider and did not launch it with saved version-sensitive controls. Refresh Agents, then retry the turn.",
+                specification.provider_id
+            ));
+        }
+        let program = specification.program.clone();
+        specification = match preset_process_spec_with_tuning(
+            &specification.provider_id,
+            program,
+            request,
+            &tuning,
+        ) {
+            Ok(specification) => specification,
+            Err(error) => {
+                return RunOutcome::runtime_probe_failed(format!(
+                    "Adam could not apply the verified {} capability contract: {error}",
+                    specification.provider_id
+                ));
+            }
+        };
+    }
+    if let Some(expected) = specification.expected_runtime_version.as_ref() {
+        if control.cancelled.load(Ordering::Acquire) {
+            return RunOutcome::CancelledBeforeLaunch;
+        }
+        let tuning = match fresh_runtime_tuning_for_program_cancellable(
+            &specification.provider_id,
+            &specification.program,
+            effective_model(request),
+            Some(&control.cancelled),
+        ) {
+            Ok(tuning) => tuning,
+            Err(CliVersionProbeFailure::Cancelled) => {
+                return RunOutcome::CancelledBeforeLaunch;
+            }
+            Err(failure) => {
+                if control.cancelled.load(Ordering::Acquire) {
+                    return RunOutcome::CancelledBeforeLaunch;
+                }
+                return RunOutcome::runtime_probe_failed(cli_version_probe_message(
+                    &specification.provider_id,
+                    &failure,
+                ));
+            }
+        };
+        if control.cancelled.load(Ordering::Acquire) {
+            return RunOutcome::CancelledBeforeLaunch;
+        }
+        let exact_contract_still_matches = tuning
+            .version
+            .as_ref()
+            .is_some_and(|version| same_cli_contract_version(version, expected))
+            && match specification.provider_id.as_str() {
+                "grok_cli" => supports_grok_legacy_process(tuning.version.as_ref()),
+                "kimi_cli" => supports_kimi_legacy_process(tuning.version.as_ref()),
+                _ => false,
+            };
+        if !exact_contract_still_matches {
+            return RunOutcome::runtime_probe_failed(format!(
+                "the installed {} runtime changed after this turn was prepared; retry the turn so Adam can apply the current transport and permission contract",
+                specification.provider_id
+            ));
+        }
+    }
     let mut task_bridge = if specification.provider_id == "custom_cli" {
         let bridge_events = event_sender.clone();
         let turn_id = request.turn_id;
@@ -2680,6 +6029,25 @@ fn run_process(
     outcome
 }
 
+fn version_sensitive_process_controls_requested(provider_id: &str, request: &AiRunRequest) -> bool {
+    let saved_effort = !request
+        .provider_preferences
+        .reasoning_effort
+        .trim()
+        .is_empty();
+    match provider_id {
+        "claude_cli" | "codex_cli" | "lm_studio" => saved_effort,
+        "ollama" => {
+            saved_effort
+                || request
+                    .provider_preferences
+                    .feature(AI_FEATURE_THINKING)
+                    .is_some()
+        }
+        _ => false,
+    }
+}
+
 fn run_process_with_timeout(
     request: &AiRunRequest,
     mut specification: ProcessSpec,
@@ -2688,6 +6056,9 @@ fn run_process_with_timeout(
     task_bridge: Option<&TaskToolBridge>,
     timeout: Duration,
 ) -> RunOutcome {
+    if control.cancelled.load(Ordering::Acquire) {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
     let temporary_prompt = if specification.prompt_input == PromptInput::SecureFile {
         match SecurePromptFile::create(request.turn_id, &request.prompt) {
             Ok(file) => {
@@ -2748,6 +6119,12 @@ fn run_process_with_timeout(
         command.current_dir(cwd);
     }
 
+    // Stop can arrive while Adam is preparing a prompt file, follower, or
+    // command. Preserve that as a locally-unsent retry instead of briefly
+    // launching the provider and reporting an ordinary cancellation.
+    if control.cancelled.load(Ordering::Acquire) {
+        return RunOutcome::CancelledBeforeLaunch;
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -3049,6 +6426,12 @@ struct PendingTaskUpdate {
     active_form: Option<String>,
 }
 
+struct PendingFileChange {
+    tool: String,
+    changes: Vec<FileChange>,
+    scope: AgentScope,
+}
+
 #[derive(Clone, Debug, Default)]
 struct KnownSubagent {
     parent_id: Option<String>,
@@ -3083,7 +6466,7 @@ struct OutputDecoder {
     poisoned: bool,
     stream_reset_emitted: bool,
     command_calls: HashMap<String, String>,
-    file_calls: HashMap<String, Vec<FileChange>>,
+    file_calls: HashMap<(AgentScope, String), PendingFileChange>,
     pending_task_creates: HashMap<String, String>,
     pending_task_updates: HashMap<String, PendingTaskUpdate>,
     task_subjects: HashMap<String, String>,
@@ -3476,6 +6859,10 @@ impl OutputDecoder {
     }
 }
 
+// Activity events stay value-typed throughout this mature decoder pipeline.
+// Boxing only this edge would add churn to every provider parser and test for
+// no measurable benefit under the existing bounded event caps.
+#[allow(clippy::large_enum_variant)]
 enum Decoded {
     Delta(String),
     Activity(ActivityEvent),
@@ -3714,31 +7101,38 @@ impl OutputDecoder {
             }
             "file_change" | "fileChange" => {
                 decoded.recognized = true;
+                let tool = string_at(item, &["tool", "tool_name", "toolName"])
+                    .filter(|tool| !tool.trim().is_empty())
+                    .unwrap_or_else(|| "Codex file change".into());
                 let changes = item
                     .get("changes")
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
-                    .map(|change| FileChange {
-                        path: self.resolve_path(
-                            change
-                                .get("path")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default(),
-                        ),
-                        kind: file_change_kind(
-                            change
-                                .get("kind")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default(),
-                        ),
+                    .filter_map(|change| {
+                        let path = resolve_provider_path(
+                            self.working_directory.as_deref(),
+                            change.get("path").and_then(Value::as_str)?,
+                        )?;
+                        Some(FileChange {
+                            path,
+                            kind: file_change_kind(
+                                change
+                                    .get("kind")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default(),
+                            ),
+                        })
                     })
-                    .collect();
-                decoded.kinds.push(ActivityKind::FileChange {
-                    id: id.into(),
-                    changes,
-                    status: lifecycle_status(item, phase),
-                });
+                    .collect::<Vec<_>>();
+                if !changes.is_empty() {
+                    decoded.kinds.push(ActivityKind::FileChange {
+                        id: id.into(),
+                        tool: Some(tool),
+                        changes,
+                        status: lifecycle_status(item, phase),
+                    });
+                }
             }
             "web_search" | "webSearch" => {
                 decoded.recognized = true;
@@ -4700,7 +8094,7 @@ impl OutputDecoder {
                             let kind = if matches!(name.as_str(), "Agent" | "Task") {
                                 self.decode_claude_agent_tool_use(block, value)
                             } else {
-                                self.decode_tool_use(block)
+                                self.decode_tool_use(block, scope.clone())
                             };
                             if let Some(kind) = kind {
                                 decoded.kinds.push_scoped(scope.clone(), kind);
@@ -5321,11 +8715,11 @@ impl OutputDecoder {
         decoded
     }
 
-    fn decode_tool_use(&mut self, block: &Value) -> Option<ActivityKind> {
+    fn decode_tool_use(&mut self, block: &Value, scope: AgentScope) -> Option<ActivityKind> {
         let id = string_at(block, &["id"]).unwrap_or_else(|| Uuid::new_v4().to_string());
         let name = string_at(block, &["name"]).unwrap_or_else(|| "tool".into());
         let input = block.get("input").cloned().unwrap_or(Value::Null);
-        self.map_tool_call(id, name, input)
+        self.map_tool_call_scoped(id, name, input, scope)
     }
 
     fn decode_openai_tool_call(&mut self, call: &Value) -> Option<ActivityKind> {
@@ -5350,6 +8744,16 @@ impl OutputDecoder {
     }
 
     fn map_tool_call(&mut self, id: String, name: String, input: Value) -> Option<ActivityKind> {
+        self.map_tool_call_scoped(id, name, input, AgentScope::Main)
+    }
+
+    fn map_tool_call_scoped(
+        &mut self,
+        id: String,
+        name: String,
+        input: Value,
+        scope: AgentScope,
+    ) -> Option<ActivityKind> {
         match name.as_str() {
             "TodoWrite" => {
                 let tasks = input
@@ -5438,19 +8842,43 @@ impl OutputDecoder {
                 })
             }
             "Write" | "Edit" | "MultiEdit" | "NotebookEdit" => {
-                let path =
-                    string_at(&input, &["file_path", "notebook_path", "path"]).unwrap_or_default();
+                let Some(path) = string_at(&input, &["file_path", "notebook_path", "path"])
+                    .filter(|path| !path.trim().is_empty())
+                else {
+                    return Some(ActivityKind::ToolCall {
+                        id,
+                        name,
+                        server: None,
+                        input_summary: compact_input_summary(&input),
+                    });
+                };
+                let Some(path) = resolve_provider_path(self.working_directory.as_deref(), &path)
+                else {
+                    return Some(ActivityKind::ToolCall {
+                        id,
+                        name,
+                        server: None,
+                        input_summary: compact_input_summary(&input),
+                    });
+                };
                 let changes = vec![FileChange {
-                    path: self.resolve_path(&path),
-                    kind: if name == "Write" {
-                        FileChangeKind::Add
-                    } else {
-                        FileChangeKind::Update
-                    },
+                    path,
+                    // Claude does not say whether Write created a new file or
+                    // replaced an existing one. Update materializes a
+                    // first-seen artifact without resetting its producer.
+                    kind: FileChangeKind::Update,
                 }];
-                self.file_calls.insert(id.clone(), changes.clone());
+                self.file_calls.insert(
+                    (scope.clone(), id.clone()),
+                    PendingFileChange {
+                        tool: name.clone(),
+                        changes: changes.clone(),
+                        scope,
+                    },
+                );
                 Some(ActivityKind::FileChange {
                     id,
+                    tool: Some(name),
                     changes,
                     status: ActivityStatus::InProgress,
                 })
@@ -5508,10 +8936,19 @@ impl OutputDecoder {
                 },
             });
         }
-        if let Some(changes) = self.file_calls.remove(&id) {
+        let result_scope = if self.provider_kind == ProviderKind::Claude {
+            envelope.and_then(|value| self.claude_envelope_scope(value))
+        } else {
+            Some(AgentScope::Main)
+        };
+        if let Some(result_scope) = result_scope
+            && let Some(pending) = self.file_calls.remove(&(result_scope.clone(), id.clone()))
+        {
+            debug_assert_eq!(pending.scope, result_scope);
             return Some(ActivityKind::FileChange {
                 id,
-                changes,
+                tool: Some(pending.tool),
+                changes: pending.changes,
                 status: if is_error {
                     ActivityStatus::Failed
                 } else {
@@ -5697,17 +9134,6 @@ impl OutputDecoder {
                 )
             }),
         })
-    }
-
-    fn resolve_path(&self, path: &str) -> String {
-        let path = Path::new(path);
-        if path.is_absolute() {
-            return path.to_string_lossy().into_owned();
-        }
-        self.working_directory
-            .as_deref()
-            .map(|directory| directory.join(path).to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string_lossy().into_owned())
     }
 }
 
@@ -7081,6 +10507,93 @@ fn file_change_kind(kind: &str) -> FileChangeKind {
     }
 }
 
+fn structured_file_changes<'a>(
+    cwd: Option<&Path>,
+    paths: impl IntoIterator<Item = &'a str>,
+    kind: FileChangeKind,
+) -> Vec<FileChange> {
+    let mut seen = HashSet::new();
+    paths
+        .into_iter()
+        .filter_map(|raw_path| {
+            let path = resolve_provider_path(cwd, raw_path)?;
+            seen.insert(path.clone())
+                .then_some(FileChange { path, kind })
+        })
+        .collect()
+}
+
+/// Resolves a provider-reported file path inside the run workspace.
+///
+/// Provider output is untrusted: lexical traversal, absolute paths outside
+/// the workspace, and symlink escapes are all rejected. Existing targets and
+/// the nearest existing ancestor of new targets are canonicalized so aliases
+/// converge on one artifact identity.
+fn resolve_provider_path(cwd: Option<&Path>, raw_path: &str) -> Option<String> {
+    let raw_path = raw_path.trim();
+    if raw_path.is_empty() {
+        return None;
+    }
+
+    let cwd = fs::canonicalize(cwd?).ok()?;
+    if !cwd.is_dir() {
+        return None;
+    }
+
+    let raw_path = Path::new(raw_path);
+    let is_absolute = raw_path.is_absolute();
+    let candidate = if is_absolute {
+        raw_path.to_path_buf()
+    } else {
+        cwd.join(raw_path)
+    };
+    let candidate = lexical_normalize_absolute(&candidate)?;
+    if !is_absolute && (candidate == cwd || !candidate.starts_with(&cwd)) {
+        return None;
+    }
+
+    let mut existing_ancestor = candidate.as_path();
+    loop {
+        match fs::symlink_metadata(existing_ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                existing_ancestor = existing_ancestor.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+    let canonical_ancestor = fs::canonicalize(existing_ancestor).ok()?;
+    if !canonical_ancestor.starts_with(&cwd) {
+        return None;
+    }
+    let unresolved_suffix = candidate.strip_prefix(existing_ancestor).ok()?;
+    let resolved = lexical_normalize_absolute(&canonical_ancestor.join(unresolved_suffix))?;
+    (resolved != cwd && resolved.starts_with(&cwd)).then(|| resolved.to_string_lossy().into_owned())
+}
+
+fn lexical_normalize_absolute(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(component) => normalized.push(component),
+        }
+    }
+    Some(normalized)
+}
+
 fn plan_status(status: Option<&str>) -> PlanItemStatus {
     parsed_plan_status(status).unwrap_or_default()
 }
@@ -7204,6 +10717,7 @@ fn run_http(
                 let _ = event_sender.send(AiEvent::Cancelled {
                     turn_id: request.turn_id,
                     conversation_id: request.conversation_id,
+                    preserve_resume: false,
                 });
             }
             wait_for_http_worker(result_receiver, worker);
@@ -7233,6 +10747,8 @@ fn run_http(
                     conversation_id: request.conversation_id,
                     kind: AiFailureKind::TimedOut,
                     message,
+                    resume_rejected: false,
+                    preserve_resume: false,
                 });
             }
             wait_for_http_worker(result_receiver, worker);
@@ -8327,10 +11843,13 @@ fn lock_unpoison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    static XAI_TRANSPORT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     fn request(provider_id: &str) -> AiRunRequest {
         AiRunRequest {
             turn_id: Uuid::from_u128(1),
             conversation_id: Uuid::from_u128(2),
+            canvas_page_id: Some(Uuid::from_u128(3)),
             provider_id: provider_id.into(),
             workspace_mode: AiWorkspaceMode::Code,
             permission_mode: PermissionMode::Sandbox,
@@ -8399,11 +11918,211 @@ mod tests {
     }
 
     #[test]
+    fn chat_mode_file_edits_are_allowed_only_inside_the_chat_sandbox() {
+        let blocked = RefCell::new(GrokPermissionBlockState::default());
+        let sandbox = PathBuf::from("/data/chat-sandboxes/abc");
+        let mut write = acp_permission("Write", GrokAcpToolKind::Edit);
+        write.tool_call.locations = vec![crate::grok_acp::GrokAcpToolLocation {
+            path: "/data/chat-sandboxes/abc/report.md".into(),
+            line: None,
+        }];
+        // The sandbox exists so the chat can hand the user files: allowed in
+        // Chat mode, and without an Ask prompt.
+        assert!(matches!(
+            grok_acp_permission_decision_scoped(
+                &write,
+                PermissionMode::Ask,
+                AiWorkspaceMode::Chat,
+                false,
+                false,
+                Some(&sandbox),
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Allow { .. }
+        ));
+        assert!(
+            blocked.borrow().pending.is_none(),
+            "a sandbox write must not record a blocked tool"
+        );
+
+        // A traversal that escapes the sandbox keeps the Chat-mode wall.
+        let mut escaping = write.clone();
+        escaping.tool_call.locations[0].path =
+            "/data/chat-sandboxes/abc/../../../home/user/report.md".into();
+        assert!(matches!(
+            grok_acp_permission_decision_scoped(
+                &escaping,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                false,
+                false,
+                Some(&sandbox),
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+
+        // Execute is never a sandbox file edit, even aimed at the sandbox.
+        let mut exec = acp_permission("Run script", GrokAcpToolKind::Execute);
+        exec.tool_call.locations = vec![crate::grok_acp::GrokAcpToolLocation {
+            path: "/data/chat-sandboxes/abc/script.sh".into(),
+            line: None,
+        }];
+        assert!(matches!(
+            grok_acp_permission_decision_scoped(
+                &exec,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                false,
+                false,
+                Some(&sandbox),
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+
+        // Grok's permission requests may omit locations; the CLI's own
+        // workspace sandbox (launched rooted at the chat sandbox) is the
+        // containment, so the edit is still allowed.
+        let bare = acp_permission("Write", GrokAcpToolKind::Edit);
+        assert!(matches!(
+            grok_acp_permission_decision_scoped(
+                &bare,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                false,
+                false,
+                Some(&sandbox),
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Allow { .. }
+        ));
+
+        // A run whose working folder is not a chat sandbox keeps the old
+        // Chat-mode policy entirely.
+        assert!(matches!(
+            grok_acp_permission_decision_scoped(
+                &write,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                false,
+                false,
+                None,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn kimi_chat_mode_sandbox_edits_are_allowed() {
+        let blocked = RefCell::new(KimiPermissionBlockState::default());
+        let sandbox = PathBuf::from("/data/chat-sandboxes/xyz");
+        let mut write = kimi_permission("Write", KimiAcpToolKind::Edit, None);
+        write.tool_call.locations = vec![crate::kimi_acp::KimiAcpToolLocation {
+            path: "/data/chat-sandboxes/xyz/notes.md".into(),
+            line: None,
+        }];
+        assert!(matches!(
+            kimi_acp_permission_decision_scoped(
+                &write,
+                PermissionMode::Ask,
+                AiWorkspaceMode::Chat,
+                true,
+                Some(&sandbox),
+                &blocked,
+            ),
+            KimiAcpPermissionDecision::Allow { .. }
+        ));
+        let mut outside = write.clone();
+        outside.tool_call.locations[0].path = "/home/user/notes.md".into();
+        assert!(matches!(
+            kimi_acp_permission_decision_scoped(
+                &outside,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                true,
+                Some(&sandbox),
+                &blocked,
+            ),
+            KimiAcpPermissionDecision::Reject { .. }
+        ));
+    }
+
+    fn kimi_permission(
+        title: &str,
+        kind: KimiAcpToolKind,
+        raw_input: Option<Value>,
+    ) -> KimiAcpPermissionRequest {
+        KimiAcpPermissionRequest {
+            session_id: "kimi-session".into(),
+            tool_call: KimiAcpToolCall {
+                id: format!("kimi-tool-{title}"),
+                title: Some(title.into()),
+                kind: Some(kind),
+                status: Some(KimiAcpToolStatus::Pending),
+                content: Vec::new(),
+                locations: Vec::new(),
+                raw_input,
+                raw_output: None,
+            },
+            options: vec![
+                crate::kimi_acp::KimiAcpPermissionOption {
+                    id: "allow-once".into(),
+                    name: "Allow once".into(),
+                    kind: crate::kimi_acp::KimiAcpPermissionOptionKind::AllowOnce,
+                },
+                crate::kimi_acp::KimiAcpPermissionOption {
+                    id: "reject-once".into(),
+                    name: "Reject once".into(),
+                    kind: crate::kimi_acp::KimiAcpPermissionOptionKind::RejectOnce,
+                },
+            ],
+        }
+    }
+
+    fn kimi_question_permission() -> KimiAcpPermissionRequest {
+        KimiAcpPermissionRequest {
+            session_id: "kimi-session".into(),
+            tool_call: KimiAcpToolCall {
+                id: "1:ask-user".into(),
+                title: Some("AskUserQuestion".into()),
+                kind: None,
+                status: None,
+                content: vec![json!({
+                    "type": "content",
+                    "content": {"type": "text", "text": "Which option?"}
+                })],
+                locations: Vec::new(),
+                raw_input: None,
+                raw_output: None,
+            },
+            options: vec![
+                crate::kimi_acp::KimiAcpPermissionOption {
+                    id: "q0_opt_0".into(),
+                    name: "First".into(),
+                    kind: crate::kimi_acp::KimiAcpPermissionOptionKind::AllowOnce,
+                },
+                crate::kimi_acp::KimiAcpPermissionOption {
+                    id: "q0_opt_1".into(),
+                    name: "Second".into(),
+                    kind: crate::kimi_acp::KimiAcpPermissionOptionKind::AllowOnce,
+                },
+                crate::kimi_acp::KimiAcpPermissionOption {
+                    id: "q0_skip".into(),
+                    name: "Skip".into(),
+                    kind: crate::kimi_acp::KimiAcpPermissionOptionKind::RejectOnce,
+                },
+            ],
+        }
+    }
+
+    #[test]
     fn grok_acp_task_bridge_is_version_pinned() {
         let task_only = CliVersion::parse("grok 0.2.114").unwrap();
         let scoped_subagents = CliVersion::parse("grok 0.2.117").unwrap();
         let old = CliVersion::parse("grok 0.2.111").unwrap();
-        let unverified_patch = CliVersion::parse("grok 0.2.118").unwrap();
+        let unverified_patch = CliVersion::parse("grok 0.2.119").unwrap();
         let future = CliVersion::parse("grok 0.3.0").unwrap();
         assert!(supports_grok_acp_task_bridge(Some(&task_only)));
         assert!(supports_grok_acp_task_bridge(Some(&scoped_subagents)));
@@ -8678,6 +12397,7 @@ mod tests {
                 PermissionMode::Ask,
                 AiWorkspaceMode::Cowork,
                 true,
+                false,
                 &blocked,
             ),
             GrokAcpPermissionDecision::Allow { .. }
@@ -8695,6 +12415,7 @@ mod tests {
                 PermissionMode::Bypass,
                 AiWorkspaceMode::Cowork,
                 true,
+                false,
                 &blocked,
             ),
             GrokAcpPermissionDecision::Reject { .. }
@@ -8711,6 +12432,7 @@ mod tests {
                 PermissionMode::Ask,
                 AiWorkspaceMode::Cowork,
                 true,
+                false,
                 &blocked,
             ),
             GrokAcpPermissionDecision::Reject { .. }
@@ -8720,6 +12442,7 @@ mod tests {
                 &spawn,
                 PermissionMode::Bypass,
                 AiWorkspaceMode::Cowork,
+                false,
                 false,
                 &blocked,
             ),
@@ -8733,6 +12456,121 @@ mod tests {
                 &title_lookalike,
                 PermissionMode::Bypass,
                 AiWorkspaceMode::Cowork,
+                true,
+                false,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn grok_acp_canvas_permissions_require_exact_root_enabled_identity() {
+        let blocked = RefCell::new(GrokPermissionBlockState::default());
+
+        for mode in [PermissionMode::Auto, PermissionMode::Bypass] {
+            let mut root_canvas = acp_permission(
+                "provider-controlled title",
+                GrokAcpToolKind::Other("mcp".into()),
+            );
+            root_canvas.tool_call.canonical_mcp_tool_name =
+                Some("adam_tasks__canvas_create_note".into());
+            assert!(matches!(
+                grok_acp_permission_decision_with_subagents(
+                    &root_canvas,
+                    mode,
+                    AiWorkspaceMode::Cowork,
+                    false,
+                    true,
+                    &blocked,
+                ),
+                GrokAcpPermissionDecision::Allow { .. }
+            ));
+            assert!(blocked.borrow().pending.is_none());
+        }
+
+        let mut disabled = acp_permission(
+            "provider-controlled title",
+            GrokAcpToolKind::Other("mcp".into()),
+        );
+        disabled.tool_call.canonical_mcp_tool_name = Some("adam_tasks__canvas_create_pile".into());
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &disabled,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Cowork,
+                false,
+                false,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+        blocked.borrow_mut().pending = None;
+
+        let mut child = disabled.clone();
+        child.session_id = "child-session".into();
+        child.scope = GrokAcpSessionScope::Child {
+            subagent_id: "provider-child".into(),
+            parent_session_id: "session".into(),
+        };
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &child,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Cowork,
+                false,
+                true,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+        assert!(
+            blocked.borrow().pending.is_none(),
+            "a child canvas denial must not become the root terminal cause"
+        );
+
+        let title_only = acp_permission(
+            "adam_tasks__canvas_create_note",
+            GrokAcpToolKind::Other("mcp".into()),
+        );
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &title_only,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Cowork,
+                false,
+                true,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+        blocked.borrow_mut().pending = None;
+
+        let mut canonical_lookalike = acp_permission(
+            "provider-controlled title",
+            GrokAcpToolKind::Other("mcp".into()),
+        );
+        canonical_lookalike.tool_call.canonical_mcp_tool_name =
+            Some("adam_tasks__canvas_create_note_backup".into());
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &canonical_lookalike,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Cowork,
+                false,
+                true,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+        blocked.borrow_mut().pending = None;
+
+        assert!(matches!(
+            grok_acp_permission_decision_with_subagents(
+                &disabled,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                false,
                 true,
                 &blocked,
             ),
@@ -8897,6 +12735,163 @@ mod tests {
                 ..
             } if tool == "Switch mode"
         ));
+    }
+
+    #[test]
+    fn grok_acp_projects_only_structured_terminal_file_mutations_with_verified_scope() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_root = fs::canonicalize(workspace.path()).unwrap();
+        let old_absolute = workspace_root.join("old.md").to_string_lossy().into_owned();
+        let mut run = request("grok_cli");
+        run.cwd = Some(workspace_root.clone());
+        let (sender, receiver) = unbounded();
+        let projection = RefCell::new(GrokAcpProjectionState {
+            root_session_id: Some("root-session".into()),
+            ..GrokAcpProjectionState::default()
+        });
+        projection.borrow_mut().remember_child(
+            "child-session",
+            GrokAcpSessionScope::Child {
+                subagent_id: "provider-child".into(),
+                parent_session_id: "root-session".into(),
+            },
+        );
+        let tool = |id: &str,
+                    title: &str,
+                    kind: GrokAcpToolKind,
+                    status: GrokAcpToolStatus,
+                    path: &str| GrokAcpToolCall {
+            id: id.into(),
+            title: Some(title.into()),
+            canonical_mcp_tool_name: None,
+            kind: Some(kind),
+            status: Some(status),
+            content: Vec::new(),
+            locations: vec![crate::grok_acp::GrokAcpToolLocation {
+                path: path.into(),
+                line: None,
+            }],
+        };
+
+        for (session_id, tool_call) in [
+            (
+                "root-session",
+                tool(
+                    "edit-report",
+                    "Edit report",
+                    GrokAcpToolKind::Edit,
+                    GrokAcpToolStatus::Completed,
+                    "report.md",
+                ),
+            ),
+            (
+                "root-session",
+                tool(
+                    "edit-old",
+                    "Edit old report",
+                    GrokAcpToolKind::Edit,
+                    GrokAcpToolStatus::Completed,
+                    "old.md",
+                ),
+            ),
+            (
+                "child-session",
+                tool(
+                    "delete-old",
+                    "Delete old report",
+                    GrokAcpToolKind::Delete,
+                    GrokAcpToolStatus::Completed,
+                    &old_absolute,
+                ),
+            ),
+            (
+                "root-session",
+                tool(
+                    "failed-edit",
+                    "Edit denied file",
+                    GrokAcpToolKind::Edit,
+                    GrokAcpToolStatus::Failed,
+                    "denied.md",
+                ),
+            ),
+            (
+                "unknown-session",
+                tool(
+                    "unscoped-edit",
+                    "Edit unscoped file",
+                    GrokAcpToolKind::Edit,
+                    GrokAcpToolStatus::Completed,
+                    "unscoped.md",
+                ),
+            ),
+            (
+                "root-session",
+                tool(
+                    "read-lookalike",
+                    "Edit-looking read",
+                    GrokAcpToolKind::Read,
+                    GrokAcpToolStatus::Completed,
+                    "not-edited.md",
+                ),
+            ),
+        ] {
+            emit_grok_acp_tool_call(&run, &sender, session_id, &tool_call, &projection, true);
+        }
+
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for event in receiver.try_iter() {
+            if let AiEvent::Activity { event, .. } = event {
+                accumulator.ingest(event);
+            }
+        }
+        let files = accumulator
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, ActivityKind::FileChange { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 4);
+        assert!(files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { tool, changes, status: ActivityStatus::Completed, .. }
+                if event.scope.is_main()
+                    && tool.as_deref() == Some("Edit report")
+                    && changes[0].path == workspace_root.join("report.md").to_string_lossy()
+        )));
+        assert!(files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { tool, changes, status: ActivityStatus::Completed, .. }
+                if matches!(&event.scope, AgentScope::Child { id } if id == "child-session")
+                    && tool.as_deref() == Some("Delete old report")
+                    && changes[0].kind == FileChangeKind::Delete
+        )));
+        assert!(files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { changes, status: ActivityStatus::Failed, .. }
+                if changes[0].path == workspace_root.join("denied.md").to_string_lossy()
+        )));
+        assert!(!files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { changes, .. }
+                if changes[0].path.ends_with("unscoped.md")
+                    || changes[0].path.ends_with("not-edited.md")
+        )));
+
+        let artifacts = crate::chat_core::project_artifacts(&accumulator.events);
+        assert_eq!(artifacts.len(), 2);
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.file_path() == Some(old_absolute.as_str()) && artifact.is_deleted
+        }));
+        assert!(artifacts.iter().all(|artifact| {
+            !artifact
+                .file_path()
+                .is_some_and(|path| path.ends_with("denied.md"))
+                && !artifact
+                    .file_path()
+                    .is_some_and(|path| path.ends_with("unscoped.md"))
+                && !artifact
+                    .file_path()
+                    .is_some_and(|path| path.ends_with("not-edited.md"))
+        }));
     }
 
     #[test]
@@ -9350,7 +13345,7 @@ mod tests {
             .or_else(|| resolve_executable("grok", Some(temporary.path())))
             .expect("installed Grok CLI");
         assert!(
-            probe_cli_version(&executable).is_some_and(|version| {
+            probe_cli_version(&executable).is_ok_and(|version| {
                 (version.major, version.minor, version.patch) == (0, 2, 117)
             }),
             "this evidence test is pinned to installed Grok 0.2.117"
@@ -9374,6 +13369,7 @@ mod tests {
                 "then reply only PARENT_PERMISSION_TEST_DONE."
             )
             .into(),
+            verified_runtime_version: "0.2.117".into(),
             rules: concat!(
                 "This is a permission-boundary test. Adam has attached no MCP servers. ",
                 "The child must attempt the requested built-in write or edit tool. ",
@@ -9391,6 +13387,8 @@ mod tests {
             reasoning_effort: Some("low".into()),
             resume_session_id: None,
             progress_route: GrokAcpProgressRoute::NativeStream,
+            task_tools_enabled: false,
+            canvas_tools_enabled: false,
             http_mcp_server: None,
             limits: GrokAcpLimits {
                 wall_timeout: Duration::from_secs(120),
@@ -9505,7 +13503,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn grok_acp_subagent_transport_uses_native_main_progress_without_mcp() {
+    fn grok_acp_native_progress_attaches_canvas_only_to_fresh_root_sessions() {
         use std::os::unix::fs::PermissionsExt;
 
         let temporary = tempfile::tempdir().unwrap();
@@ -9517,7 +13515,7 @@ import json
 import sys
 
 if "--version" in sys.argv:
-    print("grok 0.2.117 (fixture)")
+    print("grok 0.2.117 (f1c06093089f)")
     raise SystemExit(0)
 
 def receive():
@@ -9544,8 +13542,30 @@ send({
 })
 
 session = receive()
-if session["params"]["mcpServers"] != []:
-    raise RuntimeError("subagent run received an inherited MCP server")
+fresh_root_only = "--no-subagents" in sys.argv and "sessionId" not in session["params"]
+servers = session["params"]["mcpServers"]
+if len(servers) != (1 if fresh_root_only else 0):
+    raise RuntimeError("Adam MCP attachment did not match the fresh root-only gate")
+canvas_rules = {
+    "MCPTool(adam_tasks__canvas_create_note)",
+    "MCPTool(adam_tasks__canvas_create_pile)"
+}
+task_rules = {
+    "MCPTool(adam_tasks__task_create)",
+    "MCPTool(adam_tasks__task_update)",
+    "MCPTool(adam_tasks__task_list)"
+}
+allowed = {
+    sys.argv[index + 1]
+    for index, argument in enumerate(sys.argv[:-1])
+    if argument == "--allow"
+}
+if fresh_root_only and not canvas_rules.issubset(allowed):
+    raise RuntimeError("fresh root-only canvas allow rules were omitted")
+if not fresh_root_only and canvas_rules.intersection(allowed):
+    raise RuntimeError("canvas allow rules escaped the fresh root-only gate")
+if task_rules.intersection(allowed):
+    raise RuntimeError("native-progress run received Adam task allow rules")
 session_id = session["params"].get("sessionId", "fake-native-session")
 send({"jsonrpc": "2.0", "id": session["id"], "result": {"sessionId": session_id}})
 prompt = receive()
@@ -9590,6 +13610,10 @@ send({
         let mut permissions = fs::metadata(&executable).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&executable, permissions).unwrap();
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("grok 0.2.117 (f1c06093089f)")
+        );
 
         for (subagents_enabled, resume_session_id, expected_session_id) in [
             (true, None, "fake-native-session"),
@@ -9609,6 +13633,8 @@ send({
             };
             assert_eq!(specification.plan_channel, PlanChannel::NativeStream);
             assert_eq!(specification.subagents_enabled, subagents_enabled);
+            let expects_canvas = !subagents_enabled && resume_session_id.is_none();
+            assert_eq!(specification.canvas_tools_supported, expects_canvas);
 
             let registry = Arc::new(Mutex::new(TaskToolRegistry::new()));
             lock_unpoison(&registry)
@@ -9620,20 +13646,38 @@ send({
                 )
                 .unwrap();
             let (sender, receiver) = unbounded();
+            let canvas_tools = Arc::new(CanvasToolBroker::new());
+            if expects_canvas {
+                canvas_tools
+                    .register_run(run.turn_id, run.conversation_id, Uuid::new_v4(), true)
+                    .unwrap();
+                assert_eq!(canvas_tools.descriptors_for_run(run.turn_id).len(), 2);
+            }
             let outcome = run_grok_acp_transport(
                 &run,
                 specification,
                 &Arc::new(RunControl::default()),
                 &sender,
                 &registry,
+                &canvas_tools,
             );
 
-            assert!(matches!(
-                outcome,
-                RunOutcome::Completed { text, session_id }
-                    if text == "Native progress recorded."
-                        && session_id.as_deref() == Some(expected_session_id)
-            ));
+            match outcome {
+                RunOutcome::Completed { text, session_id } => {
+                    assert_eq!(text, "Native progress recorded.");
+                    assert_eq!(session_id.as_deref(), Some(expected_session_id));
+                }
+                RunOutcome::Failed { message, .. }
+                | RunOutcome::ResumeRejected { message }
+                | RunOutcome::RuntimeProbeFailed { message } => panic!(
+                    "Grok native-progress case failed (subagents={subagents_enabled}, resume={resume_session_id:?}): {message}"
+                ),
+                RunOutcome::Cancelled
+                | RunOutcome::CancelledBeforeLaunch
+                | RunOutcome::TerminalAlreadyEmitted => panic!(
+                    "Grok native-progress case stopped without completion (subagents={subagents_enabled}, resume={resume_session_id:?})"
+                ),
+            }
             assert!(
                 lock_unpoison(&registry)
                     .tasks_for_conversation(run.conversation_id)
@@ -9672,11 +13716,12 @@ send({
             r#"#!/usr/bin/env python3
 import json
 import sys
-import urllib.request
 
 if "--version" in sys.argv:
-    print("grok 0.2.114 (fixture)")
+    print("grok 0.2.114 (0c785038798)")
     raise SystemExit(0)
+
+import urllib.request
 
 def receive():
     line = sys.stdin.readline()
@@ -9780,6 +13825,10 @@ send({
         let mut permissions = fs::metadata(&executable).unwrap().permissions();
         permissions.set_mode(0o700);
         fs::set_permissions(&executable, permissions).unwrap();
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("grok 0.2.114 (0c785038798)")
+        );
 
         let mut run = request("grok_cli");
         run.cwd = Some(temporary.path().to_path_buf());
@@ -9799,6 +13848,7 @@ send({
             "resumed Grok sessions with unrecorded creation versions must not attach task tools"
         );
         assert!(!resumed_specification.subagents_enabled);
+        assert!(!resumed_specification.canvas_tools_supported);
 
         let prepared = prepare_resolved_cli("grok_cli", executable, &run).unwrap();
         let PreparedRun::GrokAcp(specification) = prepared else {
@@ -9806,6 +13856,7 @@ send({
         };
         assert_eq!(specification.plan_channel, PlanChannel::AppTaskTools);
         assert!(!specification.subagents_enabled);
+        assert!(specification.canvas_tools_supported);
         let registry = Arc::new(Mutex::new(TaskToolRegistry::new()));
         lock_unpoison(&registry)
             .register_run(
@@ -9816,12 +13867,14 @@ send({
             )
             .unwrap();
         let (sender, receiver) = unbounded();
+        let canvas_tools = Arc::new(CanvasToolBroker::new());
         let outcome = run_grok_acp_transport(
             &run,
             specification,
             &Arc::new(RunControl::default()),
             &sender,
             &registry,
+            &canvas_tools,
         );
 
         assert!(matches!(
@@ -10245,6 +14298,132 @@ send({
     }
 
     #[test]
+    fn unverified_cli_version_never_persists_a_capability_downgrade() {
+        let mut grok = AiProviderPreferences {
+            reasoning_effort: "high".into(),
+            ..AiProviderPreferences::default()
+        };
+        grok.set_feature(AI_FEATURE_SUBAGENTS, Some(true));
+        let original_grok = grok.clone();
+        let unknown_grok = runtime_tuning_profile(ProviderKind::Grok, None, "grok-4.5");
+        assert!(!clamp_provider_preferences(
+            "grok_cli",
+            &mut grok,
+            &unknown_grok
+        ));
+        assert_eq!(grok, original_grok);
+
+        let unlisted_grok = CliVersion::parse("grok 0.2.119 (94172f2aa4e5)").unwrap();
+        let unlisted_grok =
+            runtime_tuning_profile(ProviderKind::Grok, Some(&unlisted_grok), "grok-4.5");
+        assert!(!unlisted_grok.verified_runtime);
+        assert!(!clamp_provider_preferences(
+            "grok_cli",
+            &mut grok,
+            &unlisted_grok
+        ));
+        assert_eq!(grok, original_grok);
+
+        let mut kimi = AiProviderPreferences::default();
+        kimi.set_feature(AI_FEATURE_SWARM, Some(true));
+        let original_kimi = kimi.clone();
+        let unknown_kimi = runtime_tuning_profile(ProviderKind::Kimi, None, "");
+        assert!(!clamp_provider_preferences(
+            "kimi_cli",
+            &mut kimi,
+            &unknown_kimi
+        ));
+        assert_eq!(kimi, original_kimi);
+
+        let unlisted_kimi = CliVersion::parse("kimi 0.31.1").unwrap();
+        let unlisted_kimi = runtime_tuning_profile(ProviderKind::Kimi, Some(&unlisted_kimi), "");
+        assert!(!unlisted_kimi.verified_runtime);
+        assert!(!clamp_provider_preferences(
+            "kimi_cli",
+            &mut kimi,
+            &unlisted_kimi
+        ));
+        assert_eq!(kimi, original_kimi);
+    }
+
+    #[test]
+    fn observed_unlisted_generic_versions_clear_only_version_sensitive_controls() {
+        for (provider_id, kind, banner) in [
+            ("claude_cli", ProviderKind::Claude, "2.1.129 (Claude Code)"),
+            ("codex_cli", ProviderKind::Codex, "codex-cli 0.144.2"),
+            ("lm_studio", ProviderKind::LmStudio, "lms 0.3.30"),
+            (
+                "ollama",
+                ProviderKind::Ollama,
+                "Warning: client version is 0.32.2",
+            ),
+        ] {
+            let version = CliVersion::parse(banner).expect("unlisted version parses");
+            let tuning = runtime_tuning_profile(kind, Some(&version), "test-model");
+            assert!(!tuning.verified_runtime, "{provider_id}");
+            assert!(tuning.version.is_some(), "{provider_id}");
+
+            let mut preferences = AiProviderPreferences {
+                reasoning_effort: "high".into(),
+                fallback_model: "preserved-fallback".into(),
+                ..AiProviderPreferences::default()
+            };
+            if provider_id == "ollama" {
+                preferences.set_feature(AI_FEATURE_THINKING, Some(true));
+            }
+            assert!(clamp_provider_preferences(
+                provider_id,
+                &mut preferences,
+                &tuning
+            ));
+            assert!(preferences.reasoning_effort.is_empty(), "{provider_id}");
+            assert_eq!(preferences.fallback_model, "preserved-fallback");
+            if provider_id == "ollama" {
+                assert_eq!(preferences.feature(AI_FEATURE_THINKING), None);
+            }
+
+            let mut unobserved = AiProviderPreferences {
+                reasoning_effort: "high".into(),
+                ..AiProviderPreferences::default()
+            };
+            if provider_id == "ollama" {
+                unobserved.set_feature(AI_FEATURE_THINKING, Some(false));
+            }
+            let original = unobserved.clone();
+            let tuning = runtime_tuning_profile(kind, None, "test-model");
+            assert!(!clamp_provider_preferences(
+                provider_id,
+                &mut unobserved,
+                &tuning
+            ));
+            assert_eq!(unobserved, original, "{provider_id}");
+        }
+    }
+
+    #[test]
+    fn saved_xai_model_overrides_self_heal_to_the_fixed_heavy_contract() {
+        let tuning = runtime_tuning_profile(ProviderKind::Xai, None, XAI_MULTI_AGENT_MODEL);
+        let mut preferences = AiProviderPreferences {
+            model: "grok-4.20-multi-agent-beta-stale".into(),
+            reasoning_effort: " XHIGH ".into(),
+            ..AiProviderPreferences::default()
+        };
+
+        assert!(clamp_provider_preferences(
+            "xai_api",
+            &mut preferences,
+            &tuning
+        ));
+        assert!(preferences.model.is_empty());
+        assert_eq!(preferences.reasoning_effort, "xhigh");
+        assert!(!clamp_provider_preferences(
+            "xai_api",
+            &mut preferences,
+            &tuning
+        ));
+    }
+
+    #[test]
     fn kimi_and_ollama_map_explicit_thinking_controls() {
         let mut kimi = request("kimi_cli");
         kimi.permission_mode = PermissionMode::Auto;
@@ -10288,6 +14467,20 @@ send({
             "--think",
             "false"
         ));
+
+        ollama.provider_preferences.reasoning_effort = "medium".into();
+        set_feature(&mut ollama, AI_FEATURE_THINKING, true);
+        let unlisted = preset_process_spec_for_version(
+            "ollama",
+            PathBuf::from("/tmp/ollama"),
+            &ollama,
+            "Warning: client version is 0.32.2",
+        )
+        .unwrap();
+        assert!(
+            !argument_strings(&unlisted).contains(&"--think".into()),
+            "an unlisted Ollama version must use its own thinking default"
+        );
     }
 
     #[test]
@@ -10522,6 +14715,130 @@ send({
         );
         assert!(!outcome.is_error());
         assert!(delivered.get());
+    }
+
+    #[test]
+    fn cancel_immediately_invalidates_a_queued_canvas_request() {
+        let engine = AiEngine::new();
+        let turn_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        let page_id = Uuid::new_v4();
+        let control = Arc::new(RunControl::default());
+        lock_unpoison(&engine.active).insert(
+            turn_id,
+            ActiveRun {
+                conversation_id,
+                control: Arc::clone(&control),
+            },
+        );
+        engine
+            .canvas_tools
+            .register_run(turn_id, conversation_id, page_id, true)
+            .unwrap();
+
+        let broker = Arc::clone(&engine.canvas_tools);
+        let worker_control = Arc::clone(&control);
+        let call = thread::spawn(move || {
+            broker.call_for_run(
+                turn_id,
+                crate::ai_canvas_tools::CANVAS_CREATE_NOTE,
+                &json!({
+                    "idempotency_key": "cancelled-note",
+                    "title": "Report",
+                    "text": "Done"
+                }),
+                &worker_control.cancelled,
+            )
+        });
+        let request = loop {
+            if let Some(request) = engine.try_recv_canvas_tool() {
+                break request;
+            }
+            thread::yield_now();
+        };
+
+        assert!(engine.canvas_tool_request_is_active(&request));
+        assert!(engine.cancel(turn_id));
+        assert!(!engine.canvas_tool_request_is_active(&request));
+        let _ = request.respond(crate::ai_canvas_tools::CanvasToolResult::Rejected(
+            "The AI run ended before canvas creation completed".into(),
+        ));
+        assert_eq!(call.join().unwrap()["isError"], true);
+    }
+
+    #[test]
+    fn cancel_conversation_immediately_revokes_its_canvas_runs() {
+        let engine = AiEngine::new();
+        let conversation_id = Uuid::new_v4();
+        let turn_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        for turn_id in turn_ids {
+            lock_unpoison(&engine.active).insert(
+                turn_id,
+                ActiveRun {
+                    conversation_id,
+                    control: Arc::new(RunControl::default()),
+                },
+            );
+            engine
+                .canvas_tools
+                .register_run(turn_id, conversation_id, Uuid::new_v4(), true)
+                .unwrap();
+        }
+
+        assert!(engine.cancel_conversation(conversation_id));
+        for turn_id in turn_ids {
+            assert!(engine.canvas_tools.descriptors_for_run(turn_id).is_empty());
+        }
+    }
+
+    #[test]
+    fn cancel_all_immediately_revokes_every_canvas_run() {
+        let engine = AiEngine::new();
+        let turn_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        for turn_id in turn_ids {
+            lock_unpoison(&engine.active).insert(
+                turn_id,
+                ActiveRun {
+                    conversation_id: Uuid::new_v4(),
+                    control: Arc::new(RunControl::default()),
+                },
+            );
+            engine
+                .canvas_tools
+                .register_run(turn_id, Uuid::new_v4(), Uuid::new_v4(), true)
+                .unwrap();
+        }
+
+        engine.cancel_all();
+
+        for turn_id in turn_ids {
+            assert!(engine.canvas_tools.descriptors_for_run(turn_id).is_empty());
+        }
+    }
+
+    #[test]
+    fn deleted_conversation_rejects_restart_and_drops_late_events() {
+        let engine = AiEngine::new();
+        let conversation_id = Uuid::new_v4();
+        assert!(engine.delete_conversation(conversation_id));
+
+        let mut run = request("openai_compatible");
+        run.turn_id = Uuid::new_v4();
+        run.conversation_id = conversation_id;
+        assert!(matches!(
+            engine.start(run),
+            Err(AiEngineError::ConversationDeleted(id)) if id == conversation_id
+        ));
+
+        engine
+            .event_sender
+            .send(AiEvent::Delta {
+                turn_id: Uuid::new_v4(),
+                conversation_id,
+                text: "late".into(),
+            })
+            .unwrap();
+        assert!(engine.try_recv().is_none());
     }
 
     #[test]
@@ -11373,7 +15690,7 @@ send({
 
     #[cfg(unix)]
     #[test]
-    fn stub_executable_probe_reports_path_and_version_and_refresh_reprobes() {
+    fn stub_executable_probe_rechecks_changed_identity_and_refresh_reprobes() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().expect("temp dir");
@@ -11389,20 +15706,739 @@ send({
             "first probe reads the stub version"
         );
 
-        fs::write(&stub, "#!/bin/sh\necho 9.9.10\n").expect("rewrite stub");
+        fs::write(&stub, "#!/bin/sh\necho 8.8.8\n").expect("rewrite stub in place");
         fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
         assert_eq!(
             cached_cli_version(&program),
-            CliVersion::parse("9.9.9"),
-            "without invalidation the cached version is returned"
+            CliVersion::parse("8.8.8"),
+            "same-size in-place changes invalidate the cached identity"
         );
 
-        invalidate_cached_cli_version(&program);
+        let replacement = directory.path().join("adam-probe-stub-replacement");
+        fs::write(&replacement, "#!/bin/sh\necho 9.9.10\n").expect("write replacement");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755))
+            .expect("chmod replacement");
+        fs::rename(&replacement, &stub).expect("replace stub identity");
         assert_eq!(
             cached_cli_version(&program),
             CliVersion::parse("9.9.10"),
-            "refresh drops the cache entry so the new version is probed"
+            "a same-path executable replacement invalidates the cached contract"
         );
+
+        fs::write(&stub, "#!/bin/sh\necho 9.9.11\n").expect("rewrite stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+        assert_eq!(
+            refresh_cli_version(&program).ok(),
+            CliVersion::parse("9.9.11"),
+            "refresh forces a new observation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_retains_only_an_identity_matched_last_good_observation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let state = directory.path().join("probe-state");
+        let stub = directory.path().join("refresh-version-stub");
+        fs::write(&state, "9.9.9\n").expect("write initial state");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nstate=$(cat '{}')\nif [ \"$state\" = \"fail\" ]; then\n  echo 'temporary failure' >&2\n  exit 7\nfi\necho \"$state\"\n",
+                state.display()
+            ),
+        )
+        .expect("write refresh stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let first = provider_probe_for_program("claude", stub.clone(), false);
+        assert_eq!(first.version, CliVersion::parse("9.9.9"));
+        assert_eq!(first.observation, ProviderProbeObservation::Observed);
+
+        fs::write(&state, "fail\n").expect("make probe fail");
+        let failed = provider_probe_for_program("claude", stub.clone(), true);
+        assert_eq!(failed.version, CliVersion::parse("9.9.9"));
+        assert!(matches!(
+            failed.observation,
+            ProviderProbeObservation::Failed {
+                retained_last_good: true,
+                ..
+            }
+        ));
+
+        fs::write(&state, "9.9.10\n").expect("recover probe");
+        let recovered = provider_probe_for_program("claude", stub.clone(), true);
+        assert_eq!(recovered.version, CliVersion::parse("9.9.10"));
+        assert_eq!(recovered.observation, ProviderProbeObservation::Observed);
+
+        let replacement = directory.path().join("refresh-version-replacement");
+        fs::write(&replacement, "#!/bin/sh\necho failed >&2\nexit 7\n").expect("write replacement");
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755))
+            .expect("chmod replacement");
+        fs::rename(&replacement, &stub).expect("replace executable identity");
+        let replaced = provider_probe_for_program("claude", stub, true);
+        assert_eq!(replaced.version, None);
+        assert!(matches!(
+            replaced.observation,
+            ProviderProbeObservation::Failed {
+                retained_last_good: false,
+                ..
+            }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_metadata_failure_does_not_destroy_the_version_cache() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("metadata-version-stub");
+        let hidden = directory.path().join("metadata-version-stub-hidden");
+        fs::write(&stub, "#!/bin/sh\necho 'codex-cli 0.144.1'\n").expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+        let key = fs::canonicalize(&stub).expect("canonical stub");
+        assert_eq!(
+            verified_cli_version(&stub).ok(),
+            CliVersion::parse("codex-cli 0.144.1")
+        );
+
+        fs::rename(&stub, &hidden).expect("hide executable temporarily");
+        let tuning = cached_runtime_tuning_for_program("codex_cli", &stub, "gpt-5.6-sol");
+        assert_eq!(tuning.version, None);
+        assert!(
+            lock_unpoison(CLI_VERSION_CACHE.get().expect("version cache")).contains_key(&key),
+            "metadata failure removed the last-good observation"
+        );
+    }
+
+    #[test]
+    fn provider_probe_failure_text_is_single_line_and_bounded() {
+        let raw = format!("first line\nsecond\tline\0{}", "x".repeat(700));
+        let sanitized = sanitized_cli_version_probe_failure(&CliVersionProbeFailure::Metadata(raw));
+        assert!(!sanitized.chars().any(char::is_control));
+        assert!(sanitized.len() <= 512);
+        assert!(sanitized.contains("first line second line"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_version_probe_survives_the_old_one_second_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        assert!(CLI_VERSION_TIMEOUT >= Duration::from_secs(5));
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("slow-version-stub");
+        fs::write(
+            &stub,
+            "#!/bin/sh\nsleep 2\necho 'grok 0.2.114 (0c785038798)'\n",
+        )
+        .expect("write slow stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod slow stub");
+
+        let started = Instant::now();
+        let version = probe_cli_version(&stub).expect("slow probe remains within the new budget");
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert_eq!((version.major, version.minor, version.patch), (0, 2, 114));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slow_worker_probe_applies_saved_codex_effort_instead_of_downgrading() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let executable = directory.path().join("slow-codex-version-stub");
+        let invoked = directory.path().join("provider-arguments");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  sleep 2\n  echo 'codex-cli 0.144.1'\n  exit 0\nfi\nprintf '%s\\n' \"$@\" > '{}'\n",
+                invoked.display()
+            ),
+        )
+        .expect("write slow Codex stub");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("chmod Codex stub");
+
+        let mut run = request("codex_cli");
+        run.cwd = Some(directory.path().to_path_buf());
+        run.provider_preferences.reasoning_effort = "high".into();
+        let unobserved = preset_process_spec("codex_cli", executable.clone(), &run).unwrap();
+        assert!(
+            !argument_strings(&unobserved)
+                .iter()
+                .any(|argument| argument.contains("model_reasoning_effort")),
+            "cache-only preparation must not guess before the worker probe"
+        );
+
+        let (sender, _receiver) = unbounded();
+        let outcome = run_process(
+            &run,
+            unobserved,
+            &Arc::new(RunControl::default()),
+            &sender,
+            &Arc::new(Mutex::new(TaskToolRegistry::new())),
+        );
+        assert!(matches!(outcome, RunOutcome::Completed { .. }));
+        let arguments = fs::read_to_string(&invoked).expect("provider invocation arguments");
+        assert!(
+            arguments.contains("model_reasoning_effort=\"high\""),
+            "saved effort was silently omitted after a slow probe: {arguments}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn observed_unlisted_generic_versions_launch_with_provider_defaults() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (provider_id, banner, forbidden_argument) in [
+            ("claude_cli", "2.1.129 (Claude Code)", "--effort"),
+            ("codex_cli", "codex-cli 0.144.2", "model_reasoning_effort"),
+            ("lm_studio", "lms 0.3.30", "--effort"),
+        ] {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let executable = directory.path().join(format!("{provider_id}-stub"));
+            let invoked = directory.path().join("provider-arguments");
+            fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo '{banner}'\n  exit 0\nfi\nprintf '%s\\n' \"$@\" > '{}'\n",
+                    invoked.display()
+                ),
+            )
+            .expect("write provider stub");
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+                .expect("chmod provider stub");
+
+            let mut run = request(provider_id);
+            run.cwd = Some(directory.path().to_path_buf());
+            run.provider_preferences.reasoning_effort = "high".into();
+            let unobserved = preset_process_spec(provider_id, executable, &run).unwrap();
+            let (sender, _receiver) = unbounded();
+            let outcome = run_process(
+                &run,
+                unobserved,
+                &Arc::new(RunControl::default()),
+                &sender,
+                &Arc::new(Mutex::new(TaskToolRegistry::new())),
+            );
+            assert!(
+                matches!(outcome, RunOutcome::Completed { .. }),
+                "{provider_id} did not launch with provider defaults"
+            );
+            let arguments = fs::read_to_string(&invoked).expect("provider invocation arguments");
+            assert!(
+                !arguments.contains(forbidden_argument),
+                "{provider_id} received an unverified control: {arguments}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ollama_thinking_drift_reprobes_and_launches_without_an_unverified_flag() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let executable = directory.path().join("ollama-version-stub");
+        let version = directory.path().join("version");
+        let invoked = directory.path().join("provider-arguments");
+        fs::write(&version, "Warning: client version is 0.32.1\n").expect("write version");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  cat '{}'\n  exit 0\nfi\nprintf '%s\\n' \"$@\" > '{}'\n",
+                version.display(),
+                invoked.display()
+            ),
+        )
+        .expect("write Ollama stub");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("chmod Ollama stub");
+
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("Warning: client version is 0.32.1")
+        );
+        let mut run = request("ollama");
+        run.cwd = Some(directory.path().to_path_buf());
+        set_feature(&mut run, AI_FEATURE_THINKING, true);
+        let prepared = preset_process_spec("ollama", executable, &run).unwrap();
+        assert!(has_argument_pair(
+            &argument_strings(&prepared),
+            "--think",
+            "true"
+        ));
+
+        fs::write(&version, "Warning: client version is 0.32.2\n")
+            .expect("advance version without replacing executable");
+        let (sender, _receiver) = unbounded();
+        let outcome = run_process(
+            &run,
+            prepared,
+            &Arc::new(RunControl::default()),
+            &sender,
+            &Arc::new(Mutex::new(TaskToolRegistry::new())),
+        );
+        assert!(matches!(outcome, RunOutcome::Completed { .. }));
+        let arguments = fs::read_to_string(&invoked).expect("provider invocation arguments");
+        assert!(
+            !arguments.lines().any(|argument| argument == "--think"),
+            "unlisted Ollama received a stale thinking flag: {arguments}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_worker_probe_refuses_to_launch_without_a_saved_control() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let executable = directory.path().join("failed-codex-version-stub");
+        let invoked = directory.path().join("provider-invoked");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo unavailable >&2\n  exit 7\nfi\necho invoked > '{}'\n",
+                invoked.display()
+            ),
+        )
+        .expect("write failed Codex stub");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("chmod Codex stub");
+
+        let mut run = request("codex_cli");
+        run.cwd = Some(directory.path().to_path_buf());
+        run.provider_preferences.reasoning_effort = "high".into();
+        let specification = preset_process_spec("codex_cli", executable, &run).unwrap();
+        let (sender, _receiver) = unbounded();
+        let outcome = run_process(
+            &run,
+            specification,
+            &Arc::new(RunControl::default()),
+            &sender,
+            &Arc::new(Mutex::new(TaskToolRegistry::new())),
+        );
+        assert!(matches!(outcome, RunOutcome::RuntimeProbeFailed { .. }));
+        assert!(
+            !invoked.exists(),
+            "provider launched without the saved effort"
+        );
+    }
+
+    #[test]
+    fn strict_version_parser_rejects_ambiguous_and_prerelease_text() {
+        let duplicate =
+            parse_unambiguous_cli_version("grok 0.2.117 (build-a)\ngrok 0.2.117 (build-b)")
+                .expect("duplicate mentions of one release are unambiguous");
+        assert_eq!(
+            (duplicate.major, duplicate.minor, duplicate.patch),
+            (0, 2, 117)
+        );
+
+        for output in [
+            "grok 0.2.117rc1",
+            "grok 0.2.117_beta",
+            "grok 0.2.117-beta.1",
+            "grok 0.2.117+local",
+            "node 20.0.0\ngrok 0.2.117",
+        ] {
+            assert_eq!(
+                parse_unambiguous_cli_version(output),
+                Err(CliVersionProbeFailure::Ambiguous),
+                "{output:?} must not grant an exact provider contract"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_provider_banners_match_only_captured_shapes() {
+        for (provider_id, banner) in [
+            ("grok_cli", "grok 0.2.117 (f1c06093089f)"),
+            // Captured live 2026-08-02: 0.2.117 appends a release-channel
+            // tag the earlier banners lacked.
+            ("grok_cli", "grok 0.2.117 (f1c06093089f) [stable]"),
+            ("kimi_cli", "0.31.0"),
+            ("kimi_cli", "kimi 0.31.0"),
+            ("kimi_cli", "kimi, version 1.49.0"),
+        ] {
+            let version = parse_unambiguous_cli_version(banner).expect("captured banner parses");
+            assert!(
+                version_banner_matches_provider(provider_id, &version),
+                "{provider_id} rejected captured banner {banner:?}"
+            );
+        }
+
+        for (provider_id, banner) in [
+            ("grok_cli", "node 0.2.117"),
+            ("grok_cli", "warning: grok requires node 0.2.117"),
+            ("grok_cli", "kimi 0.2.117"),
+            ("grok_cli", "grok 0.2.117 beta"),
+            ("grok_cli", "grok 0.2.117 (prerelease)"),
+            ("grok_cli", "grok 0.2.117 (f1c06093089f) [stable] extra"),
+            ("grok_cli", "grok 0.2.117 (f1c06093089f) extra"),
+            ("grok_cli", "grok 0.2.117 (f1c06093089f) []"),
+            ("kimi_cli", "python 0.31.0"),
+            ("kimi_cli", "1.49.0"),
+            ("kimi_cli", "kimi, version 1.49.0 rc1"),
+            ("kimi_cli", "warning: kimi helper 0.31.0 failed"),
+            ("kimi_cli", "grok 0.31.0"),
+        ] {
+            let version = parse_unambiguous_cli_version(banner).expect("warning tuple parses");
+            assert!(
+                !version_banner_matches_provider(provider_id, &version),
+                "{provider_id} trusted unrelated banner {banner:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_version_probe_kills_its_process_group_and_can_retry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("timeout-version-stub");
+        let allow = directory.path().join("allow-success");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nif [ -f '{}' ]; then\n  echo 'grok 0.2.114'\nelse\n  sleep 10\nfi\n",
+                allow.display()
+            ),
+        )
+        .expect("write timeout stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let (pid_sender, pid_receiver) = bounded(1);
+        let worker_stub = stub.clone();
+        let worker = thread::spawn(move || {
+            probe_cli_version_with_timeout_observer(
+                &worker_stub,
+                Duration::from_millis(100),
+                None,
+                Some(&pid_sender),
+            )
+        });
+        let pid = pid_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("probe child pid") as i32;
+        let started = Instant::now();
+        assert_eq!(
+            worker.join().expect("probe worker"),
+            Err(CliVersionProbeFailure::TimedOut)
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+
+        fs::write(&allow, "ready").expect("enable retry");
+        let version = probe_cli_version(&stub).expect("same executable retries after timeout");
+        assert_eq!((version.major, version.minor, version.patch), (0, 2, 114));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_version_probe_is_not_cached_and_cannot_select_a_legacy_adapter() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let state = directory.path().join("probe-state");
+        let recovering = directory.path().join("recovering-version-stub");
+        fs::write(
+            &recovering,
+            format!(
+                "#!/bin/sh\nif [ ! -f '{}' ]; then\n  : > '{}'\n  echo 'version unavailable'\nelse\n  echo 'grok 0.2.114'\nfi\n",
+                state.display(),
+                state.display()
+            ),
+        )
+        .expect("write recovering stub");
+        fs::set_permissions(&recovering, fs::Permissions::from_mode(0o755))
+            .expect("chmod recovering stub");
+        assert_eq!(cached_cli_version(&recovering), None);
+        assert_eq!(
+            cached_cli_version(&recovering),
+            CliVersion::parse("grok 0.2.114"),
+            "an unchanged executable must run again after a transient probe failure"
+        );
+
+        let stub = directory.path().join("unknown-version-stub");
+        fs::write(&stub, "#!/bin/sh\necho 'version unavailable'\n").expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+        for provider_id in ["grok_cli", "kimi_cli"] {
+            let mut run = request(provider_id);
+            if provider_id == "kimi_cli" {
+                run.workspace_mode = AiWorkspaceMode::Cowork;
+                run.permission_mode = PermissionMode::Auto;
+            }
+            let result = prepare_resolved_cli(provider_id, stub.clone(), &run);
+            assert!(
+                matches!(
+                    result,
+                    Err(AiEngineError::InvalidConfiguration(message))
+                        if message.contains("will not silently switch provider adapters")
+                ),
+                "{provider_id} must fail visibly when its runtime contract is unknown"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_version_probe_cannot_grant_capabilities_from_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("failed-version-stub");
+        fs::write(&stub, "#!/bin/sh\necho 'grok 0.2.114' >&2\nexit 7\n").expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        assert!(matches!(
+            probe_cli_version(&stub),
+            Err(CliVersionProbeFailure::NonZero(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_fresh_probes_share_one_in_flight_observation() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Barrier;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let counter = directory.path().join("probe-count");
+        let stub = directory.path().join("single-flight-version-stub");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho probe >> '{}'\nsleep 1\necho 'grok 0.2.114'\n",
+                counter.display()
+            ),
+        )
+        .expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let stub = stub.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                fresh_runtime_tuning_for_program("grok_cli", &stub, "grok-4.5")
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            let tuning = worker.join().expect("probe worker").expect("probe result");
+            assert!(supports_grok_acp_task_bridge(tuning.version.as_ref()));
+        }
+        assert_eq!(
+            fs::read_to_string(&counter)
+                .expect("counter")
+                .lines()
+                .count(),
+            1,
+            "overlapping callers must share the completed observation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_failing_probes_share_the_failure_but_a_later_call_retries() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::Barrier;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let counter = directory.path().join("failed-probe-count");
+        let stub = directory.path().join("failed-single-flight-version-stub");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho probe >> '{}'\nsleep 1\necho 'version unavailable'\n",
+                counter.display()
+            ),
+        )
+        .expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let barrier = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let barrier = Arc::clone(&barrier);
+            let stub = stub.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                fresh_runtime_tuning_for_program("grok_cli", &stub, "grok-4.5")
+            }));
+        }
+        barrier.wait();
+        for worker in workers {
+            assert_eq!(
+                worker.join().expect("probe worker"),
+                Err(CliVersionProbeFailure::Unparseable)
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(&counter)
+                .expect("counter")
+                .lines()
+                .count(),
+            1,
+            "overlapping callers must share the failed observation"
+        );
+
+        assert_eq!(
+            fresh_runtime_tuning_for_program("grok_cli", &stub, "grok-4.5"),
+            Err(CliVersionProbeFailure::Unparseable),
+            "a later caller retries rather than caching the failure"
+        );
+        assert_eq!(
+            fs::read_to_string(&counter)
+                .expect("counter")
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preparing_a_turn_never_runs_a_slow_version_probe_on_the_caller() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let marker = directory.path().join("probe-ran");
+        let stub = directory.path().join("slow-unobserved-version-stub");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho ran > '{}'\nsleep 10\necho 'grok 0.2.117'\n",
+                marker.display()
+            ),
+        )
+        .expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let started = Instant::now();
+        let result = prepare_resolved_cli("grok_cli", stub, &request("grok_cli"));
+        assert!(
+            matches!(
+                result,
+                Err(AiEngineError::InvalidConfiguration(message))
+                    if message.contains("no current version observation")
+            ),
+            "unobserved Grok must fail preparation without probing"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!marker.exists(), "composer preparation ran `--version`");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_terminates_descendants_that_hold_output_pipes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("inherited-pipe-version-stub");
+        let child_pid = directory.path().join("child.pid");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n(sleep 10) &\necho $! > '{}'\necho 'grok 0.2.114'\nexit 0\n",
+                child_pid.display()
+            ),
+        )
+        .expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let version = probe_cli_version(&stub).expect("the direct version result remains usable");
+        assert_eq!((version.major, version.minor, version.patch), (0, 2, 114));
+        let pid: i32 = fs::read_to_string(&child_pid)
+            .expect("child pid")
+            .trim()
+            .parse()
+            .expect("numeric child pid");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_ne!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the successful probe left its helper process alive"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_drains_large_output_without_deadlocking() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let stub = directory.path().join("large-version-stub");
+        let output = "x".repeat(MAX_CLI_VERSION_OUTPUT_BYTES + 1);
+        fs::write(
+            &stub,
+            format!("#!/bin/sh\nprintf '%s\\n' '{output}'\necho 'grok 0.2.114'\n"),
+        )
+        .expect("write stub");
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).expect("chmod stub");
+
+        let result = probe_cli_version(&stub);
+        assert!(
+            matches!(
+                &result,
+                Err(CliVersionProbeFailure::Output(message))
+                    if message.contains("output exceeded")
+            ),
+            "unexpected probe result: {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlisted_grok_and_kimi_versions_never_select_legacy_adapters() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let grok = directory.path().join("unlisted-grok-stub");
+        fs::write(&grok, "#!/bin/sh\necho 'grok 0.2.119'\n").expect("write Grok stub");
+        fs::set_permissions(&grok, fs::Permissions::from_mode(0o755)).expect("chmod Grok stub");
+        assert_eq!(cached_cli_version(&grok), CliVersion::parse("grok 0.2.119"));
+        assert!(!auto_cli_candidate_is_runnable("grok_cli", &grok));
+        assert!(matches!(
+            prepare_resolved_cli("grok_cli", grok, &request("grok_cli")),
+            Err(AiEngineError::InvalidConfiguration(message))
+                if message.contains("unverified")
+        ));
+
+        let kimi = directory.path().join("unlisted-kimi-stub");
+        fs::write(&kimi, "#!/bin/sh\necho 'kimi 1.50.0'\n").expect("write Kimi stub");
+        fs::set_permissions(&kimi, fs::Permissions::from_mode(0o755)).expect("chmod Kimi stub");
+        assert_eq!(cached_cli_version(&kimi), CliVersion::parse("kimi 1.50.0"));
+        assert!(!auto_cli_candidate_is_runnable("kimi_cli", &kimi));
+        assert!(matches!(
+            prepare_resolved_cli("kimi_cli", kimi, &request("kimi_cli")),
+            Err(AiEngineError::InvalidConfiguration(message))
+                if message.contains("unverified")
+                    && message.contains("auto-approving legacy adapter")
+        ));
+
+        let supported = directory.path().join("supported-kimi-stub");
+        fs::write(&supported, "#!/bin/sh\necho 'kimi 0.31.0'\n")
+            .expect("write supported Kimi stub");
+        fs::set_permissions(&supported, fs::Permissions::from_mode(0o755))
+            .expect("chmod supported Kimi stub");
+        assert_eq!(
+            cached_cli_version(&supported),
+            CliVersion::parse("kimi 0.31.0")
+        );
+        assert!(auto_cli_candidate_is_runnable("kimi_cli", &supported));
     }
 
     #[cfg(unix)]
@@ -11422,6 +16458,10 @@ send({
         run.model = "grok-4.5".into();
 
         write_version_stub(&executable, "0.2.114");
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("grok 0.2.114")
+        );
         let PreparedRun::GrokAcp(old_specification) =
             prepare_resolved_cli("grok_cli", executable.clone(), &run).unwrap()
         else {
@@ -11439,6 +16479,10 @@ send({
         assert!(!old_specification.subagents_enabled);
 
         write_version_stub(&executable, "0.2.117");
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("grok 0.2.117")
+        );
         let PreparedRun::GrokAcp(new_specification) =
             prepare_resolved_cli("grok_cli", executable.clone(), &run).unwrap()
         else {
@@ -11460,6 +16504,7 @@ send({
         // task bridge or the provider process.
         write_version_stub(&executable, "0.2.114");
         let registry = Arc::new(Mutex::new(TaskToolRegistry::new()));
+        let canvas_tools = Arc::new(CanvasToolBroker::new());
         let (sender, _receiver) = unbounded();
         let outcome = run_grok_acp_transport(
             &run,
@@ -11467,15 +16512,270 @@ send({
             &Arc::new(RunControl::default()),
             &sender,
             &registry,
+            &canvas_tools,
         );
         assert!(matches!(
             outcome,
-            RunOutcome::Failed {
-                kind: AiFailureKind::ProviderError,
-                message,
-                ..
-            } if message.contains("runtime changed")
+            RunOutcome::RuntimeProbeFailed { message }
+                if message.contains("runtime changed")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kimi_0_31_selects_the_exact_acp_adapter_and_rejects_runtime_drift() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_version_stub(path: &Path, version: &str) {
+            fs::write(path, format!("#!/bin/sh\necho 'kimi {version}'\n")).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("kimi-version-stub");
+        let mut run = request("kimi_cli");
+        run.cwd = Some(temporary.path().to_path_buf());
+
+        write_version_stub(&executable, KIMI_ACP_RUNTIME_VERSION);
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse(&format!("kimi {KIMI_ACP_RUNTIME_VERSION}"))
+        );
+        let PreparedRun::KimiAcp(specification) =
+            prepare_resolved_cli("kimi_cli", executable.clone(), &run).unwrap()
+        else {
+            panic!("verified Kimi 0.31.0 must use ACP");
+        };
+        assert_eq!(specification.program, executable);
+        assert_eq!(
+            (
+                specification.runtime_version.major,
+                specification.runtime_version.minor,
+                specification.runtime_version.patch,
+            ),
+            (0, 31, 0)
+        );
+
+        write_version_stub(&specification.program, "0.31.1");
+        let (sender, _receiver) = unbounded();
+        let outcome = run_kimi_acp_transport(
+            &run,
+            specification,
+            &Arc::new(RunControl::default()),
+            &sender,
+        );
+        assert!(matches!(
+            outcome,
+            RunOutcome::RuntimeProbeFailed { message }
+                if message.contains("runtime changed")
+        ));
+        assert!(supports_kimi_acp_transport(
+            CliVersion::parse("0.31.0").as_ref()
+        ));
+        assert!(!supports_kimi_acp_transport(
+            CliVersion::parse("1.49.0").as_ref()
+        ));
+
+        let mut resumed = request("kimi_cli");
+        resumed.cwd = Some(temporary.path().to_path_buf());
+        resumed.resume_session_id = Some("saved-kimi-session".into());
+        write_version_stub(&executable, "1.49.0");
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("kimi 1.49.0")
+        );
+        assert!(matches!(
+            prepare_resolved_cli("kimi_cli", executable.clone(), &resumed),
+            Err(AiEngineError::NativeResumeUnavailable(message))
+                if message.contains("no longer matches")
+        ));
+
+        write_version_stub(&executable, "0.31.1");
+        assert_eq!(
+            cached_cli_version(&executable),
+            CliVersion::parse("kimi 0.31.1")
+        );
+        assert!(matches!(
+            prepare_resolved_cli("kimi_cli", executable, &resumed),
+            Err(AiEngineError::InvalidConfiguration(message))
+                if message.contains("unverified")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_exact_contracts_reprobe_before_spawn_and_refuse_runtime_drift() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_stub(path: &Path, banner: &str, marker: &Path) {
+            fs::write(
+                path,
+                format!(
+                    "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo '{banner}'\n  exit 0\nfi\necho invoked > '{}'\n",
+                    marker.display()
+                ),
+            )
+            .expect("write provider stub");
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755))
+                .expect("chmod provider stub");
+        }
+
+        for (provider_id, initial_banner, changed_banner) in [
+            ("grok_cli", "grok 0.2.111", "grok 0.2.114"),
+            ("kimi_cli", "kimi, version 1.49.0", "kimi 1.50.0"),
+        ] {
+            let directory = tempfile::tempdir().expect("temp dir");
+            let executable = directory.path().join(format!("{provider_id}-stub"));
+            let marker = directory.path().join("provider-invoked");
+            write_stub(&executable, initial_banner, &marker);
+            assert!(cached_cli_version(&executable).is_some());
+            let mut run = request(provider_id);
+            if provider_id == "kimi_cli" {
+                run.workspace_mode = AiWorkspaceMode::Cowork;
+                run.permission_mode = PermissionMode::Auto;
+            }
+            let PreparedRun::Process(specification) =
+                prepare_resolved_cli(provider_id, executable.clone(), &run)
+                    .expect("fixture-verified legacy contract prepares")
+            else {
+                panic!("{provider_id} legacy contract did not select Process");
+            };
+            assert!(specification.expected_runtime_version.is_some());
+
+            write_stub(&executable, changed_banner, &marker);
+            let (sender, _receiver) = unbounded();
+            let outcome = run_process(
+                &run,
+                specification,
+                &Arc::new(RunControl::default()),
+                &sender,
+                &Arc::new(Mutex::new(TaskToolRegistry::new())),
+            );
+            assert!(matches!(
+                outcome,
+                RunOutcome::RuntimeProbeFailed { message }
+                    if message.contains("runtime changed")
+            ));
+            assert!(
+                !marker.exists(),
+                "{provider_id} started the provider after exact-contract drift"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_slow_boundary_probe_cancels_before_provider_launch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let executable = directory.path().join("grok-slow-boundary-stub");
+        let ready = directory.path().join("probe-ready");
+        let invoked = directory.path().join("provider-invoked");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo 'grok 0.2.111'\n  exit 0\nfi\n",
+        )
+        .expect("write initial stub");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("chmod initial stub");
+        assert!(cached_cli_version(&executable).is_some());
+        let run = request("grok_cli");
+        let PreparedRun::Process(specification) =
+            prepare_resolved_cli("grok_cli", executable.clone(), &run)
+                .expect("legacy contract prepares")
+        else {
+            panic!("legacy Grok did not select Process");
+        };
+
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo ready > '{}'\n  sleep 10\n  echo 'grok 0.2.111'\n  exit 0\nfi\necho invoked > '{}'\n",
+                ready.display(),
+                invoked.display()
+            ),
+        )
+        .expect("write slow stub");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
+            .expect("chmod slow stub");
+
+        let control = Arc::new(RunControl::default());
+        let worker_control = Arc::clone(&control);
+        let (sender, _receiver) = unbounded();
+        let registry = Arc::new(Mutex::new(TaskToolRegistry::new()));
+        let worker = thread::spawn(move || {
+            run_process(&run, specification, &worker_control, &sender, &registry)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            ready.exists(),
+            "boundary probe never reached its ready point"
+        );
+        control.cancelled.store(true, Ordering::Release);
+        assert!(matches!(
+            worker.join().expect("probe worker"),
+            RunOutcome::CancelledBeforeLaunch
+        ));
+        assert!(!invoked.exists(), "provider command ran after Stop");
+    }
+
+    #[test]
+    fn exact_contract_comparison_ignores_banner_formatting() {
+        let prepared = CliVersion::parse("grok 0.2.117 (build-a)").unwrap();
+        let observed = CliVersion::parse("warning text\ngrok 0.2.117 (build-b)").unwrap();
+        assert_ne!(prepared, observed, "raw banners remain diagnostic data");
+        assert!(same_cli_contract_version(&prepared, &observed));
+    }
+
+    #[test]
+    fn kimi_session_activity_keeps_the_provider_id_sidecar_only() {
+        let mut run = request("kimi_cli");
+        run.model = "kimi-for-coding".into();
+        let (sender, receiver) = unbounded();
+        emit_kimi_acp_event(
+            &run,
+            &sender,
+            KimiAcpEvent::SessionStarted {
+                session_id: "private-kimi-session".into(),
+                resumed: false,
+            },
+            &RefCell::new(KimiAcpProjectionState::default()),
+        );
+
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AiEvent::Activity {
+                event: ActivityEvent {
+                    kind: ActivityKind::SessionInfo {
+                        model: Some(model),
+                        session_id: None,
+                    },
+                    ..
+                },
+                ..
+            } if model == "kimi-for-coding"
+        ));
+        assert!(!format!("{events:?}").contains("private-kimi-session"));
+    }
+
+    #[test]
+    fn xai_provider_selects_the_fixed_responses_transport() {
+        let prepared = prepare_run(&request("xai_api")).unwrap();
+        assert_eq!(prepared.provider_id(), "xai_api");
+        assert_eq!(prepared.plan_channel(), PlanChannel::None);
+        let PreparedRun::XaiResponses(specification) = prepared else {
+            panic!("Grok Heavy must not fall through to a CLI or generic HTTP adapter");
+        };
+        assert_eq!(
+            specification.url.as_str(),
+            crate::xai_responses::XAI_RESPONSES_ENDPOINT
+        );
     }
 
     #[test]
@@ -11778,7 +17078,22 @@ send({
         stream: &str,
         chunk_size: usize,
     ) -> (OutputDecoder, Vec<Decoded>) {
-        let mut decoder = OutputDecoder::new(provider_id.into(), OutputMode::JsonLines);
+        decode_in_chunks_with_cwd(provider_id, stream, chunk_size, None)
+    }
+
+    fn decode_in_chunks_with_cwd(
+        provider_id: &str,
+        stream: &str,
+        chunk_size: usize,
+        cwd: Option<PathBuf>,
+    ) -> (OutputDecoder, Vec<Decoded>) {
+        let profile = capability_profile(provider_id, provider_id, &[]);
+        let mut decoder = OutputDecoder::with_context(
+            provider_id.into(),
+            profile.runtime_family,
+            OutputMode::JsonLines,
+            cwd,
+        );
         let mut decoded = Vec::new();
         for chunk in stream.as_bytes().chunks(chunk_size) {
             decoder.push(chunk, |event| decoded.push(event));
@@ -11803,6 +17118,143 @@ send({
             serde_json::from_str::<Value>(line)
                 .unwrap_or_else(|error| panic!("fixture line {} is invalid: {error}", index + 1));
         }
+    }
+
+    #[test]
+    fn provider_file_paths_are_workspace_scoped_and_canonicalized() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("real")).unwrap();
+        fs::write(workspace.path().join("real/existing.txt"), "ok").unwrap();
+
+        let relative = resolve_provider_path(Some(workspace.path()), "real/existing.txt").unwrap();
+        let absolute = resolve_provider_path(
+            Some(workspace.path()),
+            workspace
+                .path()
+                .join("real/existing.txt")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .unwrap();
+        assert_eq!(relative, absolute);
+        assert_eq!(
+            relative,
+            fs::canonicalize(workspace.path().join("real/existing.txt"))
+                .unwrap()
+                .to_string_lossy()
+        );
+
+        assert!(resolve_provider_path(Some(workspace.path()), "../outside.txt").is_none());
+        assert!(
+            resolve_provider_path(
+                Some(workspace.path()),
+                outside
+                    .path()
+                    .join("outside.txt")
+                    .to_string_lossy()
+                    .as_ref(),
+            )
+            .is_none()
+        );
+        assert!(resolve_provider_path(Some(workspace.path()), "").is_none());
+        assert!(resolve_provider_path(Some(workspace.path()), "   ").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_file_paths_reject_symlink_escapes_and_dedupe_internal_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("real")).unwrap();
+        symlink(outside.path(), workspace.path().join("escape")).unwrap();
+        symlink(
+            workspace.path().join("real"),
+            workspace.path().join("alias"),
+        )
+        .unwrap();
+
+        assert!(resolve_provider_path(Some(workspace.path()), "escape/new.txt").is_none());
+        let changes = structured_file_changes(
+            Some(workspace.path()),
+            ["alias/new.txt", "real/new.txt"],
+            FileChangeKind::Update,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(
+            changes[0].path,
+            fs::canonicalize(workspace.path().join("real"))
+                .unwrap()
+                .join("new.txt")
+                .to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn codex_ignores_missing_null_and_blank_file_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let stream = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"invalid\",\"type\":\"file_change\",\"changes\":[",
+            "{\"path\":\"\",\"kind\":\"add\"},{\"path\":\"   \",\"kind\":\"add\"},{\"path\":null,\"kind\":\"add\"},{\"kind\":\"add\"}],\"status\":\"completed\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"valid\",\"type\":\"file_change\",\"changes\":[{\"path\":\"notes.txt\",\"kind\":\"add\"}],\"status\":\"completed\"}}\n"
+        );
+        let (_, decoded) =
+            decode_in_chunks_with_cwd("codex_cli", stream, 5, Some(workspace.path().to_path_buf()));
+        let events = accumulated(&decoded).events;
+        let files = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ActivityKind::FileChange { id, changes, .. } => Some((id, changes)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, "valid");
+        assert_eq!(files[0].1.len(), 1);
+        assert_ne!(files[0].1[0].path, workspace.path().to_string_lossy());
+    }
+
+    #[test]
+    fn claude_file_results_must_match_the_calling_agent_scope() {
+        let workspace = tempfile::tempdir().unwrap();
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_use\",\"id\":\"shared-id\",\"name\":\"Write\",\"input\":{\"file_path\":\"main.txt\"}}]}}\n",
+            "{\"type\":\"user\",\"parent_tool_use_id\":\"child-a\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"shared-id\",\"content\":\"wrong scope\",\"is_error\":false}]}}\n",
+            "{\"type\":\"user\",\"parent_tool_use_id\":null,\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"shared-id\",\"content\":\"right scope\",\"is_error\":false}]}}\n"
+        );
+        let (decoder, decoded) = decode_in_chunks_with_cwd(
+            "claude_cli",
+            stream,
+            7,
+            Some(workspace.path().to_path_buf()),
+        );
+        assert!(decoder.file_calls.is_empty());
+        let events = accumulated(&decoded).events;
+        let file_events = events
+            .iter()
+            .filter(|event| matches!(event.kind, ActivityKind::FileChange { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(file_events.len(), 1);
+        assert!(file_events[0].scope.is_main());
+        assert!(matches!(
+            &file_events[0].kind,
+            ActivityKind::FileChange {
+                changes,
+                status: ActivityStatus::Completed,
+                ..
+            } if changes[0].kind == FileChangeKind::Update
+        ));
+        assert!(events.iter().any(|event| {
+            matches!(
+                (&event.scope, &event.kind),
+                (
+                    AgentScope::Child { id },
+                    ActivityKind::ToolResult { id: tool_id, .. }
+                ) if id == "child-a" && tool_id == "shared-id"
+            )
+        }));
     }
 
     #[test]
@@ -12444,19 +17896,22 @@ send({
 
     #[test]
     fn codex_fixture_shape_maps_lifecycles_plan_usage_and_session_at_chunk_size_seven() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_root = fs::canonicalize(workspace.path()).unwrap();
         let stream = concat!(
             "{\"type\":\"thread.started\",\"thread_id\":\"codex-session\"}\n",
             "{\"type\":\"turn.started\"}\n",
             "{\"type\":\"item.completed\",\"item\":{\"id\":\"m1\",\"type\":\"agent_message\",\"text\":\"Starting 🧠\"}}\n",
             "{\"type\":\"item.started\",\"item\":{\"id\":\"p1\",\"type\":\"todo_list\",\"items\":[{\"text\":\"Edit file\",\"completed\":false}]}}\n",
-            "{\"type\":\"item.started\",\"item\":{\"id\":\"f1\",\"type\":\"file_change\",\"changes\":[{\"path\":\"/work/notes.txt\",\"kind\":\"add\"}],\"status\":\"in_progress\"}}\n",
-            "{\"type\":\"item.completed\",\"item\":{\"id\":\"f1\",\"type\":\"file_change\",\"changes\":[{\"path\":\"/work/notes.txt\",\"kind\":\"add\"}],\"status\":\"completed\"}}\n",
+            "{\"type\":\"item.started\",\"item\":{\"id\":\"f1\",\"type\":\"file_change\",\"changes\":[{\"path\":\"notes.txt\",\"kind\":\"add\"}],\"status\":\"in_progress\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"id\":\"f1\",\"type\":\"file_change\",\"changes\":[{\"path\":\"notes.txt\",\"kind\":\"add\"}],\"status\":\"completed\"}}\n",
             "{\"type\":\"item.started\",\"item\":{\"id\":\"c1\",\"type\":\"command_execution\",\"command\":\"ls -la\",\"aggregated_output\":\"\",\"exit_code\":null,\"status\":\"in_progress\"}}\n",
             "{\"type\":\"item.completed\",\"item\":{\"id\":\"c1\",\"type\":\"command_execution\",\"command\":\"ls -la\",\"aggregated_output\":\"notes.txt\\n\",\"exit_code\":0,\"status\":\"completed\"}}\n",
             "{\"type\":\"item.updated\",\"item\":{\"id\":\"p1\",\"type\":\"todo_list\",\"items\":[{\"text\":\"Edit file\",\"completed\":true}]}}\n",
             "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":20,\"cached_input_tokens\":4,\"output_tokens\":7,\"reasoning_output_tokens\":2}}\n"
         );
-        let (decoder, decoded) = decode_in_chunks("codex_cli", stream, 7);
+        let (decoder, decoded) =
+            decode_in_chunks_with_cwd("codex_cli", stream, 7, Some(workspace.path().to_path_buf()));
         assert_eq!(decoder.output, "Starting 🧠");
         assert_eq!(decoder.session_id.as_deref(), Some("codex-session"));
         assert!(!decoder.poisoned);
@@ -12479,13 +17934,25 @@ send({
         assert_eq!(commands.len(), 1);
         assert_eq!(*commands[0].1, ActivityStatus::Completed);
         assert_eq!(commands[0].2.as_deref(), Some("notes.txt\n"));
+        let file_changes = accumulator
+            .events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ActivityKind::FileChange {
+                    tool,
+                    changes,
+                    status,
+                    ..
+                } => Some((tool, changes, status)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(file_changes.len(), 1);
+        assert_eq!(file_changes[0].0.as_deref(), Some("Codex file change"));
+        assert_eq!(*file_changes[0].2, ActivityStatus::Completed);
         assert_eq!(
-            accumulator
-                .events
-                .iter()
-                .filter(|event| matches!(event.kind, ActivityKind::FileChange { .. }))
-                .count(),
-            1
+            file_changes[0].1[0].path,
+            workspace_root.join("notes.txt").to_string_lossy()
         );
         let plan = crate::chat_core::newest_plan(&accumulator.events).unwrap();
         assert_eq!(plan.completed, 1);
@@ -12540,6 +18007,100 @@ send({
         let usage = crate::chat_core::project_usage(&accumulator.events);
         assert_eq!((usage.input, usage.output, usage.cached_input), (10, 5, 3));
         assert_eq!(usage.cost_usd, Some(0.01));
+    }
+
+    #[test]
+    fn claude_exact_file_tools_project_only_structured_successful_results() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_root = fs::canonicalize(workspace.path()).unwrap();
+        let stream = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[",
+            "{\"type\":\"tool_use\",\"id\":\"write-1\",\"name\":\"Write\",\"input\":{\"file_path\":\"new.md\"}},",
+            "{\"type\":\"tool_use\",\"id\":\"multi-1\",\"name\":\"MultiEdit\",\"input\":{\"file_path\":\"multi.rs\"}},",
+            "{\"type\":\"tool_use\",\"id\":\"notebook-1\",\"name\":\"NotebookEdit\",\"input\":{\"notebook_path\":\"notes.ipynb\"}},",
+            "{\"type\":\"tool_use\",\"id\":\"failed-1\",\"name\":\"Write\",\"input\":{\"file_path\":\"failed.md\"}},",
+            "{\"type\":\"tool_use\",\"id\":\"lookalike-1\",\"name\":\"write\",\"input\":{\"file_path\":\"lookalike.md\"}}]}}\n",
+            "{\"type\":\"user\",\"message\":{\"content\":[",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"write-1\",\"content\":\"created\",\"is_error\":false},",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"multi-1\",\"content\":\"updated\",\"is_error\":false},",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"notebook-1\",\"content\":\"updated\",\"is_error\":false},",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"failed-1\",\"content\":\"permission denied\",\"is_error\":true},",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"lookalike-1\",\"content\":\"Wrote /work/lookalike.md\",\"is_error\":false},",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"untracked-1\",\"content\":\"Wrote /work/invented.md\",\"is_error\":false}]}}\n",
+            "{\"type\":\"assistant\",\"parent_tool_use_id\":\"child-a\",\"message\":{\"content\":[",
+            "{\"type\":\"tool_use\",\"id\":\"edit-1\",\"name\":\"Edit\",\"input\":{\"file_path\":\"child.rs\"}}]}}\n",
+            "{\"type\":\"user\",\"parent_tool_use_id\":\"child-a\",\"message\":{\"content\":[",
+            "{\"type\":\"tool_result\",\"tool_use_id\":\"edit-1\",\"content\":\"updated\",\"is_error\":false}]}}\n"
+        );
+        let (_, decoded) = decode_in_chunks_with_cwd(
+            "claude_cli",
+            stream,
+            11,
+            Some(workspace.path().to_path_buf()),
+        );
+        let accumulator = accumulated(&decoded);
+        let file_events = accumulator
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, ActivityKind::FileChange { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(file_events.len(), 5);
+
+        let exact = |path: &str| {
+            file_events.iter().find(|event| {
+                matches!(
+                    &event.kind,
+                    ActivityKind::FileChange { changes, .. }
+                        if changes.first().is_some_and(|change| change.path == path)
+                )
+            })
+        };
+        for (path, expected_tool, expected_status) in [
+            ("new.md", "Write", ActivityStatus::Completed),
+            ("multi.rs", "MultiEdit", ActivityStatus::Completed),
+            ("notes.ipynb", "NotebookEdit", ActivityStatus::Completed),
+            ("failed.md", "Write", ActivityStatus::Failed),
+            ("child.rs", "Edit", ActivityStatus::Completed),
+        ] {
+            let path = workspace_root.join(path).to_string_lossy().into_owned();
+            let event = exact(&path).unwrap_or_else(|| panic!("missing {path}"));
+            assert!(matches!(
+                &event.kind,
+                ActivityKind::FileChange { tool, status, .. }
+                    if tool.as_deref() == Some(expected_tool) && *status == expected_status
+            ));
+        }
+        let write_path = workspace_root.join("new.md").to_string_lossy().into_owned();
+        assert!(matches!(
+            &exact(&write_path).unwrap().kind,
+            ActivityKind::FileChange { changes, .. }
+                if changes[0].kind == FileChangeKind::Update
+        ));
+        let child_path = workspace_root
+            .join("child.rs")
+            .to_string_lossy()
+            .into_owned();
+        assert!(matches!(
+            exact(&child_path).unwrap().scope,
+            AgentScope::Child { ref id } if id == "child-a"
+        ));
+        let lookalike_path = workspace_root
+            .join("lookalike.md")
+            .to_string_lossy()
+            .into_owned();
+        let failed_path = workspace_root
+            .join("failed.md")
+            .to_string_lossy()
+            .into_owned();
+        assert!(exact(&lookalike_path).is_none());
+
+        let artifacts = crate::chat_core::project_artifacts(&accumulator.events);
+        assert_eq!(artifacts.len(), 4);
+        assert!(artifacts.iter().all(|artifact| {
+            artifact.file_path() != Some(failed_path.as_str())
+                && artifact.file_path() != Some(lookalike_path.as_str())
+                && artifact.file_path() != Some("/work/invented.md")
+        }));
     }
 
     #[test]
@@ -12680,8 +18241,113 @@ send({
             run_outcome_status(&RunOutcome::Cancelled),
             Some(ActivityKind::TurnStatus {
                 status: TurnStatus::UserCancelled,
+                retry: None,
                 ..
             })
+        ));
+        assert!(matches!(
+            run_outcome_status(&RunOutcome::CancelledBeforeLaunch),
+            Some(ActivityKind::TurnStatus {
+                status: TurnStatus::UserCancelled,
+                retry: Some(RetryHint::Retry),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn run_outcome_mapping_has_one_unambiguous_resume_disposition() {
+        let turn_id = Uuid::new_v4();
+        let conversation_id = Uuid::new_v4();
+        for (outcome, expected_rejected, expected_preserved) in [
+            (RunOutcome::provider_error("ordinary failure"), false, false),
+            (
+                RunOutcome::ResumeRejected {
+                    message: "stale session".into(),
+                },
+                true,
+                false,
+            ),
+            (
+                RunOutcome::runtime_probe_failed("version unavailable"),
+                false,
+                true,
+            ),
+        ] {
+            let Some(AiEvent::Failed {
+                resume_rejected,
+                preserve_resume,
+                ..
+            }) = terminal_event_for_run_outcome(turn_id, conversation_id, true, outcome)
+            else {
+                panic!("failure outcome did not map to Failed");
+            };
+            assert_eq!(resume_rejected, expected_rejected);
+            assert_eq!(preserve_resume, expected_preserved);
+            assert!(!(resume_rejected && preserve_resume));
+        }
+
+        for (outcome, expected_preserved) in [
+            (RunOutcome::Cancelled, false),
+            (RunOutcome::CancelledBeforeLaunch, true),
+        ] {
+            assert!(matches!(
+                terminal_event_for_run_outcome(turn_id, conversation_id, true, outcome),
+                Some(AiEvent::Cancelled { preserve_resume, .. })
+                    if preserve_resume == expected_preserved
+            ));
+        }
+    }
+
+    #[test]
+    fn terminal_mapping_filters_legacy_kimi_session_ids_only() {
+        let process = |provider_id: &str| {
+            PreparedRun::Process(ProcessSpec {
+                provider_id: provider_id.into(),
+                program: PathBuf::from(provider_id),
+                arguments: Vec::new(),
+                cwd: None,
+                prompt_input: PromptInput::Stdin,
+                output_mode: OutputMode::PlainText,
+                grok_session_id: None,
+                expected_runtime_version: None,
+            })
+        };
+        let legacy_kimi = process("kimi_cli");
+        let other_cli = process("claude_cli");
+        let kimi_acp = PreparedRun::KimiAcp(KimiAcpSpec {
+            program: PathBuf::from("kimi"),
+            cwd: PathBuf::from("/tmp"),
+            runtime_version: CliVersion::parse("0.31.0").unwrap(),
+        });
+        assert!(!legacy_kimi.accepts_returned_session_id());
+        assert!(other_cli.accepts_returned_session_id());
+        assert!(kimi_acp.accepts_returned_session_id());
+
+        let terminal = |accepts_returned_session_id| {
+            terminal_event_for_run_outcome(
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                accepts_returned_session_id,
+                RunOutcome::Completed {
+                    text: "done".into(),
+                    session_id: Some("provider-session".into()),
+                },
+            )
+        };
+        assert!(matches!(
+            terminal(false),
+            Some(AiEvent::Completed {
+                session_id: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            terminal(true),
+            Some(AiEvent::Completed {
+                session_id: Some(session_id),
+                ..
+            }) if session_id == "provider-session"
         ));
     }
 
@@ -13779,6 +19445,7 @@ send({
             prompt_input: PromptInput::Argument,
             output_mode: OutputMode::PlainText,
             grok_session_id: None,
+            expected_runtime_version: None,
         };
         let control = Arc::new(RunControl::default());
         let (sender, _receiver) = unbounded();
@@ -13881,6 +19548,7 @@ send({
                 Some(AiEvent::Cancelled {
                     turn_id: event_turn,
                     conversation_id: event_conversation,
+                    ..
                 }) => {
                     assert_eq!(event_turn, turn_id);
                     assert_eq!(event_conversation, conversation_id);
@@ -13947,6 +19615,1063 @@ send({
             }
         }
         assert_eq!(terminal_count, 1, "a duplicate terminal event was emitted");
+    }
+
+    #[test]
+    fn xai_stop_closes_live_connection_and_joins_worker() {
+        use std::net::TcpListener;
+
+        let _xai_test = lock_unpoison(&XAI_TRANSPORT_TEST_LOCK);
+        let workers_before = XAI_HTTP_WORKERS.load(Ordering::Acquire);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (response_sender, response_receiver) = bounded(1);
+        let (closed_sender, closed_receiver) = bounded(1);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request_bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request_bytes.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "client closed before sending HTTP headers");
+                request_bytes.extend_from_slice(&buffer[..count]);
+            }
+            let header_end = request_bytes
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = std::str::from_utf8(&request_bytes[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while request_bytes.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "client closed before sending the HTTP body");
+                request_bytes.extend_from_slice(&buffer[..count]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Connection: close\r\n\
+                      \r\n\
+                      data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-open\"}}\n\n\
+                      data: {\"type\":\"response.output_item.added\",\"item\":{\"id\":\"ws-open\",\"type\":\"web_search_call\",\"status\":\"in_progress\"}}\n\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            response_sender.send(()).unwrap();
+            let closed = match stream.read(&mut buffer) {
+                Ok(0) => true,
+                Err(error) => matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                ),
+                Ok(_) => false,
+            };
+            closed_sender.send(closed).unwrap();
+        });
+
+        let mut run = request("xai_api");
+        run.model.clear();
+        run.provider_preferences.reasoning_effort = "high".into();
+        set_feature(&mut run, AI_FEATURE_WEB_SEARCH, true);
+        let control = Arc::new(RunControl::default());
+        let worker_control = Arc::clone(&control);
+        let (sender, receiver) = unbounded();
+        let adapter = thread::spawn(move || {
+            run_xai_responses_transport(
+                &run,
+                XaiResponsesSpec {
+                    url: Url::parse(&format!("http://{address}/v1/responses")).unwrap(),
+                    disconnect_worker: false,
+                },
+                &worker_control,
+                &sender,
+            )
+        });
+
+        response_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let mut events = Vec::new();
+        let tool_deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < tool_deadline {
+            if let Ok(event) = receiver.recv_timeout(Duration::from_millis(20)) {
+                let saw_tool = matches!(
+                    &event,
+                    AiEvent::Activity {
+                        event: ActivityEvent {
+                            kind: ActivityKind::ToolCall { id, .. },
+                            ..
+                        },
+                        ..
+                    } if id == "ws-open"
+                );
+                events.push(event);
+                if saw_tool {
+                    break;
+                }
+            }
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AiEvent::Activity {
+                event: ActivityEvent {
+                    kind: ActivityKind::ToolCall { id, .. },
+                    ..
+                },
+                ..
+            } if id == "ws-open"
+        )));
+        let read_deadline = Instant::now() + Duration::from_secs(2);
+        while !control.http_read_in_progress.load(Ordering::Acquire)
+            && Instant::now() < read_deadline
+        {
+            thread::yield_now();
+        }
+        assert!(
+            control.http_read_in_progress.load(Ordering::Acquire),
+            "Grok Heavy worker never entered its blocking response read"
+        );
+        let cancelled_at = Instant::now();
+        assert!(control.cancel());
+        let finish_deadline = Instant::now() + Duration::from_secs(2);
+        while !adapter.is_finished() && Instant::now() < finish_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            adapter.is_finished(),
+            "Grok Heavy did not cleanly join after closing its transport"
+        );
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+        assert!(
+            closed_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            "the server did not observe prompt connection EOF after Stop"
+        );
+        assert!(matches!(
+            adapter.join().unwrap(),
+            RunOutcome::TerminalAlreadyEmitted
+        ));
+        assert_eq!(XAI_HTTP_WORKERS.load(Ordering::Acquire), workers_before);
+
+        events.extend(receiver.try_iter());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AiEvent::Cancelled { .. }))
+                .count(),
+            1
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AiEvent::Activity {
+                event: ActivityEvent {
+                    kind: ActivityKind::ToolResult {
+                        id,
+                        is_error: true,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            } if id == "ws-open"
+        )));
+        server.join().unwrap();
+        let late_events = receiver.try_iter().collect::<Vec<_>>();
+        assert!(
+            late_events.is_empty(),
+            "late Grok Heavy output escaped the cancellation gate: {late_events:?}"
+        );
+    }
+
+    #[test]
+    fn xai_completed_result_owns_terminal_before_group_completion_is_visible() {
+        use std::net::TcpListener;
+
+        let _xai_test = lock_unpoison(&XAI_TRANSPORT_TEST_LOCK);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_bytes = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            while !request_bytes.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "client closed before sending HTTP headers");
+                request_bytes.extend_from_slice(&buffer[..count]);
+            }
+            let header_end = request_bytes
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let headers = std::str::from_utf8(&request_bytes[..header_end]).unwrap();
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while request_bytes.len() < header_end + content_length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert_ne!(count, 0, "client closed before sending the HTTP body");
+                request_bytes.extend_from_slice(&buffer[..count]);
+            }
+            let body = concat!(
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-complete\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-complete\",\"status\":\"completed\",\"output_text\":\"done\"}}\n\n",
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let mut run = request("xai_api");
+        run.model.clear();
+        run.provider_preferences.reasoning_effort = "high".into();
+        let control = Arc::new(RunControl::default());
+        let worker_control = Arc::clone(&control);
+        let (sender, receiver) = unbounded();
+        let adapter = thread::spawn(move || {
+            run_xai_responses_transport(
+                &run,
+                XaiResponsesSpec {
+                    url: Url::parse(&format!("http://{address}/v1/responses")).unwrap(),
+                    disconnect_worker: false,
+                },
+                &worker_control,
+                &sender,
+            )
+        });
+
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if let Ok(event) = receiver.recv_timeout(Duration::from_millis(20)) {
+                let completed_group = matches!(
+                    &event,
+                    AiEvent::Activity {
+                        event: ActivityEvent {
+                            kind: ActivityKind::AgentGroup {
+                                status: SubagentStatus::Completed,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    }
+                );
+                events.push(event);
+                if completed_group {
+                    break;
+                }
+            }
+        }
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AiEvent::Activity {
+                    event: ActivityEvent {
+                        kind: ActivityKind::AgentGroup {
+                            status: SubagentStatus::Completed,
+                            ..
+                        },
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "completed group was not emitted"
+        );
+        assert!(
+            !control.cancel(),
+            "Stop must lose once the completed group is observable"
+        );
+        assert!(matches!(
+            adapter.join().unwrap(),
+            RunOutcome::Completed { ref text, .. } if text == "done"
+        ));
+        server.join().unwrap();
+        events.extend(receiver.try_iter());
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            AiEvent::Cancelled { .. }
+                | AiEvent::Activity {
+                    event: ActivityEvent {
+                        kind: ActivityKind::SessionInfo { .. },
+                        ..
+                    },
+                    ..
+                }
+        )));
+    }
+
+    #[test]
+    fn xai_worker_disconnect_claims_one_failed_terminal_not_cancellation() {
+        let _xai_test = lock_unpoison(&XAI_TRANSPORT_TEST_LOCK);
+        let mut run = request("xai_api");
+        run.model.clear();
+        let control = Arc::new(RunControl::default());
+        let (sender, receiver) = unbounded();
+        let outcome = run_xai_responses_transport(
+            &run,
+            XaiResponsesSpec {
+                url: Url::parse(crate::xai_responses::XAI_RESPONSES_ENDPOINT).unwrap(),
+                disconnect_worker: true,
+            },
+            &control,
+            &sender,
+        );
+
+        assert!(matches!(
+            outcome,
+            RunOutcome::Failed {
+                kind: AiFailureKind::ProviderError,
+                ..
+            }
+        ));
+        assert!(!control.cancel());
+        let events = receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AiEvent::Activity {
+                        event: ActivityEvent {
+                            kind: ActivityKind::AgentGroup {
+                                status: SubagentStatus::Failed,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AiEvent::Cancelled { .. }))
+        );
+    }
+
+    #[test]
+    fn kimi_acp_projects_only_root_scoped_structured_terminal_file_mutations() {
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_root = fs::canonicalize(workspace.path()).unwrap();
+        let old_absolute = workspace_root.join("old.md").to_string_lossy().into_owned();
+        let mut run = request("kimi_cli");
+        run.cwd = Some(workspace_root.clone());
+        let (sender, receiver) = unbounded();
+        let projection = RefCell::new(KimiAcpProjectionState::default());
+        let tool = |id: &str,
+                    title: &str,
+                    kind: KimiAcpToolKind,
+                    status: KimiAcpToolStatus,
+                    path: &str| KimiAcpToolCall {
+            id: id.into(),
+            title: Some(title.into()),
+            kind: Some(kind),
+            status: Some(status),
+            content: Vec::new(),
+            locations: vec![crate::kimi_acp::KimiAcpToolLocation {
+                path: path.into(),
+                line: None,
+            }],
+            raw_input: None,
+            raw_output: None,
+        };
+
+        let calls = [
+            tool(
+                "edit-report",
+                "Edit report",
+                KimiAcpToolKind::Edit,
+                KimiAcpToolStatus::Completed,
+                "report.md",
+            ),
+            tool(
+                "edit-old",
+                "Edit old report",
+                KimiAcpToolKind::Edit,
+                KimiAcpToolStatus::Completed,
+                "old.md",
+            ),
+            tool(
+                "delete-old",
+                "Delete old report",
+                KimiAcpToolKind::Delete,
+                KimiAcpToolStatus::Completed,
+                &old_absolute,
+            ),
+            tool(
+                "failed-edit",
+                "Edit denied file",
+                KimiAcpToolKind::Edit,
+                KimiAcpToolStatus::Failed,
+                "denied.md",
+            ),
+            tool(
+                "read-lookalike",
+                "Edit-looking read",
+                KimiAcpToolKind::Read,
+                KimiAcpToolStatus::Completed,
+                "not-edited.md",
+            ),
+        ];
+        for tool_call in &calls {
+            emit_kimi_acp_tool_call(&run, &sender, tool_call, &projection);
+        }
+        emit_kimi_acp_tool_call(&run, &sender, &calls[0], &projection);
+
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for event in receiver.try_iter() {
+            if let AiEvent::Activity { event, .. } = event {
+                accumulator.ingest(event);
+            }
+        }
+        let files = accumulator
+            .events
+            .iter()
+            .filter(|event| matches!(event.kind, ActivityKind::FileChange { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            files.len(),
+            4,
+            "terminal replay must not duplicate artifacts"
+        );
+        assert!(files.iter().all(|event| event.scope.is_main()));
+        assert!(files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { tool, changes, status: ActivityStatus::Completed, .. }
+                if tool.as_deref() == Some("Edit report")
+                    && changes[0].path == workspace_root.join("report.md").to_string_lossy()
+        )));
+        assert!(files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { tool, changes, status: ActivityStatus::Completed, .. }
+                if tool.as_deref() == Some("Delete old report")
+                    && changes[0].kind == FileChangeKind::Delete
+        )));
+        assert!(files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { changes, status: ActivityStatus::Failed, .. }
+                if changes[0].path == workspace_root.join("denied.md").to_string_lossy()
+        )));
+        assert!(!files.iter().any(|event| matches!(
+            &event.kind,
+            ActivityKind::FileChange { changes, .. }
+                if changes[0].path.ends_with("not-edited.md")
+        )));
+
+        let artifacts = crate::chat_core::project_artifacts(&accumulator.events);
+        assert_eq!(artifacts.len(), 2);
+        assert!(artifacts.iter().any(|artifact| {
+            artifact.file_path() == Some(old_absolute.as_str()) && artifact.is_deleted
+        }));
+        assert!(artifacts.iter().all(|artifact| {
+            !artifact
+                .file_path()
+                .is_some_and(|path| path.ends_with("denied.md"))
+                && !artifact
+                    .file_path()
+                    .is_some_and(|path| path.ends_with("not-edited.md"))
+        }));
+    }
+
+    #[test]
+    fn kimi_agent_swarm_fixture_projects_only_real_returned_children() {
+        let fixture = include_str!("../tests/fixtures/ai/kimi/0.31.0/acp-agent-tools.jsonl");
+        let mut lines = fixture.lines();
+        let _agent_start: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let _agent_finish: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let swarm_start: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let swarm_finish: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let start = swarm_start.pointer("/params/update").unwrap();
+        let finish = swarm_finish.pointer("/params/update").unwrap();
+        let tool_call = KimiAcpToolCall {
+            id: start["toolCallId"].as_str().unwrap().into(),
+            title: start["title"].as_str().map(str::to_owned),
+            kind: Some(KimiAcpToolKind::Other("other".into())),
+            status: Some(KimiAcpToolStatus::Completed),
+            content: finish["content"].as_array().cloned().unwrap_or_default(),
+            locations: Vec::new(),
+            raw_input: start.get("rawInput").cloned(),
+            raw_output: finish.get("rawOutput").cloned(),
+        };
+        assert_eq!(
+            kimi_delegation_kind(&tool_call),
+            Some(KimiDelegationKind::Swarm)
+        );
+        assert_eq!(
+            kimi_swarm_expected_count(tool_call.raw_input.as_ref().unwrap()),
+            Some(3)
+        );
+        let parsed = parse_kimi_agent_swarm_result(
+            tool_call.raw_output.as_ref().unwrap().as_str().unwrap(),
+            Some(3),
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].agent_id.as_deref(), Some("agent-1"));
+        assert_eq!(parsed[1].label, "api");
+        assert_eq!(parsed[2].status, SubagentStatus::Failed);
+
+        let run = request("kimi_cli");
+        let (sender, receiver) = unbounded();
+        emit_kimi_acp_tool_call(
+            &run,
+            &sender,
+            &tool_call,
+            &RefCell::new(KimiAcpProjectionState::default()),
+        );
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for event in receiver.try_iter() {
+            if let AiEvent::Activity { event, .. } = event {
+                accumulator.ingest(event);
+            }
+        }
+        let groups = crate::chat_core::project_agent_groups(&accumulator.events);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].expected_count, Some(3));
+        assert_eq!(groups[0].status, SubagentStatus::Failed);
+        assert_eq!(groups[0].members.len(), 3);
+        let children = crate::chat_core::project_subagents(&accumulator.events);
+        assert_eq!(children.len(), 3);
+        assert!(
+            children.iter().any(|child| child.id == "agent-2"
+                && child.prose_cells[0].text == "API review complete.")
+        );
+        assert!(crate::chat_core::assistant_flat_text(&accumulator.events).is_empty());
+    }
+
+    #[test]
+    fn kimi_swarm_parser_keeps_unidentified_jobs_aggregate_only() {
+        let output = concat!(
+            "<agent_swarm_result>\n",
+            "<summary>completed: 1, aborted: 1</summary>\n",
+            "<subagent agent_id=\"agent-a\" item=\"Known\" state=\"started\" outcome=\"completed\">done</subagent>\n",
+            "<subagent item=\"Never started\" state=\"not_started\" outcome=\"aborted\">not scheduled</subagent>\n",
+            "</agent_swarm_result>"
+        );
+        let results = parse_kimi_agent_swarm_result(output, Some(2)).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].agent_id.as_deref(), Some("agent-a"));
+        assert_eq!(results[1].agent_id, None);
+        assert_eq!(results[1].status, SubagentStatus::Cancelled);
+
+        let ambiguous = output.replace(
+            "done</subagent>",
+            "unsafe <subagent outcome=\"failed\">text</subagent></subagent>",
+        );
+        assert!(
+            parse_kimi_agent_swarm_result(&ambiguous, Some(2)).is_none(),
+            "tag-like member prose must fail closed instead of inventing a child"
+        );
+
+        let duplicate_id = concat!(
+            "<agent_swarm_result>",
+            "<subagent agent_id=\"agent-a\" item=\"One\" outcome=\"completed\">one</subagent>",
+            "<subagent agent_id=\"agent-a\" item=\"Two\" outcome=\"failed\">two</subagent>",
+            "</agent_swarm_result>"
+        );
+        assert!(
+            parse_kimi_agent_swarm_result(duplicate_id, Some(2)).is_none(),
+            "conflicting rows with one stable ID must remain aggregate-only"
+        );
+    }
+
+    #[test]
+    fn kimi_permissions_keep_swarm_preference_and_workspace_safety_separate() {
+        let swarm = kimi_permission(
+            "Launching agent swarm",
+            KimiAcpToolKind::Other("other".into()),
+            Some(json!({
+                "description": "Research",
+                "prompt_template": "Research {{item}}",
+                "items": ["one", "two"]
+            })),
+        );
+        let blocked = RefCell::new(KimiPermissionBlockState::default());
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &swarm,
+                PermissionMode::Auto,
+                AiWorkspaceMode::Code,
+                false,
+                &blocked,
+            ),
+            KimiAcpPermissionDecision::Reject { .. }
+        ));
+
+        let explore = kimi_permission(
+            "Launching agent swarm: Read-only research",
+            KimiAcpToolKind::Other("other".into()),
+            Some(json!({
+                "description": "Read-only research",
+                "prompt_template": "Research {{item}}",
+                "items": ["one", "two"],
+                "subagent_type": "explore"
+            })),
+        );
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &explore,
+                PermissionMode::Sandbox,
+                AiWorkspaceMode::Code,
+                true,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Allow { .. }
+        ));
+
+        for raw_input in [
+            json!({
+                "description": "Coder swarm",
+                "prompt_template": "Implement {{item}}",
+                "items": ["one"],
+                "subagent_type": "coder"
+            }),
+            json!({
+                "description": "Default swarm",
+                "prompt_template": "Handle {{item}}",
+                "items": ["one"]
+            }),
+            json!({
+                "description": "Unknown swarm",
+                "prompt_template": "Handle {{item}}",
+                "items": ["one"],
+                "subagent_type": "future-profile"
+            }),
+        ] {
+            let mutating = kimi_permission(
+                "Launching agent swarm: Mutating work",
+                KimiAcpToolKind::Other("other".into()),
+                Some(raw_input),
+            );
+            assert!(matches!(
+                kimi_acp_permission_decision(
+                    &mutating,
+                    PermissionMode::Ask,
+                    AiWorkspaceMode::Code,
+                    true,
+                    &RefCell::new(KimiPermissionBlockState::default()),
+                ),
+                KimiAcpPermissionDecision::Reject { .. } | KimiAcpPermissionDecision::Cancel
+            ));
+        }
+
+        let coder = kimi_permission(
+            "Launching agent swarm: Coder work",
+            KimiAcpToolKind::Other("other".into()),
+            Some(json!({
+                "description": "Coder swarm",
+                "prompt_template": "Implement {{item}}",
+                "items": ["one"],
+                "subagent_type": "coder"
+            })),
+        );
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &coder,
+                PermissionMode::Auto,
+                AiWorkspaceMode::Code,
+                true,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Allow { .. }
+        ));
+
+        let fixture = include_str!("../tests/fixtures/ai/kimi/0.31.0/acp-permission.jsonl");
+        let mut fixture_lines = fixture.lines();
+        let tracked: Value = serde_json::from_str(fixture_lines.next().unwrap()).unwrap();
+        let sparse: Value = serde_json::from_str(fixture_lines.next().unwrap()).unwrap();
+        let background = kimi_permission(
+            sparse
+                .pointer("/params/toolCall/title")
+                .and_then(Value::as_str)
+                .unwrap(),
+            KimiAcpToolKind::Other("other".into()),
+            tracked.pointer("/params/update/rawInput").cloned(),
+        );
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &background,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Code,
+                true,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Reject { .. } | KimiAcpPermissionDecision::Cancel
+        ));
+
+        let delete = kimi_permission("Delete file", KimiAcpToolKind::Delete, None);
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &delete,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                true,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn kimi_questions_are_skipped_without_fabricating_answers_or_blocking_the_turn() {
+        let question = kimi_question_permission();
+        for permission_mode in [
+            PermissionMode::Sandbox,
+            PermissionMode::Ask,
+            PermissionMode::Plan,
+            PermissionMode::Auto,
+            PermissionMode::Bypass,
+        ] {
+            for workspace_mode in [
+                AiWorkspaceMode::Chat,
+                AiWorkspaceMode::Cowork,
+                AiWorkspaceMode::Code,
+            ] {
+                let blocked = RefCell::new(KimiPermissionBlockState::default());
+                assert_eq!(
+                    kimi_acp_permission_decision(
+                        &question,
+                        permission_mode,
+                        workspace_mode,
+                        true,
+                        &blocked,
+                    ),
+                    KimiAcpPermissionDecision::Reject {
+                        option_id: "q0_skip".into()
+                    }
+                );
+                assert!(
+                    blocked.borrow().pending.is_none(),
+                    "skipping a question is not a permission-block terminal cause"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kimi_question_title_alone_cannot_change_permission_policy() {
+        let lookalike = kimi_permission(
+            "AskUserQuestion",
+            KimiAcpToolKind::Other("other".into()),
+            None,
+        );
+        assert!(lookalike.ask_user_question_skip_option().is_none());
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &lookalike,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Code,
+                true,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Allow { ref option_id } if option_id == "allow-once"
+        ));
+    }
+
+    #[test]
+    fn kimi_structured_tool_titles_do_not_alias_agent_delegations() {
+        for permission in [
+            kimi_permission("Read AGENTS.md", KimiAcpToolKind::Read, None),
+            kimi_permission("Search agent documentation", KimiAcpToolKind::Search, None),
+        ] {
+            assert_eq!(kimi_delegation_kind(&permission.tool_call), None);
+            assert!(matches!(
+                kimi_acp_permission_decision(
+                    &permission,
+                    PermissionMode::Sandbox,
+                    AiWorkspaceMode::Code,
+                    false,
+                    &RefCell::new(KimiPermissionBlockState::default()),
+                ),
+                KimiAcpPermissionDecision::Allow { .. }
+            ));
+        }
+
+        let edit = kimi_permission("Edit src/agent.rs", KimiAcpToolKind::Edit, None);
+        assert_eq!(kimi_delegation_kind(&edit.tool_call), None);
+        assert!(matches!(
+            kimi_acp_permission_decision(
+                &edit,
+                PermissionMode::Ask,
+                AiWorkspaceMode::Code,
+                false,
+                &RefCell::new(KimiPermissionBlockState::default()),
+            ),
+            KimiAcpPermissionDecision::Reject { .. } | KimiAcpPermissionDecision::Cancel
+        ));
+
+        let agent = kimi_permission(
+            "Agent",
+            KimiAcpToolKind::Other("other".into()),
+            Some(json!({"subagent_type": "explore", "prompt": "Inspect"})),
+        );
+        assert_eq!(
+            kimi_delegation_kind(&agent.tool_call),
+            Some(KimiDelegationKind::Agent)
+        );
+
+        let mut swarm = kimi_permission(
+            "Unrelated display title",
+            KimiAcpToolKind::Other("AgentSwarm".into()),
+            Some(json!({"items": ["one"], "prompt_template": "Inspect {{item}}"})),
+        );
+        assert_eq!(
+            kimi_delegation_kind(&swarm.tool_call),
+            Some(KimiDelegationKind::Swarm)
+        );
+        swarm.tool_call.kind = None;
+        swarm.tool_call.title = Some("AgentSwarm".into());
+        assert_eq!(
+            kimi_delegation_kind(&swarm.tool_call),
+            Some(KimiDelegationKind::Swarm)
+        );
+    }
+
+    #[test]
+    fn kimi_background_agent_result_stays_aggregate_and_terminal() {
+        let tool_call = KimiAcpToolCall {
+            id: "background-agent".into(),
+            title: Some("Launching background agent".into()),
+            kind: Some(KimiAcpToolKind::Other("other".into())),
+            status: Some(KimiAcpToolStatus::Completed),
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: Some(json!({
+                "description": "Research later",
+                "prompt": "Research and notify the parent later",
+                "run_in_background": true
+            })),
+            raw_output: Some(Value::String(
+                "agent_id: agent-background\nstatus: running\n\nStill working.".into(),
+            )),
+        };
+        let run = request("kimi_cli");
+        let (sender, receiver) = unbounded();
+        emit_kimi_acp_tool_call(
+            &run,
+            &sender,
+            &tool_call,
+            &RefCell::new(KimiAcpProjectionState::default()),
+        );
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for event in receiver.try_iter() {
+            if let AiEvent::Activity { event, .. } = event {
+                accumulator.ingest(event);
+            }
+        }
+        assert!(crate::chat_core::project_subagents(&accumulator.events).is_empty());
+        let groups = crate::chat_core::project_agent_groups(&accumulator.events);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].status, SubagentStatus::Failed);
+        assert!(groups[0].members.is_empty());
+        assert_eq!(groups[0].visibility, AgentGroupVisibility::AggregateOnly);
+        assert!(
+            groups[0]
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("background"))
+        );
+    }
+
+    #[test]
+    fn kimi_adapter_return_finalizes_open_delegations_once_for_errors_and_cancellation() {
+        let tool_call = KimiAcpToolCall {
+            id: "pending-swarm".into(),
+            title: Some("Launching agent swarm: Research in parallel".into()),
+            kind: Some(KimiAcpToolKind::Other("other".into())),
+            status: Some(KimiAcpToolStatus::InProgress),
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: Some(json!({
+                "description": "Research in parallel",
+                "prompt_template": "Research {{item}}",
+                "items": ["one", "two"]
+            })),
+            raw_output: None,
+        };
+        let run = request("kimi_cli");
+
+        let (failed_sender, failed_receiver) = unbounded();
+        let failed_projection = RefCell::new(KimiAcpProjectionState::default());
+        emit_kimi_acp_tool_call(&run, &failed_sender, &tool_call, &failed_projection);
+        let adapter_error: Result<KimiAcpOutcome, KimiAcpError> = Err(KimiAcpError::UnexpectedEof);
+        finalize_kimi_delegations_after_adapter_return(
+            &run,
+            &failed_sender,
+            &adapter_error,
+            false,
+            &failed_projection,
+        );
+        finalize_kimi_delegations_after_adapter_return(
+            &run,
+            &failed_sender,
+            &adapter_error,
+            false,
+            &failed_projection,
+        );
+        let failed_events = failed_receiver.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            failed_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AiEvent::Activity {
+                        event: ActivityEvent {
+                            kind: ActivityKind::AgentGroup {
+                                status: SubagentStatus::Failed,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "adapter error cleanup must be terminal and idempotent"
+        );
+
+        let (cancelled_sender, cancelled_receiver) = unbounded();
+        let cancelled_projection = RefCell::new(KimiAcpProjectionState::default());
+        emit_kimi_acp_tool_call(&run, &cancelled_sender, &tool_call, &cancelled_projection);
+        finalize_kimi_delegations_after_adapter_return(
+            &run,
+            &cancelled_sender,
+            &adapter_error,
+            true,
+            &cancelled_projection,
+        );
+        assert_eq!(
+            cancelled_receiver
+                .try_iter()
+                .filter(|event| matches!(
+                    event,
+                    AiEvent::Activity {
+                        event: ActivityEvent {
+                            kind: ActivityKind::AgentGroup {
+                                status: SubagentStatus::Cancelled,
+                                ..
+                            },
+                            ..
+                        },
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "local cancellation must close open Kimi groups as cancelled"
+        );
+    }
+
+    #[test]
+    fn ambiguous_kimi_swarm_output_projects_an_aggregate_terminal_group() {
+        let tool_call = KimiAcpToolCall {
+            id: "ambiguous-swarm".into(),
+            title: Some("Launching agent swarm: Research".into()),
+            kind: Some(KimiAcpToolKind::Other("other".into())),
+            status: Some(KimiAcpToolStatus::Completed),
+            content: Vec::new(),
+            locations: Vec::new(),
+            raw_input: Some(json!({
+                "description": "Research",
+                "items": ["one", "two"]
+            })),
+            raw_output: Some(Value::String(concat!(
+                "<agent_swarm_result>",
+                "<subagent agent_id=\"duplicate\" item=\"One\" outcome=\"completed\">one</subagent>",
+                "<subagent agent_id=\"duplicate\" item=\"Two\" outcome=\"failed\">two</subagent>",
+                "</agent_swarm_result>"
+            ).into())),
+        };
+        let run = request("kimi_cli");
+        let (sender, receiver) = unbounded();
+        emit_kimi_acp_tool_call(
+            &run,
+            &sender,
+            &tool_call,
+            &RefCell::new(KimiAcpProjectionState::default()),
+        );
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for event in receiver.try_iter() {
+            if let AiEvent::Activity { event, .. } = event {
+                accumulator.ingest(event);
+            }
+        }
+
+        assert!(crate::chat_core::project_subagents(&accumulator.events).is_empty());
+        let groups = crate::chat_core::project_agent_groups(&accumulator.events);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].status, SubagentStatus::Completed);
+        assert_eq!(groups[0].visibility, AgentGroupVisibility::AggregateOnly);
+        assert!(groups[0].members.is_empty());
+    }
+
+    #[test]
+    fn xai_multi_agent_events_remain_one_opaque_group() {
+        let run = request("xai_api");
+        let (sender, receiver) = unbounded();
+        emit_xai_responses_event(
+            &run,
+            &sender,
+            XaiResponsesEvent::GroupStarted {
+                group_id: "heavy-turn".into(),
+                model: XAI_MULTI_AGENT_MODEL.into(),
+                effort: XaiReasoningEffort::High,
+                expected_count: 16,
+            },
+        );
+        emit_xai_responses_event(
+            &run,
+            &sender,
+            XaiResponsesEvent::GroupFinished {
+                group_id: "heavy-turn".into(),
+                status: XaiGroupStatus::Completed,
+                detail: None,
+            },
+        );
+        let mut accumulator = crate::chat_core::ActivityAccumulator::new();
+        for event in receiver.try_iter() {
+            if let AiEvent::Activity { event, .. } = event {
+                accumulator.ingest(event);
+            }
+        }
+        let groups = crate::chat_core::project_agent_groups(&accumulator.events);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].expected_count, Some(16));
+        assert_eq!(groups[0].status, SubagentStatus::Completed);
+        assert_eq!(groups[0].visibility, AgentGroupVisibility::AggregateOnly);
+        assert!(groups[0].members.is_empty());
+        assert!(crate::chat_core::project_subagents(&accumulator.events).is_empty());
     }
 
     #[test]

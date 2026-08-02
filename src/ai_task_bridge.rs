@@ -6,7 +6,12 @@
 //! so revoking a run or selecting a native-plan provider fails closed even
 //! when a client retains the endpoint and token.
 
-use crate::{ai_task_tools::TaskToolRegistry, chat_core::ActivityEvent, domain::UnixMillis};
+use crate::{
+    ai_canvas_tools::{CanvasToolBroker, is_canvas_tool},
+    ai_task_tools::TaskToolRegistry,
+    chat_core::ActivityEvent,
+    domain::UnixMillis,
+};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -64,6 +69,18 @@ impl TaskToolBridge {
         registry: Arc<Mutex<TaskToolRegistry>>,
         emit_activity: TaskActivitySink,
     ) -> io::Result<Self> {
+        Self::start_with_canvas(run_id, registry, emit_activity, None)
+    }
+
+    /// Starts the same hardened endpoint with optional Adam canvas tools.
+    /// Task and canvas tools share one authenticated server because several
+    /// provider transports accept only one HTTP MCP endpoint per run.
+    pub fn start_with_canvas(
+        run_id: Uuid,
+        registry: Arc<Mutex<TaskToolRegistry>>,
+        emit_activity: TaskActivitySink,
+        canvas_tools: Option<Arc<CanvasToolBroker>>,
+    ) -> io::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
@@ -81,6 +98,7 @@ impl TaskToolBridge {
                     worker_token,
                     registry,
                     emit_activity,
+                    canvas_tools,
                     worker_stopping,
                 );
             })?;
@@ -153,6 +171,7 @@ fn serve(
     bearer_token: String,
     registry: Arc<Mutex<TaskToolRegistry>>,
     emit_activity: TaskActivitySink,
+    canvas_tools: Option<Arc<CanvasToolBroker>>,
     stopping: Arc<AtomicBool>,
 ) {
     let mut lifecycle = BridgeLifecycle::default();
@@ -172,6 +191,7 @@ fn serve(
                     &bearer_token,
                     &registry,
                     &emit_activity,
+                    canvas_tools.as_ref(),
                     &stopping,
                     &mut lifecycle,
                 );
@@ -184,12 +204,14 @@ fn serve(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     stream: &mut TcpStream,
     run_id: Uuid,
     bearer_token: &str,
     registry: &Arc<Mutex<TaskToolRegistry>>,
     emit_activity: &TaskActivitySink,
+    canvas_tools: Option<&Arc<CanvasToolBroker>>,
     stopping: &AtomicBool,
     lifecycle: &mut BridgeLifecycle,
 ) {
@@ -203,7 +225,15 @@ fn handle_connection(
     };
 
     let response = match authorize_request(&request, stream.local_addr().ok(), bearer_token) {
-        Ok(()) => dispatch_json_rpc(&request, run_id, registry, emit_activity, lifecycle),
+        Ok(()) => dispatch_json_rpc(
+            &request,
+            run_id,
+            registry,
+            emit_activity,
+            canvas_tools,
+            stopping,
+            lifecycle,
+        ),
         Err(response) => response,
     };
     let _ = write_response(stream, response);
@@ -254,6 +284,8 @@ fn dispatch_json_rpc(
     run_id: Uuid,
     registry: &Arc<Mutex<TaskToolRegistry>>,
     emit_activity: &TaskActivitySink,
+    canvas_tools: Option<&Arc<CanvasToolBroker>>,
+    stopping: &AtomicBool,
     lifecycle: &mut BridgeLifecycle,
 ) -> HttpResponse {
     let value = match serde_json::from_slice::<Value>(&request.body) {
@@ -330,13 +362,23 @@ fn dispatch_json_rpc(
             } else if params.is_some_and(|params| !params.is_object()) {
                 Err((-32602, "Invalid params"))
             } else {
-                let tools = lock_unpoison(registry).descriptors_for_run(run_id);
+                let mut tools = lock_unpoison(registry).descriptors_for_run(run_id);
+                if let Some(canvas_tools) = canvas_tools {
+                    tools.extend(canvas_tools.descriptors_for_run(run_id));
+                }
                 Ok(json!({"tools": tools}))
             }
         }
         "tools/call" => {
             if lifecycle.is_initialized() {
-                call_tool(params, run_id, registry, emit_activity)
+                call_tool(
+                    params,
+                    run_id,
+                    registry,
+                    emit_activity,
+                    canvas_tools,
+                    stopping,
+                )
             } else {
                 Err((-32002, "Server is not initialized"))
             }
@@ -406,10 +448,10 @@ fn initialize_result(params: Option<&Value>) -> Result<(&'static str, Value), (i
                 "tools": {"listChanged": false}
             },
             "serverInfo": {
-                "name": "adam-task-tools",
+                "name": "adam-tools",
                 "version": env!("CARGO_PKG_VERSION")
             },
-            "instructions": "Use task_create, task_update, and task_list to maintain the main agent's live checklist."
+            "instructions": "Use task tools to maintain the main checklist. When listed, canvas_create_note and canvas_create_pile create visible Adam canvas artifacts."
         }),
     ))
 }
@@ -419,6 +461,8 @@ fn call_tool(
     run_id: Uuid,
     registry: &Arc<Mutex<TaskToolRegistry>>,
     emit_activity: &TaskActivitySink,
+    canvas_tools: Option<&Arc<CanvasToolBroker>>,
+    stopping: &AtomicBool,
 ) -> Result<Value, (i64, &'static str)> {
     let Some(params) = params.and_then(Value::as_object) else {
         return Err((-32602, "Invalid params"));
@@ -431,6 +475,16 @@ fn call_tool(
         Some(arguments) if arguments.is_object() => arguments.clone(),
         Some(_) => return Err((-32602, "Invalid params")),
     };
+
+    if is_canvas_tool(name) {
+        let Some(canvas_tools) = canvas_tools else {
+            return Ok(json!({
+                "content": [{"type": "text", "text": "Canvas tools are not available for this run"}],
+                "isError": true
+            }));
+        };
+        return Ok(canvas_tools.call_for_run(run_id, name, &arguments, stopping));
+    }
 
     // Stage the call against a registry clone. The shared task store is only
     // committed after every normalized event reaches the sink without

@@ -1,8 +1,12 @@
-use crate::{domain::ConversationStore, model::Workspace};
+use crate::{
+    domain::{ConversationStore, Pile, TrashActor},
+    model::{Tile, TileContent, Workspace},
+};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::{
+    collections::BTreeSet,
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -18,6 +22,19 @@ const LIBRARY_FILE: &str = "library.json";
 const LIBRARY_LOCK_FILE: &str = ".library.lock";
 const LIBRARY_PREVIOUS_FILE: &str = "library.previous.json";
 const MIGRATION_MARKER: &str = ".adam-migration-complete";
+const CHECKPOINT_SCRUB_DEPTH_LIMIT: usize = 32;
+const WORKSPACE_KNOWN_JSON_FIELDS: &[&str] = &["version", "pages", "active_page", "domain"];
+const DOMAIN_KNOWN_JSON_FIELDS: &[&str] = &[
+    "tags",
+    "piles",
+    "conversations",
+    "host_artifacts",
+    "trash",
+    "protected_tiles",
+    "photo_records",
+];
+const CONVERSATION_STORE_KNOWN_JSON_FIELDS: &[&str] =
+    &["conversations", "tile_links", "deleted_conversations"];
 static LIBRARY_PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
@@ -457,6 +474,508 @@ pub fn save_workspace_atomic(paths: &AppPaths, workspace: &Workspace) -> anyhow:
     write_workspace_locked(paths, workspace)
 }
 
+#[derive(serde::Deserialize)]
+struct PersistedTrashedTileSnapshot {
+    tile: Tile,
+    #[serde(default, rename = "pile")]
+    _pile: Option<Pile>,
+}
+
+fn decode_trashed_tile(snapshot: &serde_json::Value) -> Option<Tile> {
+    serde_json::from_value::<PersistedTrashedTileSnapshot>(snapshot.clone())
+        .map(|payload| payload.tile)
+        .or_else(|_| serde_json::from_value::<Tile>(snapshot.clone()))
+        .ok()
+}
+
+fn json_tile_conversation_id(tile: &serde_json::Value) -> Option<&str> {
+    let content = tile.get("content")?.as_object()?;
+    (content.get("type")?.as_str()? == "ai_chat")
+        .then(|| content.get("conversation_id")?.as_str())?
+}
+
+fn ensure_deleted_conversation_json_marker(
+    workspace: &mut serde_json::Value,
+    conversation_id: &str,
+) {
+    let Some(root) = workspace.as_object_mut() else {
+        return;
+    };
+    let Some(domain) = root
+        .entry("domain".to_owned())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return;
+    };
+    let Some(store) = domain
+        .entry("conversations".to_owned())
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+    else {
+        return;
+    };
+    let Some(deleted) = store
+        .entry("deleted_conversations".to_owned())
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+    else {
+        return;
+    };
+    if !deleted
+        .iter()
+        .any(|value| value.as_str() == Some(conversation_id))
+    {
+        deleted.push(serde_json::Value::String(conversation_id.to_owned()));
+    }
+}
+
+fn carry_forward_unknown_object_members(
+    previous: &serde_json::Value,
+    next: &mut serde_json::Value,
+    pointer: &str,
+    known_fields: &[&str],
+) {
+    let Some(previous) = previous
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_object)
+    else {
+        return;
+    };
+    let Some(next) = next
+        .pointer_mut(pointer)
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+    for (key, value) in previous {
+        if !known_fields.contains(&key.as_str()) {
+            next.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+}
+
+/// Carries only opaque members at explicitly forward-compatible object
+/// boundaries. Known typed fields always come from the current Workspace;
+/// recursively merging maps or arrays here could resurrect deleted chats,
+/// stale tiles, or old conversation links.
+fn carry_forward_unknown_workspace_members(
+    previous: &serde_json::Value,
+    next: &mut serde_json::Value,
+) {
+    carry_forward_unknown_object_members(previous, next, "", WORKSPACE_KNOWN_JSON_FIELDS);
+    carry_forward_unknown_object_members(previous, next, "/domain", DOMAIN_KNOWN_JSON_FIELDS);
+    carry_forward_unknown_object_members(
+        previous,
+        next,
+        "/domain/conversations",
+        CONVERSATION_STORE_KNOWN_JSON_FIELDS,
+    );
+}
+
+/// Scrubs the known Workspace carrier fields in-place while retaining every
+/// unknown field in the original JSON. Checkpoint snapshots are explicitly
+/// opaque/versioned, and recovery copies may have been written by a newer
+/// Adam; a typed deserialize/reserialize would silently discard that data.
+fn scrub_deleted_conversation_json(
+    workspace: &mut serde_json::Value,
+    conversation_uuid: Uuid,
+    depth: usize,
+) {
+    let conversation_id = conversation_uuid.to_string();
+
+    if depth < CHECKPOINT_SCRUB_DEPTH_LIMIT
+        && let Some(conversations) = workspace
+            .pointer_mut("/domain/conversations/conversations")
+            .and_then(serde_json::Value::as_object_mut)
+    {
+        for conversation in conversations.values_mut() {
+            let Some(checkpoints) = conversation
+                .get_mut("checkpoints")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            for checkpoint in checkpoints {
+                let Some(snapshot) = checkpoint.get_mut("snapshot") else {
+                    continue;
+                };
+                if serde_json::from_value::<Workspace>(snapshot.clone()).is_ok() {
+                    scrub_deleted_conversation_json(
+                        snapshot,
+                        conversation_uuid,
+                        depth.saturating_add(1),
+                    );
+                }
+            }
+        }
+    }
+
+    let mut tile_ids = BTreeSet::<String>::new();
+    if let Some(pages) = workspace
+        .get_mut("pages")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for page in pages {
+            let Some(tiles) = page
+                .get_mut("tiles")
+                .and_then(serde_json::Value::as_array_mut)
+            else {
+                continue;
+            };
+            tiles.retain(|tile| {
+                if json_tile_conversation_id(tile) == Some(conversation_id.as_str()) {
+                    if let Some(tile_id) = tile.get("id").and_then(serde_json::Value::as_str) {
+                        tile_ids.insert(tile_id.to_owned());
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
+    let mut removed_trash_items = BTreeSet::<String>::new();
+    if let Some(items) = workspace
+        .pointer_mut("/domain/trash/items")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        items.retain(|item_id, item| {
+            let Some(snapshot) = item.get("snapshot") else {
+                return true;
+            };
+            let tile = snapshot.get("tile").unwrap_or(snapshot);
+            if json_tile_conversation_id(tile) != Some(conversation_id.as_str()) {
+                return true;
+            }
+            if let Some(tile_id) = item
+                .get("tile_id")
+                .or_else(|| tile.get("id"))
+                .and_then(serde_json::Value::as_str)
+            {
+                tile_ids.insert(tile_id.to_owned());
+            }
+            removed_trash_items.insert(item_id.clone());
+            false
+        });
+    }
+    if let Some(events) = workspace
+        .pointer_mut("/domain/trash/events")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        events.retain(|event| {
+            event
+                .get("trash_item_id")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|item_id| !removed_trash_items.contains(item_id))
+        });
+    }
+
+    if let Some(store) = workspace
+        .pointer_mut("/domain/conversations")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        if let Some(conversations) = store
+            .get_mut("conversations")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            conversations.remove(&conversation_id);
+        }
+        if let Some(tile_links) = store
+            .get_mut("tile_links")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            tile_links.retain(|_, linked| linked.as_str() != Some(conversation_id.as_str()));
+        }
+    }
+    ensure_deleted_conversation_json_marker(workspace, &conversation_id);
+
+    if let Some(origins) = workspace
+        .pointer_mut("/domain/host_artifacts")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        origins.retain(|_, origin| {
+            origin
+                .get("conversation_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(conversation_id.as_str())
+        });
+    }
+    if let Some(piles) = workspace
+        .pointer_mut("/domain/piles")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for pile in piles.values_mut() {
+            for field in ["overrides", "progress"] {
+                if let Some(records) = pile
+                    .get_mut(field)
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    records.retain(|tile_id, _| !tile_ids.contains(tile_id));
+                }
+            }
+        }
+    }
+    for pointer in ["/domain/tags/assignments", "/domain/photo_records"] {
+        if let Some(records) = workspace
+            .pointer_mut(pointer)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            records.retain(|tile_id, _| !tile_ids.contains(tile_id));
+        }
+    }
+    if let Some(protected) = workspace
+        .pointer_mut("/domain/protected_tiles")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        protected.retain(|tile_id| {
+            tile_id
+                .as_str()
+                .is_none_or(|tile_id| !tile_ids.contains(tile_id))
+        });
+    }
+}
+
+/// Removes a deleted conversation from one persisted checkpoint without
+/// round-tripping the snapshot through the current typed Workspace schema.
+/// This preserves fields written by newer Adam versions while recursively
+/// scrubbing any older nested checkpoints that can still decode safely.
+pub(crate) fn scrub_deleted_conversation_checkpoint_json(
+    snapshot: &mut serde_json::Value,
+    conversation_id: Uuid,
+) {
+    if serde_json::from_value::<Workspace>(snapshot.clone()).is_ok() {
+        scrub_deleted_conversation_json(snapshot, conversation_id, 1);
+    }
+}
+
+/// Removes only carriers that can restore a permanently deleted chat. Canvas
+/// entities and files created by that chat remain user-owned; only their
+/// conversation provenance is forgotten.
+fn scrub_deleted_conversation(workspace: &mut Workspace, conversation_id: Uuid) -> BTreeSet<Uuid> {
+    scrub_deleted_conversation_at_depth(workspace, conversation_id, 0)
+}
+
+fn scrub_deleted_conversation_at_depth(
+    workspace: &mut Workspace,
+    conversation_id: Uuid,
+    depth: usize,
+) -> BTreeSet<Uuid> {
+    if depth < CHECKPOINT_SCRUB_DEPTH_LIMIT {
+        for conversation in workspace.domain.conversations.conversations.values_mut() {
+            for checkpoint in conversation.checkpoints_mut() {
+                if serde_json::from_value::<Workspace>(checkpoint.snapshot.clone()).is_err() {
+                    // Opaque or damaged snapshots are preserved byte-for-byte;
+                    // never destroy unrelated user state just because Adam
+                    // cannot prove that it contains this conversation.
+                    continue;
+                }
+                scrub_deleted_conversation_json(
+                    &mut checkpoint.snapshot,
+                    conversation_id,
+                    depth.saturating_add(1),
+                );
+            }
+        }
+    }
+
+    // Tile content is the deletion authority. A stale or hand-edited semantic
+    // link must never turn a note/file into a chat tile and destroy it.
+    let mut tile_ids = workspace
+        .pages
+        .iter()
+        .flat_map(|page| {
+            page.tiles.iter().filter_map(|tile| {
+                matches!(
+                    tile.content,
+                    TileContent::AiChat {
+                        conversation_id: linked
+                    } if linked == conversation_id
+                )
+                .then_some(tile.id)
+            })
+        })
+        .collect::<BTreeSet<_>>();
+    tile_ids.extend(workspace.domain.trash.items.values().filter_map(|item| {
+        let tile = decode_trashed_tile(&item.snapshot)?;
+        matches!(
+            tile.content,
+            TileContent::AiChat {
+                conversation_id: linked
+            } if linked == conversation_id
+        )
+        .then_some(tile.id)
+    }));
+
+    workspace.domain.conversations.remove(conversation_id);
+    workspace
+        .domain
+        .host_artifacts
+        .remove_conversation(conversation_id);
+    for page in &mut workspace.pages {
+        page.tiles.retain(|tile| {
+            !tile_ids.contains(&tile.id)
+                && !matches!(
+                    tile.content,
+                    TileContent::AiChat {
+                        conversation_id: linked
+                    } if linked == conversation_id
+                )
+        });
+    }
+    for pile in workspace.domain.piles.values_mut() {
+        pile.overrides
+            .retain(|tile_id, _| !tile_ids.contains(tile_id));
+        pile.progress
+            .retain(|tile_id, _| !tile_ids.contains(tile_id));
+    }
+    let _ = workspace
+        .domain
+        .trash
+        .permanently_forget_tiles(&tile_ids, TrashActor::Human);
+    for tile_id in &tile_ids {
+        workspace.domain.tags.assignments.remove(tile_id);
+        workspace.domain.protected_tiles.remove(tile_id);
+        workspace.domain.photo_records.remove(tile_id);
+    }
+    tile_ids
+}
+
+fn known_tile_ids(workspace: &Workspace) -> BTreeSet<Uuid> {
+    workspace
+        .pages
+        .iter()
+        .flat_map(|page| page.tiles.iter().map(|tile| tile.id))
+        .chain(
+            workspace
+                .domain
+                .trash
+                .items
+                .values()
+                .map(|item| item.tile_id),
+        )
+        .collect()
+}
+
+/// Preserve canvas entities created by another Adam window after this
+/// process loaded its baseline. Existing entities keep the local branch's
+/// edits; only stable IDs absent from both `base` and `local` are transplanted.
+/// This is the minimum canvas merge needed to ensure deleting a chat from a
+/// stale window cannot erase artifacts that the chat created elsewhere.
+fn merge_remote_workspace_additions(
+    base: &Workspace,
+    remote: &Workspace,
+    merged: &mut Workspace,
+) -> anyhow::Result<()> {
+    let base_page_ids = base
+        .pages
+        .iter()
+        .map(|page| page.id)
+        .collect::<BTreeSet<_>>();
+    let base_tile_ids = known_tile_ids(base);
+    let mut merged_tile_ids = known_tile_ids(merged);
+    let mut copied_tile_ids = BTreeSet::new();
+
+    for remote_page in &remote.pages {
+        if let Some(target_page) = merged.page_mut(remote_page.id) {
+            for tile in &remote_page.tiles {
+                if !base_tile_ids.contains(&tile.id) && merged_tile_ids.insert(tile.id) {
+                    target_page.tiles.push(tile.clone());
+                    copied_tile_ids.insert(tile.id);
+                }
+            }
+        } else if !base_page_ids.contains(&remote_page.id) {
+            let mut page = remote_page.clone();
+            page.tiles.retain(|tile| merged_tile_ids.insert(tile.id));
+            copied_tile_ids.extend(page.tiles.iter().map(|tile| tile.id));
+            merged.pages.push(page);
+        }
+    }
+
+    let remote_active_trash_items = remote
+        .domain
+        .trash
+        .items
+        .iter()
+        .filter_map(|(item_id, item)| {
+            (remote.domain.trash.is_active(*item_id)
+                && !base_tile_ids.contains(&item.tile_id)
+                && !merged_tile_ids.contains(&item.tile_id))
+            .then_some(*item_id)
+        })
+        .collect::<Vec<_>>();
+    for item_id in remote_active_trash_items {
+        match merged
+            .domain
+            .trash
+            .import_active_item_from(&remote.domain.trash, item_id)
+        {
+            Ok(Some(tile_id)) => {
+                merged_tile_ids.insert(tile_id);
+                copied_tile_ids.insert(tile_id);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "could not preserve remote Trash item {item_id}: {error}"
+                ));
+            }
+        }
+    }
+
+    if copied_tile_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Carry the semantic sidecars owned by each transplanted tile. Never
+    // overwrite a local record with the same stable identity.
+    for tile_id in &copied_tile_ids {
+        if let Some(assignments) = remote.domain.tags.assignments.get(tile_id) {
+            merged
+                .domain
+                .tags
+                .assignments
+                .entry(*tile_id)
+                .or_insert_with(|| assignments.clone());
+        }
+        if let Some(record) = remote.domain.photo_records.get(tile_id) {
+            merged
+                .domain
+                .photo_records
+                .entry(*tile_id)
+                .or_insert_with(|| record.clone());
+        }
+        if remote.domain.protected_tiles.contains(tile_id) {
+            merged.domain.protected_tiles.insert(*tile_id);
+        }
+        let pile_id = remote.pages.iter().find_map(|page| {
+            page.tile(*tile_id).and_then(|tile| match &tile.content {
+                TileContent::Pile { pile_id } => Some(*pile_id),
+                _ => None,
+            })
+        });
+        if let Some(pile_id) = pile_id
+            && let Some(pile) = remote.domain.piles.get(&pile_id)
+        {
+            merged
+                .domain
+                .piles
+                .entry(pile_id)
+                .or_insert_with(|| pile.clone());
+        }
+    }
+    for (tag_id, definition) in &remote.domain.tags.definitions {
+        merged
+            .domain
+            .tags
+            .definitions
+            .entry(*tag_id)
+            .or_insert_with(|| definition.clone());
+    }
+    Ok(())
+}
+
 /// Commit a local snapshot while retaining conversation changes that another
 /// Adam process saved after `base` was loaded.
 fn save_workspace_merged(
@@ -468,11 +987,27 @@ fn save_workspace_merged(
     let _lock = LibraryLock::acquire(paths)?;
     let remote = read_workspace_for_merge_locked(paths, base)?;
     let mut merged = local.clone();
+    merged.domain.host_artifacts = base
+        .domain
+        .host_artifacts
+        .union(&local.domain.host_artifacts)?
+        .union(&remote.domain.host_artifacts)?;
     merged.domain.conversations = ConversationStore::merge_persisted(
         &base.domain.conversations,
         &local.domain.conversations,
         &remote.domain.conversations,
     );
+    merge_remote_workspace_additions(base, &remote, &mut merged)?;
+    let deleted_conversations = merged
+        .domain
+        .conversations
+        .deleted_conversations
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    for conversation_id in deleted_conversations {
+        scrub_deleted_conversation(&mut merged, conversation_id);
+    }
     write_workspace_locked(paths, &merged)?;
     Ok(merged)
 }
@@ -501,16 +1036,43 @@ fn read_workspace_for_merge_locked(
 }
 
 fn write_workspace_locked(paths: &AppPaths, workspace: &Workspace) -> anyhow::Result<()> {
-    let bytes = serde_json::to_vec_pretty(workspace)?;
     let previous = match fs::read(&paths.library) {
-        Ok(previous) if previous == bytes => return Ok(()),
         Ok(previous) => Some(previous),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
+    let deleted_conversations = &workspace.domain.conversations.deleted_conversations;
+    let mut next_json = serde_json::to_value(workspace)?;
+    let mut validated_previous_json = previous.as_deref().and_then(|bytes| {
+        let json = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+        serde_json::from_value::<Workspace>(json.clone()).ok()?;
+        Some(json)
+    });
+    if let Some(previous_json) = validated_previous_json.as_mut() {
+        for conversation_id in deleted_conversations {
+            scrub_deleted_conversation_json(previous_json, *conversation_id, 0);
+        }
+        carry_forward_unknown_workspace_members(previous_json, &mut next_json);
+    }
+    for conversation_id in deleted_conversations {
+        scrub_deleted_conversation_json(&mut next_json, *conversation_id, 0);
+    }
+    let bytes = serde_json::to_vec_pretty(&next_json)?;
+    let unchanged = previous.as_deref() == Some(bytes.as_slice());
+    if !deleted_conversations.is_empty() {
+        scrub_recoverable_workspace_copies_locked(paths, deleted_conversations)?;
+    }
+    if unchanged {
+        return Ok(());
+    }
 
     if let Some(previous) = previous {
-        if serde_json::from_slice::<Workspace>(&previous).is_ok() {
+        if let Some(previous_json) = validated_previous_json {
+            let previous = if deleted_conversations.is_empty() {
+                previous
+            } else {
+                serde_json::to_vec_pretty(&previous_json)?
+            };
             write_file_atomic(
                 &paths.root.join(LIBRARY_PREVIOUS_FILE),
                 &previous,
@@ -526,6 +1088,45 @@ fn write_workspace_locked(paths: &AppPaths, workspace: &Workspace) -> anyhow::Re
     }
 
     write_file_atomic(&paths.library, &bytes, "write")?;
+    Ok(())
+}
+
+fn scrub_recoverable_workspace_copies_locked(
+    paths: &AppPaths,
+    deleted_conversations: &BTreeSet<Uuid>,
+) -> anyhow::Result<()> {
+    let mut candidates = vec![paths.root.join(LIBRARY_PREVIOUS_FILE)];
+    for entry in fs::read_dir(&paths.root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("library.recovery-") && name.ends_with(".json") {
+            candidates.push(entry.path());
+        }
+    }
+
+    for candidate in candidates {
+        let bytes = match fs::read(&candidate) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let Ok(mut workspace_json) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            // Recovery files can intentionally contain unreadable live bytes.
+            // Preserve those rather than risking unrelated user data.
+            continue;
+        };
+        if serde_json::from_value::<Workspace>(workspace_json.clone()).is_err() {
+            continue;
+        }
+        for conversation_id in deleted_conversations {
+            scrub_deleted_conversation_json(&mut workspace_json, *conversation_id, 0);
+        }
+        let scrubbed = serde_json::to_vec_pretty(&workspace_json)?;
+        if scrubbed != bytes {
+            write_file_atomic(&candidate, &scrubbed, "recovery-scrub")?;
+        }
+    }
     Ok(())
 }
 
@@ -583,8 +1184,18 @@ enum SaveCommand {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SaveOutcome {
-    Saved,
-    Superseded { by_request_id: u64 },
+    Saved {
+        /// Tombstones discovered while merging with another Adam process.
+        /// The app consumes these monotonically so a still-open stale window
+        /// stops presenting or running a conversation deleted elsewhere.
+        learned_deleted_conversations: Vec<Uuid>,
+        /// Existing live conversations whose xAI server-storage disclosure
+        /// was learned while merging another Adam process's snapshot.
+        learned_xai_storage_conversations: Vec<Uuid>,
+    },
+    Superseded {
+        by_request_id: u64,
+    },
     Failed(String),
 }
 
@@ -773,12 +1384,60 @@ fn save_and_acknowledge(
     during_shutdown: bool,
 ) {
     let outcome = match save_workspace_merged(paths, base, workspace) {
-        Ok(_) => {
-            // Keep the baseline at what this process actually knows. Any
-            // concurrently merged remote records remain remote changes during
-            // the next three-way merge instead of looking locally deleted.
+        Ok(merged) => {
+            let learned_deleted_conversations = merged
+                .domain
+                .conversations
+                .deleted_conversations
+                .difference(&workspace.domain.conversations.deleted_conversations)
+                .copied()
+                .collect::<Vec<_>>();
+            let learned_xai_storage_conversations = merged
+                .domain
+                .conversations
+                .conversations
+                .iter()
+                .filter_map(|(conversation_id, merged_conversation)| {
+                    let submitted = workspace
+                        .domain
+                        .conversations
+                        .conversations
+                        .get(conversation_id)?;
+                    (merged_conversation.used_xai_server_storage
+                        && !submitted.used_xai_server_storage)
+                        .then_some(*conversation_id)
+                })
+                .collect::<Vec<_>>();
+
+            // Keep ordinary records at what this process actually submitted.
+            // Copying the entire merged workspace into the baseline would make
+            // a remote-added conversation look locally deleted on the next
+            // save. Tombstones are monotonic, however, so retain every durable
+            // marker learned from another process and normalize the baseline.
             base.clone_from(workspace);
-            SaveOutcome::Saved
+            for conversation_id in &learned_xai_storage_conversations {
+                if let Some(conversation) = base
+                    .domain
+                    .conversations
+                    .conversations
+                    .get_mut(conversation_id)
+                {
+                    conversation.used_xai_server_storage = true;
+                }
+            }
+            base.domain.conversations.deleted_conversations.extend(
+                merged
+                    .domain
+                    .conversations
+                    .deleted_conversations
+                    .iter()
+                    .copied(),
+            );
+            base.domain.conversations.normalize_in_place();
+            SaveOutcome::Saved {
+                learned_deleted_conversations,
+                learned_xai_storage_conversations,
+            }
         }
         Err(error) => {
             if during_shutdown {
@@ -798,7 +1457,15 @@ fn save_and_acknowledge(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{AiConversation, MessageRole, PermissionMode, UnixMillis};
+    use crate::{
+        chat_core::{ActivityEvent, ActivityKind, HostMutationKind},
+        domain::{
+            AiCheckpoint, AiConversation, HostArtifactOrigin, MessageRole, PaletteColor,
+            PermissionMode, TrashItem, UnixMillis,
+        },
+        model::WorldRect,
+        photo_details::PhotoRecord,
+    };
 
     #[test]
     fn workspace_round_trips_atomically() {
@@ -812,6 +1479,33 @@ mod tests {
         assert_eq!(loaded.pages.len(), original.pages.len());
         assert_eq!(loaded.active_page, original.active_page);
         assert!(!paths.library.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn forward_compatible_json_boundaries_list_every_current_typed_field() {
+        fn keys_at(value: &serde_json::Value, pointer: &str) -> BTreeSet<String> {
+            value
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_object)
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect()
+        }
+        fn listed(fields: &[&str]) -> BTreeSet<String> {
+            fields.iter().map(|field| (*field).to_owned()).collect()
+        }
+
+        let workspace = serde_json::to_value(Workspace::default()).unwrap();
+        assert_eq!(keys_at(&workspace, ""), listed(WORKSPACE_KNOWN_JSON_FIELDS));
+        assert_eq!(
+            keys_at(&workspace, "/domain"),
+            listed(DOMAIN_KNOWN_JSON_FIELDS)
+        );
+        assert_eq!(
+            keys_at(&workspace, "/domain/conversations"),
+            listed(CONVERSATION_STORE_KNOWN_JSON_FIELDS)
+        );
     }
 
     #[test]
@@ -1019,7 +1713,13 @@ mod tests {
 
         let completion = wait_for_completion(&worker, request_id);
 
-        assert_eq!(completion.outcome, SaveOutcome::Saved);
+        assert_eq!(
+            completion.outcome,
+            SaveOutcome::Saved {
+                learned_deleted_conversations: Vec::new(),
+                learned_xai_storage_conversations: Vec::new(),
+            }
+        );
         assert!(paths.library.exists());
         worker.stop();
     }
@@ -1073,14 +1773,20 @@ mod tests {
         let fresh_request = fresh_worker.request_tracked(fresh).unwrap();
         assert_eq!(
             wait_for_completion(&fresh_worker, fresh_request).outcome,
-            SaveOutcome::Saved
+            SaveOutcome::Saved {
+                learned_deleted_conversations: Vec::new(),
+                learned_xai_storage_conversations: Vec::new(),
+            }
         );
 
         let mut stale_worker = SaveWorker::start_with_base(paths.clone(), base);
         let stale_request = stale_worker.request_tracked(stale).unwrap();
         assert_eq!(
             wait_for_completion(&stale_worker, stale_request).outcome,
-            SaveOutcome::Saved
+            SaveOutcome::Saved {
+                learned_deleted_conversations: Vec::new(),
+                learned_xai_storage_conversations: Vec::new(),
+            }
         );
         fresh_worker.stop();
         stale_worker.stop();
@@ -1105,6 +1811,197 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn save_worker_reports_tombstones_learned_from_remote() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let conversation_id = Uuid::from_u128(150);
+        let base = workspace_with_conversation(conversation_id);
+        save_workspace_atomic(&paths, &base).unwrap();
+        let mut stale_worker = SaveWorker::start_with_base(paths.clone(), base.clone());
+
+        let mut remote = base.clone();
+        remote.domain.conversations.remove(conversation_id);
+        save_workspace_merged(&paths, &base, &remote).unwrap();
+
+        let request_id = stale_worker.request_tracked(base).unwrap();
+        assert_eq!(
+            wait_for_completion(&stale_worker, request_id).outcome,
+            SaveOutcome::Saved {
+                learned_deleted_conversations: vec![conversation_id],
+                learned_xai_storage_conversations: Vec::new(),
+            }
+        );
+        stale_worker.stop();
+    }
+
+    #[test]
+    fn save_worker_baseline_retains_learned_tombstones() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let conversation_id = Uuid::from_u128(160);
+        let base = workspace_with_conversation(conversation_id);
+        save_workspace_atomic(&paths, &base).unwrap();
+        let mut stale_worker = SaveWorker::start_with_base(paths.clone(), base.clone());
+
+        let mut remote = base.clone();
+        remote.domain.conversations.remove(conversation_id);
+        save_workspace_merged(&paths, &base, &remote).unwrap();
+
+        let first_request = stale_worker.request_tracked(base.clone()).unwrap();
+        assert_eq!(
+            wait_for_completion(&stale_worker, first_request).outcome,
+            SaveOutcome::Saved {
+                learned_deleted_conversations: vec![conversation_id],
+                learned_xai_storage_conversations: Vec::new(),
+            }
+        );
+
+        // Simulate an older writer replacing the on-disk snapshot without the
+        // marker. The still-running worker must carry its learned tombstone
+        // forward instead of accepting the resurrected record as current.
+        save_workspace_atomic(&paths, &base).unwrap();
+        let second_request = stale_worker.request_tracked(base).unwrap();
+        assert_eq!(
+            wait_for_completion(&stale_worker, second_request).outcome,
+            SaveOutcome::Saved {
+                learned_deleted_conversations: vec![conversation_id],
+                learned_xai_storage_conversations: Vec::new(),
+            }
+        );
+        stale_worker.stop();
+
+        let persisted = load_workspace(&paths).unwrap();
+        assert!(
+            persisted
+                .domain
+                .conversations
+                .deleted_conversations
+                .contains(&conversation_id)
+        );
+        assert!(
+            !persisted
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&conversation_id)
+        );
+    }
+
+    #[test]
+    fn save_worker_reports_and_retains_learned_xai_storage_disclosures() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let conversation_id = Uuid::from_u128(165);
+        let base = workspace_with_conversation(conversation_id);
+        save_workspace_atomic(&paths, &base).unwrap();
+        let mut stale_worker = SaveWorker::start_with_base(paths.clone(), base.clone());
+
+        let mut remote = base.clone();
+        let remote_conversation = remote
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&conversation_id)
+            .unwrap();
+        remote_conversation.used_xai_server_storage = true;
+        remote_conversation.settings.provider_id = "codex_cli".into();
+        save_workspace_merged(&paths, &base, &remote).unwrap();
+
+        let first_request = stale_worker.request_tracked(base.clone()).unwrap();
+        assert_eq!(
+            wait_for_completion(&stale_worker, first_request).outcome,
+            SaveOutcome::Saved {
+                learned_deleted_conversations: Vec::new(),
+                learned_xai_storage_conversations: vec![conversation_id],
+            }
+        );
+        assert!(
+            load_workspace(&paths)
+                .unwrap()
+                .domain
+                .conversations
+                .conversations[&conversation_id]
+                .used_xai_server_storage
+        );
+
+        // Even if an older writer replaces disk before the app consumes the
+        // receipt, this worker's privacy-only baseline carries the marker
+        // forward without absorbing any other remote conversation data.
+        save_workspace_atomic(&paths, &base).unwrap();
+        let second_request = stale_worker.request_tracked(base).unwrap();
+        assert_eq!(
+            wait_for_completion(&stale_worker, second_request).outcome,
+            SaveOutcome::Saved {
+                learned_deleted_conversations: Vec::new(),
+                learned_xai_storage_conversations: vec![conversation_id],
+            }
+        );
+        stale_worker.stop();
+        assert!(
+            load_workspace(&paths)
+                .unwrap()
+                .domain
+                .conversations
+                .conversations[&conversation_id]
+                .used_xai_server_storage
+        );
+    }
+
+    #[test]
+    fn save_worker_baseline_does_not_absorb_remote_added_conversations() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let remote_conversation_id = Uuid::from_u128(170);
+        let base = Workspace::default();
+        save_workspace_atomic(&paths, &base).unwrap();
+        let mut stale_worker = SaveWorker::start_with_base(paths.clone(), base.clone());
+
+        let mut remote = base.clone();
+        remote
+            .domain
+            .conversations
+            .add(conversation_with_prompt(remote_conversation_id))
+            .unwrap();
+        save_workspace_merged(&paths, &base, &remote).unwrap();
+
+        let mut first_local = base.clone();
+        first_local.active_page_mut().name = "first stale save".into();
+        let first_request = stale_worker.request_tracked(first_local).unwrap();
+        assert_eq!(
+            wait_for_completion(&stale_worker, first_request).outcome,
+            SaveOutcome::Saved {
+                learned_deleted_conversations: Vec::new(),
+                learned_xai_storage_conversations: Vec::new(),
+            }
+        );
+
+        // A merged remote addition is not evidence that this process loaded
+        // the record. Keeping it out of the baseline lets the next stale save
+        // recognize the unchanged remote record as authoritative.
+        let mut second_local = base;
+        second_local.active_page_mut().name = "second stale save".into();
+        let second_request = stale_worker.request_tracked(second_local).unwrap();
+        assert_eq!(
+            wait_for_completion(&stale_worker, second_request).outcome,
+            SaveOutcome::Saved {
+                learned_deleted_conversations: Vec::new(),
+                learned_xai_storage_conversations: Vec::new(),
+            }
+        );
+        stale_worker.stop();
+
+        let persisted = load_workspace(&paths).unwrap();
+        assert!(
+            persisted
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&remote_conversation_id)
+        );
+        assert_eq!(persisted.active_page().name, "second stale save");
     }
 
     #[test]
@@ -1182,31 +2079,933 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_conversation_deletion_is_not_resurrected_by_a_stale_save() {
+    fn concurrent_saves_union_immutable_host_artifact_origins() {
         let temporary = tempfile::tempdir().unwrap();
         let paths = AppPaths::at(temporary.path());
-        let conversation_id = Uuid::from_u128(300);
+        let conversation_id = Uuid::from_u128(250);
         let base = workspace_with_conversation(conversation_id);
         save_workspace_atomic(&paths, &base).unwrap();
-        let mut deleting_process = base.clone();
-        deleting_process
+
+        let origin = |entity: u128, turn: u128, event: u128| {
+            let entity_id = Uuid::from_u128(entity);
+            HostArtifactOrigin::new(
+                entity_id,
+                conversation_id,
+                Uuid::from_u128(turn),
+                ActivityEvent::new(
+                    Uuid::from_u128(event),
+                    UnixMillis(event as i64),
+                    ActivityKind::HostMutation {
+                        tool: "canvas_create_note".into(),
+                        summary: format!("Note {entity}"),
+                        entity_id: Some(entity_id.to_string()),
+                        container_name: Some("Canvas 1".into()),
+                        kind: HostMutationKind::Create,
+                    },
+                ),
+            )
+            .unwrap()
+        };
+        let mut remote = base.clone();
+        remote
+            .domain
+            .record_host_artifact(origin(251, 252, 253))
+            .unwrap();
+        save_workspace_merged(&paths, &base, &remote).unwrap();
+
+        let mut stale_local = base.clone();
+        stale_local
+            .domain
+            .record_host_artifact(origin(254, 255, 256))
+            .unwrap();
+        save_workspace_merged(&paths, &base, &stale_local).unwrap();
+
+        let persisted = load_workspace(&paths).unwrap();
+        assert!(
+            persisted
+                .domain
+                .host_artifacts
+                .origin(Uuid::from_u128(251))
+                .is_some()
+        );
+        assert!(
+            persisted
+                .domain
+                .host_artifacts
+                .origin(Uuid::from_u128(254))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn stale_writer_preserves_remote_created_ai_chat_tiles_and_trash() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let conversation_id = Uuid::from_u128(260);
+        let live_tile_id = Uuid::from_u128(261);
+        let trashed_tile_id = Uuid::from_u128(262);
+        let trash_item_id = Uuid::from_u128(263);
+        let base = Workspace::new();
+        save_workspace_atomic(&paths, &base).unwrap();
+
+        let mut creator = base.clone();
+        creator
             .domain
             .conversations
+            .add(conversation_with_prompt(conversation_id))
+            .unwrap();
+        let mut live_tile = Tile::ai_chat(
+            "Remote chat",
+            conversation_id,
+            WorldRect::new(0.0, 0.0, 280.0, 190.0),
+        );
+        live_tile.id = live_tile_id;
+        creator.active_page_mut().add_tile(live_tile);
+        creator
+            .domain
             .conversations
-            .remove(&conversation_id);
-        save_workspace_merged(&paths, &base, &deleting_process).unwrap();
+            .link_tile(live_tile_id, conversation_id)
+            .unwrap();
+
+        let mut trashed_tile = Tile::ai_chat(
+            "Remote chat in Trash",
+            conversation_id,
+            WorldRect::new(300.0, 0.0, 280.0, 190.0),
+        );
+        trashed_tile.id = trashed_tile_id;
+        creator
+            .domain
+            .trash
+            .move_to_trash(
+                TrashItem {
+                    id: trash_item_id,
+                    tile_id: trashed_tile_id,
+                    original_page_id: creator.active_page,
+                    original_rect: trashed_tile.rect,
+                    original_z_index: 1,
+                    trashed_at: UnixMillis(1_000),
+                    actor: TrashActor::Human,
+                    snapshot: serde_json::json!({"tile": trashed_tile, "pile": null}),
+                },
+                Uuid::from_u128(264),
+            )
+            .unwrap();
+        creator
+            .domain
+            .conversations
+            .link_tile(trashed_tile_id, conversation_id)
+            .unwrap();
+        save_workspace_merged(&paths, &base, &creator).unwrap();
 
         let mut stale = base.clone();
-        stale.active_page_mut().name = "stale but unrelated".into();
+        stale.active_page_mut().name = "Unrelated stale edit".into();
         save_workspace_merged(&paths, &base, &stale).unwrap();
 
         let persisted = load_workspace(&paths).unwrap();
         assert!(
-            !persisted
+            persisted
                 .domain
                 .conversations
                 .conversations
                 .contains_key(&conversation_id)
+        );
+        assert!(
+            persisted
+                .pages
+                .iter()
+                .any(|page| page.tile(live_tile_id).is_some())
+        );
+        assert!(
+            persisted
+                .domain
+                .trash
+                .active_item_for_tile(trashed_tile_id)
+                .is_some()
+        );
+        assert_eq!(
+            persisted.domain.conversations.tile_links.get(&live_tile_id),
+            Some(&conversation_id)
+        );
+        assert_eq!(
+            persisted
+                .domain
+                .conversations
+                .tile_links
+                .get(&trashed_tile_id),
+            Some(&conversation_id)
+        );
+    }
+
+    #[test]
+    fn stale_chat_deletion_preserves_remote_created_canvas_artifacts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let conversation_id = Uuid::from_u128(270);
+        let note_id = Uuid::from_u128(271);
+        let sheet_id = Uuid::from_u128(272);
+        let pile_id = Uuid::from_u128(273);
+        let tag_id = Uuid::from_u128(274);
+        let base = workspace_with_conversation(conversation_id);
+        save_workspace_atomic(&paths, &base).unwrap();
+
+        let mut creator = base.clone();
+        let mut note = Tile::note(
+            "Research note",
+            "Keep me",
+            WorldRect::new(0.0, 0.0, 280.0, 190.0),
+        );
+        note.id = note_id;
+        let mut sheet = Tile::from_file(
+            "/tmp/research.xlsx",
+            WorldRect::new(300.0, 0.0, 280.0, 190.0),
+        );
+        sheet.id = sheet_id;
+        let pile_rect = WorldRect::new(0.0, 220.0, 600.0, 420.0);
+        creator.active_page_mut().tiles.extend([
+            note,
+            sheet,
+            Tile::pile(pile_id, "Research", pile_rect),
+        ]);
+        creator.domain.piles.insert(
+            pile_id,
+            Pile::new(
+                pile_id,
+                creator.active_page,
+                pile_rect,
+                "Research",
+                tag_id,
+                PaletteColor::Teal,
+            )
+            .unwrap(),
+        );
+        creator
+            .domain
+            .record_host_artifact(
+                HostArtifactOrigin::new(
+                    note_id,
+                    conversation_id,
+                    Uuid::from_u128(275),
+                    ActivityEvent::new(
+                        Uuid::from_u128(276),
+                        UnixMillis(2_000),
+                        ActivityKind::HostMutation {
+                            tool: "canvas_create_note".into(),
+                            summary: "Research note".into(),
+                            entity_id: Some(note_id.to_string()),
+                            container_name: Some("Canvas 1".into()),
+                            kind: HostMutationKind::Create,
+                        },
+                    ),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        save_workspace_merged(&paths, &base, &creator).unwrap();
+
+        let mut stale_deleter = base.clone();
+        stale_deleter.domain.conversations.remove(conversation_id);
+        stale_deleter.active_page_mut().name = "Deleted from stale window".into();
+        save_workspace_merged(&paths, &base, &stale_deleter).unwrap();
+
+        // A third window loaded before either change must also preserve the
+        // entities after deletion has removed their chat provenance.
+        let mut even_staler = base.clone();
+        even_staler.active_page_mut().name = "Saved from an older window".into();
+        save_workspace_merged(&paths, &base, &even_staler).unwrap();
+
+        let persisted = load_workspace(&paths).unwrap();
+        for tile_id in [note_id, sheet_id, pile_id] {
+            assert!(
+                persisted
+                    .pages
+                    .iter()
+                    .any(|page| page.tile(tile_id).is_some()),
+                "remote-created artifact {tile_id} must survive a stale save"
+            );
+        }
+        assert!(persisted.domain.piles.contains_key(&pile_id));
+        assert!(persisted.domain.host_artifacts.origin(note_id).is_none());
+        assert!(
+            persisted
+                .domain
+                .conversations
+                .deleted_conversations
+                .contains(&conversation_id)
+        );
+    }
+
+    #[test]
+    fn stale_chat_deletion_preserves_remote_created_artifacts_already_in_trash() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let conversation_id = Uuid::from_u128(280);
+        let note_id = Uuid::from_u128(281);
+        let sheet_id = Uuid::from_u128(282);
+        let pile_id = Uuid::from_u128(283);
+        let tag_id = Uuid::from_u128(284);
+        let base = workspace_with_conversation(conversation_id);
+        save_workspace_atomic(&paths, &base).unwrap();
+
+        let mut creator = base.clone();
+        let page_id = creator.active_page;
+        let mut note = Tile::note(
+            "Trashed research",
+            "Keep the result",
+            WorldRect::new(0.0, 0.0, 280.0, 190.0),
+        );
+        note.id = note_id;
+        let mut sheet = Tile::from_file(
+            "/tmp/trashed-research.xlsx",
+            WorldRect::new(300.0, 0.0, 280.0, 190.0),
+        );
+        sheet.id = sheet_id;
+        let pile_rect = WorldRect::new(0.0, 220.0, 600.0, 420.0);
+        let pile = Pile::new(
+            pile_id,
+            page_id,
+            pile_rect,
+            "Trashed pile",
+            tag_id,
+            PaletteColor::Teal,
+        )
+        .unwrap();
+        let pile_tile = Tile::pile(pile_id, "Trashed pile", pile_rect);
+
+        for (tile, pile_snapshot, item_id, event_id, at) in [
+            (
+                note,
+                None,
+                Uuid::from_u128(285),
+                Uuid::from_u128(286),
+                UnixMillis(1_000),
+            ),
+            (
+                sheet,
+                None,
+                Uuid::from_u128(287),
+                Uuid::from_u128(288),
+                UnixMillis(1_100),
+            ),
+            (
+                pile_tile,
+                Some(pile.clone()),
+                Uuid::from_u128(289),
+                Uuid::from_u128(290),
+                UnixMillis(1_200),
+            ),
+        ] {
+            creator
+                .domain
+                .trash
+                .move_to_trash(
+                    TrashItem {
+                        id: item_id,
+                        tile_id: tile.id,
+                        original_page_id: page_id,
+                        original_rect: tile.rect,
+                        original_z_index: 0,
+                        trashed_at: at,
+                        actor: TrashActor::Human,
+                        snapshot: serde_json::json!({
+                            "tile": tile,
+                            "pile": pile_snapshot,
+                        }),
+                    },
+                    event_id,
+                )
+                .unwrap();
+        }
+        creator.domain.protected_tiles.insert(note_id);
+        creator
+            .domain
+            .photo_records
+            .insert(sheet_id, PhotoRecord::default());
+        creator
+            .domain
+            .record_host_artifact(
+                HostArtifactOrigin::new(
+                    note_id,
+                    conversation_id,
+                    Uuid::from_u128(291),
+                    ActivityEvent::new(
+                        Uuid::from_u128(292),
+                        UnixMillis(1_300),
+                        ActivityKind::HostMutation {
+                            tool: "canvas_create_note".into(),
+                            summary: "Trashed research".into(),
+                            entity_id: Some(note_id.to_string()),
+                            container_name: Some("Canvas 1".into()),
+                            kind: HostMutationKind::Create,
+                        },
+                    ),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        save_workspace_merged(&paths, &base, &creator).unwrap();
+
+        let mut stale_deleter = base.clone();
+        stale_deleter.domain.conversations.remove(conversation_id);
+        save_workspace_merged(&paths, &base, &stale_deleter).unwrap();
+        let mut even_staler = base.clone();
+        even_staler.active_page_mut().name = "Older writer".into();
+        save_workspace_merged(&paths, &base, &even_staler).unwrap();
+        even_staler.active_page_mut().name = "Oldest writer again".into();
+        save_workspace_merged(&paths, &base, &even_staler).unwrap();
+
+        let persisted = load_workspace(&paths).unwrap();
+        assert_eq!(persisted.domain.trash.items.len(), 3);
+        assert_eq!(persisted.domain.trash.events().len(), 3);
+        for tile_id in [note_id, sheet_id, pile_id] {
+            assert!(
+                persisted
+                    .domain
+                    .trash
+                    .active_item_for_tile(tile_id)
+                    .is_some(),
+                "remote-created trashed artifact {tile_id} must remain recoverable"
+            );
+            assert!(
+                persisted
+                    .pages
+                    .iter()
+                    .all(|page| page.tile(tile_id).is_none())
+            );
+        }
+        let pile_item = persisted
+            .domain
+            .trash
+            .active_item_for_tile(pile_id)
+            .unwrap();
+        let decoded_pile: Pile =
+            serde_json::from_value(pile_item.snapshot["pile"].clone()).unwrap();
+        assert_eq!(decoded_pile, pile);
+        assert!(persisted.domain.protected_tiles.contains(&note_id));
+        assert!(persisted.domain.photo_records.contains_key(&sheet_id));
+        assert!(persisted.domain.host_artifacts.origin(note_id).is_none());
+        assert!(
+            persisted
+                .domain
+                .conversations
+                .deleted_conversations
+                .contains(&conversation_id)
+        );
+    }
+
+    #[test]
+    fn conversation_tombstone_beats_a_stale_edit_in_both_save_orders() {
+        for deletion_saves_first in [true, false] {
+            let temporary = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(temporary.path());
+            let conversation_id = Uuid::from_u128(300);
+            let base = workspace_with_conversation(conversation_id);
+            save_workspace_atomic(&paths, &base).unwrap();
+
+            let mut deleting_process = base.clone();
+            deleting_process
+                .domain
+                .conversations
+                .remove(conversation_id);
+            let mut stale = base.clone();
+            stale
+                .domain
+                .conversations
+                .conversations
+                .get_mut(&conversation_id)
+                .unwrap()
+                .append_message(
+                    Uuid::from_u128(302),
+                    MessageRole::Assistant,
+                    "stale provider response",
+                    UnixMillis(2_000),
+                    Vec::new(),
+                )
+                .unwrap();
+
+            if deletion_saves_first {
+                save_workspace_merged(&paths, &base, &deleting_process).unwrap();
+                save_workspace_merged(&paths, &base, &stale).unwrap();
+            } else {
+                save_workspace_merged(&paths, &base, &stale).unwrap();
+                save_workspace_merged(&paths, &base, &deleting_process).unwrap();
+            }
+
+            let persisted = load_workspace(&paths).unwrap();
+            assert!(
+                !persisted
+                    .domain
+                    .conversations
+                    .conversations
+                    .contains_key(&conversation_id)
+            );
+            assert!(
+                persisted
+                    .domain
+                    .conversations
+                    .deleted_conversations
+                    .contains(&conversation_id)
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_workspace_members_survive_repeated_saves_without_reviving_deleted_chat() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let conversation_id = Uuid::from_u128(350);
+        let chat_tile_id = Uuid::from_u128(351);
+        let mut workspace = workspace_with_conversation(conversation_id);
+        let mut chat_tile = Tile::ai_chat(
+            "Delete me",
+            conversation_id,
+            WorldRect::new(0.0, 0.0, 280.0, 190.0),
+        );
+        chat_tile.id = chat_tile_id;
+        workspace.active_page_mut().add_tile(chat_tile);
+        workspace
+            .domain
+            .conversations
+            .link_tile(chat_tile_id, conversation_id)
+            .unwrap();
+        save_workspace_atomic(&paths, &workspace).unwrap();
+
+        let mut future_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&paths.library).unwrap()).unwrap();
+        future_json["future_root"] = serde_json::Value::Null;
+        future_json["domain"]["future_domain"] = serde_json::json!({"newer": true, "count": 2});
+        future_json["domain"]["conversations"]["future_store"] = serde_json::json!(["keep", 27]);
+        fs::write(
+            &paths.library,
+            serde_json::to_vec_pretty(&future_json).unwrap(),
+        )
+        .unwrap();
+
+        let mut first_save = load_workspace(&paths).unwrap();
+        first_save.domain.conversations.remove(conversation_id);
+        first_save.active_page_mut().name = "First known edit".into();
+        save_workspace_atomic(&paths, &first_save).unwrap();
+
+        let conversation_key = conversation_id.to_string();
+        let chat_tile_key = chat_tile_id.to_string();
+        let assert_live = |expected_page_name: &str| {
+            let json: serde_json::Value =
+                serde_json::from_slice(&fs::read(&paths.library).unwrap()).unwrap();
+            assert!(json["future_root"].is_null());
+            assert_eq!(
+                json["domain"]["future_domain"],
+                serde_json::json!({"newer": true, "count": 2})
+            );
+            assert_eq!(
+                json["domain"]["conversations"]["future_store"],
+                serde_json::json!(["keep", 27])
+            );
+            assert_eq!(json["pages"][0]["name"], expected_page_name);
+            assert!(
+                json["domain"]["conversations"]["deleted_conversations"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|value| value.as_str() == Some(conversation_key.as_str()))
+            );
+            assert!(
+                json["domain"]["conversations"]["conversations"]
+                    .as_object()
+                    .unwrap()
+                    .get(&conversation_key)
+                    .is_none()
+            );
+            assert!(
+                json["domain"]["conversations"]["tile_links"]
+                    .as_object()
+                    .unwrap()
+                    .get(&chat_tile_key)
+                    .is_none()
+            );
+            assert!(
+                json["pages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|page| page["tiles"].as_array().unwrap())
+                    .all(|tile| {
+                        json_tile_conversation_id(tile) != Some(conversation_key.as_str())
+                    })
+            );
+        };
+        assert_live("First known edit");
+
+        let mut second_save = load_workspace(&paths).unwrap();
+        second_save.active_page_mut().name = "Second known edit".into();
+        save_workspace_atomic(&paths, &second_save).unwrap();
+        assert_live("Second known edit");
+
+        let previous: serde_json::Value =
+            serde_json::from_slice(&fs::read(paths.root.join(LIBRARY_PREVIOUS_FILE)).unwrap())
+                .unwrap();
+        assert!(previous["future_root"].is_null());
+        assert_eq!(
+            previous["domain"]["future_domain"],
+            serde_json::json!({"newer": true, "count": 2})
+        );
+        assert_eq!(
+            previous["domain"]["conversations"]["future_store"],
+            serde_json::json!(["keep", 27])
+        );
+        let previous_workspace: Workspace = serde_json::from_value(previous).unwrap();
+        assert!(
+            previous_workspace
+                .domain
+                .conversations
+                .deleted_conversations
+                .contains(&conversation_id)
+        );
+        assert!(
+            !previous_workspace
+                .domain
+                .conversations
+                .conversations
+                .contains_key(&conversation_id)
+        );
+    }
+
+    #[test]
+    fn tombstone_scrubs_durable_chat_carriers_but_preserves_created_artifacts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let deleted_id = Uuid::from_u128(400);
+        let retained_id = Uuid::from_u128(401);
+        let live_chat_id = Uuid::from_u128(402);
+        let trashed_chat_id = Uuid::from_u128(403);
+        let note_id = Uuid::from_u128(404);
+        let deepest_chat_id = Uuid::from_u128(405);
+
+        let mut base = workspace_with_conversation(deleted_id);
+        base.domain
+            .conversations
+            .add(conversation_with_prompt(retained_id))
+            .unwrap();
+        let mut live_chat = Tile::ai_chat(
+            "Delete me",
+            deleted_id,
+            WorldRect::new(0.0, 0.0, 280.0, 190.0),
+        );
+        live_chat.id = live_chat_id;
+        base.active_page_mut().add_tile(live_chat);
+        base.domain
+            .conversations
+            .link_tile(live_chat_id, deleted_id)
+            .unwrap();
+        base.domain.protected_tiles.insert(live_chat_id);
+        base.domain
+            .tags
+            .assignments
+            .insert(live_chat_id, Default::default());
+        base.domain
+            .photo_records
+            .insert(live_chat_id, PhotoRecord::default());
+
+        let mut note = Tile::note(
+            "Keep this report",
+            "Durable research",
+            WorldRect::new(320.0, 0.0, 280.0, 190.0),
+        );
+        note.id = note_id;
+        base.active_page_mut().add_tile(note);
+        // A stale semantic link is not sufficient evidence to delete a real
+        // note tile. The link is scrubbed with the conversation; content stays.
+        base.domain
+            .conversations
+            .link_tile(note_id, deleted_id)
+            .unwrap();
+        let origin_event = ActivityEvent::new(
+            Uuid::from_u128(406),
+            UnixMillis(2_000),
+            ActivityKind::HostMutation {
+                tool: "canvas_create_note".into(),
+                summary: "Keep this report".into(),
+                entity_id: Some(note_id.to_string()),
+                container_name: Some("Canvas 1".into()),
+                kind: HostMutationKind::Create,
+            },
+        );
+        base.domain
+            .record_host_artifact(
+                HostArtifactOrigin::new(note_id, deleted_id, Uuid::from_u128(407), origin_event)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let mut trashed_chat = Tile::ai_chat(
+            "Trashed chat",
+            deleted_id,
+            WorldRect::new(0.0, 0.0, 280.0, 190.0),
+        );
+        trashed_chat.id = trashed_chat_id;
+        base.domain.trash.items.insert(
+            Uuid::from_u128(408),
+            TrashItem {
+                id: Uuid::from_u128(408),
+                tile_id: trashed_chat_id,
+                original_page_id: base.active_page,
+                original_rect: trashed_chat.rect,
+                original_z_index: 0,
+                trashed_at: UnixMillis(2_100),
+                actor: TrashActor::Human,
+                snapshot: serde_json::json!({"tile": trashed_chat, "pile": null}),
+            },
+        );
+
+        let mut deepest = Workspace::new();
+        let mut deepest_chat = Tile::ai_chat(
+            "Nested deleted chat",
+            deleted_id,
+            WorldRect::new(0.0, 0.0, 280.0, 190.0),
+        );
+        deepest_chat.id = deepest_chat_id;
+        deepest.active_page_mut().add_tile(deepest_chat);
+        let middle_id = Uuid::from_u128(409);
+        let mut middle = Workspace::new();
+        middle
+            .domain
+            .conversations
+            .add(conversation_with_prompt(middle_id))
+            .unwrap();
+        let middle_page_id = middle.active_page;
+        middle
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&middle_id)
+            .unwrap()
+            .add_checkpoint(AiCheckpoint {
+                id: Uuid::from_u128(410),
+                conversation_id: middle_id,
+                page_id: middle_page_id,
+                label: "Nested".into(),
+                created_at: UnixMillis(2_200),
+                action_sequence: 0,
+                snapshot: serde_json::to_value(deepest).unwrap(),
+            })
+            .unwrap();
+        let base_page_id = base.active_page;
+        base.domain
+            .conversations
+            .conversations
+            .get_mut(&retained_id)
+            .unwrap()
+            .add_checkpoint(AiCheckpoint {
+                id: Uuid::from_u128(411),
+                conversation_id: retained_id,
+                page_id: base_page_id,
+                label: "Outer".into(),
+                created_at: UnixMillis(2_300),
+                action_sequence: 0,
+                snapshot: serde_json::to_value(middle).unwrap(),
+            })
+            .unwrap();
+
+        let middle_key = middle_id.to_string();
+        let outer_snapshot = &mut base
+            .domain
+            .conversations
+            .conversations
+            .get_mut(&retained_id)
+            .unwrap()
+            .checkpoints_mut()[0]
+            .snapshot;
+        outer_snapshot["future_middle_field"] = serde_json::json!({"keep": true});
+        outer_snapshot["domain"]["conversations"]["conversations"][&middle_key]["checkpoints"][0]
+            ["snapshot"]["future_deep_field"] = serde_json::json!(["preserve", 27]);
+        outer_snapshot["domain"]["conversations"]
+            .as_object_mut()
+            .unwrap()
+            .remove("deleted_conversations");
+        outer_snapshot["domain"]["conversations"]["conversations"][&middle_key]["checkpoints"][0]
+            ["snapshot"]["domain"]["conversations"]
+            .as_object_mut()
+            .unwrap()
+            .remove("deleted_conversations");
+
+        save_workspace_atomic(&paths, &base).unwrap();
+        let mut live_json = serde_json::to_value(&base).unwrap();
+        live_json["future_live_field"] = serde_json::json!({"keep": "live backup"});
+        live_json["domain"]["future_domain_field"] = serde_json::json!({"keep": "domain backup"});
+        live_json["domain"]["conversations"]["future_store_field"] =
+            serde_json::json!({"keep": "store backup"});
+        live_json["domain"]["conversations"]
+            .as_object_mut()
+            .unwrap()
+            .remove("deleted_conversations");
+        fs::write(
+            &paths.library,
+            serde_json::to_vec_pretty(&live_json).unwrap(),
+        )
+        .unwrap();
+        let recovery = paths.root.join("library.recovery-test.json");
+        let mut recovery_json = live_json.clone();
+        recovery_json["future_recovery_field"] = serde_json::json!({"keep": "recovery"});
+        fs::write(
+            &recovery,
+            serde_json::to_vec_pretty(&recovery_json).unwrap(),
+        )
+        .unwrap();
+        let mut deleting = base.clone();
+        deleting.domain.conversations.remove(deleted_id);
+
+        save_workspace_merged(&paths, &base, &deleting).unwrap();
+
+        let persisted = load_workspace(&paths).unwrap();
+        let previous_bytes = fs::read(paths.root.join(LIBRARY_PREVIOUS_FILE)).unwrap();
+        let previous_json: serde_json::Value = serde_json::from_slice(&previous_bytes).unwrap();
+        assert_eq!(
+            previous_json["future_live_field"],
+            serde_json::json!({"keep": "live backup"})
+        );
+        assert_eq!(
+            previous_json["domain"]["future_domain_field"],
+            serde_json::json!({"keep": "domain backup"})
+        );
+        assert_eq!(
+            previous_json["domain"]["conversations"]["future_store_field"],
+            serde_json::json!({"keep": "store backup"})
+        );
+        let previous: Workspace = serde_json::from_slice(&previous_bytes).unwrap();
+        let recovery_bytes = fs::read(recovery).unwrap();
+        let recovery_json: serde_json::Value = serde_json::from_slice(&recovery_bytes).unwrap();
+        assert_eq!(
+            recovery_json["future_recovery_field"],
+            serde_json::json!({"keep": "recovery"})
+        );
+        assert_eq!(
+            recovery_json["domain"]["future_domain_field"],
+            serde_json::json!({"keep": "domain backup"})
+        );
+        assert_eq!(
+            recovery_json["domain"]["conversations"]["future_store_field"],
+            serde_json::json!({"keep": "store backup"})
+        );
+        let recovery: Workspace = serde_json::from_slice(&recovery_bytes).unwrap();
+        for workspace in [&persisted, &previous, &recovery] {
+            assert!(
+                workspace
+                    .domain
+                    .conversations
+                    .deleted_conversations
+                    .contains(&deleted_id)
+            );
+            assert!(
+                !workspace
+                    .domain
+                    .conversations
+                    .conversations
+                    .contains_key(&deleted_id)
+            );
+            assert!(workspace.domain.conversations.tile_links.is_empty());
+            assert!(
+                workspace
+                    .pages
+                    .iter()
+                    .all(|page| page.tile(live_chat_id).is_none())
+            );
+            assert!(workspace.domain.trash.items.is_empty());
+            assert!(!workspace.domain.protected_tiles.contains(&live_chat_id));
+            assert!(
+                !workspace
+                    .domain
+                    .tags
+                    .assignments
+                    .contains_key(&live_chat_id)
+            );
+            assert!(!workspace.domain.photo_records.contains_key(&live_chat_id));
+            assert!(workspace.domain.host_artifacts.origin(note_id).is_none());
+            assert!(
+                workspace
+                    .pages
+                    .iter()
+                    .any(|page| page.tile(note_id).is_some()),
+                "created note content must survive deletion"
+            );
+
+            let middle: Workspace = serde_json::from_value(
+                workspace.domain.conversations.conversations[&retained_id].checkpoints()[0]
+                    .snapshot
+                    .clone(),
+            )
+            .unwrap();
+            let deepest: Workspace = serde_json::from_value(
+                middle.domain.conversations.conversations[&middle_id].checkpoints()[0]
+                    .snapshot
+                    .clone(),
+            )
+            .unwrap();
+            assert!(
+                middle
+                    .domain
+                    .conversations
+                    .deleted_conversations
+                    .contains(&deleted_id)
+            );
+            assert!(
+                deepest
+                    .domain
+                    .conversations
+                    .deleted_conversations
+                    .contains(&deleted_id)
+            );
+            assert!(
+                deepest
+                    .pages
+                    .iter()
+                    .all(|page| page.tile(deepest_chat_id).is_none())
+            );
+            let outer = &workspace.domain.conversations.conversations[&retained_id].checkpoints()
+                [0]
+            .snapshot;
+            assert_eq!(
+                outer["future_middle_field"],
+                serde_json::json!({"keep": true})
+            );
+            assert_eq!(
+                outer["domain"]["conversations"]["conversations"][&middle_key]["checkpoints"][0]["snapshot"]
+                    ["future_deep_field"],
+                serde_json::json!(["preserve", 27])
+            );
+        }
+    }
+
+    #[test]
+    fn json_scrub_creates_a_legacy_missing_conversation_store_marker() {
+        let conversation_id = Uuid::from_u128(450);
+        let mut workspace = Workspace::new();
+        workspace.active_page_mut().add_tile(Tile::ai_chat(
+            "Legacy carrier",
+            conversation_id,
+            WorldRect::new(0.0, 0.0, 280.0, 190.0),
+        ));
+        let mut json = serde_json::to_value(workspace).unwrap();
+        json["domain"]
+            .as_object_mut()
+            .unwrap()
+            .remove("conversations");
+        json["domain"]["future_domain_field"] = serde_json::json!(["preserve"]);
+
+        scrub_deleted_conversation_json(&mut json, conversation_id, 0);
+
+        assert_eq!(
+            json["domain"]["conversations"]["deleted_conversations"],
+            serde_json::json!([conversation_id])
+        );
+        assert_eq!(
+            json["domain"]["future_domain_field"],
+            serde_json::json!(["preserve"])
+        );
+        assert!(
+            json["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|page| page["tiles"].as_array().unwrap())
+                .all(|tile| json_tile_conversation_id(tile).is_none())
         );
     }
 
@@ -1252,7 +3051,10 @@ mod tests {
             completions.try_recv().unwrap(),
             SaveCompletion {
                 request_id: 11,
-                outcome: SaveOutcome::Saved,
+                outcome: SaveOutcome::Saved {
+                    learned_deleted_conversations: Vec::new(),
+                    learned_xai_storage_conversations: Vec::new(),
+                },
             }
         );
         assert_eq!(load_workspace(&paths).unwrap().active_page().name, "second");
@@ -1272,6 +3074,15 @@ mod tests {
 
     fn workspace_with_conversation(conversation_id: Uuid) -> Workspace {
         let mut workspace = Workspace::default();
+        workspace
+            .domain
+            .conversations
+            .add(conversation_with_prompt(conversation_id))
+            .unwrap();
+        workspace
+    }
+
+    fn conversation_with_prompt(conversation_id: Uuid) -> AiConversation {
         let mut conversation = AiConversation::new(
             conversation_id,
             "Persistence",
@@ -1287,7 +3098,6 @@ mod tests {
                 Vec::new(),
             )
             .unwrap();
-        workspace.domain.conversations.add(conversation).unwrap();
-        workspace
+        conversation
     }
 }

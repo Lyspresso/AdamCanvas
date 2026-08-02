@@ -1,6 +1,8 @@
 # Progress & Artifacts parity plan (EarlIt → Adam)
 
-Status: **active**. Agreed 2026-07-30 by Lydia + Claude + Codex (joint audit).
+Status: **complete** — acceptance scenario executed live 2026-08-02 (see
+"Acceptance run" at the end of this file). Agreed 2026-07-30 by Lydia +
+Claude + Codex (joint audit).
 Division: **Codex owns PRs 1–4** (harness internals & card data). **Claude owns PR 5** (task-rail visuals) on `work/claude`. Line refs are as of merge `78be2d5`; cite function names over line numbers — they drift.
 
 ## Diagnosis (confirmed in code)
@@ -89,3 +91,43 @@ Verified against EarlIt source (`AgentTaskStore.swift`, `AgentActivityModels.swi
 **Fixed points from the Agents-panel insert (branch `work/claude-agents`, outside this effort's numbering):** `src/ai.rs` gained one additive accessor — `pub struct ProviderProbe` + `pub fn probe_installed_provider(provider_id: &str, refresh: bool)` + a private cache-invalidation helper, placed directly after `clamp_provider_preferences` — and `src/app.rs` gained the module `src/agents_panel.rs`'s wiring: `agents: AgentsPanelState` field, a poll in `fn logic`, `show_agents_panel`, one quick-bar slot, `AiWorkspaceUiAction.open_agents_panel`, and one `preflight` parameter threaded into `render_ai_chat_page`. PR 2 should treat these as fixed points; none of them touch stream handling or projections. *(Stack ordering note resolved 2026-07-30: PR 2 merged first as planned; PR A merged with post-PR-2 main by the integrator (merge commit, history preserved).)* The follow-up branch `work/claude-agents-install` additionally threads an `AgentsChatView` parameter through `render_ai_chat_page`, embeds an `AgentsPanelAction` in `AiWorkspaceUiAction`, and conditionally renders the chat empty state as the agents setup screen — still no contact with stream handling or projections.
 
 **Grok 0.2.114 contract row — landed.** PR 2 shipped it in `runtime_tuning_profile` (ACP adapter pinned to 0.2.114), fulfilling the request previously queued here from `work/claude-agents-drift`. Both lanes captured 0.2.114 independently — the legacy-grammar drift canary and the ACP contract capture — and `tests/fixtures/ai/grok/0.2.114/manifest.json` now documents both. `agents_panel::TESTED_VERSIONS` was advanced to 0.2.114 to match.
+
+## Acceptance run — executed 2026-08-02 (sign-off)
+
+Run live in an isolated copy (`ADAM_DATA_DIR` scratch library, disposable
+.app) against the real installed CLIs; five-agent research request on Grok
+0.2.117, completion turn on Codex CLI. Verdict per scenario line:
+
+1. Main Progress showed only the primary plan on both providers — **pass**.
+2. Agents showed all five children with per-child model, tool calls,
+   duration, and session ids, independent of Progress — **pass**.
+3. No child published a checklist and none was invented — **pass**.
+4. The synthesized file appeared in Artifacts at completion with provenance
+   and Preview/Reveal; the earlier *failed* write correctly produced no
+   artifact. Canvas-item leg could not run live (only Grok exposes canvas
+   host tools and it was contract-paused mid-run, below); it remains covered
+   by the domain/ledger tests — **pass (file leg live, host leg by test)**.
+5. Kill + relaunch restored Progress, Agents (all five chips), and
+   Artifacts identically — **pass**.
+6. No interleaved prose anywhere; every agent's words stayed in its own
+   cell — **pass**.
+7. Reasoning menu offered only low/medium/high for Grok; the send gate
+   blocked the uncontracted version — **pass**.
+8. Terminal outcome, not checked rows, drove the header both ways:
+   provider error + checked rows → Needs attention; success + a pending
+   row → Completed — **pass**.
+
+Events observed and acted on during the run:
+
+- **Grok self-updated 0.2.117 → 0.2.118 mid-session**, killing the ACP
+  prompt; Adam revoked the queued Write, recorded the provider error, and
+  fail-closed the send gate on the new uncontracted version — the safety
+  rails worked live. Follow-up (Codex lane): capture the 0.2.118 contract.
+- Grok 0.2.117's version banner gained a ` [stable]` channel tag that the
+  banner matcher rejected, wrongly pausing send on a contracted version —
+  fixed with the captured banner pinned in tests.
+- Claude CLI reported "Not logged in" when spawned from the GUI app despite
+  a signed-in terminal — environmental (credential context of GUI-spawned
+  processes), not an Adam defect; worth a look if it recurs.
+- Restored window geometry from another display reopens partially
+  off-screen (tracked separately; startup clamp).
