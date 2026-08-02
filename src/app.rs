@@ -15909,33 +15909,48 @@ fn render_ai_chat_page(
                         | TurnStatus::ProviderError => "Provider error",
                     })
                     .unwrap_or("Provider error");
-                Frame::NONE
-                    .fill(
-                        colors
-                            .danger
-                            .gamma_multiply(if colors.dark { 0.14 } else { 0.08 }),
-                    )
-                    .corner_radius(10)
-                    .inner_margin(Margin::same(12))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new(error_title).strong().color(colors.danger));
-                        ui.label(RichText::new(error).color(colors.secondary_text));
+                // Indented to the assistant content edge (avatar + gap); a
+                // flush-left card reads as outside the conversation. (User
+                // feedback, 2026-08-02.)
+                ui.horizontal_top(|ui| {
+                    ui.add_space(38.0);
+                    ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() - 10.0).max(220.0));
+                        Frame::NONE
+                            .fill(colors.danger.gamma_multiply(if colors.dark {
+                                0.14
+                            } else {
+                                0.08
+                            }))
+                            .corner_radius(10)
+                            .inner_margin(Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(error_title).strong().color(colors.danger));
+                                ui.label(RichText::new(error).color(colors.secondary_text));
+                            });
                     });
+                });
                 ui.add_space(14.0);
             }
             if let Some(request) = pending_action {
-                Frame::NONE
-                    .fill(colors.selection_fill)
-                    .corner_radius(10)
-                    .inner_margin(Margin::same(12))
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("Approve canvas action?").strong());
-                        ui.label(&request.summary);
-                        ui.horizontal(|ui| {
-                            action.approve_pending |= ui.button("Approve").clicked();
-                            action.cancel_pending |= ui.button("Cancel").clicked();
-                        });
+                ui.horizontal_top(|ui| {
+                    ui.add_space(38.0);
+                    ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() - 10.0).max(220.0));
+                        Frame::NONE
+                            .fill(colors.selection_fill)
+                            .corner_radius(10)
+                            .inner_margin(Margin::same(12))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Approve canvas action?").strong());
+                                ui.label(&request.summary);
+                                ui.horizontal(|ui| {
+                                    action.approve_pending |= ui.button("Approve").clicked();
+                                    action.cancel_pending |= ui.button("Cancel").clicked();
+                                });
+                            });
                     });
+                });
             }
             ui.add_space(12.0);
         });
