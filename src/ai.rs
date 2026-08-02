@@ -11920,10 +11920,12 @@ mod tests {
     #[test]
     fn chat_mode_file_edits_are_allowed_only_inside_the_chat_sandbox() {
         let blocked = RefCell::new(GrokPermissionBlockState::default());
-        let sandbox = PathBuf::from("/data/chat-sandboxes/abc");
+        // Built from temp_dir so the paths are absolute on every OS; the
+        // policy under test is cross-platform.
+        let sandbox = std::env::temp_dir().join("chat-sandboxes").join("abc");
         let mut write = acp_permission("Write", GrokAcpToolKind::Edit);
         write.tool_call.locations = vec![crate::grok_acp::GrokAcpToolLocation {
-            path: "/data/chat-sandboxes/abc/report.md".into(),
+            path: sandbox.join("report.md").to_string_lossy().into_owned(),
             line: None,
         }];
         // The sandbox exists so the chat can hand the user files: allowed in
@@ -11947,8 +11949,10 @@ mod tests {
 
         // A traversal that escapes the sandbox keeps the Chat-mode wall.
         let mut escaping = write.clone();
-        escaping.tool_call.locations[0].path =
-            "/data/chat-sandboxes/abc/../../../home/user/report.md".into();
+        escaping.tool_call.locations[0].path = format!(
+            "{}/../../../../home/user/report.md",
+            sandbox.to_string_lossy()
+        );
         assert!(matches!(
             grok_acp_permission_decision_scoped(
                 &escaping,
@@ -11965,7 +11969,7 @@ mod tests {
         // Execute is never a sandbox file edit, even aimed at the sandbox.
         let mut exec = acp_permission("Run script", GrokAcpToolKind::Execute);
         exec.tool_call.locations = vec![crate::grok_acp::GrokAcpToolLocation {
-            path: "/data/chat-sandboxes/abc/script.sh".into(),
+            path: sandbox.join("script.sh").to_string_lossy().into_owned(),
             line: None,
         }];
         assert!(matches!(
@@ -12017,10 +12021,10 @@ mod tests {
     #[test]
     fn kimi_chat_mode_sandbox_edits_are_allowed() {
         let blocked = RefCell::new(KimiPermissionBlockState::default());
-        let sandbox = PathBuf::from("/data/chat-sandboxes/xyz");
+        let sandbox = std::env::temp_dir().join("chat-sandboxes").join("xyz");
         let mut write = kimi_permission("Write", KimiAcpToolKind::Edit, None);
         write.tool_call.locations = vec![crate::kimi_acp::KimiAcpToolLocation {
-            path: "/data/chat-sandboxes/xyz/notes.md".into(),
+            path: sandbox.join("notes.md").to_string_lossy().into_owned(),
             line: None,
         }];
         assert!(matches!(
@@ -12035,7 +12039,11 @@ mod tests {
             KimiAcpPermissionDecision::Allow { .. }
         ));
         let mut outside = write.clone();
-        outside.tool_call.locations[0].path = "/home/user/notes.md".into();
+        outside.tool_call.locations[0].path = std::env::temp_dir()
+            .join("elsewhere")
+            .join("notes.md")
+            .to_string_lossy()
+            .into_owned();
         assert!(matches!(
             kimi_acp_permission_decision_scoped(
                 &outside,
@@ -12878,8 +12886,12 @@ mod tests {
 
         let artifacts = crate::chat_core::project_artifacts(&accumulator.events);
         assert_eq!(artifacts.len(), 2);
+        // Artifact identities are slash-normalized; normalize the expected
+        // path the same way so the comparison holds on Windows canonical
+        // (\\?\-prefixed) roots too.
+        let old_normalized = crate::chat_core::normalize_lexical_path(&old_absolute).unwrap();
         assert!(artifacts.iter().any(|artifact| {
-            artifact.file_path() == Some(old_absolute.as_str()) && artifact.is_deleted
+            artifact.file_path() == Some(old_normalized.as_str()) && artifact.is_deleted
         }));
         assert!(artifacts.iter().all(|artifact| {
             !artifact
@@ -18633,6 +18645,8 @@ send({
     }
 
     #[test]
+    #[cfg(unix)] // W3 ports Grok session discovery (windows-port.md); the
+    // key encoding is percent-of-'/' and asserts unix path shapes.
     fn grok_session_lookup_can_be_bound_to_the_canonical_working_directory() {
         let temporary = tempfile::tempdir().unwrap();
         let cwd = temporary.path().join("working folder");
@@ -20090,8 +20104,12 @@ send({
 
         let artifacts = crate::chat_core::project_artifacts(&accumulator.events);
         assert_eq!(artifacts.len(), 2);
+        // Artifact identities are slash-normalized; normalize the expected
+        // path the same way so the comparison holds on Windows canonical
+        // (\\?\-prefixed) roots too.
+        let old_normalized = crate::chat_core::normalize_lexical_path(&old_absolute).unwrap();
         assert!(artifacts.iter().any(|artifact| {
-            artifact.file_path() == Some(old_absolute.as_str()) && artifact.is_deleted
+            artifact.file_path() == Some(old_normalized.as_str()) && artifact.is_deleted
         }));
         assert!(artifacts.iter().all(|artifact| {
             !artifact

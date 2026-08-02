@@ -2480,6 +2480,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // Installer flow execs unix shells; W3 ports it.
     fn install_command_captures_output_and_reports_success() {
         let step = run_install_command(
             "echo agents-panel-ok",
@@ -2504,6 +2505,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn runaway_pipeline_is_stopped_at_the_deadline_including_all_stages() {
         // The pipeline shape matters: every allowlisted command is
         // `curl … | sh`, and zsh forks BOTH stages — killing only the shell
@@ -2526,6 +2528,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn background_child_left_by_a_successful_installer_cannot_wedge_the_worker() {
         // An installer may exit successfully while a spawned background
         // process (updater/daemon) inherits the pipes and holds them open;

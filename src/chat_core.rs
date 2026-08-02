@@ -2418,7 +2418,7 @@ fn nonempty_owned(value: &str) -> Option<String> {
 
 /// Normalizes a provider-reported path without consulting the filesystem.
 /// Both slash styles are accepted so persisted fixtures remain portable.
-fn normalize_lexical_path(path: &str) -> Option<String> {
+pub(crate) fn normalize_lexical_path(path: &str) -> Option<String> {
     let path = path.trim().replace('\\', "/");
     if path.is_empty() {
         return None;

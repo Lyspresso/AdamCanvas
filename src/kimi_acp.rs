@@ -3924,6 +3924,7 @@ mod tests {
         assert!(!debug.contains("secret prompt"));
         assert!(!debug.contains("secret-session"));
         assert!(debug.contains("[REDACTED]"));
+        #[cfg(unix)]
         assert!(Path::new("/opt/kimi").is_absolute());
     }
 }

@@ -3,8 +3,6 @@ use crate::{
     model::{Tile, TileContent, Workspace},
 };
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
 use std::{
     collections::BTreeSet,
     fs::{self, OpenOptions},
@@ -218,7 +216,13 @@ fn copy_file_atomic(source: &Path, destination: &Path) -> std::io::Result<()> {
             .unwrap_or_default()
     ));
     fs::copy(source, &temporary)?;
-    fs::File::open(&temporary)?.sync_all()?;
+    // FlushFileBuffers needs a writable handle on Windows; a read-only
+    // handle flushes fine on unix but returns Access Denied there.
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&temporary)?
+        .sync_all()?;
     fs::rename(&temporary, destination)?;
     sync_parent(destination);
     Ok(())
@@ -342,18 +346,10 @@ impl LibraryLock {
             .read(true)
             .write(true)
             .open(paths.root.join(LIBRARY_LOCK_FILE))?;
-        #[cfg(unix)]
-        loop {
-            // SAFETY: `file` owns a valid descriptor for the lifetime of this
-            // guard. `flock` does not take ownership of the descriptor.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
+        // Portable exclusive lock (flock on unix, LockFileEx on Windows) —
+        // the same guard on both OSes, so a shared cross-OS library keeps
+        // its two-instance protection everywhere.
+        file.lock()?;
         Ok(Self {
             file,
             _process_guard: process_guard,
@@ -363,12 +359,8 @@ impl LibraryLock {
 
 impl Drop for LibraryLock {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            // SAFETY: the descriptor remains valid until this guard finishes
-            // dropping. Unlock failure is not actionable during cleanup.
-            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        }
+        // Unlock failure is not actionable during cleanup.
+        let _ = self.file.unlock();
     }
 }
 
