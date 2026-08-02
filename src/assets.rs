@@ -1135,6 +1135,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn managed_file_view_preserves_extension_without_exposing_the_canonical_inode() {
         let temporary = tempfile::tempdir().unwrap();
         let store = store_at(&temporary);
