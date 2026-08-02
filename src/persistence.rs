@@ -3,7 +3,6 @@ use crate::{
     model::{Tile, TileContent, Workspace},
 };
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
-#[cfg(unix)]
 use std::{
     collections::BTreeSet,
     fs::{self, OpenOptions},

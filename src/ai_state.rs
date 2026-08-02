@@ -8,7 +8,6 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[cfg(unix)]
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
