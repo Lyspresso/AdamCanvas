@@ -115,6 +115,27 @@ do not port it.
   walk leaves the route, it never returns to its anchor, or the lap is under 50 ms. The
   clamps must be **identical** in the lap-duration and replay paths or phase drifts.
 
+## End-of-route semantics (Lydia, 2026-08-02) — a tile never travels backwards
+
+**A route either leads to its end or it loops. There is no third behaviour, and nothing
+ever returns a tile to where it started.**
+
+- **Completed** — the tile comes to rest **at the final node** and stays there. It does
+  *not* return to its pre-enrollment position, and that position is not remembered as a
+  destination. Enrollment is one-way.
+- **Loop** — `repeats` is a **real closing segment** from the last node back to the first.
+  A looping tile *travels* that segment at its speed like any other leg, emitting the pile
+  crossings along it. It never teleports to the start.
+- **Detached** — the tile stays exactly where it was when authority was lost
+  (materialise, then detach). No snap-back.
+- **Paused / blocked / waiting** — the tile holds its current position.
+
+The only position a pathway may ever write is the one the route implies at that instant.
+No code path may restore a tile's pre-enrollment position for any reason.
+
+*(Distinct from risk 2 below, which is about **piles**: a pile's own rect must never be
+modified by pathway motion at all.)*
+
 ## PR sequence
 
 Each starts from current `main`, opened as its own PR, CI green, reviewed before the next.
@@ -157,7 +178,7 @@ lap-skip; the Adam-shaped save-failure protocol.
 
 ## Decisions taken (Lydia to revisit if wrong)
 
-- **Yarn is dropped.** Adam has no connection primitive; the EarlIt dependency is
+- **Yarn is dropped** (confirmed by Lydia 2026-08-02). Adam has no connection primitive; the EarlIt dependency is
   one-directional (yarn reads the projection, never the reverse). Tiles glide, nothing
   trails them. No coherence loss.
 - **No full `CanvasTileIndex`.** Pathways needs id→rect, tile type, page scope — all
@@ -179,10 +200,14 @@ lap-skip; the Adam-shaped save-failure protocol.
 3. Dragging a tile off a route detaches it, preserving history; the row is never deleted.
 4. Undo of an unrelated canvas action does not rewind pathway history.
 5. Pile rects are never modified by pathway motion.
-6. Marquee selection and hit-testing agree with rendering for a moving tile at any instant.
-7. Editing a live route is impossible without pausing; removing a repeat closure never
+6. Marquee selection and hit-testing agree with rendering for a moving tile at any
+   instant — including while it moves with **no user input at all** (the stale-index case
+   in risk 3). Test by advancing the clock without generating events, then marquee-select.
+7. A completed route leaves its tile resting at the final node; a looping route carries it
+   around the closing segment. **No path returns a tile to its pre-enrollment position.**
+8. Editing a live route is impossible without pausing; removing a repeat closure never
    wedges cargo.
-8. A route that would generate unbounded transitions trips the breaker, disables itself,
+9. A route that would generate unbounded transitions trips the breaker, disables itself,
    and says so — visibly, not silently.
 
 ## Lane protocol
