@@ -243,6 +243,13 @@ impl History {
     }
 }
 
+/// Pathway definitions, assignments, and their append-only event ledger are
+/// durable audit state. An unrelated canvas undo may restore older layout,
+/// but it must never rewind any part of the current pathway container.
+fn carry_forward_pathways(current: &Workspace, restored: &mut Workspace) {
+    restored.domain.pathways = current.domain.pathways.clone();
+}
+
 struct DragSession {
     page_id: Uuid,
     start_world: [f32; 2],
@@ -1460,10 +1467,9 @@ impl AdamApp {
     }
 
     fn restore_workspace(&mut self, mut workspace: Workspace) {
-        // Conversation deletion and host-artifact provenance are durable
-        // audit state, not reversible canvas layout. Undo/checkpoint restores
-        // may add older layout back, but cannot resurrect a deleted chat or
-        // discard an origin recorded after the snapshot was taken.
+        // Pathway state, conversation deletion, and host-artifact provenance
+        // are durable audit state, not reversible canvas layout.
+        carry_forward_pathways(&self.workspace, &mut workspace);
         workspace.domain.conversations.deleted_conversations.extend(
             self.workspace
                 .domain
@@ -20751,6 +20757,68 @@ mod tests {
                     .all(|page| page.tile(tile_id).is_none())
             );
         }
+    }
+
+    #[test]
+    fn unrelated_undo_carries_forward_the_entire_pathway_container() {
+        let mut history = History::default();
+        let mut workspace = Workspace::new();
+        let pathway_id = Uuid::from_u128(90_001);
+        let page_id = workspace.active_page;
+        workspace
+            .domain
+            .pathways
+            .insert_pathway(
+                crate::domain::Pathway::new(
+                    pathway_id,
+                    page_id,
+                    "Delivery route",
+                    "#0A84FF",
+                    crate::domain::UnixMicros(1_000_001),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        history.checkpoint(&workspace);
+
+        let added_tile = Tile::note(
+            "Later layout",
+            "This should be undone",
+            WorldRect::new(12.0, 14.0, 200.0, 120.0),
+        );
+        let added_tile_id = added_tile.id;
+        workspace.active_page_mut().add_tile(added_tile);
+        workspace
+            .domain
+            .pathways
+            .append_event(crate::domain::PathwayEvent::new(
+                Uuid::from_u128(90_002),
+                Uuid::from_u128(90_003),
+                pathway_id,
+                crate::domain::UnixMicros(1_000_011),
+                "pathway-reconciliation",
+                crate::domain::PathwayEventKind::ConfigurationChanged,
+                crate::domain::PathwayEventPayload {
+                    explanation: "changed after checkpoint".into(),
+                    ..crate::domain::PathwayEventPayload::default()
+                },
+            ))
+            .unwrap();
+        workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&pathway_id)
+            .unwrap()
+            .title = "Current route".into();
+        let current_pathways = workspace.domain.pathways.clone();
+
+        let mut restored = history.undo(&workspace).unwrap();
+        carry_forward_pathways(&workspace, &mut restored);
+
+        assert!(restored.active_page().tile(added_tile_id).is_none());
+        assert_eq!(restored.domain.pathways, current_pathways);
+        assert_eq!(restored.domain.pathways.events().len(), 1);
     }
 
     #[test]
