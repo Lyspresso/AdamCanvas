@@ -8,12 +8,17 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Mutex, MutexGuard, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -23,8 +28,9 @@ use uuid::Uuid;
 /// Version 1 is still readable. It predates the committed-message sequence
 /// gate, so a v1 record can be inspected and explicitly invalidated but will
 /// never be eligible for automatic resume.
-pub const RESUME_SCHEMA_VERSION: u32 = 2;
+pub const RESUME_SCHEMA_VERSION: u32 = 3;
 const MIN_RESUME_SCHEMA_VERSION: u32 = 1;
+const RESUME_COMMITTED_SEQUENCE_SCHEMA_VERSION: u32 = 2;
 
 /// The current local-compaction sidecar schema.
 pub const COMPACTION_SCHEMA_VERSION: u32 = 1;
@@ -37,6 +43,7 @@ const MAX_SUMMARY_BYTES: usize = 512 * 1024;
 const SHA256_PREFIX: &str = "sha256:";
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static RESUME_PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn legacy_resume_schema_version() -> u32 {
     MIN_RESUME_SCHEMA_VERSION
@@ -51,7 +58,7 @@ fn current_compaction_schema_version() -> u32 {
 ///
 /// Every field has a serde default so additions remain backward-decodable.
 /// A defaulted required field is deliberately *not* resume-eligible.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(default)]
 pub struct ResumeRecord {
     /// Opaque provider-issued identifier. This is local state, not a secret.
@@ -292,6 +299,8 @@ pub enum ResumeRecordError {
     ResumeUnsupported,
     #[error("the conversation id is invalid")]
     InvalidConversationId,
+    #[error("the conversation was permanently deleted")]
+    ConversationDeleted,
     #[error("the native session id is empty or malformed")]
     InvalidSessionId,
     #[error("the provider key is empty or malformed")]
@@ -316,6 +325,8 @@ pub enum ResumeIneligibility {
     ResumeUnsupported,
     #[error("the conversation id is invalid")]
     InvalidConversationId,
+    #[error("the conversation was permanently deleted")]
+    ConversationDeleted,
     #[error("the current gate belongs to a different conversation")]
     ConversationMismatch,
     #[error("the stored native session id is missing")]
@@ -358,6 +369,15 @@ pub struct ResumeStore {
     pub schema_version: u32,
     #[serde(alias = "sessions")]
     records: BTreeMap<Uuid, ResumeRecord>,
+    /// Monotonic deletion markers. Once present, a stale Adam process cannot
+    /// restore provider authority for this conversation.
+    #[serde(default)]
+    deleted_conversations: BTreeSet<Uuid>,
+    /// Ordinary resume invalidations are intentionally not durable
+    /// tombstones, but they must still remove the corresponding on-disk record
+    /// during the next locked merge.
+    #[serde(skip)]
+    forgotten_conversations: BTreeSet<Uuid>,
 }
 
 impl Default for ResumeStore {
@@ -365,6 +385,8 @@ impl Default for ResumeStore {
         Self {
             schema_version: RESUME_SCHEMA_VERSION,
             records: BTreeMap::new(),
+            deleted_conversations: BTreeSet::new(),
+            forgotten_conversations: BTreeSet::new(),
         }
     }
 }
@@ -380,10 +402,30 @@ impl ResumeStore {
 
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
+            && self.deleted_conversations.is_empty()
+            && self.forgotten_conversations.is_empty()
     }
 
     pub fn record(&self, conversation_id: Uuid) -> Option<&ResumeRecord> {
+        if self.is_permanently_forgotten(conversation_id) {
+            return None;
+        }
         self.records.get(&conversation_id)
+    }
+
+    pub fn is_permanently_forgotten(&self, conversation_id: Uuid) -> bool {
+        self.deleted_conversations.contains(&conversation_id)
+    }
+
+    pub fn deleted_conversation_count(&self) -> usize {
+        self.deleted_conversations.len()
+    }
+
+    /// Monotonic provider-session tombstones, exposed so the workspace can
+    /// finish the same permanent deletion after a crash between the two
+    /// independently persisted stores.
+    pub fn permanently_forgotten_conversation_ids(&self) -> impl Iterator<Item = Uuid> + '_ {
+        self.deleted_conversations.iter().copied()
     }
 
     /// Returns a record only when every current runtime identity agrees.
@@ -400,6 +442,9 @@ impl ResumeStore {
         }
         if conversation_id != gate.conversation_id {
             return Err(ResumeIneligibility::ConversationMismatch);
+        }
+        if self.is_permanently_forgotten(conversation_id) {
+            return Err(ResumeIneligibility::ConversationDeleted);
         }
         let Some(record) = self.records.get(&conversation_id) else {
             return Ok(None);
@@ -426,14 +471,38 @@ impl ResumeStore {
         if conversation_id.is_nil() {
             return Err(ResumeRecordError::InvalidConversationId);
         }
+        if self.is_permanently_forgotten(conversation_id) {
+            return Err(ResumeRecordError::ConversationDeleted);
+        }
         record.validate_for_storage()?;
         self.records.insert(conversation_id, record);
+        self.forgotten_conversations.remove(&conversation_id);
         self.schema_version = RESUME_SCHEMA_VERSION;
         Ok(RecordDisposition::Recorded)
     }
 
     pub fn forget(&mut self, conversation_id: Uuid) -> Option<ResumeRecord> {
+        if !conversation_id.is_nil() && !self.is_permanently_forgotten(conversation_id) {
+            self.forgotten_conversations.insert(conversation_id);
+        }
         self.records.remove(&conversation_id)
+    }
+
+    /// Permanently removes provider resume authority for a conversation.
+    ///
+    /// Unlike [`Self::forget`], this writes a monotonic tombstone during the
+    /// next save. It returns whether this call added a marker or removed a
+    /// local record, so deleting a conversation that exists only in another
+    /// Adam process still counts as a durable change.
+    pub fn permanently_forget(&mut self, conversation_id: Uuid) -> Result<bool, ResumeRecordError> {
+        if conversation_id.is_nil() {
+            return Err(ResumeRecordError::InvalidConversationId);
+        }
+        let removed = self.records.remove(&conversation_id).is_some();
+        self.forgotten_conversations.remove(&conversation_id);
+        let inserted = self.deleted_conversations.insert(conversation_id);
+        self.schema_version = RESUME_SCHEMA_VERSION;
+        Ok(removed || inserted)
     }
 
     /// Removes a record when it is not eligible for the supplied current gate.
@@ -446,7 +515,7 @@ impl ResumeStore {
         match self.eligible_record(conversation_id, gate) {
             Ok(_) => None,
             Err(reason) => {
-                self.records.remove(&conversation_id);
+                self.forget(conversation_id);
                 Some(reason)
             }
         }
@@ -479,6 +548,8 @@ impl ResumeStore {
 
     pub fn invalidate_all(&mut self) -> usize {
         let count = self.records.len();
+        self.forgotten_conversations
+            .extend(self.records.keys().copied());
         self.records.clear();
         count
     }
@@ -496,20 +567,44 @@ impl ResumeStore {
 
     /// Atomically persists a sidecar to an explicit path.
     ///
-    /// The existing file is decoded and validated before it may become the
-    /// `.previous` generation. A corrupt or newer current file is never silently
-    /// overwritten.
+    /// This compatibility wrapper performs the same locked merge as
+    /// [`Self::save_merged`] and discards the returned in-memory snapshot.
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), AiStateFileError> {
+        self.save_merged(path).map(|_| ())
+    }
+
+    /// Serializes a read/merge/publish transaction across threads and Adam
+    /// processes, returning the exact merged snapshot written to disk.
+    ///
+    /// Tombstones are monotonic and always win over resume records. Ordinary
+    /// `forget` operations remove records without creating tombstones. Record
+    /// conflicts prefer the newer timestamp, with a stable total-order tie
+    /// break so write order cannot change the result.
+    pub fn save_merged(&self, path: impl AsRef<Path>) -> Result<Self, AiStateFileError> {
         let path = path.as_ref();
-        let previous = match read_optional(path)? {
+        let _lock = ResumeStateLock::acquire(path)?;
+        let (on_disk, previous) = match read_optional(path)? {
             Some(bytes) => {
-                Self::decode(path, &bytes)?;
-                Some(bytes)
+                let store = Self::decode(path, &bytes)?;
+                (store, Some(bytes))
             }
-            None => None,
+            None => (Self::new(), None),
         };
 
-        let mut snapshot = self.clone();
+        if self.schema_version > RESUME_SCHEMA_VERSION {
+            return Err(AiStateFileError::NewerSchema {
+                kind: "native-session resume",
+                found: u64::from(self.schema_version),
+                supported: RESUME_SCHEMA_VERSION,
+            });
+        }
+        if self.schema_version < MIN_RESUME_SCHEMA_VERSION {
+            return Err(AiStateFileError::InvalidSchemaVersion {
+                kind: "native-session resume",
+                found: self.schema_version.to_string(),
+            });
+        }
+        let mut snapshot = self.merge_for_save(on_disk);
         snapshot.schema_version = RESUME_SCHEMA_VERSION;
         snapshot.validate_for_schema(RESUME_SCHEMA_VERSION)?;
         let bytes =
@@ -517,7 +612,8 @@ impl ResumeStore {
                 path: path.to_path_buf(),
                 source,
             })?;
-        atomic_publish(path, &bytes, previous.as_deref())
+        atomic_publish(path, &bytes, previous.as_deref())?;
+        Ok(snapshot)
     }
 
     fn decode(path: &Path, bytes: &[u8]) -> Result<Self, AiStateFileError> {
@@ -538,11 +634,28 @@ impl ResumeStore {
                 source,
             })?;
         store.schema_version = version;
+        store.apply_tombstones();
         store.validate_for_schema(version)?;
         Ok(store)
     }
 
     fn validate_for_schema(&self, version: u32) -> Result<(), AiStateFileError> {
+        if version < RESUME_SCHEMA_VERSION && !self.deleted_conversations.is_empty() {
+            return Err(AiStateFileError::InvalidRecord {
+                kind: "resume",
+                conversation_id: *self.deleted_conversations.iter().next().unwrap(),
+                reason: "deleted-conversation tombstones require resume schema 3".to_owned(),
+            });
+        }
+        for conversation_id in &self.deleted_conversations {
+            if conversation_id.is_nil() {
+                return Err(AiStateFileError::InvalidRecord {
+                    kind: "resume tombstone",
+                    conversation_id: *conversation_id,
+                    reason: "conversation id is nil".to_owned(),
+                });
+            }
+        }
         for (conversation_id, record) in &self.records {
             if conversation_id.is_nil() {
                 return Err(AiStateFileError::InvalidRecord {
@@ -551,7 +664,7 @@ impl ResumeStore {
                     reason: "conversation id is nil".to_owned(),
                 });
             }
-            let validation = if version >= RESUME_SCHEMA_VERSION {
+            let validation = if version >= RESUME_COMMITTED_SEQUENCE_SCHEMA_VERSION {
                 record.validate_for_storage()
             } else {
                 record.validate_v1_for_load()
@@ -568,9 +681,62 @@ impl ResumeStore {
     }
 
     fn remove_where(&mut self, mut predicate: impl FnMut(&ResumeRecord) -> bool) -> usize {
-        let before = self.records.len();
-        self.records.retain(|_, record| !predicate(record));
-        before - self.records.len()
+        let ids = self
+            .records
+            .iter()
+            .filter_map(|(conversation_id, record)| predicate(record).then_some(*conversation_id))
+            .collect::<Vec<_>>();
+        for conversation_id in &ids {
+            self.forget(*conversation_id);
+        }
+        ids.len()
+    }
+
+    fn apply_tombstones(&mut self) {
+        for conversation_id in &self.deleted_conversations {
+            self.records.remove(conversation_id);
+            self.forgotten_conversations.remove(conversation_id);
+        }
+    }
+
+    fn merge_for_save(&self, on_disk: Self) -> Self {
+        let mut merged = on_disk;
+        // V1 records without committed-message sequences were never eligible
+        // for automatic resume. Exclude them before conflict selection so an
+        // old high timestamp cannot displace a valid v2/v3 record and then be
+        // dropped during the schema upgrade.
+        merged
+            .records
+            .retain(|_, record| record.validate_for_storage().is_ok());
+        for conversation_id in &self.forgotten_conversations {
+            merged.records.remove(conversation_id);
+        }
+        for (conversation_id, local_record) in &self.records {
+            if local_record.validate_for_storage().is_err() {
+                continue;
+            }
+            match merged.records.entry(*conversation_id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(local_record.clone());
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let disk_record = entry.get();
+                    let local_wins = local_record.updated_at_millis > disk_record.updated_at_millis
+                        || (local_record.updated_at_millis == disk_record.updated_at_millis
+                            && local_record > disk_record);
+                    if local_wins {
+                        entry.insert(local_record.clone());
+                    }
+                }
+            }
+        }
+        merged
+            .deleted_conversations
+            .extend(self.deleted_conversations.iter().copied());
+        merged.apply_tombstones();
+        merged.forgotten_conversations.clear();
+        merged.schema_version = RESUME_SCHEMA_VERSION;
+        merged
     }
 }
 
@@ -983,6 +1149,71 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, AiStateFileError> {
     }
 }
 
+/// Holds both an in-process mutex and an advisory OS file lock for one resume
+/// read/merge/write transaction. Atomic rename prevents torn JSON; this guard
+/// prevents a complete but stale snapshot from replacing newer state.
+struct ResumeStateLock {
+    file: File,
+    _process_guard: MutexGuard<'static, ()>,
+}
+
+impl ResumeStateLock {
+    fn acquire(path: &Path) -> Result<Self, AiStateFileError> {
+        let process_guard = RESUME_PROCESS_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let parent = path
+            .parent()
+            .filter(|candidate| !candidate.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|source| AiStateFileError::Persist {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let lock_path = sibling_with_suffix(path, ".lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|source| AiStateFileError::Persist {
+                path: lock_path,
+                source,
+            })?;
+        #[cfg(unix)]
+        loop {
+            // SAFETY: `file` owns this descriptor until the guard is dropped;
+            // flock borrows it and never assumes ownership.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                break;
+            }
+            let source = io::Error::last_os_error();
+            if source.kind() != io::ErrorKind::Interrupted {
+                return Err(AiStateFileError::Persist {
+                    path: sibling_with_suffix(path, ".lock"),
+                    source,
+                });
+            }
+        }
+        Ok(Self {
+            file,
+            _process_guard: process_guard,
+        })
+    }
+}
+
+impl Drop for ResumeStateLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            // SAFETY: the descriptor remains valid through this Drop call.
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
 fn atomic_publish(
     path: &Path,
     bytes: &[u8],
@@ -1277,6 +1508,317 @@ mod tests {
         assert_eq!(
             store.eligible_record(conversation_id, &gate),
             Err(ResumeIneligibility::MissingCommittedMessageSequence)
+        );
+    }
+
+    #[test]
+    fn legacy_resume_schemas_default_to_no_deletion_tombstones() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cwd = fs::canonicalize(temporary.path()).unwrap();
+        let conversation_id = Uuid::new_v4();
+        for version in [1_u32, 2_u32] {
+            let path = temporary.path().join(format!("resume-v{version}.json"));
+            let mut record = serde_json::json!({
+                "session_id": "legacy-session",
+                "provider_key": "claude",
+                "executable_basename": "claude",
+                "canonical_working_directory": cwd,
+                "parser_dialect": "claude-stream-json:v1",
+                "sandbox_profile": "workspace-write",
+                "updated_at_millis": 1_754_000_000_000_u64
+            });
+            if version >= RESUME_COMMITTED_SEQUENCE_SCHEMA_VERSION {
+                record["last_committed_message_sequence"] = serde_json::json!(42);
+            }
+            let value = serde_json::json!({
+                "schema_version": version,
+                "records": { conversation_id.to_string(): record }
+            });
+            fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+            let store = ResumeStore::load(&path).unwrap();
+            assert_eq!(store.schema_version, version);
+            assert_eq!(store.deleted_conversation_count(), 0);
+            assert!(!store.is_permanently_forgotten(conversation_id));
+        }
+    }
+
+    #[test]
+    fn version_two_still_requires_a_committed_message_sequence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let conversation_id = Uuid::new_v4();
+        let path = temporary.path().join("resume-v2-invalid.json");
+        let value = serde_json::json!({
+            "schema_version": 2,
+            "records": {
+                conversation_id.to_string(): {
+                    "session_id": "legacy-session",
+                    "provider_key": "claude",
+                    "executable_basename": "claude",
+                    "canonical_working_directory": fs::canonicalize(temporary.path()).unwrap(),
+                    "parser_dialect": "claude-stream-json:v1",
+                    "sandbox_profile": "workspace-write",
+                    "updated_at_millis": 1_754_000_000_000_u64
+                }
+            }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        assert!(matches!(
+            ResumeStore::load(&path),
+            Err(AiStateFileError::InvalidRecord {
+                kind: "resume",
+                conversation_id: found,
+                ..
+            }) if found == conversation_id
+        ));
+    }
+
+    #[test]
+    fn permanent_delete_upgrades_a_version_one_store_without_restoring_legacy_records() {
+        let temporary = tempfile::tempdir().unwrap();
+        let deleted_id = Uuid::new_v4();
+        let legacy_id = Uuid::new_v4();
+        let path = temporary.path().join("resume-v1-upgrade.json");
+        let legacy_record = || {
+            serde_json::json!({
+                "session_id": "legacy-session",
+                "provider_key": "claude",
+                "executable_basename": "claude",
+                "canonical_working_directory": fs::canonicalize(temporary.path()).unwrap(),
+                "parser_dialect": "claude-stream-json:v1",
+                "sandbox_profile": "workspace-write",
+                "updated_at_millis": 1_754_000_000_000_u64
+            })
+        };
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "records": {
+                deleted_id.to_string(): legacy_record(),
+                legacy_id.to_string(): legacy_record()
+            }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let mut store = ResumeStore::load(&path).unwrap();
+        store.permanently_forget(deleted_id).unwrap();
+        let upgraded = store.save_merged(&path).unwrap();
+        assert_eq!(upgraded.schema_version, RESUME_SCHEMA_VERSION);
+        assert!(upgraded.is_permanently_forgotten(deleted_id));
+        assert!(upgraded.record(deleted_id).is_none());
+        assert!(
+            upgraded.record(legacy_id).is_none(),
+            "v1 records without message sequence were never safe to resume"
+        );
+    }
+
+    #[test]
+    fn valid_current_record_replaces_an_unresumable_v1_record_during_merge() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cwd = fs::canonicalize(temporary.path()).unwrap();
+        let conversation_id = Uuid::new_v4();
+        let path = temporary.path().join("resume-v1-replaced.json");
+        let value = serde_json::json!({
+            "schema_version": 1,
+            "records": {
+                conversation_id.to_string(): {
+                    "session_id": "legacy-high-timestamp",
+                    "provider_key": "claude",
+                    "executable_basename": "claude",
+                    "canonical_working_directory": cwd,
+                    "parser_dialect": "claude-stream-json:v1",
+                    "sandbox_profile": "workspace-write",
+                    "updated_at_millis": u64::MAX
+                }
+            }
+        });
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let gate = fixture_gate(conversation_id, &cwd);
+        let current = fixture_record(&gate);
+        let mut local = ResumeStore::new();
+        local
+            .record_or_forget(conversation_id, current.clone())
+            .unwrap();
+        let merged = local.save_merged(&path).unwrap();
+        assert_eq!(merged.record(conversation_id), Some(&current));
+    }
+
+    #[test]
+    fn permanent_forget_blocks_resume_and_recording() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cwd = fs::canonicalize(temporary.path()).unwrap();
+        let conversation_id = Uuid::new_v4();
+        let gate = fixture_gate(conversation_id, &cwd);
+        let mut store = ResumeStore::new();
+        store
+            .record_or_forget(conversation_id, fixture_record(&gate))
+            .unwrap();
+        assert!(store.permanently_forget(conversation_id).unwrap());
+        assert!(store.is_permanently_forgotten(conversation_id));
+        assert!(store.record(conversation_id).is_none());
+        assert_eq!(
+            store.eligible_record(conversation_id, &gate),
+            Err(ResumeIneligibility::ConversationDeleted)
+        );
+        assert_eq!(
+            store.record_or_forget(conversation_id, fixture_record(&gate)),
+            Err(ResumeRecordError::ConversationDeleted)
+        );
+    }
+
+    #[test]
+    fn permanent_delete_without_a_local_record_beats_disk_and_preserves_others() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cwd = fs::canonicalize(temporary.path()).unwrap();
+        let path = temporary.path().join("resume.json");
+        let deleted_id = Uuid::new_v4();
+        let retained_id = Uuid::new_v4();
+        let mut remote = ResumeStore::new();
+        remote
+            .record_or_forget(deleted_id, fixture_record(&fixture_gate(deleted_id, &cwd)))
+            .unwrap();
+        let mut retained = fixture_record(&fixture_gate(retained_id, &cwd));
+        retained.session_id = "retained-session".into();
+        remote
+            .record_or_forget(retained_id, retained.clone())
+            .unwrap();
+        remote.save(&path).unwrap();
+
+        let mut local_without_remote_records = ResumeStore::new();
+        assert!(
+            local_without_remote_records
+                .permanently_forget(deleted_id)
+                .unwrap()
+        );
+        let merged = local_without_remote_records.save_merged(&path).unwrap();
+        assert!(merged.is_permanently_forgotten(deleted_id));
+        assert!(merged.record(deleted_id).is_none());
+        assert_eq!(merged.record(retained_id), Some(&retained));
+        assert_eq!(ResumeStore::load(&path).unwrap(), merged);
+    }
+
+    #[test]
+    fn delete_first_stale_update_second_cannot_resurrect_resume_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cwd = fs::canonicalize(temporary.path()).unwrap();
+        let path = temporary.path().join("resume.json");
+        let conversation_id = Uuid::new_v4();
+        let gate = fixture_gate(conversation_id, &cwd);
+        let mut initial = ResumeStore::new();
+        initial
+            .record_or_forget(conversation_id, fixture_record(&gate))
+            .unwrap();
+        initial.save(&path).unwrap();
+
+        let mut deleter = ResumeStore::load(&path).unwrap();
+        let mut stale_updater = ResumeStore::load(&path).unwrap();
+        deleter.permanently_forget(conversation_id).unwrap();
+        deleter.save_merged(&path).unwrap();
+
+        let mut stale_record = fixture_record(&gate);
+        stale_record.session_id = "stale-session-after-delete".into();
+        stale_record.updated_at_millis += 10_000;
+        stale_updater
+            .record_or_forget(conversation_id, stale_record)
+            .unwrap();
+        let merged = stale_updater.save_merged(&path).unwrap();
+        assert!(merged.is_permanently_forgotten(conversation_id));
+        assert!(merged.record(conversation_id).is_none());
+        assert_eq!(ResumeStore::load(&path).unwrap(), merged);
+    }
+
+    #[test]
+    fn ordinary_forget_remains_non_tombstoning() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cwd = fs::canonicalize(temporary.path()).unwrap();
+        let path = temporary.path().join("resume.json");
+        let conversation_id = Uuid::new_v4();
+        let gate = fixture_gate(conversation_id, &cwd);
+        let mut store = ResumeStore::new();
+        store
+            .record_or_forget(conversation_id, fixture_record(&gate))
+            .unwrap();
+        store.save(&path).unwrap();
+
+        let mut forgotten = ResumeStore::load(&path).unwrap();
+        assert!(forgotten.forget(conversation_id).is_some());
+        let forgotten = forgotten.save_merged(&path).unwrap();
+        assert!(forgotten.record(conversation_id).is_none());
+        assert!(!forgotten.is_permanently_forgotten(conversation_id));
+
+        let mut replacement = forgotten;
+        let mut record = fixture_record(&gate);
+        record.session_id = "new-session".into();
+        record.updated_at_millis += 1;
+        replacement
+            .record_or_forget(conversation_id, record.clone())
+            .unwrap();
+        let replacement = replacement.save_merged(&path).unwrap();
+        assert_eq!(replacement.record(conversation_id), Some(&record));
+    }
+
+    #[test]
+    fn schema_three_roundtrips_and_schema_two_readers_refuse_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("resume-v3.json");
+        let conversation_id = Uuid::new_v4();
+        let mut store = ResumeStore::new();
+        store.permanently_forget(conversation_id).unwrap();
+        let saved = store.save_merged(&path).unwrap();
+        assert_eq!(saved.schema_version, RESUME_SCHEMA_VERSION);
+        assert_eq!(ResumeStore::load(&path).unwrap(), saved);
+
+        let value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(matches!(
+            schema_version(&value, "native-session resume", 1, 2),
+            Err(AiStateFileError::NewerSchema {
+                found: 3,
+                supported: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn locked_concurrent_saves_merge_every_conversation() {
+        use std::{sync::Arc, thread};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let cwd = fs::canonicalize(temporary.path()).unwrap();
+        let path = Arc::new(temporary.path().join("resume-concurrent.json"));
+        let barrier = Arc::new(std::sync::Barrier::new(4));
+        let conversation_ids = (0..4).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        let workers = conversation_ids
+            .iter()
+            .enumerate()
+            .map(|(index, conversation_id)| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                let cwd = cwd.clone();
+                let conversation_id = *conversation_id;
+                thread::spawn(move || {
+                    let gate = fixture_gate(conversation_id, &cwd);
+                    let mut record = fixture_record(&gate);
+                    record.session_id = format!("concurrent-session-{index}");
+                    record.updated_at_millis += index as u64;
+                    let mut store = ResumeStore::new();
+                    store.record_or_forget(conversation_id, record).unwrap();
+                    barrier.wait();
+                    store.save_merged(path.as_ref()).unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let merged = ResumeStore::load(path.as_ref()).unwrap();
+        assert_eq!(merged.len(), conversation_ids.len());
+        assert!(
+            conversation_ids
+                .iter()
+                .all(|conversation_id| merged.record(*conversation_id).is_some())
         );
     }
 

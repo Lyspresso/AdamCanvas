@@ -27,6 +27,7 @@ fn custom_cli_environment_handoff_reaches_live_authenticated_bridge() {
         .start(AiRunRequest {
             turn_id,
             conversation_id,
+            canvas_page_id: None,
             provider_id: "custom_cli".into(),
             workspace_mode: AiWorkspaceMode::Code,
             permission_mode: PermissionMode::Sandbox,

@@ -323,6 +323,10 @@ pub enum ActivityKind {
     FileChange {
         #[serde(default)]
         id: String,
+        /// Provider tool that produced this change when the structured
+        /// stream exposes it. Legacy events omit this field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<String>,
         #[serde(default)]
         changes: Vec<FileChange>,
         #[serde(default)]
@@ -557,9 +561,7 @@ impl ActivityKind {
             self,
             Self::AssistantText { .. }
                 | Self::Thinking { .. }
-                | Self::FileChange { .. }
                 | Self::TaskMutation { .. }
-                | Self::HostMutation { .. }
                 | Self::PermissionPrompt { .. }
                 | Self::Subagent { .. }
                 | Self::AgentGroup { .. }
@@ -875,6 +877,21 @@ impl ActivityAccumulator {
                         }
                     }
                 }
+                (
+                    ActivityKind::FileChange {
+                        tool: previous_tool,
+                        changes: previous_changes,
+                        ..
+                    },
+                    ActivityKind::FileChange { tool, changes, .. },
+                ) => {
+                    if tool.is_none() {
+                        *tool = previous_tool;
+                    }
+                    if changes.is_empty() {
+                        *changes = previous_changes;
+                    }
+                }
                 _ => {}
             }
             return;
@@ -894,10 +911,10 @@ impl ActivityAccumulator {
     fn enforce_live_cap(&mut self) {
         while self.events.len() > self.max_events {
             let Some(eviction) = self.events.iter().position(is_live_cap_evictable) else {
-                // Plans, errors, permission prompts, child lifecycle, and
-                // scoped child prose are exempt. Their combined must-keep set
-                // may exceed the soft live cap rather than silently deleting
-                // authoritative state.
+                // Plans, errors, permission prompts, artifact lifecycles,
+                // child lifecycle, and scoped child prose are exempt. Their
+                // combined must-keep set may exceed the soft live cap rather
+                // than silently deleting authoritative state.
                 break;
             };
             if self.events[eviction].kind.is_task_state() {
@@ -1047,7 +1064,10 @@ fn is_live_cap_evictable(event: &ActivityEvent) -> bool {
         && !event.kind.is_plan_snapshot()
         && !matches!(
             event.kind,
-            ActivityKind::Subagent { .. } | ActivityKind::AgentGroup { .. }
+            ActivityKind::FileChange { .. }
+                | ActivityKind::HostMutation { .. }
+                | ActivityKind::Subagent { .. }
+                | ActivityKind::AgentGroup { .. }
         )
         && !(event.scope.child_id().is_some()
             && matches!(event.kind, ActivityKind::AssistantText { .. }))
@@ -1056,9 +1076,10 @@ fn is_live_cap_evictable(event: &ActivityEvent) -> bool {
 /// Applies the persistence must-keep contract while preserving original
 /// event order.
 ///
-/// All errors, prompts, file changes, host mutations (Adam's artifact-bearing
-/// domain case), merged text/thinking, and the trailing plan survive. Newest
-/// ordinary events fill the remaining budget. Must-keeps may exceed `cap`.
+/// All errors, prompts, file/host artifact transitions, merged text/thinking,
+/// and the trailing plan survive. Newest ordinary events fill the remaining
+/// budget. Artifact transitions may exceed `cap`: conversation-local
+/// compaction is not compositional when other chats interleave by timestamp.
 pub fn activity_events_for_persistence(events: &[ActivityEvent], cap: usize) -> Vec<ActivityEvent> {
     if events.is_empty() {
         return Vec::new();
@@ -1072,7 +1093,12 @@ pub fn activity_events_for_persistence(events: &[ActivityEvent], cap: usize) -> 
     }
     let mut retained = BTreeSet::new();
     for (index, event) in events.iter().enumerate() {
-        if event.kind.is_persist_must_keep()
+        let artifact_event = matches!(
+            &event.kind,
+            ActivityKind::FileChange { .. } | ActivityKind::HostMutation { .. }
+        );
+        if artifact_event
+            || (!artifact_event && event.kind.is_persist_must_keep())
             || trailing_plans.get(&event.scope).copied() == Some(index)
         {
             retained.insert(index);
@@ -2085,7 +2111,40 @@ impl Default for ArtifactSource {
     }
 }
 
-/// One newest-wins output record for a conversation.
+/// Conversation and turn context paired with one event before artifact
+/// reduction. The borrowed event remains the single source of truth; this
+/// wrapper supplies ownership that does not belong on every activity record.
+#[derive(Clone, Copy, Debug)]
+pub struct ArtifactEventRef<'a> {
+    pub conversation_id: Option<Uuid>,
+    pub turn_id: Option<Uuid>,
+    pub event: &'a ActivityEvent,
+}
+
+impl<'a> From<&'a ActivityEvent> for ArtifactEventRef<'a> {
+    fn from(event: &'a ActivityEvent) -> Self {
+        Self {
+            conversation_id: None,
+            turn_id: None,
+            event,
+        }
+    }
+}
+
+/// Durable origin of one artifact lifecycle transition.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ArtifactProvenance {
+    pub conversation_id: Option<Uuid>,
+    pub turn_id: Option<Uuid>,
+    pub event_id: Uuid,
+    pub tool_call_id: Option<String>,
+    pub tool: Option<String>,
+    pub scope: AgentScope,
+    pub at: UnixMillis,
+}
+
+/// One newest-in-stream artifact record for a conversation.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct ArtifactProjection {
@@ -2095,6 +2154,29 @@ pub struct ArtifactProjection {
     pub source: ArtifactSource,
     pub at: UnixMillis,
     pub is_deleted: bool,
+    /// The event that established the current artifact lifetime. Updates and
+    /// deletion preserve this; an explicit recreation replaces it.
+    pub produced_by: ArtifactProvenance,
+    /// The newest lifecycle event folded into this projection.
+    pub last_changed_by: ArtifactProvenance,
+}
+
+/// Timestamp at which an artifact transition actually became true.
+///
+/// Lifecycle records retain their start timestamp when they complete and put
+/// the elapsed interval in duration_ms. Cross-conversation artifact replay
+/// must compare completion instants, otherwise a long-running write can sort
+/// before a delete that happened while the write was still in flight.
+pub fn artifact_effective_at(event: &ActivityEvent) -> UnixMillis {
+    match event.kind {
+        ActivityKind::FileChange {
+            status: ActivityStatus::Completed,
+            ..
+        } => event
+            .at
+            .saturating_add(event.duration_ms.unwrap_or_default()),
+        _ => event.at,
+    }
 }
 
 impl ArtifactProjection {
@@ -2106,34 +2188,126 @@ impl ArtifactProjection {
     }
 }
 
-/// Outputs from file and host mutations, deduped within this event stream.
+/// Artifacts from file and host mutations, deduped within this event stream.
 ///
-/// Newer timestamps win; on a timestamp tie, the later event in stream order
-/// wins. Consequently a later delete replaces and strikes an earlier add.
+/// Compatibility wrapper for callers projecting one conversation without
+/// message-level turn context.
 pub fn project_artifacts(events: &[ActivityEvent]) -> Vec<ArtifactProjection> {
-    let mut by_identity = BTreeMap::<String, ArtifactProjection>::new();
+    project_artifacts_with_provenance(events.iter().map(ArtifactEventRef::from))
+}
 
-    for event in events {
+/// Projects artifact lifecycles across one or more conversations.
+///
+/// Input order, rather than provider timestamps, is authoritative. Identity
+/// is scoped by conversation so the same path or host entity in two chats
+/// remains two library records. Only completed file-change lifecycles are
+/// materialized. A delete cannot invent an artifact, and updates/deletes keep
+/// the provenance of the event that originally produced it.
+pub fn project_artifacts_with_provenance<'a>(
+    events: impl IntoIterator<Item = ArtifactEventRef<'a>>,
+) -> Vec<ArtifactProjection> {
+    project_artifacts_with_identity(events, ArtifactIdentityScope::Conversation)
+}
+
+/// Projects one workspace-global artifact record per stable path or entity.
+///
+/// Unlike [`project_artifacts_with_provenance`], conversation ownership does
+/// not participate in identity. A later update or deletion from another chat
+/// therefore changes the same physical artifact while retaining the producer
+/// and newest-change provenance from their respective turns.
+pub fn project_global_artifacts_with_provenance<'a>(
+    events: impl IntoIterator<Item = ArtifactEventRef<'a>>,
+) -> Vec<ArtifactProjection> {
+    project_artifacts_with_identity(events, ArtifactIdentityScope::Global)
+}
+
+#[derive(Clone, Copy)]
+enum ArtifactIdentityScope {
+    Conversation,
+    Global,
+}
+
+fn project_artifacts_with_identity<'a>(
+    events: impl IntoIterator<Item = ArtifactEventRef<'a>>,
+    identity_scope: ArtifactIdentityScope,
+) -> Vec<ArtifactProjection> {
+    let mut by_identity = BTreeMap::<(Option<Uuid>, String), (usize, ArtifactProjection)>::new();
+    let mut seen_events = BTreeSet::<(Option<Uuid>, Uuid)>::new();
+
+    for (stream_index, input) in events.into_iter().enumerate() {
+        let event = input.event;
+        let effective_at = artifact_effective_at(event);
+        let identity_conversation = match identity_scope {
+            ArtifactIdentityScope::Conversation => input.conversation_id,
+            ArtifactIdentityScope::Global => None,
+        };
+        // Legacy activity records can deserialize with a nil identity. They
+        // are not safe to coalesce because multiple distinct old events may
+        // share that sentinel.
+        if !event.id.is_nil() && !seen_events.insert((identity_conversation, event.id)) {
+            continue;
+        }
         match &event.kind {
             ActivityKind::FileChange {
-                changes, status, ..
-            } if *status != ActivityStatus::Failed && *status != ActivityStatus::Declined => {
+                id,
+                tool,
+                changes,
+                status,
+            } if *status == ActivityStatus::Completed => {
+                let provenance = artifact_provenance(
+                    input,
+                    nonempty_owned(id),
+                    tool.as_deref().and_then(nonempty_owned),
+                );
                 for change in changes {
-                    let id = format!("file:{}", change.path);
-                    let (title, subtitle) = split_path_label(&change.path);
-                    upsert_artifact(
-                        &mut by_identity,
-                        ArtifactProjection {
-                            id,
-                            title,
-                            subtitle,
-                            source: ArtifactSource::File {
-                                path: change.path.clone(),
-                                change: change.kind,
+                    let Some(path) = normalize_lexical_path(&change.path) else {
+                        continue;
+                    };
+                    let id = format!("file:{path}");
+                    let key = (identity_conversation, id.clone());
+                    let (title, subtitle) = split_path_label(&path);
+                    if change.kind == FileChangeKind::Delete {
+                        let Some((last_index, existing)) = by_identity.get_mut(&key) else {
+                            continue;
+                        };
+                        existing.title = title;
+                        existing.subtitle = subtitle;
+                        existing.source = ArtifactSource::File {
+                            path,
+                            change: change.kind,
+                        };
+                        existing.at = effective_at;
+                        existing.is_deleted = true;
+                        existing.last_changed_by = provenance.clone();
+                        *last_index = stream_index;
+                        continue;
+                    }
+
+                    let produced_by = by_identity
+                        .get(&key)
+                        .filter(|(_, existing)| {
+                            change.kind != FileChangeKind::Add && !existing.is_deleted
+                        })
+                        .map(|(_, existing)| existing.produced_by.clone())
+                        .unwrap_or_else(|| provenance.clone());
+                    by_identity.insert(
+                        key,
+                        (
+                            stream_index,
+                            ArtifactProjection {
+                                id,
+                                title,
+                                subtitle,
+                                source: ArtifactSource::File {
+                                    path,
+                                    change: change.kind,
+                                },
+                                at: effective_at,
+                                is_deleted: false,
+                                produced_by,
+                                last_changed_by: provenance.clone(),
                             },
-                            at: event.at,
-                            is_deleted: change.kind == FileChangeKind::Delete,
-                        },
+                        ),
                     );
                 }
             }
@@ -2144,59 +2318,154 @@ pub fn project_artifacts(events: &[ActivityEvent]) -> Vec<ArtifactProjection> {
                 container_name,
                 kind,
             } => {
-                // Only a creation invents a host output. An update or delete
-                // can revise an already-created entity when it carries the
-                // same stable id, but an operation on pre-existing host data
-                // is provenance rather than a produced artifact.
-                let id = match (kind, entity_id.as_deref()) {
-                    (HostMutationKind::Create, Some(id)) => format!("host:{id}"),
-                    (HostMutationKind::Create, None) => format!("host-event:{}", event.id),
-                    (HostMutationKind::Update | HostMutationKind::Delete, Some(id)) => {
-                        let id = format!("host:{id}");
-                        if !by_identity.contains_key(&id) {
-                            continue;
-                        }
-                        id
-                    }
-                    (HostMutationKind::Update | HostMutationKind::Delete, None) => continue,
+                // A host artifact must expose a durable entity identity. An
+                // anonymous creation cannot support later reveal/jump/dedupe
+                // actions and therefore remains activity provenance only.
+                let Some(entity_id) = entity_id.as_deref().and_then(nonempty_owned) else {
+                    continue;
                 };
-                upsert_artifact(
-                    &mut by_identity,
-                    ArtifactProjection {
-                        id,
-                        title: summary.clone(),
-                        subtitle: container_name.clone(),
-                        source: ArtifactSource::Host {
-                            tool: tool.clone(),
-                            entity_id: entity_id.clone(),
-                            container_name: container_name.clone(),
-                            mutation: *kind,
+                let id = format!("host:{entity_id}");
+                let key = (identity_conversation, id.clone());
+                let provenance = artifact_provenance(input, None, nonempty_owned(tool));
+
+                if *kind != HostMutationKind::Create && !by_identity.contains_key(&key) {
+                    continue;
+                }
+                if *kind == HostMutationKind::Delete {
+                    let Some((last_index, existing)) = by_identity.get_mut(&key) else {
+                        continue;
+                    };
+                    if let ArtifactSource::Host { mutation, .. } = &mut existing.source {
+                        *mutation = HostMutationKind::Delete;
+                    }
+                    existing.at = effective_at;
+                    existing.is_deleted = true;
+                    existing.last_changed_by = provenance;
+                    *last_index = stream_index;
+                    continue;
+                }
+                let produced_by = if *kind == HostMutationKind::Create {
+                    provenance.clone()
+                } else {
+                    by_identity
+                        .get(&key)
+                        .map(|(_, existing)| existing.produced_by.clone())
+                        .unwrap_or_else(|| provenance.clone())
+                };
+                by_identity.insert(
+                    key,
+                    (
+                        stream_index,
+                        ArtifactProjection {
+                            id,
+                            title: summary.clone(),
+                            subtitle: container_name.clone(),
+                            source: ArtifactSource::Host {
+                                tool: tool.clone(),
+                                entity_id: Some(entity_id),
+                                container_name: container_name.clone(),
+                                mutation: *kind,
+                            },
+                            at: effective_at,
+                            is_deleted: *kind == HostMutationKind::Delete,
+                            produced_by,
+                            last_changed_by: provenance,
                         },
-                        at: event.at,
-                        is_deleted: *kind == HostMutationKind::Delete,
-                    },
+                    ),
                 );
             }
             _ => {}
         }
     }
 
-    let mut outputs: Vec<_> = by_identity.into_values().collect();
-    outputs.sort_by(|left, right| right.at.cmp(&left.at).then_with(|| left.id.cmp(&right.id)));
-    outputs
+    let mut artifacts: Vec<_> = by_identity.into_values().collect();
+    artifacts.sort_by(|(left_index, left), (right_index, right)| {
+        right_index
+            .cmp(left_index)
+            .then_with(|| left.id.cmp(&right.id))
+            .then_with(|| {
+                left.produced_by
+                    .conversation_id
+                    .cmp(&right.produced_by.conversation_id)
+            })
+    });
+    artifacts
+        .into_iter()
+        .map(|(_, projection)| projection)
+        .collect()
 }
 
-fn upsert_artifact(
-    artifacts: &mut BTreeMap<String, ArtifactProjection>,
-    incoming: ArtifactProjection,
-) {
-    if artifacts
-        .get(&incoming.id)
-        .is_some_and(|existing| existing.at > incoming.at)
-    {
-        return;
+fn artifact_provenance(
+    input: ArtifactEventRef<'_>,
+    tool_call_id: Option<String>,
+    tool: Option<String>,
+) -> ArtifactProvenance {
+    ArtifactProvenance {
+        conversation_id: input.conversation_id,
+        turn_id: input.turn_id,
+        event_id: input.event.id,
+        tool_call_id,
+        tool,
+        scope: input.event.scope.clone(),
+        at: artifact_effective_at(input.event),
     }
-    artifacts.insert(incoming.id.clone(), incoming);
+}
+
+fn nonempty_owned(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// Normalizes a provider-reported path without consulting the filesystem.
+/// Both slash styles are accepted so persisted fixtures remain portable.
+fn normalize_lexical_path(path: &str) -> Option<String> {
+    let path = path.trim().replace('\\', "/");
+    if path.is_empty() {
+        return None;
+    }
+
+    let is_unc = path.starts_with("//");
+    let has_drive = path.as_bytes().get(1) == Some(&b':')
+        && path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic);
+    let drive = has_drive.then(|| path[..2].to_owned());
+    let remainder = if has_drive { &path[2..] } else { &path };
+    let is_absolute = is_unc || remainder.starts_with('/');
+    let mut components = Vec::<String>::new();
+    let protected_components = if is_unc { 2 } else { 0 };
+
+    for component in remainder.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.len() > protected_components
+                    && components.last().is_some_and(|last| last != "..")
+                {
+                    components.pop();
+                } else if !is_absolute {
+                    components.push("..".into());
+                }
+            }
+            component => components.push(component.to_owned()),
+        }
+    }
+
+    let joined = components.join("/");
+    let normalized = if is_unc {
+        format!("//{joined}")
+    } else if let Some(drive) = drive {
+        if is_absolute {
+            format!("{drive}/{joined}")
+        } else {
+            format!("{drive}{joined}")
+        }
+    } else if is_absolute {
+        format!("/{joined}")
+    } else if joined.is_empty() {
+        ".".into()
+    } else {
+        joined
+    };
+    Some(normalized)
 }
 
 fn split_path_label(path: &str) -> (String, Option<String>) {
@@ -4081,6 +4350,7 @@ mod tests {
                 4,
                 ActivityKind::FileChange {
                     id: "file".into(),
+                    tool: None,
                     changes: vec![FileChange {
                         path: "/work/src/lib.rs".into(),
                         kind: FileChangeKind::Update,
@@ -4249,6 +4519,7 @@ mod tests {
                 2,
                 ActivityKind::FileChange {
                     id: "f".into(),
+                    tool: None,
                     changes: vec![FileChange {
                         path: "/tmp/a.txt".into(),
                         kind: FileChangeKind::Add,
@@ -4285,13 +4556,333 @@ mod tests {
     }
 
     #[test]
-    fn artifact_projection_dedupes_and_later_delete_strikes_add() {
+    fn persistence_keeps_repeated_artifact_transitions_beyond_the_soft_cap() {
+        let events = (1..=600)
+            .map(|index| {
+                event(
+                    index,
+                    index as i64,
+                    ActivityKind::FileChange {
+                        id: format!("edit-{index}"),
+                        tool: Some("Edit".into()),
+                        changes: vec![FileChange {
+                            path: "/workspace/report.md".into(),
+                            kind: FileChangeKind::Update,
+                        }],
+                        status: ActivityStatus::Completed,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let retained = activity_events_for_persistence(&events, 8);
+
+        assert_eq!(retained, events);
+        assert_eq!(project_artifacts(&retained), project_artifacts(&events));
+    }
+
+    #[test]
+    fn persistence_artifact_must_keeps_displace_chatter_and_may_exceed_the_soft_cap() {
+        let artifact = |id_value, path: String| {
+            event(
+                id_value,
+                id_value as i64,
+                ActivityKind::FileChange {
+                    id: format!("file-{id_value}"),
+                    tool: Some("Write".into()),
+                    changes: vec![FileChange {
+                        path,
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            )
+        };
+        let mut mixed = vec![
+            artifact(1, "/workspace/one.md".into()),
+            artifact(2, "/workspace/two.md".into()),
+        ];
+        mixed.extend((3..=603).map(|index| {
+            event(
+                index,
+                index as i64,
+                ActivityKind::ToolCall {
+                    id: format!("tool-{index}"),
+                    name: "Read".into(),
+                    server: None,
+                    input_summary: Some("ordinary chatter".into()),
+                },
+            )
+        }));
+        let retained = activity_events_for_persistence(&mixed, PERSISTED_ACTIVITY_EVENT_CAP);
+        assert_eq!(retained.len(), PERSISTED_ACTIVITY_EVENT_CAP);
+        assert_eq!(retained[0].id, Uuid::from_u128(1));
+        assert_eq!(retained[1].id, Uuid::from_u128(2));
+
+        let artifacts = (1..=PERSISTED_ACTIVITY_EVENT_CAP as u128 + 1)
+            .map(|index| artifact(index, format!("/workspace/{index}.md")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            activity_events_for_persistence(&artifacts, PERSISTED_ACTIVITY_EVENT_CAP).len(),
+            PERSISTED_ACTIVITY_EVENT_CAP + 1
+        );
+    }
+
+    #[test]
+    fn persistence_keeps_delete_update_pair_that_resets_an_older_file_lifetime() {
+        let prior = event(
+            1,
+            1,
+            ActivityKind::FileChange {
+                id: "create".into(),
+                tool: Some("Write".into()),
+                changes: vec![FileChange {
+                    path: "/workspace/report.md".into(),
+                    kind: FileChangeKind::Add,
+                }],
+                status: ActivityStatus::Completed,
+            },
+        );
+        let current = vec![
+            event(
+                2,
+                2,
+                ActivityKind::FileChange {
+                    id: "delete".into(),
+                    tool: Some("Delete".into()),
+                    changes: vec![FileChange {
+                        path: "/workspace/report.md".into(),
+                        kind: FileChangeKind::Delete,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+            event(
+                3,
+                3,
+                ActivityKind::FileChange {
+                    id: "recreate".into(),
+                    tool: Some("Edit".into()),
+                    changes: vec![FileChange {
+                        path: "/workspace/report.md".into(),
+                        kind: FileChangeKind::Update,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+        ];
+        let retained = activity_events_for_persistence(&current, 1);
+        let mut full = vec![prior.clone()];
+        full.extend(current);
+        let mut compacted = vec![prior];
+        compacted.extend(retained.clone());
+
+        assert_eq!(retained.len(), 2);
+        assert_eq!(project_artifacts(&compacted), project_artifacts(&full));
+    }
+
+    #[test]
+    fn persistence_keeps_host_metadata_before_a_final_delete() {
+        let host = |tool: &str, summary: &str, container_name: Option<&str>, kind| {
+            ActivityKind::HostMutation {
+                tool: tool.into(),
+                summary: summary.into(),
+                entity_id: Some("note-1".into()),
+                container_name: container_name.map(str::to_owned),
+                kind,
+            }
+        };
+        let prior = event(
+            1,
+            1,
+            host(
+                "canvas_create_note",
+                "Original title",
+                Some("Page 1"),
+                HostMutationKind::Create,
+            ),
+        );
+        let current = vec![
+            event(
+                2,
+                2,
+                host(
+                    "canvas_update_note",
+                    "Renamed title",
+                    Some("Page 2"),
+                    HostMutationKind::Update,
+                ),
+            ),
+            event(
+                3,
+                3,
+                host(
+                    "canvas_delete_note",
+                    "Deleted note",
+                    None,
+                    HostMutationKind::Delete,
+                ),
+            ),
+        ];
+        let retained = activity_events_for_persistence(&current, 1);
+        let mut full = vec![prior.clone()];
+        full.extend(current);
+        let mut compacted = vec![prior];
+        compacted.extend(retained.clone());
+
+        assert_eq!(retained.len(), 2);
+        assert_eq!(project_artifacts(&compacted), project_artifacts(&full));
+        let artifact = project_artifacts(&compacted).pop().unwrap();
+        assert_eq!(artifact.title, "Renamed title");
+        assert_eq!(artifact.subtitle.as_deref(), Some("Page 2"));
+        assert!(artifact.is_deleted);
+    }
+
+    #[test]
+    fn live_cap_keeps_repeated_artifact_transitions_as_soft_must_keeps() {
+        let mut accumulator = ActivityAccumulator::with_max_events(2);
+        for index in 1..=50 {
+            accumulator.ingest(event(
+                index,
+                index as i64,
+                ActivityKind::FileChange {
+                    id: format!("edit-{index}"),
+                    tool: Some("Edit".into()),
+                    changes: vec![FileChange {
+                        path: "/workspace/report.md".into(),
+                        kind: FileChangeKind::Update,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ));
+        }
+
+        assert_eq!(accumulator.len(), 50);
+        let artifact = project_artifacts(&accumulator.events).pop().unwrap();
+        assert_eq!(artifact.produced_by.event_id, Uuid::from_u128(1));
+        assert_eq!(artifact.last_changed_by.event_id, Uuid::from_u128(50));
+    }
+
+    #[test]
+    fn live_cap_never_evicts_artifact_lifecycle_events() {
+        let mut accumulator = ActivityAccumulator::with_max_events(1);
+        accumulator.ingest(event(
+            1,
+            1,
+            ActivityKind::FileChange {
+                id: "file".into(),
+                tool: Some("Write".into()),
+                changes: vec![FileChange {
+                    path: "/tmp/a.txt".into(),
+                    kind: FileChangeKind::Add,
+                }],
+                status: ActivityStatus::Completed,
+            },
+        ));
+        accumulator.ingest(event(
+            2,
+            2,
+            ActivityKind::HostMutation {
+                tool: "create_note".into(),
+                summary: "Note".into(),
+                entity_id: Some("n1".into()),
+                container_name: None,
+                kind: HostMutationKind::Create,
+            },
+        ));
+        accumulator.ingest(event(3, 3, command("ordinary", ActivityStatus::Completed)));
+
+        assert_eq!(accumulator.events.len(), 2);
+        assert!(
+            accumulator
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, ActivityKind::FileChange { .. }))
+        );
+        assert!(
+            accumulator
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, ActivityKind::HostMutation { .. }))
+        );
+    }
+
+    #[test]
+    fn file_change_lifecycle_completion_preserves_tool_and_changes() {
+        let mut accumulator = ActivityAccumulator::new();
+        accumulator.ingest(event(
+            1,
+            1,
+            ActivityKind::FileChange {
+                id: "call-1".into(),
+                tool: Some("Edit".into()),
+                changes: vec![FileChange {
+                    path: "/tmp/a.txt".into(),
+                    kind: FileChangeKind::Update,
+                }],
+                status: ActivityStatus::InProgress,
+            },
+        ));
+        accumulator.ingest(event(
+            2,
+            2,
+            ActivityKind::FileChange {
+                id: "call-1".into(),
+                tool: None,
+                changes: Vec::new(),
+                status: ActivityStatus::Completed,
+            },
+        ));
+
+        assert_eq!(accumulator.events.len(), 1);
+        let ActivityKind::FileChange {
+            tool,
+            changes,
+            status,
+            ..
+        } = &accumulator.events[0].kind
+        else {
+            panic!("expected file change");
+        };
+        assert_eq!(tool.as_deref(), Some("Edit"));
+        assert_eq!(changes.len(), 1);
+        assert_eq!(*status, ActivityStatus::Completed);
+    }
+
+    #[test]
+    fn file_change_tool_is_backward_compatible_on_the_wire() {
+        let legacy: ActivityKind = serde_json::from_str(
+            r#"{"type":"fileChange","id":"call","changes":[],"status":"completed"}"#,
+        )
+        .unwrap();
+        let ActivityKind::FileChange { tool, .. } = legacy else {
+            panic!("expected file change");
+        };
+        assert_eq!(tool, None);
+
+        let current = ActivityKind::FileChange {
+            id: "call".into(),
+            tool: Some("Write".into()),
+            changes: Vec::new(),
+            status: ActivityStatus::Completed,
+        };
+        let encoded = serde_json::to_string(&current).unwrap();
+        assert!(encoded.contains(r#""tool":"Write""#));
+        assert_eq!(
+            serde_json::from_str::<ActivityKind>(&encoded).unwrap(),
+            current
+        );
+    }
+
+    #[test]
+    fn artifact_projection_uses_stream_order_and_completed_lifecycles_only() {
         let events = vec![
             event(
                 1,
-                1,
+                100,
                 ActivityKind::FileChange {
                     id: "f1".into(),
+                    tool: Some("Write".into()),
                     changes: vec![FileChange {
                         path: "/work/report.md".into(),
                         kind: FileChangeKind::Add,
@@ -4304,6 +4895,7 @@ mod tests {
                 2,
                 ActivityKind::FileChange {
                     id: "f2".into(),
+                    tool: Some("Delete".into()),
                     changes: vec![FileChange {
                         path: "/work/report.md".into(),
                         kind: FileChangeKind::Delete,
@@ -4316,6 +4908,7 @@ mod tests {
                 3,
                 ActivityKind::FileChange {
                     id: "failed".into(),
+                    tool: None,
                     changes: vec![FileChange {
                         path: "/work/never.txt".into(),
                         kind: FileChangeKind::Add,
@@ -4323,16 +4916,49 @@ mod tests {
                     status: ActivityStatus::Failed,
                 },
             ),
+            event(
+                4,
+                4,
+                ActivityKind::FileChange {
+                    id: "running".into(),
+                    tool: None,
+                    changes: vec![FileChange {
+                        path: "/work/running.txt".into(),
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::InProgress,
+                },
+            ),
+            event(
+                5,
+                5,
+                ActivityKind::FileChange {
+                    id: "delete-only".into(),
+                    tool: None,
+                    changes: vec![FileChange {
+                        path: "/work/pre-existing.txt".into(),
+                        kind: FileChangeKind::Delete,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
         ];
-        let outputs = project_artifacts(&events);
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].title, "report.md");
-        assert!(outputs[0].is_deleted);
-        assert_eq!(outputs[0].at, UnixMillis(2));
+        let artifacts = project_artifacts(&events);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].title, "report.md");
+        assert!(artifacts[0].is_deleted);
+        assert_eq!(artifacts[0].at, UnixMillis(2));
+        assert_eq!(artifacts[0].produced_by.event_id, Uuid::from_u128(1));
+        assert_eq!(artifacts[0].produced_by.tool.as_deref(), Some("Write"));
+        assert_eq!(artifacts[0].last_changed_by.event_id, Uuid::from_u128(2));
+        assert_eq!(
+            artifacts[0].last_changed_by.tool_call_id.as_deref(),
+            Some("f2")
+        );
     }
 
     #[test]
-    fn host_outputs_dedupe_by_entity_and_unknown_creations_stay_distinct() {
+    fn host_artifacts_require_stable_ids_and_preserve_creation_provenance() {
         let host = |entity_id: Option<&str>, summary: &str, kind| ActivityKind::HostMutation {
             tool: "note".into(),
             summary: summary.into(),
@@ -4349,19 +4975,117 @@ mod tests {
             event(
                 2,
                 2,
-                host(Some("n1"), "Deleted note", HostMutationKind::Delete),
+                ActivityKind::HostMutation {
+                    tool: "delete_note".into(),
+                    summary: "Deleted note".into(),
+                    entity_id: Some("n1".into()),
+                    container_name: None,
+                    kind: HostMutationKind::Delete,
+                },
             ),
             event(3, 3, host(None, "New note A", HostMutationKind::Create)),
             event(4, 4, host(None, "New note B", HostMutationKind::Create)),
         ];
-        let outputs = project_artifacts(&events);
-        assert_eq!(outputs.len(), 3);
-        let known = outputs
+        let artifacts = project_artifacts(&events);
+        assert_eq!(artifacts.len(), 1);
+        let known = artifacts
             .iter()
-            .find(|output| output.id == "host:n1")
+            .find(|artifact| artifact.id == "host:n1")
             .unwrap();
         assert!(known.is_deleted);
-        assert_eq!(known.title, "Deleted note");
+        assert_eq!(known.title, "Created note");
+        assert_eq!(known.subtitle.as_deref(), Some("Project"));
+        assert!(matches!(
+            &known.source,
+            ArtifactSource::Host {
+                container_name: Some(container),
+                mutation: HostMutationKind::Delete,
+                ..
+            } if container == "Project"
+        ));
+        assert_eq!(known.produced_by.event_id, Uuid::from_u128(1));
+        assert_eq!(known.last_changed_by.event_id, Uuid::from_u128(2));
+        assert_eq!(known.last_changed_by.tool.as_deref(), Some("delete_note"));
+    }
+
+    #[test]
+    fn artifact_projection_dedupes_stable_event_replays_but_not_legacy_nil_ids() {
+        let file_event = |event_id, path: &str| {
+            event(
+                event_id,
+                1,
+                ActivityKind::FileChange {
+                    id: "write".into(),
+                    tool: Some("Write".into()),
+                    changes: vec![FileChange {
+                        path: path.into(),
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            )
+        };
+
+        let replayed = project_artifacts(&[
+            file_event(1, "/work/first.md"),
+            file_event(1, "/work/replayed-with-different-payload.md"),
+        ]);
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].file_path(), Some("/work/first.md"));
+
+        let legacy = project_artifacts(&[
+            file_event(0, "/work/legacy-a.md"),
+            file_event(0, "/work/legacy-b.md"),
+        ]);
+        assert_eq!(legacy.len(), 2, "nil is a legacy sentinel, not an identity");
+    }
+
+    #[test]
+    fn file_artifact_identity_uses_portable_lexical_normalization() {
+        assert_eq!(
+            normalize_lexical_path(r"C:\work\.\draft\..\report.md").as_deref(),
+            Some("C:/work/report.md")
+        );
+        assert_eq!(
+            normalize_lexical_path("//server/share/folder/../report.md").as_deref(),
+            Some("//server/share/report.md")
+        );
+
+        let events = vec![
+            event(
+                1,
+                1,
+                ActivityKind::FileChange {
+                    id: "create".into(),
+                    tool: Some("Write".into()),
+                    changes: vec![FileChange {
+                        path: "/work/./draft/../report.md".into(),
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+            event(
+                2,
+                2,
+                ActivityKind::FileChange {
+                    id: "update".into(),
+                    tool: Some("Edit".into()),
+                    changes: vec![FileChange {
+                        path: r"\work\report.md".into(),
+                        kind: FileChangeKind::Update,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+        ];
+
+        let artifacts = project_artifacts(&events);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].id, "file:/work/report.md");
+        assert_eq!(artifacts[0].file_path(), Some("/work/report.md"));
+        assert_eq!(artifacts[0].produced_by.event_id, Uuid::from_u128(1));
+        assert_eq!(artifacts[0].last_changed_by.event_id, Uuid::from_u128(2));
     }
 
     #[test]
@@ -4409,12 +5133,104 @@ mod tests {
             ),
         ];
 
-        let outputs = project_artifacts(&events);
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].id, "host:created");
-        assert_eq!(outputs[0].title, "Updated note");
-        assert!(!outputs[0].is_deleted);
-        assert_eq!(outputs[0].at, UnixMillis(5));
+        let artifacts = project_artifacts(&events);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].id, "host:created");
+        assert_eq!(artifacts[0].title, "Updated note");
+        assert!(!artifacts[0].is_deleted);
+        assert_eq!(artifacts[0].at, UnixMillis(5));
+        assert_eq!(artifacts[0].produced_by.event_id, Uuid::from_u128(4));
+        assert_eq!(artifacts[0].last_changed_by.event_id, Uuid::from_u128(5));
+    }
+
+    #[test]
+    fn explicit_recreation_resets_production_provenance() {
+        let host = |summary: &str, kind| ActivityKind::HostMutation {
+            tool: "note".into(),
+            summary: summary.into(),
+            entity_id: Some("n1".into()),
+            container_name: None,
+            kind,
+        };
+        let events = vec![
+            event(1, 1, host("First note", HostMutationKind::Create)),
+            event(2, 2, host("Deleted note", HostMutationKind::Delete)),
+            event(3, 3, host("Second note", HostMutationKind::Create)),
+        ];
+
+        let artifacts = project_artifacts(&events);
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].title, "Second note");
+        assert!(!artifacts[0].is_deleted);
+        assert_eq!(artifacts[0].produced_by.event_id, Uuid::from_u128(3));
+        assert_eq!(artifacts[0].last_changed_by.event_id, Uuid::from_u128(3));
+    }
+
+    #[test]
+    fn provenance_projection_scopes_identity_by_conversation_and_turn() {
+        let first_conversation = Uuid::from_u128(101);
+        let second_conversation = Uuid::from_u128(102);
+        let first_turn = Uuid::from_u128(201);
+        let second_turn = Uuid::from_u128(202);
+        let events = [
+            child_event(
+                1,
+                1,
+                "child-a",
+                ActivityKind::FileChange {
+                    id: "call-a".into(),
+                    tool: Some("Edit".into()),
+                    changes: vec![FileChange {
+                        path: "/work/shared.md".into(),
+                        kind: FileChangeKind::Update,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+            event(
+                2,
+                2,
+                ActivityKind::FileChange {
+                    id: "call-b".into(),
+                    tool: Some("Write".into()),
+                    changes: vec![FileChange {
+                        path: "/work/shared.md".into(),
+                        kind: FileChangeKind::Add,
+                    }],
+                    status: ActivityStatus::Completed,
+                },
+            ),
+        ];
+        let artifacts = project_artifacts_with_provenance([
+            ArtifactEventRef {
+                conversation_id: Some(first_conversation),
+                turn_id: Some(first_turn),
+                event: &events[0],
+            },
+            ArtifactEventRef {
+                conversation_id: Some(second_conversation),
+                turn_id: Some(second_turn),
+                event: &events[1],
+            },
+        ]);
+
+        assert_eq!(artifacts.len(), 2);
+        let child_artifact = artifacts
+            .iter()
+            .find(|artifact| artifact.produced_by.conversation_id == Some(first_conversation))
+            .unwrap();
+        assert_eq!(child_artifact.produced_by.turn_id, Some(first_turn));
+        assert_eq!(
+            child_artifact.produced_by.scope,
+            AgentScope::Child {
+                id: "child-a".into()
+            }
+        );
+        assert_eq!(
+            child_artifact.produced_by.tool_call_id.as_deref(),
+            Some("call-a")
+        );
+        assert_eq!(child_artifact.produced_by.tool.as_deref(), Some("Edit"));
     }
 
     #[test]
@@ -5221,6 +6037,7 @@ mod tests {
             command("2", ActivityStatus::Completed),
             ActivityKind::FileChange {
                 id: "3".into(),
+                tool: None,
                 changes: vec![FileChange {
                     path: "/tmp/a".into(),
                     kind: FileChangeKind::Update,

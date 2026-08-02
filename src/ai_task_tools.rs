@@ -593,6 +593,16 @@ impl TaskToolRegistry {
         self.active_runs.remove(&run_id).is_some()
     }
 
+    /// Erases all checklist state and revokes every live tool gate for a
+    /// permanently deleted conversation.
+    pub fn forget_conversation(&mut self, conversation_id: Uuid) -> bool {
+        let removed_store = self.stores.remove(&conversation_id).is_some();
+        let before = self.active_runs.len();
+        self.active_runs
+            .retain(|_, run| run.conversation_id != conversation_id);
+        removed_store || self.active_runs.len() != before
+    }
+
     /// `None` means the run is dead or unknown and must fail closed.
     pub fn offers_task_tools(&self, run_id: Uuid) -> Option<bool> {
         self.active_runs
@@ -838,6 +848,29 @@ mod tests {
         assert!(app.unregister_run(app_run));
         assert_eq!(app.offers_task_tools(app_run), None);
         assert!(app.descriptors_for_run(app_run).is_empty());
+    }
+
+    #[test]
+    fn forgetting_conversation_erases_tasks_and_revokes_live_runs() {
+        let (mut registry, run_id, conversation_id) = registry_with_run(PlanChannel::AppTaskTools);
+        let outcome = registry.call_for_run(
+            run_id,
+            TASK_CREATE,
+            &json!({"content": "Temporary"}),
+            UnixMillis(1),
+        );
+        assert!(!outcome.is_error());
+        assert!(registry.tasks_for_conversation(conversation_id).is_some());
+
+        assert!(registry.forget_conversation(conversation_id));
+        assert!(registry.tasks_for_conversation(conversation_id).is_none());
+        assert_eq!(registry.offers_task_tools(run_id), None);
+        assert!(
+            registry
+                .call_for_run(run_id, TASK_LIST, &json!({}), UnixMillis(2))
+                .is_error()
+        );
+        assert!(!registry.forget_conversation(conversation_id));
     }
 
     #[test]

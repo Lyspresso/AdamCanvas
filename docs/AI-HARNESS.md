@@ -796,16 +796,30 @@ conversation, Deny, destructive-Always refusal, stance re-evaluation,
 single-flight execution claims, and run teardown. It fails closed on malformed
 or mismatched input.
 
-Direct model-callable Adam canvas tools still require the local loopback bridge
-that will feed calls into that gate. Until then, the Canvas inspector actions
-are visible user-invoked operations and should not be described as autonomous
-model tools.
+The first direct model-callable Adam canvas tools now use the same
+loopback-only MCP bridge as Adam task tools. The initial exposure is
+deliberately narrow: a verified Grok ACP root session, with child agents off,
+in Cowork or Code, and only when the current stance already allows mutation
+(Auto or Bypass). Kimi, HTTP/API, custom, Claude, Codex, and child-capable Grok
+runs receive no canvas tool descriptors until those transports can prove the
+exact caller identity. Ask, Sandbox, and Plan therefore fail closed rather than
+creating an approval Adam cannot yet route back to the blocked provider call.
 
-Adam’s task-tool bridge is deliberately separate from that future canvas
-bridge. It is a loopback-only, bearer-authenticated, per-run MCP endpoint. Its
-tool list and every call are re-authorized against the active run and the
-run’s single declared plan channel; possessing a stale endpoint or token
-cannot revive a completed run.
+The only exposed operations are `canvas_create_note` and
+`canvas_create_pile`. They require a per-run idempotency key, queue a typed
+request to the UI owner, revalidate the live run, page, conversation, and
+permission immediately before commit, checkpoint and audit the mutation, and
+return a stable entity receipt. Only that receipt creates a `HostMutation`
+artifact event. Cancelling a turn or deleting its conversation revokes queued
+calls before cooperative provider shutdown completes.
+
+Task and canvas calls share one loopback-only, bearer-authenticated, per-run
+MCP endpoint because provider transports may accept only one server. Their
+registries and exposure gates remain separate: a native Progress run can list
+the canvas-only subset without gaining Adam checklist tools, while a task-tool
+run lists canvas tools only when the canvas gate independently authorizes it.
+Every list and call is re-authorized against the active run; a stale endpoint
+or token cannot revive a completed run.
 
 ## Data boundaries
 
@@ -830,12 +844,25 @@ cannot revive a completed run.
   non-conflicting edits survive stale writers. Before atomic replacement Adam
   rotates a validated `library.previous.json`; unreadable files are preserved
   as timestamped recovery copies instead of being silently overwritten.
+- Hiding a chat cancels its active turn, pauses its queue, and keeps the full
+  conversation in a discoverable Hidden section until the user unhides it;
+  background activity never silently promotes it. Opening a hidden chat or its
+  canvas tile shows an explicit hidden state: Send and Send next remain blocked,
+  the draft and queue stay untouched, and Unhide keeps that queue paused until
+  the user explicitly sends it. Permanent Delete requires a confirmation,
+  removes chat tiles, sessions, task/canvas gates, checkpoints, and artifact
+  provenance, and records a durable tombstone so a stale Adam window cannot
+  resurrect the conversation. Notes, piles, and files created by the chat
+  remain on the canvas. For Grok Heavy, this removes Adam's local
+  response-resume link but does not erase messages or responses retained by
+  xAI; the confirmation repeats that distinction.
 
 ## Deliberate limits
 
 The current harness does not claim:
 
-- a completed model-callable Adam host-tool server;
+- broad model-callable Adam host editing beyond the narrowly gated note and
+  pile creation tools described above;
 - scoped child prose for Grok versions whose streams do not identify the
   emitting child session;
 - live Kimi 0.31.0 child prose or child lifecycle—the ACP root tool reveals
