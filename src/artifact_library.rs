@@ -411,6 +411,13 @@ pub fn artifact_library_ui(
             response.request_focus();
             state.focus_search = false;
         }
+        // Live-run finding: egui 0.35 leaves the field focused on Escape
+        // (TextEdit's event filter neither consumes nor surrenders it), so
+        // the first press must give the field up here; the guard above then
+        // lets the second press close the panel.
+        if response.has_focus() && ui.input(|input| input.key_pressed(Key::Escape)) {
+            response.surrender_focus();
+        }
         state.search_had_focus = response.has_focus() || focus_requested;
         if response.changed() {
             action.query_changed = true;
