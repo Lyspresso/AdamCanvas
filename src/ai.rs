@@ -2275,7 +2275,12 @@ fn preset_process_spec_with_tuning(
                 request.permission_mode,
                 PermissionMode::Auto | PermissionMode::Bypass
             ) && request.workspace_mode != AiWorkspaceMode::Chat
+                || cwd.as_deref().is_some_and(is_chat_sandbox_root)
             {
+                // A chat-sandbox working folder gets the CLI's own
+                // workspace sandbox in every mode: the OS layer confines
+                // writes to the Adam-owned folder, which is exactly the
+                // containment the sandbox exists to provide.
                 "workspace"
             } else {
                 "read-only"
@@ -3361,10 +3366,13 @@ fn path_stays_within(root: &Path, candidate: &Path) -> bool {
     resolved.starts_with(root)
 }
 
-/// A file edit whose every reported location stays inside the chat's own
-/// sandbox is as safe as replying with text: Adam created that folder so the
-/// agent can hand the user files (user decision, 2026-08-02). Empty location
-/// lists fail closed — an edit that names no target earns no trust.
+/// A file edit in a chat-sandbox run is as safe as replying with text:
+/// Adam created that folder so the agent can hand the user files (user
+/// decision, 2026-08-02), and the CLI is launched with its own workspace
+/// sandbox rooted there, so the OS layer already confines writes to the
+/// folder. A request that reports locations must keep every one inside the
+/// root — explicit evidence of escape is still denied — while a request
+/// that names none rides the enforced containment.
 fn sandbox_scoped_file_edit<'a>(
     sandbox_root: Option<&Path>,
     locations: impl Iterator<Item = &'a str>,
@@ -3372,14 +3380,9 @@ fn sandbox_scoped_file_edit<'a>(
     let Some(root) = sandbox_root else {
         return false;
     };
-    let mut seen = 0_usize;
-    for location in locations {
-        seen += 1;
-        if !path_stays_within(root, Path::new(location)) {
-            return false;
-        }
-    }
-    seen > 0
+    locations
+        .into_iter()
+        .all(|location| path_stays_within(root, Path::new(location)))
 }
 
 #[cfg(test)]
@@ -4541,8 +4544,12 @@ fn kimi_acp_permission_decision_scoped(
             }
         }
     };
+    // Unlike Grok, Kimi's launch does not pin an OS sandbox to the working
+    // folder, so a location-less edit earns no trust here: explicit in-root
+    // locations remain required.
     let sandbox_edit = delegation.is_none()
         && matches!(permission.tool_call.kind, Some(KimiAcpToolKind::Edit))
+        && !permission.tool_call.locations.is_empty()
         && sandbox_scoped_file_edit(
             sandbox_root,
             permission
@@ -11974,7 +11981,9 @@ mod tests {
             GrokAcpPermissionDecision::Reject { .. }
         ));
 
-        // An edit that names no target earns no trust.
+        // Grok's permission requests may omit locations; the CLI's own
+        // workspace sandbox (launched rooted at the chat sandbox) is the
+        // containment, so the edit is still allowed.
         let bare = acp_permission("Write", GrokAcpToolKind::Edit);
         assert!(matches!(
             grok_acp_permission_decision_scoped(
@@ -11986,7 +11995,7 @@ mod tests {
                 Some(&sandbox),
                 &blocked,
             ),
-            GrokAcpPermissionDecision::Reject { .. }
+            GrokAcpPermissionDecision::Allow { .. }
         ));
 
         // A run whose working folder is not a chat sandbox keeps the old
