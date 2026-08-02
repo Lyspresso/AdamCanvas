@@ -35,7 +35,7 @@ PR descriptions of the W series).
   Windows test rig until a physical machine exists.
 - Unix-only tests gated `#[cfg(unix)]` (asset symlink/metadata tests).
 
-### W2 — shared saves (requirement 2's main work)
+### W2 — shared saves (requirement 2's main work) — *shipped in the W2 PR*
 - Persist data-root-relative paths for everything under the data root
   (managed assets, chat sandboxes); resolve against the *current* root on
   load. Absolute user paths (chosen working folders, file tiles pointing at

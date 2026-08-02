@@ -376,7 +376,13 @@ pub fn load_workspace(paths: &AppPaths) -> anyhow::Result<Workspace> {
                 },
             };
             let base = workspace.clone();
-            if rebase_legacy_paths(paths, &mut workspace) {
+            let mut changed = rebase_legacy_paths(paths, &mut workspace);
+            if let Ok(stamp) = serde_json::from_slice::<DataRootStamp>(&bytes)
+                && let Some(stored_root) = stamp.data_root.as_deref()
+            {
+                changed |= rebase_foreign_data_root(stored_root, paths, &mut workspace);
+            }
+            if changed {
                 workspace = save_workspace_merged(paths, &base, &workspace)?;
             }
             Ok(workspace.normalized())
@@ -442,6 +448,134 @@ fn rebase_legacy_paths(paths: &AppPaths, workspace: &mut Workspace) -> bool {
             let replacement = paths.root.join(relative);
             if replacement.exists() && *path != replacement {
                 *path = replacement;
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// The data root that wrote a library, read from the raw bytes so the typed
+/// workspace document and its three-way merge stay untouched. Written by
+/// every save; absent in libraries from builds before the Windows series.
+#[derive(serde::Deserialize)]
+struct DataRootStamp {
+    #[serde(default)]
+    data_root: Option<String>,
+}
+
+/// Strips `stored_root` off the front of a stored path string, tolerating
+/// the other OS's separator style and, for Windows-shaped roots, ASCII case
+/// differences in the drive letter and folders. Returns the remainder when
+/// the path lives under the root.
+fn stored_path_strip_root<'a>(candidate: &'a str, stored_root: &str) -> Option<&'a str> {
+    fn normalize(byte: u8, case_insensitive: bool) -> u8 {
+        let byte = if byte == b'\\' { b'/' } else { byte };
+        if case_insensitive {
+            byte.to_ascii_lowercase()
+        } else {
+            byte
+        }
+    }
+    let stored_root = stored_root.trim_end_matches(['/', '\\']);
+    if stored_root.is_empty() || candidate.len() < stored_root.len() {
+        return None;
+    }
+    // Windows paths are case-insensitive in practice; unix roots stay exact.
+    let windows_shaped = stored_root
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && stored_root.as_bytes().get(1) == Some(&b':');
+    let (head, tail) = candidate.split_at(stored_root.len());
+    let matches = head
+        .bytes()
+        .zip(stored_root.bytes())
+        .all(|(left, right)| normalize(left, windows_shaped) == normalize(right, windows_shaped));
+    if !matches {
+        return None;
+    }
+    match tail.bytes().next() {
+        None => Some(""),
+        Some(b'/') | Some(b'\\') => Some(tail),
+        Some(_) => None,
+    }
+}
+
+fn rebase_stored_path(candidate: &str, stored_root: &str, current_root: &Path) -> Option<PathBuf> {
+    let remainder = stored_path_strip_root(candidate, stored_root)?;
+    let mut rebased = current_root.to_path_buf();
+    for part in remainder
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
+        rebased.push(part);
+    }
+    Some(rebased)
+}
+
+/// Rewrites every path that lived under the writing machine's data root so
+/// it lives under this machine's data root instead: file tiles, trashed
+/// tile snapshots, and chat working folders (the per-chat sandboxes).
+/// Absolute paths outside the stored root — user-chosen folders, external
+/// files — pass through untouched, so a foreign OS session can never mangle
+/// them. This is what lets one library travel between a Mac and a Windows
+/// machine.
+fn rebase_foreign_data_root(
+    stored_root: &str,
+    paths: &AppPaths,
+    workspace: &mut Workspace,
+) -> bool {
+    let current_root = &paths.root;
+    if stored_path_strip_root(&current_root.to_string_lossy(), stored_root) == Some("") {
+        return false;
+    }
+    let mut changed = false;
+    for page in &mut workspace.pages {
+        for tile in &mut page.tiles {
+            let crate::model::TileContent::File { path, .. } = &mut tile.content else {
+                continue;
+            };
+            let stored = path.to_string_lossy().into_owned();
+            if let Some(rebased) = rebase_stored_path(&stored, stored_root, current_root)
+                && *path != rebased
+            {
+                *path = rebased;
+                changed = true;
+            }
+        }
+    }
+    for item in workspace.domain.trash.items.values_mut() {
+        for pointer in ["/tile/content", "/content"] {
+            let Some(content) = item.snapshot.pointer_mut(pointer) else {
+                continue;
+            };
+            let Some(object) = content.as_object_mut() else {
+                continue;
+            };
+            if object.get("type").and_then(serde_json::Value::as_str) != Some("file") {
+                continue;
+            }
+            let Some(stored) = object.get("path").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if let Some(rebased) = rebase_stored_path(stored, stored_root, current_root) {
+                let rebased = rebased.to_string_lossy().into_owned();
+                if stored != rebased {
+                    object.insert("path".into(), serde_json::Value::String(rebased));
+                    changed = true;
+                }
+            }
+        }
+    }
+    for conversation in workspace.domain.conversations.conversations.values_mut() {
+        let Some(directory) = conversation.settings.working_directory.as_deref() else {
+            continue;
+        };
+        if let Some(rebased) = rebase_stored_path(directory, stored_root, current_root) {
+            let rebased = rebased.to_string_lossy().into_owned();
+            if conversation.settings.working_directory.as_deref() != Some(rebased.as_str()) {
+                conversation.settings.working_directory = Some(rebased);
                 changed = true;
             }
         }
@@ -1049,6 +1183,14 @@ fn write_workspace_locked(paths: &AppPaths, workspace: &Workspace) -> anyhow::Re
     for conversation_id in deleted_conversations {
         scrub_deleted_conversation_json(&mut next_json, *conversation_id, 0);
     }
+    // Stamped after the unknown-member carry-forward so a foreign library's
+    // stamp can never survive a save on this machine.
+    if let Some(root_object) = next_json.as_object_mut() {
+        root_object.insert(
+            "data_root".into(),
+            serde_json::Value::String(paths.root.to_string_lossy().into_owned()),
+        );
+    }
     let bytes = serde_json::to_vec_pretty(&next_json)?;
     let unchanged = previous.as_deref() == Some(bytes.as_slice());
     if !deleted_conversations.is_empty() {
@@ -1639,6 +1781,166 @@ mod tests {
             !fs::read_to_string(&paths.library)
                 .unwrap()
                 .contains("Mosaic")
+        );
+    }
+
+    #[test]
+    fn windows_written_library_rebases_onto_the_current_mac_shaped_root() {
+        let stored_root = "C:\\Users\\lyd\\AppData\\Local\\Adam";
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path().join("Adam"));
+
+        let mut workspace = Workspace::default();
+        workspace
+            .active_page_mut()
+            .add_tile(crate::model::Tile::from_file(
+                "C:\\Users\\lyd\\AppData\\Local\\Adam\\assets\\readable\\ab\\photo.png",
+                crate::model::WorldRect::new(0.0, 0.0, 100.0, 100.0),
+            ));
+        workspace
+            .active_page_mut()
+            .add_tile(crate::model::Tile::from_file(
+                "D:\\Elsewhere\\report.docx",
+                crate::model::WorldRect::new(120.0, 0.0, 100.0, 100.0),
+            ));
+
+        let changed = rebase_foreign_data_root(stored_root, &paths, &mut workspace);
+        assert!(changed);
+        let crate::model::TileContent::File { path, .. } =
+            &workspace.active_page().tiles[0].content
+        else {
+            panic!("expected file tile");
+        };
+        assert_eq!(
+            path,
+            &paths
+                .root
+                .join("assets")
+                .join("readable")
+                .join("ab")
+                .join("photo.png"),
+            "managed paths must land under this machine's root"
+        );
+        let crate::model::TileContent::File { path, .. } =
+            &workspace.active_page().tiles[1].content
+        else {
+            panic!("expected file tile");
+        };
+        assert_eq!(
+            path,
+            std::path::Path::new("D:\\Elsewhere\\report.docx"),
+            "paths outside the stored root must never be touched"
+        );
+    }
+
+    #[test]
+    fn mac_written_library_rebases_paths_including_spaces() {
+        let stored_root = "/Users/lyd/Library/Application Support/Adam";
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path().join("Adam"));
+
+        let mut workspace = Workspace::default();
+        workspace
+            .active_page_mut()
+            .add_tile(crate::model::Tile::from_file(
+                "/Users/lyd/Library/Application Support/Adam/assets/readable/cd/My Photo.png",
+                crate::model::WorldRect::new(0.0, 0.0, 100.0, 100.0),
+            ));
+
+        assert!(rebase_foreign_data_root(
+            stored_root,
+            &paths,
+            &mut workspace
+        ));
+        let crate::model::TileContent::File { path, .. } =
+            &workspace.active_page().tiles[0].content
+        else {
+            panic!("expected file tile");
+        };
+        assert_eq!(
+            path,
+            &paths
+                .root
+                .join("assets")
+                .join("readable")
+                .join("cd")
+                .join("My Photo.png")
+        );
+    }
+
+    #[test]
+    fn same_root_library_is_left_completely_alone() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path().join("Adam"));
+        let managed = paths.root.join("assets").join("readable").join("x.png");
+        let mut workspace = Workspace::default();
+        workspace
+            .active_page_mut()
+            .add_tile(crate::model::Tile::from_file(
+                &managed,
+                crate::model::WorldRect::new(0.0, 0.0, 100.0, 100.0),
+            ));
+        let stored_root = paths.root.to_string_lossy().into_owned();
+        assert!(!rebase_foreign_data_root(
+            &stored_root,
+            &paths,
+            &mut workspace
+        ));
+    }
+
+    #[test]
+    fn saves_stamp_the_data_root_and_loads_rebase_foreign_stamps() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path().join("Adam"));
+        let workspace = Workspace::default();
+        save_workspace_atomic(&paths, &workspace).unwrap();
+        let written = fs::read_to_string(&paths.library).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            value["data_root"].as_str(),
+            Some(paths.root.to_string_lossy().as_ref()),
+            "every save stamps the root that wrote it"
+        );
+
+        // Simulate the same library arriving from a Windows machine: foreign
+        // stamp plus a managed tile path under that foreign root.
+        let mut foreign: serde_json::Value = serde_json::from_str(&written).unwrap();
+        foreign["data_root"] =
+            serde_json::Value::String("C:\\Users\\lyd\\AppData\\Local\\Adam".into());
+        let mut tile = serde_json::to_value(crate::model::Tile::from_file(
+            "C:\\Users\\lyd\\AppData\\Local\\Adam\\assets\\readable\\ef\\pic.png",
+            crate::model::WorldRect::new(0.0, 0.0, 64.0, 64.0),
+        ))
+        .unwrap();
+        // Serialized tiles carry their id; keep it stable across the insert.
+        tile["id"] = serde_json::Value::String(Uuid::new_v4().to_string());
+        // A Windows-written tile has a real basename title; from_file on this
+        // OS cannot split the foreign separator, so set it explicitly.
+        tile["title"] = serde_json::Value::String("pic.png".into());
+        foreign["pages"][0]["tiles"]
+            .as_array_mut()
+            .unwrap()
+            .push(tile);
+        fs::write(&paths.library, serde_json::to_vec_pretty(&foreign).unwrap()).unwrap();
+
+        let loaded = load_workspace(&paths).unwrap();
+        let rebased = loaded.pages[0].tiles.iter().any(|tile| {
+            matches!(
+                &tile.content,
+                crate::model::TileContent::File { path, .. }
+                    if path == &paths
+                        .root
+                        .join("assets")
+                        .join("readable")
+                        .join("ef")
+                        .join("pic.png")
+            )
+        });
+        assert!(rebased, "loading must rebase the foreign managed path");
+        let saved_back = fs::read_to_string(&paths.library).unwrap();
+        assert!(
+            !saved_back.contains("C:\\\\Users"),
+            "the rewritten library must not retain foreign managed paths"
         );
     }
 
