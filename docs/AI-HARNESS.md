@@ -624,7 +624,13 @@ already created. Updating pre-existing host data does not falsely claim it as
 a newly produced deliverable.
 
 The first eight artifacts are shown by default, with an explicit Show all
-control. Text and Markdown outputs open in a wider in-app File view with path,
+control that opens the artifact library — a searchable surface spanning every
+conversation, grouped by the chat that produced each artifact and ordered by
+newest output. Deleted artifacts stay visibly struck there, canvas items carry
+their reconciled available / in-Trash / missing state with a jump to their
+page, and file rows keep Preview and Reveal, each scoped to the owning
+conversation's working folder. Text and Markdown outputs open in a wider
+in-app File view with path,
 size, selectable content, Reveal, missing-file feedback, and a 256 KiB preview
 bound. Unsupported binary files remain revealable without being decoded as
 text. Provider-reported paths are canonicalized and must remain inside the

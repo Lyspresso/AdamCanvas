@@ -7,6 +7,7 @@ pub(crate) mod ai_task_bridge;
 pub(crate) mod ai_task_tools;
 pub mod ai_tool_gate;
 pub mod app;
+pub mod artifact_library;
 pub mod assets;
 pub mod automation;
 pub mod chat_core;
