@@ -34,6 +34,7 @@ const DOMAIN_KNOWN_JSON_FIELDS: &[&str] = &[
 ];
 const CONVERSATION_STORE_KNOWN_JSON_FIELDS: &[&str] =
     &["conversations", "tile_links", "deleted_conversations"];
+const PATHWAY_STORE_KNOWN_JSON_FIELDS: &[&str] = &["pathways", "assignments", "events"];
 static LIBRARY_PROCESS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
@@ -697,6 +698,12 @@ fn carry_forward_unknown_workspace_members(
         next,
         "/domain/conversations",
         CONVERSATION_STORE_KNOWN_JSON_FIELDS,
+    );
+    carry_forward_unknown_object_members(
+        previous,
+        next,
+        "/domain/pathways",
+        PATHWAY_STORE_KNOWN_JSON_FIELDS,
     );
 }
 
@@ -1646,6 +1653,10 @@ mod tests {
         assert_eq!(
             keys_at(&workspace, "/domain/conversations"),
             listed(CONVERSATION_STORE_KNOWN_JSON_FIELDS)
+        );
+        assert_eq!(
+            keys_at(&workspace, "/domain/pathways"),
+            listed(PATHWAY_STORE_KNOWN_JSON_FIELDS)
         );
     }
 
@@ -2877,6 +2888,8 @@ mod tests {
         future_json["future_root"] = serde_json::Value::Null;
         future_json["domain"]["future_domain"] = serde_json::json!({"newer": true, "count": 2});
         future_json["domain"]["conversations"]["future_store"] = serde_json::json!(["keep", 27]);
+        future_json["domain"]["pathways"]["future_store"] =
+            serde_json::json!({"preserve": "pathway metadata"});
         fs::write(
             &paths.library,
             serde_json::to_vec_pretty(&future_json).unwrap(),
@@ -2901,6 +2914,10 @@ mod tests {
             assert_eq!(
                 json["domain"]["conversations"]["future_store"],
                 serde_json::json!(["keep", 27])
+            );
+            assert_eq!(
+                json["domain"]["pathways"]["future_store"],
+                serde_json::json!({"preserve": "pathway metadata"})
             );
             assert_eq!(json["pages"][0]["name"], expected_page_name);
             assert!(
@@ -3391,7 +3408,7 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_pathway_events_are_unioned_with_fresh_sequences() {
+    fn concurrent_pathway_events_append_without_renumbering_committed_rows() {
         let temporary = tempfile::tempdir().unwrap();
         let paths = AppPaths::at(temporary.path());
         let pathway_id = Uuid::from_u128(81_000);
@@ -3421,7 +3438,7 @@ mod tests {
                 .iter()
                 .map(|event| (event.id, event.sequence))
                 .collect::<Vec<_>>(),
-            vec![(Uuid::from_u128(81_011), 1), (Uuid::from_u128(81_012), 2)]
+            vec![(Uuid::from_u128(81_012), 1), (Uuid::from_u128(81_011), 2)]
         );
     }
 

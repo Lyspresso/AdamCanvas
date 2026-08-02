@@ -161,9 +161,14 @@ fn canonical_uuid_cmp(left: &Uuid, right: &Uuid) -> Ordering {
 }
 
 fn indexed_cmp(left_index: f64, left_id: &Uuid, right_index: f64, right_id: &Uuid) -> Ordering {
-    left_index
-        .total_cmp(&right_index)
-        .then_with(|| canonical_uuid_cmp(left_id, right_id))
+    // Numeric tuple ordering treats signed zeroes as the same sort index.
+    // `total_cmp` alone would put -0 before +0 and bypass the UUID tie-break.
+    let index_order = if left_index == right_index {
+        Ordering::Equal
+    } else {
+        left_index.total_cmp(&right_index)
+    };
+    index_order.then_with(|| canonical_uuid_cmp(left_id, right_id))
 }
 
 pub fn first_node(pathway: &Pathway) -> Option<&PathwayNode> {
@@ -325,6 +330,9 @@ pub fn line_boundaries(
 
     let dx = end.x - start.x;
     let dy = end.y - start.y;
+    if !dx.is_finite() || !dy.is_finite() {
+        return Vec::new();
+    }
     let mut lower = 0.0;
     let mut upper = 1.0;
     if !liang_barsky_clip(-dx, start.x - rect.min_x(), &mut lower, &mut upper)
@@ -383,7 +391,13 @@ pub fn tile_membership_boundaries(
     pile_frame: PathwayRect,
     mode: ContainmentMode,
 ) -> Vec<PathwayBoundary> {
-    if !tile_size.is_valid() || !pile_frame.is_valid() {
+    if !point_is_finite(start_center)
+        || !point_is_finite(end_center)
+        || !(end_center.x - start_center.x).is_finite()
+        || !(end_center.y - start_center.y).is_finite()
+        || !tile_size.is_valid()
+        || !pile_frame.is_valid()
+    {
         return Vec::new();
     }
     let half_width = tile_size.width / 2.0;
@@ -566,10 +580,18 @@ fn majority_boundaries(
             let discriminant = b * b - 4.0 * a * c;
             if discriminant >= -MAJORITY_COEFFICIENT_EPSILON {
                 let square_root = discriminant.max(0.0).sqrt();
-                for root in [
-                    (-b - square_root) / (2.0 * a),
-                    (-b + square_root) / (2.0 * a),
-                ] {
+                // The textbook formula loses the small root when `b` and
+                // `sqrt(discriminant)` nearly cancel (common when one overlap
+                // dimension is mathematically constant but coefficient
+                // recovery leaves a tiny slope). `q` computes the large root
+                // without subtraction; Vieta's relation recovers the other.
+                let q = -0.5 * (b + square_root.copysign(b));
+                let candidate_roots = if q.abs() < MAJORITY_COEFFICIENT_EPSILON {
+                    [-b / (2.0 * a), f64::NAN]
+                } else {
+                    [q / a, c / q]
+                };
+                for root in candidate_roots {
                     if root >= lower - MAJORITY_ROOT_EPSILON
                         && root <= upper + MAJORITY_ROOT_EPSILON
                     {
@@ -800,12 +822,13 @@ mod tests {
         let lower_id = Uuid::from_u128(0x0a);
         let upper_id = Uuid::from_u128(0x0b);
         for id in [upper_id, lower_id] {
+            let sort_index = if id == upper_id { -0.0 } else { 0.0 };
             pathway.nodes.insert(
                 id,
                 PathwayNode::new(
                     id,
                     point(f64::from(id.as_bytes()[15]), 0.0),
-                    4.0,
+                    sort_index,
                     "Equal",
                     PathwayNodeKind::Destination,
                     0.0,
@@ -817,9 +840,10 @@ mod tests {
         assert_eq!(first_node(&pathway).map(|node| node.id), Some(lower_id));
 
         for id in [upper_id, lower_id] {
+            let sort_index = if id == upper_id { -0.0 } else { 0.0 };
             pathway.segments.insert(
                 id,
-                PathwaySegment::new(id, start_id, end_id, 9.0, 80.0, now).unwrap(),
+                PathwaySegment::new(id, start_id, end_id, sort_index, 80.0, now).unwrap(),
             );
         }
         assert_eq!(
@@ -975,6 +999,52 @@ mod tests {
     }
 
     #[test]
+    fn majority_overlap_uses_stable_roots_for_nearly_linear_pieces() {
+        let start = point(3_668.256_572_041_271_3, 191.729_484_176_361_44);
+        let end = point(-3_064.412_431_818_601_4, 6_975.776_159_043_206);
+        let tile = PathwaySize::new(462.876_333_730_713_55, 248.919_612_837_896_38);
+        let pile = PathwayRect::new(
+            318.355_719_351_928_2,
+            1_918.917_973_932_316_3,
+            1_446.135_859_525_723_2,
+            1_221.636_548_455_931_5,
+        );
+        let boundaries =
+            tile_membership_boundaries(start, end, tile, pile, ContainmentMode::MajorityOverlap);
+        let exit = boundaries
+            .iter()
+            .find(|boundary| !boundary.enters)
+            .expect("the route must leave strict-majority overlap");
+
+        // Refine a dense sampled bracket into an independent predicate oracle.
+        let qualifies = |progress: f64| {
+            is_strict_majority_overlap(interpolate(start, end, progress), tile, pile)
+        };
+        let samples = 100_000_u32;
+        let mut bracket = None;
+        let mut previous = qualifies(0.0);
+        for index in 1..=samples {
+            let progress = f64::from(index) / f64::from(samples);
+            let current = qualifies(progress);
+            if previous && !current {
+                bracket = Some((progress - 1.0 / f64::from(samples), progress));
+                break;
+            }
+            previous = current;
+        }
+        let (mut lower, mut upper) = bracket.expect("sampled oracle must bracket the exit");
+        for _ in 0..80 {
+            let middle = (lower + upper) / 2.0;
+            if qualifies(middle) {
+                lower = middle;
+            } else {
+                upper = middle;
+            }
+        }
+        assert!((exit.progress - (lower + upper) / 2.0).abs() <= 1e-9);
+    }
+
+    #[test]
     fn exact_half_overlap_plateau_has_no_majority_boundaries() {
         let tile = PathwaySize::new(100.0, 100.0);
         let pile = PathwayRect::new(0.0, -100.0, 100.0, 400.0);
@@ -1016,6 +1086,14 @@ mod tests {
                 PathwaySize::new(0.0, 1.0),
                 PathwayRect::new(0.0, 0.0, 1.0, 1.0),
                 ContainmentMode::CenterInside,
+            )
+            .is_empty()
+        );
+        assert!(
+            line_boundaries(
+                point(-f64::MAX, 0.0),
+                point(f64::MAX, 0.0),
+                PathwayRect::new(0.0, 0.0, 1.0, 1.0),
             )
             .is_empty()
         );

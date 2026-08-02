@@ -127,6 +127,8 @@ pub enum DomainError {
     HumanRequiredForPermanentDelete,
     #[error("invalid pathway: {0}")]
     InvalidPathway(String),
+    #[error("pathway event sequence is exhausted")]
+    PathwaySequenceExhausted,
     #[error("{0}")]
     InvalidRule(String),
 }
@@ -4319,16 +4321,63 @@ pub enum PathwayMergeError {
     ReorderedBaseEvents { log: &'static str },
     #[error("pathway event {0} has conflicting immutable contents")]
     ConflictingEvent(Uuid),
-    #[error("pathway event histories contain incompatible causal order")]
-    EventOrderCycle,
+    #[error("pathway event sequence is exhausted")]
+    SequenceExhausted,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PathwayStore {
     pub pathways: BTreeMap<PathwayId, Pathway>,
     pub assignments: BTreeMap<PathwayAssignmentId, PathwayAssignment>,
     events: Vec<PathwayEvent>,
+}
+
+impl<'de> Deserialize<'de> for PathwayStore {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Default, Deserialize)]
+        #[serde(default, rename_all = "camelCase")]
+        struct PersistedPathwayStore {
+            pathways: BTreeMap<PathwayId, Pathway>,
+            assignments: BTreeMap<PathwayAssignmentId, PathwayAssignment>,
+            events: Vec<JsonValue>,
+        }
+
+        let persisted = PersistedPathwayStore::deserialize(deserializer)?;
+        // Decode ledger rows independently. A future event kind or one damaged
+        // row must not make the entire Workspace unreadable; retain every
+        // valid row whose identity and sequence still advance the log.
+        let mut events = Vec::with_capacity(persisted.events.len());
+        let mut event_ids = BTreeSet::new();
+        let mut last_sequence = 0;
+        let mut skipped = 0usize;
+        for value in persisted.events {
+            let Ok(event) = serde_json::from_value::<PathwayEvent>(value) else {
+                skipped = skipped.saturating_add(1);
+                continue;
+            };
+            if event.sequence == 0 || event.sequence <= last_sequence || !event_ids.insert(event.id)
+            {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+            last_sequence = event.sequence;
+            events.push(event);
+        }
+        if skipped > 0 {
+            log::warn!(
+                "ignored {skipped} invalid or unsupported pathway event record(s) while loading"
+            );
+        }
+        Ok(Self {
+            pathways: persisted.pathways,
+            assignments: persisted.assignments,
+            events,
+        })
+    }
 }
 
 impl PathwayStore {
@@ -4386,11 +4435,13 @@ impl PathwayStore {
         if self.events.iter().any(|existing| existing.id == event.id) {
             return Err(DomainError::DuplicateId(event.id));
         }
-        event.sequence = self
-            .events
-            .last()
-            .map(|event| event.sequence.saturating_add(1))
-            .unwrap_or(1);
+        event.sequence = match self.events.last() {
+            Some(event) => event
+                .sequence
+                .checked_add(1)
+                .ok_or(DomainError::PathwaySequenceExhausted)?,
+            None => 1,
+        };
         let sequence = event.sequence;
         self.events.push(event);
         Ok(sequence)
@@ -4494,6 +4545,9 @@ fn validate_pathway_event_log(
                 id: event.id,
             });
         }
+        if event.sequence == 0 {
+            return Err(PathwayMergeError::NonMonotonicSequence { log: source });
+        }
         if previous_sequence.is_some_and(|previous| event.sequence <= previous) {
             return Err(PathwayMergeError::NonMonotonicSequence { log: source });
         }
@@ -4555,72 +4609,27 @@ fn merge_pathway_events(
         }
     }
 
-    let retained = records.keys().copied().collect::<BTreeSet<_>>();
-    let mut earliest_position = retained
-        .iter()
-        .copied()
-        .map(|id| (id, usize::MAX))
-        .collect::<BTreeMap<_, _>>();
-    let mut outgoing = retained
-        .iter()
-        .copied()
-        .map(|id| (id, BTreeSet::new()))
-        .collect::<BTreeMap<_, _>>();
-    let mut indegree = retained
-        .iter()
-        .copied()
-        .map(|id| (id, 0usize))
-        .collect::<BTreeMap<_, _>>();
-
-    for source in [base, local, remote] {
-        for (position, event) in source.iter().enumerate() {
-            let earliest = earliest_position
-                .get_mut(&event.id)
-                .expect("every source event was retained");
-            *earliest = (*earliest).min(position);
+    // `remote` is the already-committed library held under the save lock.
+    // Its rows and sequences are immutable. Concurrent local-only rows commit
+    // after that durable tail in their own causal order; exact transition time
+    // remains in `at`, while `sequence` records durable commit order.
+    let remote_ids = remote.iter().map(|event| event.id).collect::<BTreeSet<_>>();
+    let mut merged = remote.to_vec();
+    let mut tail_sequence = merged.last().map(|event| event.sequence).unwrap_or(0);
+    for local_event in local {
+        if remote_ids.contains(&local_event.id) {
+            continue;
         }
-        for pair in source.windows(2) {
-            let from = pair[0].id;
-            let to = pair[1].id;
-            if from != to
-                && outgoing
-                    .get_mut(&from)
-                    .expect("every source event was retained")
-                    .insert(to)
-            {
-                *indegree
-                    .get_mut(&to)
-                    .expect("every source event was retained") += 1;
-            }
-        }
-    }
-
-    let rank = |id: Uuid| (earliest_position[&id], id);
-    let mut ready = indegree
-        .iter()
-        .filter_map(|(id, degree)| (*degree == 0).then_some(rank(*id)))
-        .collect::<BTreeSet<_>>();
-    let mut ordered = Vec::with_capacity(records.len());
-    while let Some((_, id)) = ready.pop_first() {
         let mut event = records
-            .remove(&id)
-            .expect("ready pathway event must still be retained");
-        event.sequence = ordered.len() as u64 + 1;
-        ordered.push(event);
-        for successor in outgoing.get(&id).into_iter().flatten() {
-            let degree = indegree
-                .get_mut(successor)
-                .expect("every successor was retained");
-            *degree = degree.saturating_sub(1);
-            if *degree == 0 {
-                ready.insert(rank(*successor));
-            }
-        }
+            .remove(&local_event.id)
+            .expect("every local pathway event was retained");
+        tail_sequence = tail_sequence
+            .checked_add(1)
+            .ok_or(PathwayMergeError::SequenceExhausted)?;
+        event.sequence = tail_sequence;
+        merged.push(event);
     }
-    if !records.is_empty() {
-        return Err(PathwayMergeError::EventOrderCycle);
-    }
-    Ok(ordered)
+    Ok(merged)
 }
 
 /// One backward-compatible persistence field can hold Adam's complete semantic
@@ -7853,6 +7862,15 @@ mod tests {
     }
 
     #[test]
+    fn workspace_without_a_pathways_field_decodes_an_empty_container() {
+        let mut value = serde_json::to_value(Workspace::default()).unwrap();
+        value["domain"].as_object_mut().unwrap().remove("pathways");
+
+        let decoded: Workspace = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.domain.pathways, PathwayStore::default());
+    }
+
+    #[test]
     fn pathway_history_rejects_duplicates_and_assigns_monotonic_sequences() {
         let (mut store, pathway_id) = pathway_fixture();
         let operation_id = id(8_100);
@@ -7883,7 +7901,7 @@ mod tests {
     }
 
     #[test]
-    fn pathway_merge_unions_concurrent_events_and_resequences_them() {
+    fn pathway_merge_preserves_committed_sequences_and_appends_local_events() {
         let (mut base, pathway_id) = pathway_fixture();
         base.append_event(pathway_event(
             8_020,
@@ -7912,8 +7930,6 @@ mod tests {
             .unwrap();
 
         let merged = PathwayStore::merge_persisted(&base, &local, &remote).unwrap();
-        let swapped = PathwayStore::merge_persisted(&base, &remote, &local).unwrap();
-        assert_eq!(merged, swapped);
         assert_eq!(
             merged
                 .events()
@@ -7922,6 +7938,61 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(id(8_020), 1), (id(8_021), 2), (id(8_022), 3)]
         );
+    }
+
+    #[test]
+    fn pathway_history_decode_salvages_bad_rows_and_append_refuses_overflow() {
+        let (mut store, pathway_id) = pathway_fixture();
+        store
+            .append_event(pathway_event(
+                8_020,
+                pathway_id,
+                1,
+                PathwayEventKind::Assigned,
+            ))
+            .unwrap();
+
+        let mut duplicate = store.clone();
+        let mut repeated = duplicate.events()[0].clone();
+        repeated.sequence = 2;
+        duplicate.events.push(repeated);
+        let decoded: PathwayStore =
+            serde_json::from_value(serde_json::to_value(duplicate).unwrap()).unwrap();
+        assert_eq!(decoded.events(), store.events());
+
+        let mut non_monotonic = store.clone();
+        let mut later = pathway_event(8_021, pathway_id, 2, PathwayEventKind::ConfigurationChanged);
+        later.sequence = 1;
+        non_monotonic.events.push(later);
+        let decoded: PathwayStore =
+            serde_json::from_value(serde_json::to_value(non_monotonic).unwrap()).unwrap();
+        assert_eq!(decoded.events(), store.events());
+
+        let mut future = serde_json::to_value(&store).unwrap();
+        let mut unknown = serde_json::to_value(pathway_event(
+            8_023,
+            pathway_id,
+            3,
+            PathwayEventKind::ConfigurationChanged,
+        ))
+        .unwrap();
+        unknown["sequence"] = json!(2);
+        unknown["kind"] = json!("futureEventKind");
+        future["events"].as_array_mut().unwrap().push(unknown);
+        let decoded: PathwayStore = serde_json::from_value(future).unwrap();
+        assert_eq!(decoded.events(), store.events());
+
+        store.events.last_mut().unwrap().sequence = u64::MAX;
+        assert_eq!(
+            store.append_event(pathway_event(
+                8_022,
+                pathway_id,
+                3,
+                PathwayEventKind::ConfigurationChanged,
+            )),
+            Err(DomainError::PathwaySequenceExhausted)
+        );
+        assert_eq!(store.events().len(), 1);
     }
 
     #[test]
