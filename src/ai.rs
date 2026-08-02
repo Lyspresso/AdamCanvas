@@ -1670,14 +1670,27 @@ pub(crate) fn version_banner_matches_provider(provider_id: &str, version: &CliVe
             if provider_id != "grok_cli" {
                 return false;
             }
-            let Some(build) = tail
+            let Some(rest) = tail
                 .strip_prefix(&numeric)
                 .and_then(|suffix| suffix.strip_prefix(" ("))
-                .and_then(|suffix| suffix.strip_suffix(')'))
             else {
                 return false;
             };
-            !build.is_empty() && build.bytes().all(|byte| byte.is_ascii_hexdigit())
+            let Some((build, after)) = rest.split_once(')') else {
+                return false;
+            };
+            // Grok 0.2.117 started appending a release-channel tag after
+            // the build hash: "grok 0.2.117 (f1c06093089f) [stable]".
+            // Accept exactly one bracketed alphanumeric tag; anything else
+            // trailing still fails closed.
+            let channel_ok = after.is_empty()
+                || after
+                    .strip_prefix(" [")
+                    .and_then(|suffix| suffix.strip_suffix(']'))
+                    .is_some_and(|tag| {
+                        !tag.is_empty() && tag.bytes().all(|byte| byte.is_ascii_alphanumeric())
+                    });
+            channel_ok && !build.is_empty() && build.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
     })
 }
@@ -15786,6 +15799,9 @@ send({
     fn exact_provider_banners_match_only_captured_shapes() {
         for (provider_id, banner) in [
             ("grok_cli", "grok 0.2.117 (f1c06093089f)"),
+            // Captured live 2026-08-02: 0.2.117 appends a release-channel
+            // tag the earlier banners lacked.
+            ("grok_cli", "grok 0.2.117 (f1c06093089f) [stable]"),
             ("kimi_cli", "0.31.0"),
             ("kimi_cli", "kimi 0.31.0"),
             ("kimi_cli", "kimi, version 1.49.0"),
@@ -15803,6 +15819,9 @@ send({
             ("grok_cli", "kimi 0.2.117"),
             ("grok_cli", "grok 0.2.117 beta"),
             ("grok_cli", "grok 0.2.117 (prerelease)"),
+            ("grok_cli", "grok 0.2.117 (f1c06093089f) [stable] extra"),
+            ("grok_cli", "grok 0.2.117 (f1c06093089f) extra"),
+            ("grok_cli", "grok 0.2.117 (f1c06093089f) []"),
             ("kimi_cli", "python 0.31.0"),
             ("kimi_cli", "1.49.0"),
             ("kimi_cli", "kimi, version 1.49.0 rc1"),
