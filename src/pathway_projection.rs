@@ -3,6 +3,13 @@
 //! This module deliberately owns no clock, store, scheduler, or UI. Callers
 //! provide immutable domain values and an explicit instant; rendering and
 //! later reconciliation can therefore use the exact same arithmetic.
+//!
+//! The majority-overlap solver inherits the reference's `1e-8` progress
+//! deduplication and assumes transit across a tile edge occupies at least about
+//! `1e-8` of segment progress. At fantastically large segment-to-tile ratios,
+//! paired breakpoints can coalesce and omit a crossing. Adam's canvas scale is
+//! safely inside this numerical regime; changing the epsilon requires renewed
+//! reference-parity and root-stability validation.
 
 use crate::domain::{
     ContainmentMode, Pathway, PathwayAssignment, PathwayAssignmentState, PathwayNode, PathwayPoint,

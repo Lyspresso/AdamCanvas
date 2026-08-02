@@ -1608,8 +1608,8 @@ mod tests {
         chat_core::{ActivityEvent, ActivityKind, HostMutationKind},
         domain::{
             AiCheckpoint, AiConversation, HostArtifactOrigin, MessageRole, PaletteColor, Pathway,
-            PathwayEvent, PathwayEventKind, PathwayEventPayload, PermissionMode, TrashItem,
-            UnixMicros, UnixMillis,
+            PathwayAssignment, PathwayAssignmentState, PathwayEvent, PathwayEventKind,
+            PathwayEventPayload, PathwayPoint, PermissionMode, TrashItem, UnixMicros, UnixMillis,
         },
         model::WorldRect,
         photo_details::PhotoRecord,
@@ -3408,6 +3408,46 @@ mod tests {
     }
 
     #[test]
+    fn load_then_save_reemits_a_future_pathway_event_row() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let pathway_id = Uuid::from_u128(80_100);
+        let base = workspace_with_pathway(pathway_id);
+        save_workspace_atomic(&paths, &base).unwrap();
+        let future = serde_json::json!({
+            "id": Uuid::from_u128(80_101),
+            "sequence": u64::MAX,
+            "operationId": Uuid::from_u128(80_102),
+            "pathwayId": pathway_id,
+            "at": 9_999_999,
+            "actor": "future-adam",
+            "kind": "futureEventKind",
+            "payload": {"futurePayload": true}
+        });
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&fs::read(&paths.library).unwrap()).unwrap();
+        raw["domain"]["pathways"]["events"] = serde_json::json!([future.clone()]);
+        fs::write(&paths.library, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+
+        let loaded = load_workspace(&paths).unwrap();
+        assert!(loaded.domain.pathways.events().is_empty());
+        let mut local = loaded.clone();
+        local.active_page_mut().name = "Saved without stripping future history".into();
+        save_workspace_merged(&paths, &loaded, &local).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&fs::read(&paths.library).unwrap()).unwrap();
+        assert_eq!(
+            saved["domain"]["pathways"]["events"],
+            serde_json::json!([future])
+        );
+        assert_eq!(
+            load_workspace(&paths).unwrap().active_page().name,
+            "Saved without stripping future history"
+        );
+    }
+
+    #[test]
     fn concurrent_pathway_events_append_without_renumbering_committed_rows() {
         let temporary = tempfile::tempdir().unwrap();
         let paths = AppPaths::at(temporary.path());
@@ -3439,6 +3479,110 @@ mod tests {
                 .map(|event| (event.id, event.sequence))
                 .collect::<Vec<_>>(),
             vec![(Uuid::from_u128(81_012), 1), (Uuid::from_u128(81_011), 2)]
+        );
+    }
+
+    #[test]
+    fn concurrent_pathway_record_edits_converge_without_blocking_other_saves() {
+        fn save_in_order(base: &Workspace, first: &Workspace, second: &Workspace) -> Workspace {
+            let temporary = tempfile::tempdir().unwrap();
+            let paths = AppPaths::at(temporary.path());
+            save_workspace_atomic(&paths, base).unwrap();
+            save_workspace_merged(&paths, base, first).unwrap();
+            save_workspace_merged(&paths, base, second).unwrap();
+            load_workspace(&paths).unwrap()
+        }
+
+        let pathway_id = Uuid::from_u128(82_000);
+        let assignment_id = Uuid::from_u128(82_001);
+        let mut base = workspace_with_pathway(pathway_id);
+        base.domain
+            .pathways
+            .insert_assignment(
+                PathwayAssignment::new(
+                    assignment_id,
+                    pathway_id,
+                    Uuid::from_u128(82_002),
+                    base.active_page,
+                    PathwayAssignmentState::Paused,
+                    PathwayPoint::ZERO,
+                    PathwayPoint::ZERO,
+                    PathwayPoint::ZERO,
+                    UnixMicros(1_000_001),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let mut older_writer = base.clone();
+        older_writer.active_page_mut().name = "Older writer canvas edit".into();
+        let older_pathway = older_writer
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&pathway_id)
+            .unwrap();
+        older_pathway.title = "Older route edit".into();
+        older_pathway.modified_at = UnixMicros(2_000_001);
+        let older_assignment = older_writer
+            .domain
+            .pathways
+            .assignments
+            .get_mut(&assignment_id)
+            .unwrap();
+        older_assignment.state = PathwayAssignmentState::Moving;
+        older_assignment.modified_at = UnixMicros(2_000_001);
+
+        let mut newer_writer = base.clone();
+        newer_writer.active_page_mut().name = "Newer writer canvas edit".into();
+        let newer_pathway = newer_writer
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&pathway_id)
+            .unwrap();
+        newer_pathway.title = "Newer route edit".into();
+        newer_pathway.modified_at = UnixMicros(3_000_001);
+        let newer_assignment = newer_writer
+            .domain
+            .pathways
+            .assignments
+            .get_mut(&assignment_id)
+            .unwrap();
+        newer_assignment.state = PathwayAssignmentState::Blocked;
+        newer_assignment.modified_at = UnixMicros(3_000_001);
+
+        let older_then_newer = save_in_order(&base, &older_writer, &newer_writer);
+        let newer_then_older = save_in_order(&base, &newer_writer, &older_writer);
+        assert_eq!(
+            older_then_newer.domain.pathways,
+            newer_then_older.domain.pathways
+        );
+        assert_eq!(
+            older_then_newer
+                .domain
+                .pathways
+                .pathway(pathway_id)
+                .unwrap()
+                .title,
+            "Newer route edit"
+        );
+        assert_eq!(
+            newer_then_older
+                .domain
+                .pathways
+                .assignment(assignment_id)
+                .unwrap()
+                .state,
+            PathwayAssignmentState::Blocked
+        );
+        assert_eq!(
+            older_then_newer.active_page().name,
+            "Newer writer canvas edit"
+        );
+        assert_eq!(
+            newer_then_older.active_page().name,
+            "Older writer canvas edit"
         );
     }
 

@@ -16,7 +16,7 @@ use crate::{
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use uuid::Uuid;
 
@@ -4307,10 +4307,6 @@ impl PathwayEvent {
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PathwayMergeError {
-    #[error("pathway {0} changed incompatibly in two Adam processes")]
-    ConflictingPathway(PathwayId),
-    #[error("pathway assignment {0} changed incompatibly in two Adam processes")]
-    ConflictingAssignment(PathwayAssignmentId),
     #[error("{log} pathway history repeats event {id}")]
     DuplicateEvent { log: &'static str, id: Uuid },
     #[error("{log} pathway history has a non-monotonic event sequence")]
@@ -4325,12 +4321,64 @@ pub enum PathwayMergeError {
     SequenceExhausted,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq)]
+struct OpaquePathwayEventRow {
+    /// Number of understood rows that preceded this row when it was read.
+    known_before: usize,
+    value: JsonValue,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PathwayStore {
     pub pathways: BTreeMap<PathwayId, Pathway>,
     pub assignments: BTreeMap<PathwayAssignmentId, PathwayAssignment>,
     events: Vec<PathwayEvent>,
+    opaque_events: Vec<OpaquePathwayEventRow>,
+}
+
+impl Serialize for PathwayStore {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum PersistedEventRow<'a> {
+            Known(&'a PathwayEvent),
+            Opaque(&'a JsonValue),
+        }
+
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PersistedPathwayStore<'a> {
+            pathways: &'a BTreeMap<PathwayId, Pathway>,
+            assignments: &'a BTreeMap<PathwayAssignmentId, PathwayAssignment>,
+            events: Vec<PersistedEventRow<'a>>,
+        }
+
+        let mut rows =
+            Vec::with_capacity(self.events.len().saturating_add(self.opaque_events.len()));
+        let mut known_index = 0usize;
+        for opaque in &self.opaque_events {
+            let anchor = opaque.known_before.min(self.events.len());
+            while known_index < anchor {
+                rows.push(PersistedEventRow::Known(&self.events[known_index]));
+                known_index += 1;
+            }
+            rows.push(PersistedEventRow::Opaque(&opaque.value));
+        }
+        while known_index < self.events.len() {
+            rows.push(PersistedEventRow::Known(&self.events[known_index]));
+            known_index += 1;
+        }
+
+        PersistedPathwayStore {
+            pathways: &self.pathways,
+            assignments: &self.assignments,
+            events: rows,
+        }
+        .serialize(serializer)
+    }
 }
 
 impl<'de> Deserialize<'de> for PathwayStore {
@@ -4347,40 +4395,67 @@ impl<'de> Deserialize<'de> for PathwayStore {
         }
 
         let persisted = PersistedPathwayStore::deserialize(deserializer)?;
-        // Decode ledger rows independently. A future event kind or one damaged
-        // row must not make the entire Workspace unreadable; retain every
-        // valid row whose identity and sequence still advance the log.
+        // Decode ledger rows independently. Stored sequence numbers are a
+        // derivable presentation of array order, so repair every understood,
+        // uniquely identified row to 1..n rather than letting one anomalous
+        // value poison the remainder. Future/damaged rows stay opaque at their
+        // relative position and are written back unchanged.
         let mut events = Vec::with_capacity(persisted.events.len());
         let mut event_ids = BTreeSet::new();
-        let mut last_sequence = 0;
-        let mut skipped = 0usize;
+        let mut opaque_events = Vec::new();
+        let mut duplicate_rows = 0usize;
         for value in persisted.events {
-            let Ok(event) = serde_json::from_value::<PathwayEvent>(value) else {
-                skipped = skipped.saturating_add(1);
-                continue;
-            };
-            if event.sequence == 0 || event.sequence <= last_sequence || !event_ids.insert(event.id)
-            {
-                skipped = skipped.saturating_add(1);
-                continue;
+            let raw_id = opaque_pathway_event_id(&value);
+            match serde_json::from_value::<PathwayEvent>(value.clone()) {
+                Ok(mut event) if event_ids.insert(event.id) => {
+                    let Some(sequence) = u64::try_from(events.len())
+                        .ok()
+                        .and_then(|length| length.checked_add(1))
+                    else {
+                        opaque_events.push(OpaquePathwayEventRow {
+                            known_before: events.len(),
+                            value,
+                        });
+                        continue;
+                    };
+                    event.sequence = sequence;
+                    events.push(event);
+                }
+                Ok(_) => {
+                    duplicate_rows = duplicate_rows.saturating_add(1);
+                }
+                Err(_) if raw_id.is_some_and(|id| !event_ids.insert(id)) => {
+                    duplicate_rows = duplicate_rows.saturating_add(1);
+                }
+                Err(_) => opaque_events.push(OpaquePathwayEventRow {
+                    known_before: events.len(),
+                    value,
+                }),
             }
-            last_sequence = event.sequence;
-            events.push(event);
         }
-        if skipped > 0 {
+        if !opaque_events.is_empty() {
             log::warn!(
-                "ignored {skipped} invalid or unsupported pathway event record(s) while loading"
+                "retained {} unsupported pathway event record(s) opaquely while loading",
+                opaque_events.len()
             );
+        }
+        if duplicate_rows > 0 {
+            log::warn!("ignored {duplicate_rows} duplicate pathway event record(s) while loading");
         }
         Ok(Self {
             pathways: persisted.pathways,
             assignments: persisted.assignments,
             events,
+            opaque_events,
         })
     }
 }
 
 impl PathwayStore {
+    /// Returns append-only audit history, including rows for deleted pathways.
+    /// An event's `pathway_id` is durable provenance and is not guaranteed to
+    /// resolve in the `pathways` map. Unsupported rows remain preserved in the
+    /// serialized ledger but are intentionally absent from this typed view.
     pub fn events(&self) -> &[PathwayEvent] {
         &self.events
     }
@@ -4400,6 +4475,132 @@ impl PathwayStore {
         self.assignments
             .values()
             .filter(move |assignment| assignment.pathway_id == pathway_id)
+    }
+
+    /// Repairs only decode-time scalar and reference invariants. Route
+    /// authoring policy (minimum node counts, repeat closure, state-machine
+    /// transitions, and event emission) belongs to the P2 service layer.
+    pub(crate) fn normalize_in_place(&mut self, valid_page_ids: &BTreeSet<PageId>) {
+        let mut dropped_rows = 0usize;
+        let mut structurally_repaired_pathway_ids = BTreeSet::new();
+        self.pathways.retain(|id, pathway| {
+            let keep = *id == pathway.id;
+            dropped_rows += usize::from(!keep);
+            keep
+        });
+        for (pathway_id, pathway) in &mut self.pathways {
+            pathway.title = normalize_pathway_title(&pathway.title, "Pathway");
+            pathway.color_hex = pathway.color_hex.trim().to_owned();
+            if pathway.color_hex.is_empty() {
+                pathway.color_hex = "#0A84FF".into();
+            }
+            let page_is_missing = !valid_page_ids.contains(&pathway.page_id);
+            if page_is_missing {
+                pathway.is_enabled = false;
+                pathway.disabled_reason = Some("Pathway page is missing.".into());
+            }
+
+            let node_count = pathway.nodes.len();
+            pathway.nodes.retain(|id, node| {
+                let keep = *id == node.id && node.point.is_finite() && node.sort_index.is_finite();
+                dropped_rows += usize::from(!keep);
+                keep
+            });
+            for node in pathway.nodes.values_mut() {
+                node.title = normalize_pathway_title(&node.title, "Stop");
+                node.wait_duration_seconds = if node.wait_duration_seconds.is_finite() {
+                    node.wait_duration_seconds.max(0.0)
+                } else {
+                    0.0
+                };
+            }
+
+            let node_ids = pathway.nodes.keys().copied().collect::<BTreeSet<_>>();
+            let segment_count = pathway.segments.len();
+            pathway.segments.retain(|id, segment| {
+                let keep = *id == segment.id
+                    && segment.sort_index.is_finite()
+                    && node_ids.contains(&segment.from_node_id)
+                    && node_ids.contains(&segment.to_node_id);
+                dropped_rows += usize::from(!keep);
+                keep
+            });
+            for segment in pathway.segments.values_mut() {
+                segment.speed_points_per_second = if segment.speed_points_per_second.is_finite() {
+                    segment.speed_points_per_second.max(1.0)
+                } else {
+                    default_pathway_speed()
+                };
+            }
+            if pathway.nodes.len() != node_count || pathway.segments.len() != segment_count {
+                structurally_repaired_pathway_ids.insert(*pathway_id);
+                if !page_is_missing {
+                    pathway.is_enabled = false;
+                    pathway.disabled_reason =
+                        Some("Pathway graph was repaired and requires review.".into());
+                }
+            }
+        }
+
+        self.assignments.retain(|id, assignment| {
+            let keep = *id == assignment.id
+                && assignment.path_offset.is_finite()
+                && assignment.materialized_route_point.is_finite()
+                && assignment.materialized_tile_point.is_finite();
+            dropped_rows += usize::from(!keep);
+            keep
+        });
+        for assignment in self.assignments.values_mut() {
+            assignment.segment_start_progress = if assignment.segment_start_progress.is_finite() {
+                assignment.segment_start_progress.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            if assignment.state == PathwayAssignmentState::Detached {
+                continue;
+            }
+            let invalid_reason = match self.pathways.get(&assignment.pathway_id) {
+                None => Some("Pathway definition is missing."),
+                Some(pathway) if pathway.page_id != assignment.page_id => {
+                    Some("Assignment and pathway pages do not match.")
+                }
+                Some(pathway) if !valid_page_ids.contains(&pathway.page_id) => {
+                    Some("Pathway page is missing.")
+                }
+                Some(pathway)
+                    if assignment
+                        .current_node_id
+                        .is_some_and(|node_id| !pathway.nodes.contains_key(&node_id)) =>
+                {
+                    Some("Current pathway node is missing.")
+                }
+                Some(pathway)
+                    if assignment
+                        .current_segment_id
+                        .is_some_and(|segment_id| !pathway.segments.contains_key(&segment_id)) =>
+                {
+                    Some("Current pathway segment is missing.")
+                }
+                Some(_) if structurally_repaired_pathway_ids.contains(&assignment.pathway_id) => {
+                    Some("Pathway graph requires review.")
+                }
+                Some(_) => None,
+            };
+            if let Some(reason) = invalid_reason {
+                assignment.state = PathwayAssignmentState::NeedsAttention;
+                assignment.needs_attention_reason = Some(reason.into());
+                assignment.previous_state = None;
+                assignment.segment_started_at = None;
+                assignment.wait_until = None;
+                assignment.blocked_at = None;
+                assignment.paused_at = None;
+            }
+        }
+        if dropped_rows > 0 {
+            log::warn!(
+                "dropped {dropped_rows} structurally invalid pathway record(s) while loading"
+            );
+        }
     }
 
     pub fn insert_pathway(&mut self, pathway: Pathway) -> Result<(), DomainError> {
@@ -4432,7 +4633,12 @@ impl PathwayStore {
         if !self.pathways.contains_key(&event.pathway_id) {
             return Err(DomainError::MissingPathway(event.pathway_id));
         }
-        if self.events.iter().any(|existing| existing.id == event.id) {
+        if self.events.iter().any(|existing| existing.id == event.id)
+            || self
+                .opaque_events
+                .iter()
+                .any(|existing| opaque_pathway_event_id(&existing.value) == Some(event.id))
+        {
             return Err(DomainError::DuplicateId(event.id));
         }
         event.sequence = match self.events.last() {
@@ -4452,20 +4658,21 @@ impl PathwayStore {
         local: &Self,
         remote: &Self,
     ) -> Result<Self, PathwayMergeError> {
+        let events = merge_pathway_events(&base.events, &local.events, &remote.events)?;
         Ok(Self {
-            pathways: merge_pathway_maps(
-                &base.pathways,
-                &local.pathways,
-                &remote.pathways,
-                PathwayMergeError::ConflictingPathway,
-            )?,
+            pathways: merge_pathway_maps(&base.pathways, &local.pathways, &remote.pathways),
             assignments: merge_pathway_maps(
                 &base.assignments,
                 &local.assignments,
                 &remote.assignments,
-                PathwayMergeError::ConflictingAssignment,
+            ),
+            opaque_events: merge_opaque_pathway_events(
+                &base.opaque_events,
+                &local.opaque_events,
+                &remote.opaque_events,
+                &events,
             )?,
-            events: merge_pathway_events(&base.events, &local.events, &remote.events)?,
+            events,
         })
     }
 }
@@ -4479,6 +4686,15 @@ fn validate_pathway_title(value: impl Into<String>) -> Result<String, DomainErro
         return Err(DomainError::NameTooLong);
     }
     Ok(value)
+}
+
+fn normalize_pathway_title(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        fallback.to_owned()
+    } else {
+        value.chars().take(128).collect()
+    }
 }
 
 fn validate_pathway_point(point: PathwayPoint, name: &'static str) -> Result<(), DomainError> {
@@ -4501,12 +4717,69 @@ fn validate_finite_pathway_value(value: f64, name: &'static str) -> Result<(), D
     }
 }
 
-fn merge_pathway_maps<T: Clone + PartialEq>(
+trait PathwayMergeRecord: Clone + fmt::Debug + Serialize {
+    fn modified_at(&self) -> UnixMicros;
+    fn append_float_bits(&self, key: &mut Vec<u8>);
+}
+
+impl PathwayMergeRecord for Pathway {
+    fn modified_at(&self) -> UnixMicros {
+        self.modified_at
+    }
+
+    fn append_float_bits(&self, key: &mut Vec<u8>) {
+        for node in self.nodes.values() {
+            for value in [
+                node.point.x,
+                node.point.y,
+                node.sort_index,
+                node.wait_duration_seconds,
+            ] {
+                key.extend_from_slice(&value.to_bits().to_be_bytes());
+            }
+        }
+        for segment in self.segments.values() {
+            for value in [segment.sort_index, segment.speed_points_per_second] {
+                key.extend_from_slice(&value.to_bits().to_be_bytes());
+            }
+        }
+    }
+}
+
+impl PathwayMergeRecord for PathwayAssignment {
+    fn modified_at(&self) -> UnixMicros {
+        self.modified_at
+    }
+
+    fn append_float_bits(&self, key: &mut Vec<u8>) {
+        for value in [
+            self.segment_start_progress,
+            self.path_offset.x,
+            self.path_offset.y,
+            self.materialized_route_point.x,
+            self.materialized_route_point.y,
+            self.materialized_tile_point.x,
+            self.materialized_tile_point.y,
+        ] {
+            key.extend_from_slice(&value.to_bits().to_be_bytes());
+        }
+    }
+}
+
+/// Three-way merges whole mutable Pathways records without making an
+/// unrelated workspace save depend on conflict resolution UI.
+///
+/// An unchanged side yields to the changed side. Concurrent deletion beats a
+/// concurrent edit, preventing a stale process from resurrecting a record.
+/// Concurrent live values choose the newest `modified_at`; equal timestamps
+/// use canonical serialized bytes as a stable final tie-break. The rule is
+/// independent of writer/save order, so repeated stale saves converge. This
+/// deliberately does not field-merge two independently edited route graphs.
+fn merge_pathway_maps<T: PathwayMergeRecord>(
     base: &BTreeMap<Uuid, T>,
     local: &BTreeMap<Uuid, T>,
     remote: &BTreeMap<Uuid, T>,
-    conflict: impl Fn(Uuid) -> PathwayMergeError,
-) -> Result<BTreeMap<Uuid, T>, PathwayMergeError> {
+) -> BTreeMap<Uuid, T> {
     let mut ids = BTreeSet::new();
     ids.extend(base.keys().copied());
     ids.extend(local.keys().copied());
@@ -4516,17 +4789,189 @@ fn merge_pathway_maps<T: Clone + PartialEq>(
         let base_value = base.get(&id);
         let local_value = local.get(&id);
         let remote_value = remote.get(&id);
-        let value = if local_value == remote_value {
+        let value = if pathway_record_options_equal(local_value, remote_value) {
             local_value
-        } else if local_value == base_value {
+        } else if pathway_record_options_equal(local_value, base_value) {
             remote_value
-        } else if remote_value == base_value {
+        } else if pathway_record_options_equal(remote_value, base_value) {
             local_value
         } else {
-            return Err(conflict(id));
+            match (local_value, remote_value) {
+                (None, _) | (_, None) => None,
+                (Some(local_value), Some(remote_value)) => {
+                    let ordering = local_value
+                        .modified_at()
+                        .cmp(&remote_value.modified_at())
+                        .then_with(|| {
+                            stable_pathway_record_key(local_value)
+                                .cmp(&stable_pathway_record_key(remote_value))
+                        });
+                    Some(if ordering.is_lt() {
+                        remote_value
+                    } else {
+                        local_value
+                    })
+                }
+            }
         };
         if let Some(value) = value {
             merged.insert(id, value.clone());
+        }
+    }
+    merged
+}
+
+fn pathway_record_options_equal<T: PathwayMergeRecord>(
+    left: Option<&T>,
+    right: Option<&T>,
+) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            stable_pathway_record_key(left) == stable_pathway_record_key(right)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn stable_pathway_record_key<T: PathwayMergeRecord>(value: &T) -> Vec<u8> {
+    // JSON is canonical for current ordered records. The Debug fallback keeps
+    // future serialization failures deterministic, while raw float bits make
+    // malformed NaN payloads distinguishable even though JSON renders them as
+    // null and Debug renders every payload as `NaN`.
+    let body = serde_json::to_vec(value).unwrap_or_else(|_| format!("{value:#?}").into_bytes());
+    let mut key = Vec::with_capacity(body.len().saturating_add(64));
+    key.extend_from_slice(&(body.len() as u64).to_be_bytes());
+    key.extend_from_slice(&body);
+    value.append_float_bits(&mut key);
+    key
+}
+
+fn opaque_pathway_event_id(value: &JsonValue) -> Option<Uuid> {
+    value
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
+
+fn pathway_event_json_body(mut value: JsonValue) -> JsonValue {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("sequence");
+    }
+    value
+}
+
+fn opaque_pathway_event_key(value: &JsonValue) -> String {
+    // JsonValue has no fallible/custom serializers, and its map representation
+    // is ordered without serde_json's preserve_order feature.
+    serde_json::to_string(value).unwrap_or_default()
+}
+
+fn merge_opaque_pathway_events(
+    base: &[OpaquePathwayEventRow],
+    local: &[OpaquePathwayEventRow],
+    remote: &[OpaquePathwayEventRow],
+    known: &[PathwayEvent],
+) -> Result<Vec<OpaquePathwayEventRow>, PathwayMergeError> {
+    for (name, rows) in [("base", base), ("local", local), ("remote", remote)] {
+        let mut ids = HashSet::new();
+        for row in rows {
+            if let Some(id) = opaque_pathway_event_id(&row.value)
+                && !ids.insert(id)
+            {
+                return Err(PathwayMergeError::DuplicateEvent { log: name, id });
+            }
+        }
+    }
+
+    let known_bodies = known
+        .iter()
+        .map(|event| {
+            (
+                event.id,
+                pathway_event_json_body(
+                    serde_json::to_value(event)
+                        .expect("PathwayEvent contains only JSON-compatible fields"),
+                ),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut opaque_bodies = HashMap::<Uuid, JsonValue>::new();
+    for row in base.iter().chain(local).chain(remote) {
+        let Some(id) = opaque_pathway_event_id(&row.value) else {
+            continue;
+        };
+        let body = pathway_event_json_body(row.value.clone());
+        if known_bodies
+            .get(&id)
+            .is_some_and(|known_body| known_body != &body)
+            || opaque_bodies
+                .get(&id)
+                .is_some_and(|existing| existing != &body)
+        {
+            return Err(PathwayMergeError::ConflictingEvent(id));
+        }
+        opaque_bodies.entry(id).or_insert(body);
+    }
+
+    // The locked remote ledger is the durable ordering authority. Preserve it
+    // exactly, then recover opaque rows missing there from local/base at the
+    // typed tail. Parseable event ids are unique; idless malformed rows use
+    // multiset counts so repeated byte-equivalent rows are never collapsed.
+    let mut merged = Vec::new();
+    let mut included_ids = HashSet::new();
+    let mut idless_counts = BTreeMap::<String, usize>::new();
+    for row in remote {
+        if let Some(id) = opaque_pathway_event_id(&row.value) {
+            if !known_bodies.contains_key(&id) {
+                included_ids.insert(id);
+                merged.push(row.clone());
+            }
+        } else {
+            let key = opaque_pathway_event_key(&row.value);
+            *idless_counts.entry(key).or_default() += 1;
+            merged.push(row.clone());
+        }
+    }
+
+    let mut desired_idless_counts = idless_counts.clone();
+    for source in [local, base] {
+        let mut source_counts = BTreeMap::<String, usize>::new();
+        for row in source {
+            if opaque_pathway_event_id(&row.value).is_none() {
+                *source_counts
+                    .entry(opaque_pathway_event_key(&row.value))
+                    .or_default() += 1;
+            }
+        }
+        for (key, count) in source_counts {
+            desired_idless_counts
+                .entry(key)
+                .and_modify(|desired| *desired = (*desired).max(count))
+                .or_insert(count);
+        }
+    }
+
+    for source in [local, base] {
+        for row in source {
+            if let Some(id) = opaque_pathway_event_id(&row.value) {
+                if !known_bodies.contains_key(&id) && included_ids.insert(id) {
+                    merged.push(OpaquePathwayEventRow {
+                        known_before: known.len(),
+                        value: row.value.clone(),
+                    });
+                }
+            } else {
+                let key = opaque_pathway_event_key(&row.value);
+                let included = idless_counts.entry(key.clone()).or_default();
+                if *included < desired_idless_counts[&key] {
+                    *included += 1;
+                    merged.push(OpaquePathwayEventRow {
+                        known_before: known.len(),
+                        value: row.value.clone(),
+                    });
+                }
+            }
         }
     }
     Ok(merged)
@@ -4560,28 +5005,41 @@ fn validate_base_event_subsequence(
     source_name: &'static str,
     base: &[PathwayEvent],
     source: &[PathwayEvent],
+    allow_missing: bool,
 ) -> Result<(), PathwayMergeError> {
     let source_by_id = source
         .iter()
         .map(|event| (event.id, event))
-        .collect::<BTreeMap<_, _>>();
+        .collect::<HashMap<_, _>>();
     for base_event in base {
-        let Some(source_event) = source_by_id.get(&base_event.id) else {
-            return Err(PathwayMergeError::MissingBaseEvent {
-                log: source_name,
-                id: base_event.id,
-            });
-        };
-        if !base_event.same_body(source_event) {
-            return Err(PathwayMergeError::ConflictingEvent(base_event.id));
+        match source_by_id.get(&base_event.id) {
+            Some(source_event) if !base_event.same_body(source_event) => {
+                return Err(PathwayMergeError::ConflictingEvent(base_event.id));
+            }
+            None if !allow_missing => {
+                return Err(PathwayMergeError::MissingBaseEvent {
+                    log: source_name,
+                    id: base_event.id,
+                });
+            }
+            _ => {}
         }
     }
-    let base_ids = base.iter().map(|event| event.id).collect::<Vec<_>>();
-    let source_base_ids = source
+
+    let base_ids = base.iter().map(|event| event.id).collect::<HashSet<_>>();
+    let mut expected = base
         .iter()
-        .filter_map(|event| base_ids.contains(&event.id).then_some(event.id))
-        .collect::<Vec<_>>();
-    if source_base_ids != base_ids {
+        .filter(|event| source_by_id.contains_key(&event.id));
+    let mut next_expected = expected.next().map(|event| event.id);
+    for event in source {
+        if base_ids.contains(&event.id) {
+            if next_expected != Some(event.id) {
+                return Err(PathwayMergeError::ReorderedBaseEvents { log: source_name });
+            }
+            next_expected = expected.next().map(|event| event.id);
+        }
+    }
+    if next_expected.is_some() {
         return Err(PathwayMergeError::ReorderedBaseEvents { log: source_name });
     }
     Ok(())
@@ -4595,8 +5053,21 @@ fn merge_pathway_events(
     for (name, events) in [("base", base), ("local", local), ("remote", remote)] {
         validate_pathway_event_log(name, events)?;
     }
-    validate_base_event_subsequence("local", base, local)?;
-    validate_base_event_subsequence("remote", base, remote)?;
+    validate_base_event_subsequence("local", base, local, false)?;
+    // A legacy/older writer may have stripped a row from the durable file.
+    // Local still contains the validated base row, so restore it after the
+    // remote tail instead of turning every later save into a permanent retry.
+    // That tail recovery can also make the remote intersection differ from an
+    // old in-memory base forever (the save worker does not absorb the merged
+    // result), so remote reordering is advisory. Immutable body conflicts stay
+    // fatal; local reorder remains a hard invariant violation.
+    match validate_base_event_subsequence("remote", base, remote, true) {
+        Err(PathwayMergeError::ReorderedBaseEvents { .. }) => {
+            log::warn!("accepted durable pathway event order that differs from the stale base");
+        }
+        Err(error) => return Err(error),
+        Ok(()) => {}
+    }
 
     let mut records = BTreeMap::<Uuid, PathwayEvent>::new();
     for event in base.iter().chain(local).chain(remote) {
@@ -7941,7 +8412,278 @@ mod tests {
     }
 
     #[test]
-    fn pathway_history_decode_salvages_bad_rows_and_append_refuses_overflow() {
+    fn pathway_record_merge_converges_independent_of_writer_order() {
+        let (mut base, pathway_id) = pathway_fixture();
+        let page_id = base.pathway(pathway_id).unwrap().page_id;
+        let assignment_id = id(8_010);
+        base.insert_assignment(
+            PathwayAssignment::new(
+                assignment_id,
+                pathway_id,
+                id(8_011),
+                page_id,
+                PathwayAssignmentState::Paused,
+                PathwayPoint::ZERO,
+                PathwayPoint::ZERO,
+                PathwayPoint::ZERO,
+                UnixMicros(10),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut first_writer = base.clone();
+        let first_pathway = first_writer.pathways.get_mut(&pathway_id).unwrap();
+        first_pathway.title = "First writer".into();
+        first_pathway.nodes.get_mut(&id(8_002)).unwrap().point.x = 11.0;
+        first_pathway.modified_at = UnixMicros(20);
+        let first_assignment = first_writer.assignments.get_mut(&assignment_id).unwrap();
+        first_assignment.state = PathwayAssignmentState::Moving;
+        first_assignment.modified_at = UnixMicros(20);
+
+        let mut second_writer = base.clone();
+        let second_pathway = second_writer.pathways.get_mut(&pathway_id).unwrap();
+        second_pathway.title = "Second writer".into();
+        second_pathway.nodes.get_mut(&id(8_003)).unwrap().point.x = 99.0;
+        second_pathway.modified_at = UnixMicros(30);
+        let second_assignment = second_writer.assignments.get_mut(&assignment_id).unwrap();
+        second_assignment.state = PathwayAssignmentState::Blocked;
+        second_assignment.modified_at = UnixMicros(30);
+
+        let first_then_second =
+            PathwayStore::merge_persisted(&base, &second_writer, &first_writer).unwrap();
+        let second_then_first =
+            PathwayStore::merge_persisted(&base, &first_writer, &second_writer).unwrap();
+        assert_eq!(first_then_second, second_then_first);
+        assert_eq!(
+            first_then_second.pathway(pathway_id).unwrap().title,
+            "Second writer"
+        );
+        assert_eq!(
+            first_then_second
+                .pathway(pathway_id)
+                .unwrap()
+                .node(id(8_002))
+                .unwrap()
+                .point
+                .x,
+            10.0,
+            "the documented whole-record LWW rule does not field-merge the older edit"
+        );
+        assert_eq!(
+            first_then_second.assignment(assignment_id).unwrap().state,
+            PathwayAssignmentState::Blocked
+        );
+
+        let mut same_time_first = first_writer.clone();
+        same_time_first
+            .pathways
+            .get_mut(&pathway_id)
+            .unwrap()
+            .modified_at = UnixMicros(40);
+        let mut same_time_second = second_writer.clone();
+        same_time_second
+            .pathways
+            .get_mut(&pathway_id)
+            .unwrap()
+            .modified_at = UnixMicros(40);
+        assert_eq!(
+            PathwayStore::merge_persisted(&base, &same_time_first, &same_time_second).unwrap(),
+            PathwayStore::merge_persisted(&base, &same_time_second, &same_time_first).unwrap()
+        );
+
+        let mut positive_zero = base.clone();
+        let positive_pathway = positive_zero.pathways.get_mut(&pathway_id).unwrap();
+        positive_pathway.nodes.get_mut(&id(8_002)).unwrap().point.x = 0.0;
+        positive_pathway.modified_at = UnixMicros(50);
+        let mut negative_zero = positive_zero.clone();
+        negative_zero
+            .pathways
+            .get_mut(&pathway_id)
+            .unwrap()
+            .nodes
+            .get_mut(&id(8_002))
+            .unwrap()
+            .point
+            .x = -0.0;
+        let positive_then_negative =
+            PathwayStore::merge_persisted(&base, &positive_zero, &negative_zero).unwrap();
+        let negative_then_positive =
+            PathwayStore::merge_persisted(&base, &negative_zero, &positive_zero).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&positive_then_negative).unwrap(),
+            serde_json::to_vec(&negative_then_positive).unwrap(),
+            "signed zero must not make durable bytes depend on writer order"
+        );
+
+        let mut deleting_writer = base.clone();
+        deleting_writer.pathways.remove(&pathway_id);
+        deleting_writer.assignments.remove(&assignment_id);
+        let deletion_wins =
+            PathwayStore::merge_persisted(&base, &deleting_writer, &second_writer).unwrap();
+        let deletion_wins_reversed =
+            PathwayStore::merge_persisted(&base, &second_writer, &deleting_writer).unwrap();
+        assert_eq!(deletion_wins, deletion_wins_reversed);
+        assert!(deletion_wins.pathway(pathway_id).is_none());
+        assert!(deletion_wins.assignment(assignment_id).is_none());
+    }
+
+    #[test]
+    fn pathway_history_decode_renumbers_anomalous_sequences_without_cascading() {
+        let (store, pathway_id) = pathway_fixture();
+        let mut value = serde_json::to_value(&store).unwrap();
+        let mut rows = [1, u64::MAX, 2, 0, 2]
+            .into_iter()
+            .enumerate()
+            .map(|(index, sequence)| {
+                let mut row = serde_json::to_value(pathway_event(
+                    8_020 + index as u128,
+                    pathway_id,
+                    index as i64,
+                    PathwayEventKind::ConfigurationChanged,
+                ))
+                .unwrap();
+                row["sequence"] = json!(sequence);
+                row
+            })
+            .collect::<Vec<_>>();
+        let mut duplicate = rows[0].clone();
+        duplicate["sequence"] = json!(9_999);
+        rows.insert(2, duplicate);
+        value["events"] = JsonValue::Array(rows);
+
+        let mut decoded: PathwayStore = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            decoded
+                .events()
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            decoded
+                .append_event(pathway_event(
+                    8_030,
+                    pathway_id,
+                    10,
+                    PathwayEventKind::Completed,
+                ))
+                .unwrap(),
+            6
+        );
+    }
+
+    #[test]
+    fn pathway_history_reemits_opaque_rows_at_their_relative_positions() {
+        let (store, pathway_id) = pathway_fixture();
+        let mut first = serde_json::to_value(pathway_event(
+            8_020,
+            pathway_id,
+            1,
+            PathwayEventKind::Assigned,
+        ))
+        .unwrap();
+        first["sequence"] = json!(7);
+        let mut second = serde_json::to_value(pathway_event(
+            8_021,
+            pathway_id,
+            2,
+            PathwayEventKind::Completed,
+        ))
+        .unwrap();
+        second["sequence"] = json!(u64::MAX);
+        let leading = json!({"id": id(8_030), "sequence": 91, "kind": "futureLeading"});
+        let middle = json!({"futureMalformed": ["keep", 2]});
+        let trailing = json!({"id": id(8_031), "sequence": u64::MAX, "kind": "futureTrailing"});
+        let mut value = serde_json::to_value(&store).unwrap();
+        value["events"] = json!([
+            leading.clone(),
+            first,
+            middle.clone(),
+            second,
+            trailing.clone()
+        ]);
+
+        let mut decoded: PathwayStore = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            decoded
+                .events()
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            decoded
+                .append_event(pathway_event(
+                    8_022,
+                    pathway_id,
+                    3,
+                    PathwayEventKind::ConfigurationChanged,
+                ))
+                .unwrap(),
+            3
+        );
+
+        let encoded = serde_json::to_value(&decoded).unwrap();
+        let rows = encoded["events"].as_array().unwrap();
+        assert_eq!(rows[0], leading);
+        assert_eq!(rows[2], middle);
+        assert_eq!(rows[4], trailing);
+        assert_eq!(rows[5]["id"], json!(id(8_022)));
+        let twice: PathwayStore = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(twice).unwrap(), encoded);
+    }
+
+    #[test]
+    fn pathway_merge_recovers_opaque_rows_and_preserves_idless_multiplicity() {
+        let (store, _) = pathway_fixture();
+        let future = json!({"id": id(8_030), "sequence": 1, "kind": "futureEvent"});
+        let malformed = json!({"futureMalformed": ["repeat"]});
+        let mut value = serde_json::to_value(&store).unwrap();
+        value["events"] = json!([future.clone(), malformed.clone(), malformed.clone()]);
+        let base: PathwayStore = serde_json::from_value(value).unwrap();
+
+        let remote_added = PathwayStore::merge_persisted(&store, &store, &base).unwrap();
+        assert_eq!(
+            serde_json::to_value(remote_added).unwrap()["events"],
+            json!([future.clone(), malformed.clone(), malformed.clone()])
+        );
+
+        let local = base.clone();
+        let mut stripped_remote = base.clone();
+        stripped_remote.opaque_events.clear();
+
+        let merged = PathwayStore::merge_persisted(&base, &local, &stripped_remote).unwrap();
+        assert_eq!(
+            serde_json::to_value(&merged).unwrap()["events"],
+            json!([future, malformed.clone(), malformed])
+        );
+        assert_eq!(
+            PathwayStore::merge_persisted(&base, &local, &merged).unwrap(),
+            merged
+        );
+    }
+
+    #[test]
+    fn pathway_merge_rejects_conflicting_opaque_event_bodies() {
+        let (store, _) = pathway_fixture();
+        let mut first_value = serde_json::to_value(&store).unwrap();
+        first_value["events"] = json!([{"id": id(8_030), "sequence": 1, "kind": "futureOne"}]);
+        let first: PathwayStore = serde_json::from_value(first_value).unwrap();
+        let mut second_value = serde_json::to_value(&store).unwrap();
+        second_value["events"] = json!([{"id": id(8_030), "sequence": 99, "kind": "futureTwo"}]);
+        let second: PathwayStore = serde_json::from_value(second_value).unwrap();
+
+        assert_eq!(
+            PathwayStore::merge_persisted(&store, &first, &second),
+            Err(PathwayMergeError::ConflictingEvent(id(8_030)))
+        );
+    }
+
+    #[test]
+    fn pathway_history_direct_sequence_exhaustion_does_not_mutate_the_log() {
         let (mut store, pathway_id) = pathway_fixture();
         store
             .append_event(pathway_event(
@@ -7951,38 +8693,8 @@ mod tests {
                 PathwayEventKind::Assigned,
             ))
             .unwrap();
-
-        let mut duplicate = store.clone();
-        let mut repeated = duplicate.events()[0].clone();
-        repeated.sequence = 2;
-        duplicate.events.push(repeated);
-        let decoded: PathwayStore =
-            serde_json::from_value(serde_json::to_value(duplicate).unwrap()).unwrap();
-        assert_eq!(decoded.events(), store.events());
-
-        let mut non_monotonic = store.clone();
-        let mut later = pathway_event(8_021, pathway_id, 2, PathwayEventKind::ConfigurationChanged);
-        later.sequence = 1;
-        non_monotonic.events.push(later);
-        let decoded: PathwayStore =
-            serde_json::from_value(serde_json::to_value(non_monotonic).unwrap()).unwrap();
-        assert_eq!(decoded.events(), store.events());
-
-        let mut future = serde_json::to_value(&store).unwrap();
-        let mut unknown = serde_json::to_value(pathway_event(
-            8_023,
-            pathway_id,
-            3,
-            PathwayEventKind::ConfigurationChanged,
-        ))
-        .unwrap();
-        unknown["sequence"] = json!(2);
-        unknown["kind"] = json!("futureEventKind");
-        future["events"].as_array_mut().unwrap().push(unknown);
-        let decoded: PathwayStore = serde_json::from_value(future).unwrap();
-        assert_eq!(decoded.events(), store.events());
-
         store.events.last_mut().unwrap().sequence = u64::MAX;
+
         assert_eq!(
             store.append_event(pathway_event(
                 8_022,
@@ -8027,6 +8739,150 @@ mod tests {
                 .map(|event| event.id)
                 .collect::<Vec<_>>(),
             vec![id(8_020), id(8_021), id(8_022)]
+        );
+    }
+
+    #[test]
+    fn pathway_merge_reappends_a_base_event_stripped_from_remote() {
+        let (mut base, pathway_id) = pathway_fixture();
+        base.append_event(pathway_event(
+            8_020,
+            pathway_id,
+            1,
+            PathwayEventKind::Assigned,
+        ))
+        .unwrap();
+        base.append_event(pathway_event(
+            8_021,
+            pathway_id,
+            2,
+            PathwayEventKind::WaitStarted,
+        ))
+        .unwrap();
+        let local = base.clone();
+        let mut remote = base.clone();
+        remote.events.remove(0);
+        remote
+            .append_event(pathway_event(
+                8_022,
+                pathway_id,
+                3,
+                PathwayEventKind::Completed,
+            ))
+            .unwrap();
+
+        let merged = PathwayStore::merge_persisted(&base, &local, &remote).unwrap();
+        assert_eq!(
+            merged
+                .events()
+                .iter()
+                .map(|event| (event.id, event.sequence))
+                .collect::<Vec<_>>(),
+            vec![(id(8_021), 2), (id(8_022), 3), (id(8_020), 4)]
+        );
+        assert_eq!(
+            PathwayStore::merge_persisted(&base, &local, &merged).unwrap(),
+            merged,
+            "a stale baseline must not duplicate or reject the recovered row"
+        );
+    }
+
+    #[test]
+    fn pathway_merge_still_rejects_a_local_that_dropped_its_base_event() {
+        let (mut base, pathway_id) = pathway_fixture();
+        base.append_event(pathway_event(
+            8_020,
+            pathway_id,
+            1,
+            PathwayEventKind::Assigned,
+        ))
+        .unwrap();
+        let mut local = base.clone();
+        local.events.clear();
+
+        assert_eq!(
+            PathwayStore::merge_persisted(&base, &local, &base),
+            Err(PathwayMergeError::MissingBaseEvent {
+                log: "local",
+                id: id(8_020),
+            })
+        );
+    }
+
+    #[test]
+    fn pathway_merge_rejects_local_reordering_but_accepts_durable_remote_order() {
+        let (mut base, pathway_id) = pathway_fixture();
+        for (id_value, kind) in [
+            (8_020, PathwayEventKind::Assigned),
+            (8_021, PathwayEventKind::Completed),
+        ] {
+            base.append_event(pathway_event(id_value, pathway_id, 1, kind))
+                .unwrap();
+        }
+        let mut reordered = base.clone();
+        reordered.events.swap(0, 1);
+        reordered.events[0].sequence = 1;
+        reordered.events[1].sequence = 2;
+
+        assert_eq!(
+            PathwayStore::merge_persisted(&base, &reordered, &base),
+            Err(PathwayMergeError::ReorderedBaseEvents { log: "local" })
+        );
+        assert_eq!(
+            PathwayStore::merge_persisted(&base, &base, &reordered)
+                .unwrap()
+                .events()
+                .iter()
+                .map(|event| event.id)
+                .collect::<Vec<_>>(),
+            vec![id(8_021), id(8_020)]
+        );
+    }
+
+    #[test]
+    fn pathway_base_subsequence_validation_scales_with_interleaved_rows() {
+        let (mut base, pathway_id) = pathway_fixture();
+        for index in 0..5_000u128 {
+            let mut event = pathway_event(
+                100_000 + index,
+                pathway_id,
+                index as i64,
+                PathwayEventKind::ConfigurationChanged,
+            );
+            event.sequence = index as u64 + 1;
+            base.events.push(event);
+        }
+        let mut interleaved = base.clone();
+        interleaved.events.clear();
+        for (index, base_event) in base.events().iter().enumerate() {
+            let mut extra = pathway_event(
+                200_000 + index as u128,
+                pathway_id,
+                index as i64,
+                PathwayEventKind::OfflineCatchUp,
+            );
+            extra.sequence = index as u64 * 2 + 1;
+            interleaved.events.push(extra);
+            let mut base_event = base_event.clone();
+            base_event.sequence = index as u64 * 2 + 2;
+            interleaved.events.push(base_event);
+        }
+
+        assert_eq!(
+            PathwayStore::merge_persisted(&base, &interleaved, &base)
+                .unwrap()
+                .events()
+                .len(),
+            10_000
+        );
+
+        interleaved.events.swap(1, 3);
+        for (index, event) in interleaved.events.iter_mut().enumerate() {
+            event.sequence = index as u64 + 1;
+        }
+        assert_eq!(
+            PathwayStore::merge_persisted(&base, &interleaved, &base),
+            Err(PathwayMergeError::ReorderedBaseEvents { log: "local" })
         );
     }
 

@@ -1,7 +1,7 @@
 use crate::domain::DomainState;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
@@ -458,7 +458,6 @@ impl Workspace {
             let page = CanvasPage::default();
             self.active_page = page.id;
             self.pages.push(page);
-            return self;
         }
 
         for page in &mut self.pages {
@@ -483,6 +482,12 @@ impl Workspace {
         if !self.pages.iter().any(|page| page.id == self.active_page) {
             self.active_page = self.pages[0].id;
         }
+        let valid_page_ids = self
+            .pages
+            .iter()
+            .map(|page| page.id)
+            .collect::<BTreeSet<_>>();
+        self.domain.pathways.normalize_in_place(&valid_page_ids);
         self
     }
 
@@ -673,6 +678,11 @@ fn positive_or(value: f32, fallback: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{
+        Pathway, PathwayAssignment, PathwayAssignmentState, PathwayEvent, PathwayEventKind,
+        PathwayEventPayload, PathwayNode, PathwayNodeKind, PathwayPoint, PathwaySegment,
+        UnixMicros,
+    };
 
     fn fixed_tile(id: u128, title: &str, rect: WorldRect) -> Tile {
         Tile {
@@ -910,5 +920,253 @@ mod tests {
         assert_eq!(workspace.active_page().size, DEFAULT_PAGE_SIZE);
         assert_eq!(workspace.active_page().view, PageViewState::default());
         assert!(workspace.active_page().tiles[0].rect.is_finite());
+    }
+
+    #[test]
+    fn workspace_normalization_repairs_pathway_decode_invariants_idempotently() {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let pathway_id = Uuid::from_u128(10_000);
+        let node_id = Uuid::from_u128(10_001);
+        let invalid_node_id = Uuid::from_u128(10_002);
+        let segment_id = Uuid::from_u128(10_003);
+        let mut pathway =
+            Pathway::new(pathway_id, page_id, "Route", "#0A84FF", UnixMicros(1)).unwrap();
+        pathway.title = "   ".into();
+        pathway.color_hex = "  ".into();
+        let mut node = PathwayNode::new(
+            node_id,
+            PathwayPoint::new(10.0, 20.0),
+            0.0,
+            "Node",
+            PathwayNodeKind::Waypoint,
+            0.0,
+            UnixMicros(1),
+        )
+        .unwrap();
+        node.title = "é".repeat(140);
+        node.wait_duration_seconds = -4.0;
+        let mut invalid_node = node.clone();
+        invalid_node.id = invalid_node_id;
+        invalid_node.point.x = f64::NAN;
+        pathway.nodes.insert(node_id, node);
+        pathway.nodes.insert(invalid_node_id, invalid_node);
+        let mut segment =
+            PathwaySegment::new(segment_id, node_id, node_id, 0.0, 80.0, UnixMicros(1)).unwrap();
+        segment.speed_points_per_second = 0.0;
+        pathway.segments.insert(segment_id, segment);
+        let dangling_segment_id = Uuid::from_u128(10_004);
+        pathway.segments.insert(
+            dangling_segment_id,
+            PathwaySegment::new(
+                dangling_segment_id,
+                node_id,
+                invalid_node_id,
+                1.0,
+                80.0,
+                UnixMicros(1),
+            )
+            .unwrap(),
+        );
+        workspace.domain.pathways.insert_pathway(pathway).unwrap();
+
+        let assignment_id = Uuid::from_u128(10_010);
+        let mut assignment = PathwayAssignment::new(
+            assignment_id,
+            pathway_id,
+            Uuid::from_u128(10_011),
+            page_id,
+            PathwayAssignmentState::Moving,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            UnixMicros(2),
+        )
+        .unwrap();
+        assignment.segment_start_progress = 3.0;
+        assignment.current_segment_id = Some(segment_id);
+        assignment.previous_state = Some(PathwayAssignmentState::Paused);
+        assignment.segment_started_at = Some(UnixMicros(3));
+        assignment.wait_until = Some(UnixMicros(4));
+        assignment.blocked_at = Some(UnixMicros(5));
+        assignment.paused_at = Some(UnixMicros(6));
+        workspace
+            .domain
+            .pathways
+            .insert_assignment(assignment)
+            .unwrap();
+
+        let direct_assignment_id = Uuid::from_u128(10_016);
+        let mut direct_assignment = PathwayAssignment::new(
+            direct_assignment_id,
+            pathway_id,
+            Uuid::from_u128(10_017),
+            page_id,
+            PathwayAssignmentState::Moving,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            UnixMicros(2),
+        )
+        .unwrap();
+        direct_assignment.current_segment_id = Some(dangling_segment_id);
+        workspace
+            .domain
+            .pathways
+            .insert_assignment(direct_assignment)
+            .unwrap();
+
+        let detached_id = Uuid::from_u128(10_012);
+        let detached = PathwayAssignment::new(
+            detached_id,
+            Uuid::from_u128(77_777),
+            Uuid::from_u128(10_013),
+            page_id,
+            PathwayAssignmentState::Detached,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            UnixMicros(2),
+        )
+        .unwrap();
+        workspace
+            .domain
+            .pathways
+            .assignments
+            .insert(detached_id, detached);
+        let invalid_assignment_id = Uuid::from_u128(10_014);
+        let mut invalid_assignment = PathwayAssignment::new(
+            invalid_assignment_id,
+            pathway_id,
+            Uuid::from_u128(10_015),
+            page_id,
+            PathwayAssignmentState::Paused,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            UnixMicros(2),
+        )
+        .unwrap();
+        invalid_assignment.materialized_route_point.y = f64::INFINITY;
+        workspace
+            .domain
+            .pathways
+            .assignments
+            .insert(invalid_assignment_id, invalid_assignment);
+
+        let missing_page_pathway_id = Uuid::from_u128(10_020);
+        workspace.domain.pathways.pathways.insert(
+            missing_page_pathway_id,
+            Pathway::new(
+                missing_page_pathway_id,
+                Uuid::from_u128(55_555),
+                "Missing page",
+                "#fff",
+                UnixMicros(1),
+            )
+            .unwrap(),
+        );
+        let mismatched_key = Uuid::from_u128(10_021);
+        let mismatched_value_id = Uuid::from_u128(10_022);
+        workspace.domain.pathways.pathways.insert(
+            mismatched_key,
+            Pathway::new(
+                mismatched_value_id,
+                page_id,
+                "Bad identity",
+                "#fff",
+                UnixMicros(1),
+            )
+            .unwrap(),
+        );
+        workspace
+            .domain
+            .pathways
+            .append_event(PathwayEvent::new(
+                Uuid::from_u128(10_030),
+                Uuid::from_u128(10_031),
+                pathway_id,
+                UnixMicros(10),
+                "normalization-test",
+                PathwayEventKind::ConfigurationChanged,
+                PathwayEventPayload::default(),
+            ))
+            .unwrap();
+
+        let normalized = workspace.normalized();
+        let pathway = normalized.domain.pathways.pathway(pathway_id).unwrap();
+        assert_eq!(pathway.title, "Pathway");
+        assert_eq!(pathway.color_hex, "#0A84FF");
+        assert_eq!(pathway.nodes.len(), 1);
+        assert_eq!(pathway.node(node_id).unwrap().title.chars().count(), 128);
+        assert_eq!(pathway.node(node_id).unwrap().wait_duration_seconds, 0.0);
+        assert_eq!(pathway.segments.len(), 1);
+        assert!(!pathway.is_enabled);
+        assert_eq!(
+            pathway.disabled_reason.as_deref(),
+            Some("Pathway graph was repaired and requires review.")
+        );
+        assert_eq!(
+            pathway.segment(segment_id).unwrap().speed_points_per_second,
+            1.0
+        );
+        let assignment = normalized
+            .domain
+            .pathways
+            .assignment(assignment_id)
+            .unwrap();
+        assert_eq!(assignment.segment_start_progress, 1.0);
+        assert_eq!(assignment.state, PathwayAssignmentState::NeedsAttention);
+        assert_eq!(
+            assignment.needs_attention_reason.as_deref(),
+            Some("Pathway graph requires review.")
+        );
+        assert!(assignment.previous_state.is_none());
+        assert!(assignment.segment_started_at.is_none());
+        assert!(assignment.wait_until.is_none());
+        assert!(assignment.blocked_at.is_none());
+        assert!(assignment.paused_at.is_none());
+        let direct_assignment = normalized
+            .domain
+            .pathways
+            .assignment(direct_assignment_id)
+            .unwrap();
+        assert_eq!(
+            direct_assignment.state,
+            PathwayAssignmentState::NeedsAttention
+        );
+        assert_eq!(
+            direct_assignment.needs_attention_reason.as_deref(),
+            Some("Current pathway segment is missing.")
+        );
+        assert_eq!(
+            normalized
+                .domain
+                .pathways
+                .assignment(detached_id)
+                .unwrap()
+                .state,
+            PathwayAssignmentState::Detached
+        );
+        assert!(
+            normalized
+                .domain
+                .pathways
+                .assignment(invalid_assignment_id)
+                .is_none()
+        );
+        let missing_page = normalized
+            .domain
+            .pathways
+            .pathway(missing_page_pathway_id)
+            .unwrap();
+        assert!(!missing_page.is_enabled);
+        assert_eq!(
+            missing_page.disabled_reason.as_deref(),
+            Some("Pathway page is missing.")
+        );
+        assert!(normalized.domain.pathways.pathway(mismatched_key).is_none());
+        assert_eq!(normalized.domain.pathways.events().len(), 1);
+        assert_eq!(normalized.clone().normalized(), normalized);
     }
 }
