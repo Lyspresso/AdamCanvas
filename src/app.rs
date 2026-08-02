@@ -16764,7 +16764,7 @@ fn render_ai_activity_trace(
                     {
                         ui.label(
                             RichText::new(
-                                "Chat mode is read-only — files and canvas items need Cowork.",
+                                "Chat writes only inside its own sandbox — other folders and canvas items need Cowork.",
                             )
                             .size(10.5)
                             .color(colors.tertiary_text),
@@ -17812,9 +17812,7 @@ fn capture_ai_workspace_root(root: &Path) -> Result<PathBuf, String> {
     Ok(canonical_root)
 }
 
-/// Directory name segment marking per-chat sandbox working folders under
-/// the app data root; the inspector uses it to caption the default.
-const AI_CHAT_SANDBOX_SEGMENT: &str = "chat-sandboxes";
+use crate::ai::AI_CHAT_SANDBOX_SEGMENT;
 
 fn ai_chat_sandbox_directory(data_root: &Path, conversation_id: Uuid) -> PathBuf {
     data_root

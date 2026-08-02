@@ -647,6 +647,15 @@ folder overrides the sandbox; clearing returns the chat to it on the next
 send; the folder and its files outlive chat deletion like every other
 produced file.
 
+File edits whose every reported target lies inside the chat's own sandbox
+are permitted in every workspace and permission mode — including Chat mode,
+whose otherwise read-only wall stays up for everything else, and including
+Ask mode, which is not prompted for them: writing into the Adam-owned
+sandbox is as consequential as replying with text. Location-less edit
+requests, shell execution, canvas tools, and targets outside the sandbox
+keep the standing policy; a path that traverses out of the sandbox fails
+closed.
+
 The working-folder browser sorts directories first, expands lazily to four
 visible levels, previews files on selection, and can reveal either files or
 folders in the system file browser. Folder changes are locked during an active

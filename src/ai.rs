@@ -3220,16 +3220,18 @@ fn run_grok_acp_transport(
     });
     let root_task_tools_enabled = task_tools_enabled;
     let root_canvas_tools_enabled = has_canvas_tools;
+    let sandbox_cwd = is_chat_sandbox_root(&acp_request.cwd).then(|| acp_request.cwd.clone());
     let result = run_grok_acp(
         &acp_request,
         &control.cancelled,
         |permission| {
-            grok_acp_permission_decision_with_subagents(
+            grok_acp_permission_decision_scoped(
                 permission,
                 request.permission_mode,
                 request.workspace_mode,
                 root_task_tools_enabled,
                 root_canvas_tools_enabled,
+                sandbox_cwd.as_deref(),
                 &permission_block,
             )
         },
@@ -3328,6 +3330,58 @@ fn grok_permission_blocked_outcome(tool: String) -> RunOutcome {
     }
 }
 
+/// Path segment marking per-chat sandbox working folders under the app data
+/// root. Shared with the app layer, which creates the folders and captions
+/// them in the inspector.
+pub(crate) const AI_CHAT_SANDBOX_SEGMENT: &str = "chat-sandboxes";
+
+fn is_chat_sandbox_root(root: &Path) -> bool {
+    root.components()
+        .any(|part| part.as_os_str() == AI_CHAT_SANDBOX_SEGMENT)
+}
+
+/// Lexically resolves `.`/`..` so a target that does not exist yet can be
+/// scope-checked; a traversal that escapes the root fails closed.
+fn path_stays_within(root: &Path, candidate: &Path) -> bool {
+    if !candidate.is_absolute() {
+        return false;
+    }
+    let mut resolved = PathBuf::new();
+    for part in candidate.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                if !resolved.pop() {
+                    return false;
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => resolved.push(other),
+        }
+    }
+    resolved.starts_with(root)
+}
+
+/// A file edit whose every reported location stays inside the chat's own
+/// sandbox is as safe as replying with text: Adam created that folder so the
+/// agent can hand the user files (user decision, 2026-08-02). Empty location
+/// lists fail closed — an edit that names no target earns no trust.
+fn sandbox_scoped_file_edit<'a>(
+    sandbox_root: Option<&Path>,
+    locations: impl Iterator<Item = &'a str>,
+) -> bool {
+    let Some(root) = sandbox_root else {
+        return false;
+    };
+    let mut seen = 0_usize;
+    for location in locations {
+        seen += 1;
+        if !path_stays_within(root, Path::new(location)) {
+            return false;
+        }
+    }
+    seen > 0
+}
+
 #[cfg(test)]
 fn grok_acp_permission_decision(
     permission: &GrokAcpPermissionRequest,
@@ -3351,6 +3405,27 @@ fn grok_acp_permission_decision_with_subagents(
     workspace_mode: AiWorkspaceMode,
     root_task_tools_enabled: bool,
     root_canvas_tools_enabled: bool,
+    blocked: &RefCell<GrokPermissionBlockState>,
+) -> GrokAcpPermissionDecision {
+    grok_acp_permission_decision_scoped(
+        permission,
+        mode,
+        workspace_mode,
+        root_task_tools_enabled,
+        root_canvas_tools_enabled,
+        None,
+        blocked,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn grok_acp_permission_decision_scoped(
+    permission: &GrokAcpPermissionRequest,
+    mode: PermissionMode,
+    workspace_mode: AiWorkspaceMode,
+    root_task_tools_enabled: bool,
+    root_canvas_tools_enabled: bool,
+    sandbox_root: Option<&Path>,
     blocked: &RefCell<GrokPermissionBlockState>,
 ) -> GrokAcpPermissionDecision {
     let tool = grok_acp_tool_label(&permission.tool_call);
@@ -3442,6 +3517,19 @@ fn grok_acp_permission_decision_with_subagents(
         } else {
             AiPermissionVerdict::Deny
         }
+    } else if matches!(permission.tool_call.kind, Some(GrokAcpToolKind::Edit))
+        && sandbox_scoped_file_edit(
+            sandbox_root,
+            permission
+                .tool_call
+                .locations
+                .iter()
+                .map(|location| location.path.as_str()),
+        )
+    {
+        // Sandbox file edits skip the Chat-mode wall and the Ask prompt
+        // alike; everything outside the sandbox keeps the standing policy.
+        AiPermissionVerdict::Allow
     } else if workspace_mode == AiWorkspaceMode::Chat && class != AiPermissionClass::Read {
         AiPermissionVerdict::Deny
     } else {
@@ -4237,15 +4325,17 @@ fn run_kimi_acp_transport(
     let permission_block = RefCell::new(KimiPermissionBlockState::default());
     let projection = RefCell::new(KimiAcpProjectionState::default());
     let swarm_enabled = request.provider_preferences.feature(AI_FEATURE_SWARM) != Some(false);
+    let kimi_sandbox_cwd = is_chat_sandbox_root(&acp_request.cwd).then(|| acp_request.cwd.clone());
     let result = run_kimi_acp(
         &acp_request,
         &control.cancelled,
         |permission| {
-            kimi_acp_permission_decision(
+            kimi_acp_permission_decision_scoped(
                 permission,
                 request.permission_mode,
                 request.workspace_mode,
                 swarm_enabled,
+                kimi_sandbox_cwd.as_deref(),
                 &permission_block,
             )
         },
@@ -4391,6 +4481,24 @@ fn kimi_acp_permission_decision(
     swarm_enabled: bool,
     blocked: &RefCell<KimiPermissionBlockState>,
 ) -> KimiAcpPermissionDecision {
+    kimi_acp_permission_decision_scoped(
+        permission,
+        mode,
+        workspace_mode,
+        swarm_enabled,
+        None,
+        blocked,
+    )
+}
+
+fn kimi_acp_permission_decision_scoped(
+    permission: &KimiAcpPermissionRequest,
+    mode: PermissionMode,
+    workspace_mode: AiWorkspaceMode,
+    swarm_enabled: bool,
+    sandbox_root: Option<&Path>,
+    blocked: &RefCell<KimiPermissionBlockState>,
+) -> KimiAcpPermissionDecision {
     // Kimi 0.31 reuses session/request_permission for AskUserQuestion because
     // ACP has no question RPC. Adam does not yet have an interactive question
     // surface, so choose Kimi's explicit Skip option in every stance. In
@@ -4433,10 +4541,23 @@ fn kimi_acp_permission_decision(
             }
         }
     };
-    let verdict = if background_agent
-        || (delegation.is_some() && !swarm_enabled)
-        || (workspace_mode == AiWorkspaceMode::Chat && class != AiPermissionClass::Read)
-    {
+    let sandbox_edit = delegation.is_none()
+        && matches!(permission.tool_call.kind, Some(KimiAcpToolKind::Edit))
+        && sandbox_scoped_file_edit(
+            sandbox_root,
+            permission
+                .tool_call
+                .locations
+                .iter()
+                .map(|location| location.path.as_str()),
+        );
+    let verdict = if background_agent || (delegation.is_some() && !swarm_enabled) {
+        AiPermissionVerdict::Deny
+    } else if sandbox_edit {
+        // Sandbox file edits skip the Chat-mode wall and the Ask prompt
+        // alike; everything outside the sandbox keeps the standing policy.
+        AiPermissionVerdict::Allow
+    } else if workspace_mode == AiWorkspaceMode::Chat && class != AiPermissionClass::Read {
         AiPermissionVerdict::Deny
     } else {
         ai_permission_verdict(mode, class)
@@ -11787,6 +11908,136 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn chat_mode_file_edits_are_allowed_only_inside_the_chat_sandbox() {
+        let blocked = RefCell::new(GrokPermissionBlockState::default());
+        let sandbox = PathBuf::from("/data/chat-sandboxes/abc");
+        let mut write = acp_permission("Write", GrokAcpToolKind::Edit);
+        write.tool_call.locations = vec![crate::grok_acp::GrokAcpToolLocation {
+            path: "/data/chat-sandboxes/abc/report.md".into(),
+            line: None,
+        }];
+        // The sandbox exists so the chat can hand the user files: allowed in
+        // Chat mode, and without an Ask prompt.
+        assert!(matches!(
+            grok_acp_permission_decision_scoped(
+                &write,
+                PermissionMode::Ask,
+                AiWorkspaceMode::Chat,
+                false,
+                false,
+                Some(&sandbox),
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Allow { .. }
+        ));
+        assert!(
+            blocked.borrow().pending.is_none(),
+            "a sandbox write must not record a blocked tool"
+        );
+
+        // A traversal that escapes the sandbox keeps the Chat-mode wall.
+        let mut escaping = write.clone();
+        escaping.tool_call.locations[0].path =
+            "/data/chat-sandboxes/abc/../../../home/user/report.md".into();
+        assert!(matches!(
+            grok_acp_permission_decision_scoped(
+                &escaping,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                false,
+                false,
+                Some(&sandbox),
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+
+        // Execute is never a sandbox file edit, even aimed at the sandbox.
+        let mut exec = acp_permission("Run script", GrokAcpToolKind::Execute);
+        exec.tool_call.locations = vec![crate::grok_acp::GrokAcpToolLocation {
+            path: "/data/chat-sandboxes/abc/script.sh".into(),
+            line: None,
+        }];
+        assert!(matches!(
+            grok_acp_permission_decision_scoped(
+                &exec,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                false,
+                false,
+                Some(&sandbox),
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+
+        // An edit that names no target earns no trust.
+        let bare = acp_permission("Write", GrokAcpToolKind::Edit);
+        assert!(matches!(
+            grok_acp_permission_decision_scoped(
+                &bare,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                false,
+                false,
+                Some(&sandbox),
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+
+        // A run whose working folder is not a chat sandbox keeps the old
+        // Chat-mode policy entirely.
+        assert!(matches!(
+            grok_acp_permission_decision_scoped(
+                &write,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                false,
+                false,
+                None,
+                &blocked,
+            ),
+            GrokAcpPermissionDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn kimi_chat_mode_sandbox_edits_are_allowed() {
+        let blocked = RefCell::new(KimiPermissionBlockState::default());
+        let sandbox = PathBuf::from("/data/chat-sandboxes/xyz");
+        let mut write = kimi_permission("Write", KimiAcpToolKind::Edit, None);
+        write.tool_call.locations = vec![crate::kimi_acp::KimiAcpToolLocation {
+            path: "/data/chat-sandboxes/xyz/notes.md".into(),
+            line: None,
+        }];
+        assert!(matches!(
+            kimi_acp_permission_decision_scoped(
+                &write,
+                PermissionMode::Ask,
+                AiWorkspaceMode::Chat,
+                true,
+                Some(&sandbox),
+                &blocked,
+            ),
+            KimiAcpPermissionDecision::Allow { .. }
+        ));
+        let mut outside = write.clone();
+        outside.tool_call.locations[0].path = "/home/user/notes.md".into();
+        assert!(matches!(
+            kimi_acp_permission_decision_scoped(
+                &outside,
+                PermissionMode::Bypass,
+                AiWorkspaceMode::Chat,
+                true,
+                Some(&sandbox),
+                &blocked,
+            ),
+            KimiAcpPermissionDecision::Reject { .. }
+        ));
     }
 
     fn kimi_permission(
