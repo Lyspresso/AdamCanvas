@@ -384,10 +384,23 @@ pub fn load_workspace(paths: &AppPaths) -> anyhow::Result<Workspace> {
             {
                 changed |= rebase_foreign_data_root(stored_root, paths, &mut workspace);
             }
+            // Preview activation only to decide whether this load needs a
+            // migration write. The actual repair must run on the final merged
+            // workspace under the library lock: another Adam process can add
+            // a real page or a newer Pathway after the read above.
+            let activation_preview = workspace.clone().normalized_from_persistence();
+            let pathways_changed = serde_json::to_vec(&workspace.domain.pathways)?
+                != serde_json::to_vec(&activation_preview.domain.pathways)?;
+            changed |= workspace.pages.is_empty() || pathways_changed;
             if changed {
-                workspace = save_workspace_merged(paths, &base, &workspace)?;
+                // Pass the raw decoded-and-rebased local value, not the
+                // preview. Synthesizing a default page before the lock could
+                // otherwise duplicate a real page created concurrently.
+                workspace = save_workspace_merged_for_activation(paths, &base, &workspace)?;
+            } else {
+                workspace = activation_preview;
             }
-            Ok(workspace.normalized())
+            Ok(workspace)
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Workspace::default()),
         Err(error) => Err(error.into()),
@@ -410,7 +423,7 @@ fn recover_previous_library(
     if live_bytes != unreadable_bytes
         && let Ok(workspace) = serde_json::from_slice::<Workspace>(&live_bytes)
     {
-        return Ok(Some(workspace.normalized()));
+        return Ok(Some(workspace));
     }
 
     let previous_path = paths.root.join(LIBRARY_PREVIOUS_FILE);
@@ -431,7 +444,7 @@ fn recover_previous_library(
         previous_path.display(),
         backup.display()
     );
-    Ok(Some(previous.normalized()))
+    Ok(Some(previous))
 }
 
 fn rebase_legacy_paths(paths: &AppPaths, workspace: &mut Workspace) -> bool {
@@ -1117,6 +1130,36 @@ fn save_workspace_merged(
     base: &Workspace,
     local: &Workspace,
 ) -> anyhow::Result<Workspace> {
+    save_workspace_merged_with_mode(paths, base, local, WorkspaceMergeMode::Runtime)
+}
+
+/// Commits a load-time migration after merging the latest durable state, then
+/// activates destructive Pathways repair while the cross-process lock is held.
+fn save_workspace_merged_for_activation(
+    paths: &AppPaths,
+    base: &Workspace,
+    local: &Workspace,
+) -> anyhow::Result<Workspace> {
+    save_workspace_merged_with_mode(
+        paths,
+        base,
+        local,
+        WorkspaceMergeMode::PersistenceActivation,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkspaceMergeMode {
+    Runtime,
+    PersistenceActivation,
+}
+
+fn save_workspace_merged_with_mode(
+    paths: &AppPaths,
+    base: &Workspace,
+    local: &Workspace,
+    mode: WorkspaceMergeMode,
+) -> anyhow::Result<Workspace> {
     paths.ensure()?;
     let _lock = LibraryLock::acquire(paths)?;
     let remote = read_workspace_for_merge_locked(paths, base)?;
@@ -1147,6 +1190,12 @@ fn save_workspace_merged(
     for conversation_id in deleted_conversations {
         scrub_deleted_conversation(&mut merged, conversation_id);
     }
+    if mode == WorkspaceMergeMode::PersistenceActivation {
+        // This is deliberately absent from ordinary saves. Undo snapshots can
+        // carry a PathwayStore whose page is temporarily absent until redo;
+        // repairing that transient snapshot would make the loss permanent.
+        merged = merged.normalized_from_persistence();
+    }
     write_workspace_locked(paths, &merged)?;
     Ok(merged)
 }
@@ -1157,6 +1206,11 @@ fn read_workspace_for_merge_locked(
 ) -> anyhow::Result<Workspace> {
     match fs::read(&paths.library) {
         Ok(bytes) => match serde_json::from_slice::<Workspace>(&bytes) {
+            // Do not synthesize a random page during a locked merge read.
+            // Load-time activation chooses a safe page only after importing
+            // any real page committed by another process; ordinary saves must
+            // likewise preserve transient undo snapshots verbatim.
+            Ok(workspace) if workspace.pages.is_empty() => Ok(workspace),
             Ok(workspace) => Ok(workspace.normalized()),
             Err(error) => {
                 let backup = write_recovery_copy_locked(paths, &bytes)?;
@@ -1627,6 +1681,168 @@ mod tests {
         assert_eq!(loaded.pages.len(), original.pages.len());
         assert_eq!(loaded.active_page, original.active_page);
         assert!(!paths.library.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn page_less_persisted_workspace_repairs_pathways_after_creating_a_safe_page() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let pathway_id = Uuid::from_u128(79_000);
+        let assignment_id = Uuid::from_u128(79_001);
+        let mut stored = workspace_with_pathway(pathway_id);
+        let missing_page_id = stored.active_page;
+        let mut assignment = PathwayAssignment::new(
+            assignment_id,
+            pathway_id,
+            Uuid::from_u128(79_002),
+            missing_page_id,
+            PathwayAssignmentState::Moving,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            UnixMicros(1_000_002),
+        )
+        .unwrap();
+        assignment.previous_state = Some(PathwayAssignmentState::Waiting);
+        assignment.segment_started_at = Some(UnixMicros(1_000_003));
+        assignment.wait_until = Some(UnixMicros(1_000_004));
+        stored
+            .domain
+            .pathways
+            .insert_assignment(assignment)
+            .unwrap();
+        stored.pages.clear();
+
+        save_workspace_atomic(&paths, &stored).unwrap();
+        let loaded = load_workspace(&paths).unwrap();
+
+        assert_eq!(loaded.pages.len(), 1);
+        assert_eq!(loaded.active_page, loaded.pages[0].id);
+        let pathway = loaded.domain.pathways.pathway(pathway_id).unwrap();
+        assert!(!pathway.is_enabled);
+        assert_eq!(
+            pathway.disabled_reason.as_deref(),
+            Some("Pathway page is missing.")
+        );
+        let assignment = loaded.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(assignment.state, PathwayAssignmentState::NeedsAttention);
+        assert_eq!(
+            assignment.needs_attention_reason.as_deref(),
+            Some("Pathway page is missing.")
+        );
+        assert!(assignment.previous_state.is_none());
+        assert!(assignment.segment_started_at.is_none());
+        assert!(assignment.wait_until.is_none());
+        let durable: Workspace =
+            serde_json::from_slice(&fs::read(&paths.library).unwrap()).unwrap();
+        assert_eq!(durable.pages, loaded.pages);
+        assert_eq!(durable.active_page, loaded.active_page);
+        assert_eq!(durable.domain.pathways, loaded.domain.pathways);
+    }
+
+    #[test]
+    fn activation_merge_prefers_a_concurrently_created_page_over_a_synthetic_page() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let mut base = Workspace::new();
+        base.pages.clear();
+        let local = base.clone();
+        save_workspace_atomic(&paths, &base).unwrap();
+
+        // Model a second Adam process committing a real page after this load
+        // decoded its page-less baseline but before it acquired the merge lock.
+        let real_page_id = Uuid::from_u128(79_100);
+        let real_page = crate::model::CanvasPage {
+            id: real_page_id,
+            name: "Concurrent page".into(),
+            ..crate::model::CanvasPage::default()
+        };
+        let mut concurrent = base.clone();
+        concurrent.pages.push(real_page);
+        concurrent.active_page = real_page_id;
+        save_workspace_atomic(&paths, &concurrent).unwrap();
+
+        let activated = save_workspace_merged_for_activation(&paths, &base, &local).unwrap();
+        assert_eq!(activated.pages.len(), 1);
+        assert_eq!(activated.pages[0].id, real_page_id);
+        assert_eq!(activated.active_page, real_page_id);
+        let durable: Workspace =
+            serde_json::from_slice(&fs::read(&paths.library).unwrap()).unwrap();
+        assert_eq!(durable, activated);
+    }
+
+    #[test]
+    fn activation_merge_repairs_a_concurrently_winning_invalid_pathway_before_write() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let pathway_id = Uuid::from_u128(79_200);
+        let assignment_id = Uuid::from_u128(79_201);
+        let mut base = workspace_with_pathway(pathway_id);
+        let mut assignment = PathwayAssignment::new(
+            assignment_id,
+            pathway_id,
+            Uuid::from_u128(79_202),
+            base.active_page,
+            PathwayAssignmentState::Moving,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            UnixMicros(1_000_002),
+        )
+        .unwrap();
+        assignment.previous_state = Some(PathwayAssignmentState::Waiting);
+        assignment.segment_started_at = Some(UnixMicros(1_000_003));
+        assignment.wait_until = Some(UnixMicros(1_000_004));
+        base.domain.pathways.insert_assignment(assignment).unwrap();
+        save_workspace_atomic(&paths, &base).unwrap();
+        let local = base.clone();
+
+        // Model a concurrent higher-clock edit that changes the route and its
+        // assignment to a page absent from the final merged canvas.
+        let missing_page_id = Uuid::from_u128(79_299);
+        let mut concurrent = base.clone();
+        let pathway = concurrent
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&pathway_id)
+            .unwrap();
+        pathway.page_id = missing_page_id;
+        pathway.modified_at = UnixMicros(2_000_001);
+        let assignment = concurrent
+            .domain
+            .pathways
+            .assignments
+            .get_mut(&assignment_id)
+            .unwrap();
+        assignment.page_id = missing_page_id;
+        assignment.modified_at = UnixMicros(2_000_002);
+        save_workspace_atomic(&paths, &concurrent).unwrap();
+
+        let activated = save_workspace_merged_for_activation(&paths, &base, &local).unwrap();
+        let pathway = activated.domain.pathways.pathway(pathway_id).unwrap();
+        assert_eq!(pathway.page_id, missing_page_id);
+        assert!(!pathway.is_enabled);
+        assert_eq!(
+            pathway.disabled_reason.as_deref(),
+            Some("Pathway page is missing.")
+        );
+        let assignment = activated.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(assignment.state, PathwayAssignmentState::NeedsAttention);
+        assert!(assignment.previous_state.is_none());
+        assert!(assignment.segment_started_at.is_none());
+        assert!(assignment.wait_until.is_none());
+
+        let durable: Workspace =
+            serde_json::from_slice(&fs::read(&paths.library).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&durable).unwrap(),
+            serde_json::to_vec(&activated).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&activated.clone().normalized_from_persistence()).unwrap(),
+            serde_json::to_vec(&activated).unwrap()
+        );
     }
 
     #[test]
@@ -3583,6 +3799,76 @@ mod tests {
         assert_eq!(
             newer_then_older.active_page().name,
             "Older writer canvas edit"
+        );
+    }
+
+    #[test]
+    fn autosaved_undo_then_redo_preserves_the_entire_pathway_container() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let mut before_undo = Workspace::new();
+        let original_page_id = before_undo.active_page;
+        let pathway_page_id = Uuid::from_u128(82_100);
+        let pathway_page = crate::model::CanvasPage {
+            id: pathway_page_id,
+            name: "Pathway page".into(),
+            ..crate::model::CanvasPage::default()
+        };
+        before_undo.pages.push(pathway_page);
+
+        let pathway_id = Uuid::from_u128(82_101);
+        let assignment_id = Uuid::from_u128(82_102);
+        before_undo
+            .domain
+            .pathways
+            .insert_pathway(
+                Pathway::new(
+                    pathway_id,
+                    pathway_page_id,
+                    "Autosaved route",
+                    "#0A84FF",
+                    UnixMicros(3_000_001),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut assignment = PathwayAssignment::new(
+            assignment_id,
+            pathway_id,
+            Uuid::from_u128(82_103),
+            pathway_page_id,
+            PathwayAssignmentState::Moving,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            PathwayPoint::ZERO,
+            UnixMicros(3_000_002),
+        )
+        .unwrap();
+        assignment.previous_state = Some(PathwayAssignmentState::Waiting);
+        assignment.segment_started_at = Some(UnixMicros(3_000_003));
+        assignment.wait_until = Some(UnixMicros(3_000_004));
+        assignment.blocked_at = Some(UnixMicros(3_000_005));
+        assignment.paused_at = Some(UnixMicros(3_000_006));
+        before_undo
+            .domain
+            .pathways
+            .insert_assignment(assignment)
+            .unwrap();
+        let expected_pathways = before_undo.domain.pathways.clone();
+        save_workspace_atomic(&paths, &before_undo).unwrap();
+
+        let mut undone = before_undo.clone();
+        undone.pages.retain(|page| page.id != pathway_page_id);
+        undone.active_page = original_page_id;
+        let saved_undo = save_workspace_merged(&paths, &before_undo, &undone).unwrap();
+        assert_eq!(saved_undo.domain.pathways, expected_pathways);
+
+        let redone = before_undo.clone();
+        let saved_redo = save_workspace_merged(&paths, &undone, &redone).unwrap();
+        assert_eq!(saved_redo.domain.pathways, expected_pathways);
+        assert_eq!(
+            load_workspace(&paths).unwrap().domain.pathways,
+            expected_pathways
         );
     }
 

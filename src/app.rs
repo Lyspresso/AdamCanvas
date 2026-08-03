@@ -20822,6 +20822,92 @@ mod tests {
     }
 
     #[test]
+    fn undo_past_pathway_page_creation_then_redo_preserves_pathway_runtime_state() {
+        let mut history = History::default();
+        let before_page_creation = Workspace::new();
+        history.checkpoint(&before_page_creation);
+
+        let mut current = before_page_creation.clone();
+        let pathway_page_id = Uuid::from_u128(90_010);
+        let pathway_page = CanvasPage {
+            id: pathway_page_id,
+            name: "Pathway page".into(),
+            ..CanvasPage::default()
+        };
+        current.pages.push(pathway_page);
+        current.active_page = pathway_page_id;
+
+        let pathway_id = Uuid::from_u128(90_011);
+        current
+            .domain
+            .pathways
+            .insert_pathway(
+                crate::domain::Pathway::new(
+                    pathway_id,
+                    pathway_page_id,
+                    "Runtime route",
+                    "#0A84FF",
+                    crate::domain::UnixMicros(2_000_001),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let assignment_id = Uuid::from_u128(90_012);
+        let mut assignment = crate::domain::PathwayAssignment::new(
+            assignment_id,
+            pathway_id,
+            Uuid::from_u128(90_013),
+            pathway_page_id,
+            crate::domain::PathwayAssignmentState::Moving,
+            crate::domain::PathwayPoint::ZERO,
+            crate::domain::PathwayPoint::ZERO,
+            crate::domain::PathwayPoint::ZERO,
+            crate::domain::UnixMicros(2_000_002),
+        )
+        .unwrap();
+        assignment.previous_state = Some(crate::domain::PathwayAssignmentState::Waiting);
+        assignment.segment_started_at = Some(crate::domain::UnixMicros(2_000_003));
+        assignment.wait_until = Some(crate::domain::UnixMicros(2_000_004));
+        assignment.blocked_at = Some(crate::domain::UnixMicros(2_000_005));
+        assignment.paused_at = Some(crate::domain::UnixMicros(2_000_006));
+        current
+            .domain
+            .pathways
+            .insert_assignment(assignment)
+            .unwrap();
+        let expected_pathways = current.domain.pathways.clone();
+
+        let mut undone = history.undo(&current).unwrap();
+        carry_forward_pathways(&current, &mut undone);
+        let undone = undone.normalized();
+        assert!(undone.page(pathway_page_id).is_none());
+        assert_eq!(undone.domain.pathways, expected_pathways);
+
+        let mut redone = history.redo(&undone).unwrap();
+        carry_forward_pathways(&undone, &mut redone);
+        let redone = redone.normalized();
+        assert!(redone.page(pathway_page_id).is_some());
+        assert_eq!(redone.domain.pathways, expected_pathways);
+        let assignment = redone.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(
+            assignment.segment_started_at,
+            Some(crate::domain::UnixMicros(2_000_003))
+        );
+        assert_eq!(
+            assignment.wait_until,
+            Some(crate::domain::UnixMicros(2_000_004))
+        );
+        assert_eq!(
+            assignment.blocked_at,
+            Some(crate::domain::UnixMicros(2_000_005))
+        );
+        assert_eq!(
+            assignment.paused_at,
+            Some(crate::domain::UnixMicros(2_000_006))
+        );
+    }
+
+    #[test]
     fn resume_tombstone_finishes_chat_deletion_and_preserves_created_artifacts() {
         let mut workspace = Workspace::new();
         let conversation_id = Uuid::new_v4();

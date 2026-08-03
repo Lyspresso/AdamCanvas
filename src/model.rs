@@ -446,8 +446,10 @@ impl Workspace {
         }
     }
 
-    /// Repairs lightweight invariants after decoding an older or hand-edited
-    /// library. Runtime-only camera and selection state are not introduced.
+    /// Repairs lightweight invariants after decoding or restoring a workspace.
+    /// Runtime-only camera and selection state are not introduced, and durable
+    /// semantic containers are not destructively repaired here because canvas
+    /// undo can temporarily restore an older page set.
     pub fn normalized(mut self) -> Self {
         self.version = CURRENT_WORKSPACE_VERSION;
         self.domain.conversations.normalize_in_place();
@@ -482,6 +484,15 @@ impl Workspace {
         if !self.pages.iter().any(|page| page.id == self.active_page) {
             self.active_page = self.pages[0].id;
         }
+        self
+    }
+
+    /// Applies destructive, non-self-healing Pathways repairs only to a
+    /// workspace decoded at a persistence boundary. Callers must not use this
+    /// for canvas undo/redo snapshots, whose page set can be transiently older
+    /// than the durable Pathways container carried forward by the app.
+    pub(crate) fn normalized_from_persistence(mut self) -> Self {
+        self = self.normalized();
         let valid_page_ids = self
             .pages
             .iter()
@@ -944,7 +955,7 @@ mod tests {
             UnixMicros(1),
         )
         .unwrap();
-        node.title = "é".repeat(140);
+        node.title = format!("{} suffix", "é".repeat(127));
         node.wait_duration_seconds = -4.0;
         let mut invalid_node = node.clone();
         invalid_node.id = invalid_node_id;
@@ -1093,12 +1104,12 @@ mod tests {
             ))
             .unwrap();
 
-        let normalized = workspace.normalized();
+        let normalized = workspace.normalized_from_persistence();
         let pathway = normalized.domain.pathways.pathway(pathway_id).unwrap();
         assert_eq!(pathway.title, "Pathway");
         assert_eq!(pathway.color_hex, "#0A84FF");
         assert_eq!(pathway.nodes.len(), 1);
-        assert_eq!(pathway.node(node_id).unwrap().title.chars().count(), 128);
+        assert_eq!(pathway.node(node_id).unwrap().title, "é".repeat(127));
         assert_eq!(pathway.node(node_id).unwrap().wait_duration_seconds, 0.0);
         assert_eq!(pathway.segments.len(), 1);
         assert!(!pathway.is_enabled);
@@ -1167,6 +1178,6 @@ mod tests {
         );
         assert!(normalized.domain.pathways.pathway(mismatched_key).is_none());
         assert_eq!(normalized.domain.pathways.events().len(), 1);
-        assert_eq!(normalized.clone().normalized(), normalized);
+        assert_eq!(normalized.clone().normalized_from_persistence(), normalized);
     }
 }

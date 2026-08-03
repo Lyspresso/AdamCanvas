@@ -4693,7 +4693,12 @@ fn normalize_pathway_title(value: &str, fallback: &str) -> String {
     if value.is_empty() {
         fallback.to_owned()
     } else {
-        value.chars().take(128).collect()
+        value
+            .chars()
+            .take(128)
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
     }
 }
 
