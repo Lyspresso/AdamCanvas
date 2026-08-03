@@ -17,7 +17,10 @@ use crate::{
     ai_state::{RecordDisposition, ResumeGate, ResumeRecord, ResumeStore},
     artifact_library::{self, ArtifactLibraryState, LibraryTarget},
     assets::AssetStore,
-    automation::{ReconcileRequest, canvas_objects_from_workspace, reconcile_workspace},
+    automation::{
+        CanvasGeometrySnapshot, ReconcileRequest, canvas_objects_from_workspace,
+        reconcile_workspace,
+    },
     chat_core::{
         ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, AgentGroupKind,
         AgentGroupProjection, AgentGroupVisibility, AgentScope, HostMutationKind, PlanItem,
@@ -37,7 +40,7 @@ use crate::{
         AutoTagRule, AutoTagSettings, ContainmentMode, DomainActor, EarnedTagRemovalPolicy,
         ExistingTilesPolicy, HostArtifactOrigin, InitialMembership, MessageRole, PaletteColor,
         PermissionMode, Pile, PileHistoryKind, RuleEditProgressPolicy, RuleState, TagClaim,
-        TagName, TagSource, TimeUnit, TimingMode, TrashActor, TrashItem, UnixMillis,
+        TagName, TagSource, TimeUnit, TimingMode, TrashActor, TrashItem, UnixMicros, UnixMillis,
         ai_permission_verdict, apply_rule_edit, authorize_ai_action, auto_tag_rule_sentence,
         resolve_pile_memberships,
     },
@@ -106,11 +109,15 @@ const CANVAS_QUICK_SLOT_GAP: f32 = 4.0;
 const CANVAS_QUICK_SLOT_COUNT: usize = 12;
 
 fn unix_now() -> UnixMillis {
-    let milliseconds = SystemTime::now()
+    unix_now_micros().to_unix_millis_floor()
+}
+
+fn unix_now_micros() -> UnixMicros {
+    let microseconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .map(|duration| duration.as_micros().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
-    UnixMillis(milliseconds)
+    UnixMicros(microseconds)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -253,7 +260,12 @@ fn carry_forward_pathways(current: &Workspace, restored: &mut Workspace) {
 struct DragSession {
     page_id: Uuid,
     start_world: [f32; 2],
+    /// Rects shown at gesture start. Pathway riders use their projected rects
+    /// so the first moved frame cannot jump back to stale durable geometry.
     originals: HashMap<Uuid, WorldRect>,
+    /// Store-backed rects used only to cancel the gesture. Merely pressing a
+    /// moving rider must never materialize its projected position.
+    durable_originals: HashMap<Uuid, WorldRect>,
     text_source: Option<Uuid>,
     moved: bool,
 }
@@ -261,7 +273,10 @@ struct DragSession {
 struct ResizeSession {
     page_id: Uuid,
     start_world: [f32; 2],
+    /// Rects shown at gesture start; see [`DragSession::originals`].
     originals: HashMap<Uuid, WorldRect>,
+    /// Store-backed rects restored when the resize is cancelled.
+    durable_originals: HashMap<Uuid, WorldRect>,
     handle: ResizeHandle,
     preserve_aspect: bool,
     photo_aspect: Option<f32>,
@@ -2141,7 +2156,9 @@ impl AdamApp {
 
         let before_piles = self.workspace.domain.piles.clone();
         let before_tags = self.workspace.domain.tags.clone();
-        let objects = canvas_objects_from_workspace(&self.workspace, |_| None);
+        let now = unix_now_micros();
+        let geometry = canvas_objects_from_workspace(&self.workspace, now, |_| None)
+            .durable_reconciliation_view(&self.workspace);
         let active_elapsed_ms = self
             .last_automation_tick
             .elapsed()
@@ -2156,8 +2173,8 @@ impl AdamApp {
         let report = reconcile_workspace(
             &mut self.workspace,
             ReconcileRequest {
-                objects: &objects,
-                now: unix_now(),
+                objects: geometry.objects(),
+                now: now.to_unix_millis_floor(),
                 active_elapsed_ms,
                 settled,
                 initial_membership,
@@ -2183,7 +2200,8 @@ impl AdamApp {
             }
         }
         if settled {
-            meaningful_automation_change |= self.reconcile_tag_tiles(unix_now());
+            meaningful_automation_change |=
+                self.reconcile_tag_tiles(now.to_unix_millis_floor(), &geometry);
         }
 
         let automation_state_changed = self.workspace.domain.piles != before_piles
@@ -2210,16 +2228,23 @@ impl AdamApp {
         }
     }
 
-    fn reconcile_tag_tiles(&mut self, now: UnixMillis) -> bool {
+    fn reconcile_tag_tiles(&mut self, now: UnixMillis, geometry: &CanvasGeometrySnapshot) -> bool {
         let mut expected = HashSet::new();
         for page in &self.workspace.pages {
             for tag_tile in &page.tiles {
                 let TileContent::Tag { tag_id } = &tag_tile.content else {
                     continue;
                 };
-                for tile in &page.tiles {
-                    if tile.id != tag_tile.id && tag_tile.rect.intersects(tile.rect) {
-                        expected.insert((tile.id, *tag_id, tag_tile.id));
+                let Some(tag_rect) = geometry.rect_for(page.id, tag_tile.id) else {
+                    continue;
+                };
+                for object in geometry
+                    .objects()
+                    .iter()
+                    .filter(|object| object.page_id == page.id)
+                {
+                    if object.id != tag_tile.id && tag_rect.intersects(object.rect) {
+                        expected.insert((object.id, *tag_id, tag_tile.id));
                     }
                 }
             }
@@ -2732,18 +2757,18 @@ impl AdamApp {
             if let Some(drag) = self.drag.take()
                 && let Some(page) = self.workspace.page_mut(drag.page_id)
             {
-                for tile in &mut page.tiles {
-                    if let Some(original) = drag.originals.get(&tile.id) {
-                        tile.rect = *original;
-                    }
-                }
+                restore_tile_rects(page, &drag.durable_originals);
+            }
+            if let Some(resize) = self.resize.take()
+                && let Some(page) = self.workspace.page_mut(resize.page_id)
+            {
+                restore_tile_rects(page, &resize.durable_originals);
             }
             self.armed_canvas_tool = None;
             self.note_draft = None;
             self.text_note_drop_target = None;
             self.selection.clear();
             self.marquee = None;
-            self.resize = None;
         }
     }
 
@@ -3021,11 +3046,17 @@ impl AdamApp {
                                 self.checkpoint();
                                 self.page_size_edit_active = true;
                             }
-                            let required = self.workspace.active_page().tiles.iter().fold(
+                            let active_page = self.workspace.active_page;
+                            let geometry = canvas_objects_from_workspace(
+                                &self.workspace,
+                                unix_now_micros(),
+                                |_| None,
+                            );
+                            let required = geometry.page_rects(active_page).fold(
                                 [800.0_f32, 640.0_f32],
-                                |mut required, tile| {
-                                    required[0] = required[0].max(tile.rect.max_x() + 96.0);
-                                    required[1] = required[1].max(tile.rect.max_y() + 96.0);
+                                |mut required, rect| {
+                                    required[0] = required[0].max(rect.max_x() + 96.0);
+                                    required[1] = required[1].max(rect.max_y() + 96.0);
                                     required
                                 },
                             );
@@ -3747,10 +3778,45 @@ impl AdamApp {
                 let page_size = self.workspace.active_page().size;
                 draw_canvas_background(&painter, view, page_size, camera, self.show_grid, colors);
 
+                // One wall-clock sample and one immutable geometry snapshot
+                // drive every canvas read in this frame. Projection remains
+                // functional under Reduce Motion; only decorative animation
+                // is governed by that preference.
+                let pathway_now = unix_now_micros();
+                let mut geometry =
+                    canvas_objects_from_workspace(&self.workspace, pathway_now, |_| None);
+                overlay_live_gesture_geometry(
+                    &mut geometry,
+                    self.workspace.active_page(),
+                    self.drag.as_ref(),
+                    self.resize.as_ref(),
+                );
+                let projected_rects = geometry.page_rects(page_id).collect::<Vec<_>>();
+                debug_assert_eq!(
+                    projected_rects.len(),
+                    self.workspace.active_page().tiles.len()
+                );
+                let projected_rect_by_tile = self
+                    .workspace
+                    .active_page()
+                    .tiles
+                    .iter()
+                    .zip(projected_rects.iter().copied())
+                    .map(|(tile, rect)| (tile.id, rect))
+                    .collect::<HashMap<_, _>>();
+                if let Some(delay) = geometry.repaint_after(page_id, pathway_now) {
+                    context.request_repaint_after(delay);
+                }
+
                 if self.spatial_dirty || self.spatial_page != Some(page_id) {
-                    self.spatial.rebuild(&self.workspace.active_page().tiles);
+                    self.spatial.rebuild_rects(projected_rects.iter().copied());
                     self.spatial_page = Some(page_id);
                     self.spatial_dirty = false;
+                } else {
+                    // `spatial_dirty` cannot observe the wall clock. Compare
+                    // against the frame geometry so the endpoint frame also
+                    // replaces the penultimate moving rect.
+                    self.spatial.refresh_rects(projected_rects.iter().copied());
                 }
 
                 let visible_world = camera.visible_world(view);
@@ -3783,8 +3849,8 @@ impl AdamApp {
                     })
                     .collect();
                 pile_indices.sort_by(|left, right| {
-                    let left_rect = page.tiles[*left].rect;
-                    let right_rect = page.tiles[*right].rect;
+                    let left_rect = projected_rects[*left];
+                    let right_rect = projected_rects[*right];
                     let left_area = left_rect.w.abs() * left_rect.h.abs();
                     let right_area = right_rect.w.abs() * right_rect.h.abs();
                     right_area
@@ -3801,8 +3867,7 @@ impl AdamApp {
                 let pile_memberships = if pile_indices.is_empty() {
                     Default::default()
                 } else {
-                    let objects = canvas_objects_from_workspace(&self.workspace, |_| None);
-                    resolve_pile_memberships(&self.workspace.domain.piles, &objects)
+                    resolve_pile_memberships(&self.workspace.domain.piles, geometry.objects())
                 };
                 let pointer_over_content = context
                     .input(|input| input.pointer.hover_pos())
@@ -3810,7 +3875,9 @@ impl AdamApp {
                         visible_indices.iter().rev().any(|index| {
                             page.tiles.get(*index).is_some_and(|tile| {
                                 tile.kind() != TileKind::Pile
-                                    && camera.screen_rect(tile.rect, view).contains(pointer)
+                                    && projected_rects.get(*index).is_some_and(|rect| {
+                                        camera.screen_rect(*rect, view).contains(pointer)
+                                    })
                             })
                         })
                     });
@@ -3910,6 +3977,7 @@ impl AdamApp {
                             ui,
                             &painter,
                             tile,
+                            projected_rects.get(index).copied().unwrap_or(tile.rect),
                             camera,
                             view,
                             selection.contains(&tile.id),
@@ -3951,7 +4019,14 @@ impl AdamApp {
                     quick_bar_rect,
                 );
                 if !quick_tool_consumed && self.armed_canvas_tool.is_none() {
-                    self.apply_tile_events(&context, tile_events, camera, view);
+                    self.apply_tile_events(
+                        &context,
+                        tile_events,
+                        camera,
+                        view,
+                        &geometry,
+                        &projected_rect_by_tile,
+                    );
                     self.handle_background_interaction(
                         &context,
                         &canvas_response,
@@ -3960,11 +4035,17 @@ impl AdamApp {
                         any_tile_pressed,
                     );
                 }
-                self.update_live_gestures(&context, camera, view);
-                self.draw_text_note_drop_target(&painter, camera, view, colors);
+                self.update_live_gestures(&context, camera, view, &projected_rect_by_tile);
+                self.draw_text_note_drop_target(
+                    &painter,
+                    camera,
+                    view,
+                    colors,
+                    &projected_rect_by_tile,
+                );
                 self.draw_marquee(&painter, camera, view, colors);
-                self.show_note_editor(ui, &context, camera, view, colors);
-                self.draw_minimap(&painter, view, camera, colors);
+                self.show_note_editor(ui, &context, camera, view, colors, &projected_rect_by_tile);
+                self.draw_minimap(&painter, view, camera, colors, &projected_rects);
                 self.show_canvas_status(ui, view, colors);
                 self.show_drop_overlay(&context, &painter, view, colors);
 
@@ -5168,6 +5249,7 @@ impl AdamApp {
         camera: Camera,
         view: Rect,
         colors: Theme,
+        projected_rects: &HashMap<Uuid, WorldRect>,
     ) {
         let Some(target_id) = self.text_note_drop_target else {
             return;
@@ -5175,7 +5257,8 @@ impl AdamApp {
         let Some(tile) = self.workspace.active_page().tile(target_id) else {
             return;
         };
-        let rect = camera.screen_rect(tile.rect, view);
+        let world_rect = projected_rects.get(&tile.id).copied().unwrap_or(tile.rect);
+        let rect = camera.screen_rect(world_rect, view);
         painter.rect_filled(
             rect,
             CANVAS_OBJECT_RADIUS,
@@ -5249,6 +5332,8 @@ impl AdamApp {
         events: Vec<TileUiEvent>,
         camera: Camera,
         view: Rect,
+        geometry: &CanvasGeometrySnapshot,
+        projected_rects: &HashMap<Uuid, WorldRect>,
     ) {
         for event in events {
             let Some(id) = event.id else {
@@ -5279,7 +5364,12 @@ impl AdamApp {
                         self.selection.clear();
                         self.selection.insert(id);
                     }
-                    self.begin_drag(id, camera.screen_to_world(pointer, view));
+                    self.begin_drag(
+                        id,
+                        camera.screen_to_world(pointer, view),
+                        geometry,
+                        projected_rects,
+                    );
                 }
             }
 
@@ -5289,6 +5379,7 @@ impl AdamApp {
                     camera.screen_to_world(pointer, view),
                     handle,
                     context.input(|input| input.modifiers.shift),
+                    projected_rects,
                 );
             }
 
@@ -5364,7 +5455,7 @@ impl AdamApp {
                         self.changed(false);
                     }
                     TileAction::SelectPileAndContents(pile_id) => {
-                        self.select_pile_and_contents(pile_id);
+                        self.select_pile_and_contents(pile_id, geometry);
                     }
                     TileAction::BringToFront(id) => {
                         self.reorder_tile(id, true);
@@ -5401,10 +5492,14 @@ impl AdamApp {
                     TileAction::NoteChecklist(id) => {
                         self.insert_note_markup(id, "- [ ] Checklist item\n")
                     }
-                    TileAction::AlignLeft => self.align_selection(true),
-                    TileAction::AlignTop => self.align_selection(false),
-                    TileAction::DistributeHorizontally => self.distribute_selection(true),
-                    TileAction::DistributeVertically => self.distribute_selection(false),
+                    TileAction::AlignLeft => self.align_selection(true, projected_rects),
+                    TileAction::AlignTop => self.align_selection(false, projected_rects),
+                    TileAction::DistributeHorizontally => {
+                        self.distribute_selection(true, projected_rects)
+                    }
+                    TileAction::DistributeVertically => {
+                        self.distribute_selection(false, projected_rects)
+                    }
                     TileAction::Delete(id) => {
                         self.select_context_target(id);
                         self.delete_selection(context);
@@ -5485,7 +5580,7 @@ impl AdamApp {
         self.changed(false);
     }
 
-    fn align_selection(&mut self, align_left: bool) {
+    fn align_selection(&mut self, align_left: bool, projected_rects: &HashMap<Uuid, WorldRect>) {
         if self.selection.len() < 2 {
             return;
         }
@@ -5496,10 +5591,11 @@ impl AdamApp {
             .iter()
             .filter(|tile| self.selection.contains(&tile.id))
             .map(|tile| {
+                let rect = projected_rects.get(&tile.id).copied().unwrap_or(tile.rect);
                 if align_left {
-                    tile.rect.min_x()
+                    rect.min_x()
                 } else {
-                    tile.rect.min_y()
+                    rect.min_y()
                 }
             })
             .fold(f32::INFINITY, f32::min);
@@ -5519,7 +5615,11 @@ impl AdamApp {
         self.changed(true);
     }
 
-    fn distribute_selection(&mut self, horizontal: bool) {
+    fn distribute_selection(
+        &mut self,
+        horizontal: bool,
+        projected_rects: &HashMap<Uuid, WorldRect>,
+    ) {
         if self.selection.len() < 3 {
             return;
         }
@@ -5530,12 +5630,13 @@ impl AdamApp {
             .iter()
             .filter(|tile| self.selection.contains(&tile.id))
             .map(|tile| {
+                let rect = projected_rects.get(&tile.id).copied().unwrap_or(tile.rect);
                 (
                     tile.id,
                     if horizontal {
-                        tile.rect.center()[0]
+                        rect.center()[0]
                     } else {
-                        tile.rect.center()[1]
+                        rect.center()[1]
                     },
                 )
             })
@@ -5566,12 +5667,12 @@ impl AdamApp {
         }
     }
 
-    fn select_pile_and_contents(&mut self, pile_id: Uuid) {
+    fn select_pile_and_contents(&mut self, pile_id: Uuid, geometry: &CanvasGeometrySnapshot) {
         if !self.workspace.domain.piles.contains_key(&pile_id) {
             return;
         }
-        let objects = canvas_objects_from_workspace(&self.workspace, |_| None);
-        let memberships = resolve_pile_memberships(&self.workspace.domain.piles, &objects);
+        let memberships =
+            resolve_pile_memberships(&self.workspace.domain.piles, geometry.objects());
         let page_tile_ids: HashSet<_> = self
             .workspace
             .active_page()
@@ -5634,7 +5735,13 @@ impl AdamApp {
         }
     }
 
-    fn update_live_gestures(&mut self, context: &Context, camera: Camera, view: Rect) {
+    fn update_live_gestures(
+        &mut self,
+        context: &Context,
+        camera: Camera,
+        view: Rect,
+        projected_rects: &HashMap<Uuid, WorldRect>,
+    ) {
         let pointer = context.input(|input| input.pointer.interact_pos());
         let primary_released =
             context.input(|input| input.pointer.button_released(PointerButton::Primary));
@@ -5645,13 +5752,10 @@ impl AdamApp {
                 marquee.current = current;
                 let rect = rect_from_points(marquee.start, marquee.current);
                 let mut selected = marquee.base_selection.clone();
-                for index in self.spatial.query_visible(rect) {
-                    if let Some(tile) = self.workspace.active_page().tiles.get(index) {
-                        if tile.kind() != TileKind::Pile {
-                            selected.insert(tile.id);
-                        }
-                    }
-                }
+                selected.extend(
+                    self.spatial
+                        .query_non_pile_tile_ids(&self.workspace.active_page().tiles, rect),
+                );
                 self.selection = selected;
             }
 
@@ -5663,12 +5767,12 @@ impl AdamApp {
                     current[1] - drag.start_world[1],
                 ];
                 drag.moved |= delta[0].abs() > 0.25 || delta[1].abs() > 0.25;
-                let page = self.workspace.active_page_mut();
-                for tile in &mut page.tiles {
-                    if let Some(original) = drag.originals.get(&tile.id) {
-                        tile.rect = original.translated(delta);
-                    }
-                }
+                apply_drag_delta(
+                    self.workspace.active_page_mut(),
+                    &drag.originals,
+                    delta,
+                    drag.moved,
+                );
                 context.request_repaint();
             }
 
@@ -5683,7 +5787,12 @@ impl AdamApp {
                         && self.drag_destination_page.is_none()
                 })
                 .and_then(|source_id| {
-                    topmost_standard_note_at(self.workspace.active_page(), current, source_id)
+                    topmost_standard_note_at(
+                        self.workspace.active_page(),
+                        projected_rects,
+                        current,
+                        source_id,
+                    )
                 });
 
             if let Some(resize) = &mut self.resize
@@ -5694,61 +5803,67 @@ impl AdamApp {
                     current[1] - resize.start_world[1],
                 ];
                 resize.changed |= delta[0].abs() > 0.25 || delta[1].abs() > 0.25;
-                let page = self.workspace.active_page_mut();
-                for tile in &mut page.tiles {
-                    if let Some(original) = resize.originals.get(&tile.id) {
-                        let left = resize.handle.moves_left();
-                        let right = resize.handle.moves_right();
-                        let top = resize.handle.moves_top();
-                        let bottom = resize.handle.moves_bottom();
-                        let proposed_width = if left {
-                            original.w - delta[0]
-                        } else if right {
-                            original.w + delta[0]
-                        } else {
-                            original.w
-                        };
-                        let proposed_height = if top {
-                            original.h - delta[1]
-                        } else if bottom {
-                            original.h + delta[1]
-                        } else {
-                            original.h
-                        };
-                        let (mut width, mut height) = if resize.preserve_aspect
-                            && let Some(aspect) = resize.photo_aspect
-                        {
-                            let size = resized_photo_tile_size(
-                                *original,
-                                vec2(proposed_width, proposed_height),
-                                resize.handle,
-                                aspect,
-                            );
-                            (size.x, size.y)
-                        } else {
-                            (
-                                proposed_width.clamp(MIN_TILE_SIZE.x, MAX_TILE_SIZE.x),
-                                proposed_height.clamp(MIN_TILE_SIZE.y, MAX_TILE_SIZE.y),
-                            )
-                        };
-                        if resize.preserve_aspect && resize.photo_aspect.is_none() {
-                            let ratio = original.w / original.h.max(1.0);
-                            if (left || right) && !(top || bottom) {
-                                height = (width / ratio).clamp(MIN_TILE_SIZE.y, MAX_TILE_SIZE.y);
-                            } else if (top || bottom) && !(left || right) {
-                                width = (height * ratio).clamp(MIN_TILE_SIZE.x, MAX_TILE_SIZE.x);
-                            } else if delta[0].abs() >= delta[1].abs() {
-                                height = (width / ratio).clamp(MIN_TILE_SIZE.y, MAX_TILE_SIZE.y);
+                if resize.changed {
+                    let page = self.workspace.active_page_mut();
+                    for tile in &mut page.tiles {
+                        if let Some(original) = resize.originals.get(&tile.id) {
+                            let left = resize.handle.moves_left();
+                            let right = resize.handle.moves_right();
+                            let top = resize.handle.moves_top();
+                            let bottom = resize.handle.moves_bottom();
+                            let proposed_width = if left {
+                                original.w - delta[0]
+                            } else if right {
+                                original.w + delta[0]
                             } else {
-                                width = (height * ratio).clamp(MIN_TILE_SIZE.x, MAX_TILE_SIZE.x);
+                                original.w
+                            };
+                            let proposed_height = if top {
+                                original.h - delta[1]
+                            } else if bottom {
+                                original.h + delta[1]
+                            } else {
+                                original.h
+                            };
+                            let (mut width, mut height) = if resize.preserve_aspect
+                                && let Some(aspect) = resize.photo_aspect
+                            {
+                                let size = resized_photo_tile_size(
+                                    *original,
+                                    vec2(proposed_width, proposed_height),
+                                    resize.handle,
+                                    aspect,
+                                );
+                                (size.x, size.y)
+                            } else {
+                                (
+                                    proposed_width.clamp(MIN_TILE_SIZE.x, MAX_TILE_SIZE.x),
+                                    proposed_height.clamp(MIN_TILE_SIZE.y, MAX_TILE_SIZE.y),
+                                )
+                            };
+                            if resize.preserve_aspect && resize.photo_aspect.is_none() {
+                                let ratio = original.w / original.h.max(1.0);
+                                if (left || right) && !(top || bottom) {
+                                    height =
+                                        (width / ratio).clamp(MIN_TILE_SIZE.y, MAX_TILE_SIZE.y);
+                                } else if (top || bottom) && !(left || right) {
+                                    width =
+                                        (height * ratio).clamp(MIN_TILE_SIZE.x, MAX_TILE_SIZE.x);
+                                } else if delta[0].abs() >= delta[1].abs() {
+                                    height =
+                                        (width / ratio).clamp(MIN_TILE_SIZE.y, MAX_TILE_SIZE.y);
+                                } else {
+                                    width =
+                                        (height * ratio).clamp(MIN_TILE_SIZE.x, MAX_TILE_SIZE.x);
+                                }
                             }
+                            tile.rect = positioned_resized_rect(
+                                *original,
+                                vec2(width, height),
+                                resize.handle,
+                                resize.preserve_aspect && resize.photo_aspect.is_some(),
+                            );
                         }
-                        tile.rect = positioned_resized_rect(
-                            *original,
-                            vec2(width, height),
-                            resize.handle,
-                            resize.preserve_aspect && resize.photo_aspect.is_some(),
-                        );
                     }
                 }
                 context.request_repaint();
@@ -5759,7 +5874,7 @@ impl AdamApp {
             if let Some(drag) = self.drag.take()
                 && drag.moved
             {
-                let ids: Vec<_> = drag.originals.iter().map(|(id, _)| *id).collect();
+                let ids: Vec<_> = drag.originals.keys().copied().collect();
                 let mut final_page = drag.page_id;
                 let mut moved_to_page = false;
                 let mut merged_into_note = false;
@@ -5871,7 +5986,13 @@ impl AdamApp {
         }
     }
 
-    fn begin_drag(&mut self, pressed_id: Uuid, start_world: [f32; 2]) {
+    fn begin_drag(
+        &mut self,
+        pressed_id: Uuid,
+        start_world: [f32; 2],
+        geometry: &CanvasGeometrySnapshot,
+        projected_rects: &HashMap<Uuid, WorldRect>,
+    ) {
         self.checkpoint();
         let selected_piles: Vec<_> = self
             .selection
@@ -5881,8 +6002,8 @@ impl AdamApp {
             .map(|pile| pile.id)
             .collect();
         if !selected_piles.is_empty() {
-            let objects = canvas_objects_from_workspace(&self.workspace, |_| None);
-            let memberships = resolve_pile_memberships(&self.workspace.domain.piles, &objects);
+            let memberships =
+                resolve_pile_memberships(&self.workspace.domain.piles, geometry.objects());
             for pile_id in selected_piles {
                 if let Some(members) = memberships.get(&pile_id) {
                     self.selection.extend(members.iter().copied());
@@ -5890,6 +6011,19 @@ impl AdamApp {
             }
         }
         let originals = self
+            .workspace
+            .active_page()
+            .tiles
+            .iter()
+            .filter(|tile| self.selection.contains(&tile.id))
+            .map(|tile| {
+                (
+                    tile.id,
+                    projected_rects.get(&tile.id).copied().unwrap_or(tile.rect),
+                )
+            })
+            .collect();
+        let durable_originals = self
             .workspace
             .active_page()
             .tiles
@@ -5906,6 +6040,7 @@ impl AdamApp {
             page_id: self.workspace.active_page,
             start_world,
             originals,
+            durable_originals,
             text_source,
             moved: false,
         });
@@ -5919,6 +6054,7 @@ impl AdamApp {
         start_world: [f32; 2],
         handle: ResizeHandle,
         shift_down: bool,
+        projected_rects: &HashMap<Uuid, WorldRect>,
     ) {
         if !self.selection.contains(&id) {
             self.selection.clear();
@@ -5926,6 +6062,19 @@ impl AdamApp {
         }
         self.checkpoint();
         let originals = self
+            .workspace
+            .active_page()
+            .tiles
+            .iter()
+            .filter(|tile| self.selection.contains(&tile.id))
+            .map(|tile| {
+                (
+                    tile.id,
+                    projected_rects.get(&tile.id).copied().unwrap_or(tile.rect),
+                )
+            })
+            .collect();
+        let durable_originals = self
             .workspace
             .active_page()
             .tiles
@@ -5949,6 +6098,7 @@ impl AdamApp {
             page_id: self.workspace.active_page,
             start_world,
             originals,
+            durable_originals,
             handle,
             preserve_aspect,
             photo_aspect,
@@ -5996,17 +6146,12 @@ impl AdamApp {
             return;
         };
         let world = camera.screen_to_world(pointer, view);
-        let Some(bounds) = drag
-            .originals
-            .iter()
-            .map(|(_, rect)| *rect)
-            .reduce(union_rect)
-        else {
+        let Some(bounds) = drag.originals.values().copied().reduce(union_rect) else {
             return;
         };
         let center = bounds.center();
         let delta = [world[0] - center[0], world[1] - center[1]];
-        for (_, original) in &drag.originals {
+        for original in drag.originals.values() {
             let rect = camera.screen_rect(original.translated(delta), view);
             painter.rect_filled(rect, CANVAS_OBJECT_RADIUS, colors.selection_fill);
             painter.rect_stroke(
@@ -6025,6 +6170,7 @@ impl AdamApp {
         camera: Camera,
         view: Rect,
         colors: Theme,
+        projected_rects: &HashMap<Uuid, WorldRect>,
     ) {
         let Some(id) = self.editing_note else {
             return;
@@ -6034,7 +6180,8 @@ impl AdamApp {
             return;
         };
         let canvas_style = tile.canvas_style;
-        let tile_rect = camera.screen_rect(tile.rect, view);
+        let world_rect = projected_rects.get(&id).copied().unwrap_or(tile.rect);
+        let tile_rect = camera.screen_rect(world_rect, view);
         let too_small = if canvas_style == CanvasTileStyle::FreeText {
             tile_rect.width() < 30.0 || tile_rect.height() < 24.0
         } else {
@@ -6886,7 +7033,7 @@ impl AdamApp {
                 .map(|artifact| artifact.text.as_ref().clone()),
             user_notes: nonblank(&record.user_notes),
         };
-        PhotoDossier::from_workspace(&self.workspace, tile_id, enrichment)
+        PhotoDossier::from_workspace(&self.workspace, tile_id, enrichment, unix_now_micros())
     }
 
     fn show_tag_picker(&mut self, context: &Context) {
@@ -9879,7 +10026,7 @@ impl AdamApp {
         let mode = ai_workspace_mode_label(conversation.settings.workspace_mode);
         let permission = permission_label(conversation.permission_mode);
         let page = self.workspace.active_page();
-        let visible_ids = assistant_visible_tile_ids(&self.workspace);
+        let visible_ids = assistant_visible_tile_ids(&self.workspace, unix_now_micros());
         let mut visible_tiles = page
             .tiles
             .iter()
@@ -10431,7 +10578,7 @@ impl AdamApp {
                 now,
                 Vec::new(),
             );
-            let tile_count = assistant_visible_tile_ids(&self.workspace).len();
+            let tile_count = assistant_visible_tile_ids(&self.workspace, unix_now_micros()).len();
             let response = format!(
                 "I can see {tile_count} tiles on “{}”. I’m running in local stub mode: I’ll respect {:?} permission, protected tiles, checkpoints, and Trash, but no cloud model is connected.",
                 self.workspace.active_page().name,
@@ -10497,7 +10644,7 @@ impl AdamApp {
 
         let response = match &request.kind {
             AiActionKind::ReadPage => {
-                let visible = assistant_visible_tile_ids(&self.workspace);
+                let visible = assistant_visible_tile_ids(&self.workspace, unix_now_micros());
                 let titles = self
                     .workspace
                     .active_page()
@@ -11087,9 +11234,13 @@ impl AdamApp {
         let Some(tile) = self.workspace.active_page().tile(tile_id) else {
             return;
         };
+        let geometry = canvas_objects_from_workspace(&self.workspace, unix_now_micros(), |_| None);
+        let rect = geometry
+            .rect_for(self.workspace.active_page, tile_id)
+            .unwrap_or(tile.rect);
         let center = vec2(
-            (tile.rect.min_x() + tile.rect.max_x()) / 2.0,
-            (tile.rect.min_y() + tile.rect.max_y()) / 2.0,
+            (rect.min_x() + rect.max_x()) / 2.0,
+            (rect.min_y() + rect.max_y()) / 2.0,
         );
         let mut camera = self.active_camera();
         camera.origin = center - view.size() / (2.0 * camera.zoom);
@@ -11185,20 +11336,26 @@ impl AdamApp {
 
     fn fit_content(&mut self, context: &Context) {
         let page = self.workspace.active_page();
-        let Some(first) = page.tiles.first() else {
+        if page.tiles.is_empty() {
+            self.toast("There are no tiles to fit", context);
+            return;
+        }
+        let geometry = canvas_objects_from_workspace(&self.workspace, unix_now_micros(), |_| None);
+        let mut rects = geometry.page_rects(page.id);
+        let Some(first) = rects.next() else {
             self.toast("There are no tiles to fit", context);
             return;
         };
 
-        let mut min_x = first.rect.min_x();
-        let mut min_y = first.rect.min_y();
-        let mut max_x = first.rect.max_x();
-        let mut max_y = first.rect.max_y();
-        for tile in &page.tiles[1..] {
-            min_x = min_x.min(tile.rect.min_x());
-            min_y = min_y.min(tile.rect.min_y());
-            max_x = max_x.max(tile.rect.max_x());
-            max_y = max_y.max(tile.rect.max_y());
+        let mut min_x = first.min_x();
+        let mut min_y = first.min_y();
+        let mut max_x = first.max_x();
+        let mut max_y = first.max_y();
+        for rect in rects {
+            min_x = min_x.min(rect.min_x());
+            min_y = min_y.min(rect.min_y());
+            max_x = max_x.max(rect.max_x());
+            max_y = max_y.max(rect.max_y());
         }
 
         const CONTENT_MARGIN: f32 = 96.0;
@@ -11227,7 +11384,14 @@ impl AdamApp {
         );
     }
 
-    fn draw_minimap(&self, painter: &Painter, view: Rect, camera: Camera, colors: Theme) {
+    fn draw_minimap(
+        &self,
+        painter: &Painter,
+        view: Rect,
+        camera: Camera,
+        colors: Theme,
+        projected_rects: &[WorldRect],
+    ) {
         let page = self.workspace.active_page();
         let page_screen_size = vec2(page.size[0], page.size[1]) * camera.zoom;
         let substantially_larger =
@@ -11258,11 +11422,12 @@ impl AdamApp {
             StrokeKind::Inside,
         );
 
-        for tile in page.tiles.iter().take(400) {
-            let x0 = tile.rect.min_x().clamp(0.0, page.size[0]);
-            let y0 = tile.rect.min_y().clamp(0.0, page.size[1]);
-            let x1 = tile.rect.max_x().clamp(0.0, page.size[0]);
-            let y1 = tile.rect.max_y().clamp(0.0, page.size[1]);
+        for (index, tile) in page.tiles.iter().take(400).enumerate() {
+            let rect = projected_rects.get(index).copied().unwrap_or(tile.rect);
+            let x0 = rect.min_x().clamp(0.0, page.size[0]);
+            let y0 = rect.min_y().clamp(0.0, page.size[1]);
+            let x1 = rect.max_x().clamp(0.0, page.size[0]);
+            let y1 = rect.max_y().clamp(0.0, page.size[1]);
             if x1 <= x0 || y1 <= y0 {
                 continue;
             }
@@ -12249,13 +12414,14 @@ impl AdamApp {
     }
 
     fn ensure_page_contains(&mut self, page_id: Uuid) {
+        let geometry = canvas_objects_from_workspace(&self.workspace, unix_now_micros(), |_| None);
         let Some(page) = self.workspace.page(page_id) else {
             return;
         };
         let mut required = page.size;
-        for tile in &page.tiles {
-            required[0] = required[0].max(tile.rect.max_x() + 96.0);
-            required[1] = required[1].max(tile.rect.max_y() + 96.0);
+        for rect in geometry.page_rects(page_id) {
+            required[0] = required[0].max(rect.max_x() + 96.0);
+            required[1] = required[1].max(rect.max_y() + 96.0);
         }
         if let Some(page) = self.workspace.page_mut(page_id) {
             page.set_size(required);
@@ -12642,6 +12808,7 @@ fn draw_tile(
     ui: &mut Ui,
     painter: &Painter,
     tile: &Tile,
+    world_rect: WorldRect,
     camera: Camera,
     view: Rect,
     selected: bool,
@@ -12661,7 +12828,7 @@ fn draw_tile(
     page_targets: &[(Uuid, String)],
     colors: Theme,
 ) -> TileUiEvent {
-    let screen_rect = camera.screen_rect(tile.rect, view);
+    let screen_rect = camera.screen_rect(world_rect, view);
     let mut event = TileUiEvent {
         id: Some(tile.id),
         ..Default::default()
@@ -14973,12 +15140,21 @@ fn measured_free_text_world_size(context: &Context, text: &str) -> [f32; 2] {
     })
 }
 
-fn topmost_standard_note_at(page: &CanvasPage, point: [f32; 2], source_id: Uuid) -> Option<Uuid> {
+fn topmost_standard_note_at(
+    page: &CanvasPage,
+    projected_rects: &HashMap<Uuid, WorldRect>,
+    point: [f32; 2],
+    source_id: Uuid,
+) -> Option<Uuid> {
     page.tiles.iter().rev().find_map(|tile| {
         (tile.id != source_id
             && tile.canvas_style == CanvasTileStyle::Standard
             && matches!(tile.content, TileContent::Note { .. })
-            && tile.rect.contains_point(point))
+            && projected_rects
+                .get(&tile.id)
+                .copied()
+                .unwrap_or(tile.rect)
+                .contains_point(point))
         .then_some(tile.id)
     })
 }
@@ -20400,9 +20576,9 @@ fn ai_checkpoint_snapshot(workspace: &Workspace) -> serde_json::Value {
     serde_json::to_value(checkpoint).unwrap_or(serde_json::Value::Null)
 }
 
-fn assistant_visible_tile_ids(workspace: &Workspace) -> HashSet<Uuid> {
-    let objects = canvas_objects_from_workspace(workspace, |_| None);
-    let memberships = resolve_pile_memberships(&workspace.domain.piles, &objects);
+fn assistant_visible_tile_ids(workspace: &Workspace, at: UnixMicros) -> HashSet<Uuid> {
+    let geometry = canvas_objects_from_workspace(workspace, at, |_| None);
+    let memberships = resolve_pile_memberships(&workspace.domain.piles, geometry.objects());
     let mut hidden = HashSet::new();
     for pile in workspace
         .domain
@@ -20497,6 +20673,49 @@ fn snap_tile_group(page: &mut CanvasPage, ids: &[Uuid], spacing: f32) {
         ids,
         [snapped_x - anchor.min_x(), snapped_y - anchor.min_y()],
     );
+}
+
+fn apply_drag_delta(
+    page: &mut CanvasPage,
+    visual_origins: &HashMap<Uuid, WorldRect>,
+    delta: [f32; 2],
+    moved: bool,
+) {
+    if !moved {
+        return;
+    }
+    for tile in &mut page.tiles {
+        if let Some(original) = visual_origins.get(&tile.id) {
+            tile.rect = original.translated(delta);
+        }
+    }
+}
+
+fn overlay_live_gesture_geometry(
+    geometry: &mut CanvasGeometrySnapshot,
+    page: &CanvasPage,
+    drag: Option<&DragSession>,
+    resize: Option<&ResizeSession>,
+) {
+    for tile in &page.tiles {
+        let dragged = drag.is_some_and(|drag| {
+            drag.page_id == page.id && drag.moved && drag.originals.contains_key(&tile.id)
+        });
+        let resized = resize.is_some_and(|resize| {
+            resize.page_id == page.id && resize.changed && resize.originals.contains_key(&tile.id)
+        });
+        if dragged || resized {
+            let _ = geometry.overlay_rect(page.id, tile.id, tile.rect);
+        }
+    }
+}
+
+fn restore_tile_rects(page: &mut CanvasPage, durable_originals: &HashMap<Uuid, WorldRect>) {
+    for tile in &mut page.tiles {
+        if let Some(original) = durable_originals.get(&tile.id) {
+            tile.rect = *original;
+        }
+    }
 }
 
 fn snap_resized_tiles(
@@ -20904,6 +21123,68 @@ mod tests {
         assert_eq!(
             assignment.paused_at,
             Some(crate::domain::UnixMicros(2_000_006))
+        );
+    }
+
+    #[test]
+    fn projected_drag_noop_and_cancel_preserve_durable_rect_bits() {
+        fn bits(rect: WorldRect) -> [u32; 4] {
+            [
+                rect.x.to_bits(),
+                rect.y.to_bits(),
+                rect.w.to_bits(),
+                rect.h.to_bits(),
+            ]
+        }
+
+        let mut workspace = Workspace::new();
+        let durable = WorldRect::new(11.25, 22.5, 180.75, 120.125);
+        let tile = Tile::note("Rider", "", durable);
+        let tile_id = tile.id;
+        let page_id = workspace.active_page;
+        workspace.active_page_mut().add_tile(tile);
+
+        // The visual origin stands in for the pathway-projected rect supplied
+        // by the frame bridge. A press with no threshold-crossing movement is
+        // a read-only gesture and cannot materialize that rect into the model.
+        let projected = WorldRect::new(410.0, 260.0, durable.w, durable.h);
+        let visual_origins = HashMap::from([(tile_id, projected)]);
+        let durable_originals = HashMap::from([(tile_id, durable)]);
+        apply_drag_delta(
+            workspace.active_page_mut(),
+            &visual_origins,
+            [0.1, -0.1],
+            false,
+        );
+        assert_eq!(
+            bits(workspace.active_page().tile(tile_id).unwrap().rect),
+            bits(durable)
+        );
+
+        // Once movement is intentional, the transient gesture rect overlays
+        // pathway projection so rendering and the spatial index see the same
+        // pointer-relative position. Cancelling restores the exact store bits.
+        let delta = [17.5, -9.25];
+        apply_drag_delta(workspace.active_page_mut(), &visual_origins, delta, true);
+        let mut geometry = canvas_objects_from_workspace(&workspace, UnixMicros(0), |_| None);
+        let drag = DragSession {
+            page_id,
+            start_world: [0.0, 0.0],
+            originals: visual_origins,
+            durable_originals: durable_originals.clone(),
+            text_source: None,
+            moved: true,
+        };
+        overlay_live_gesture_geometry(&mut geometry, workspace.active_page(), Some(&drag), None);
+        assert_eq!(
+            geometry.rect_for(page_id, tile_id),
+            Some(projected.translated(delta))
+        );
+
+        restore_tile_rects(workspace.active_page_mut(), &durable_originals);
+        assert_eq!(
+            bits(workspace.active_page().tile(tile_id).unwrap().rect),
+            bits(durable)
         );
     }
 
@@ -21569,13 +21850,18 @@ mod tests {
         page.add_tile(lower);
         page.add_tile(upper);
         page.add_tile(overlay_text);
+        let projected_rects = page
+            .tiles
+            .iter()
+            .map(|tile| (tile.id, tile.rect))
+            .collect::<HashMap<_, _>>();
 
         assert_eq!(
-            topmost_standard_note_at(&page, [250.0, 250.0], source_id),
+            topmost_standard_note_at(&page, &projected_rects, [250.0, 250.0], source_id),
             Some(upper_id)
         );
         assert_ne!(
-            topmost_standard_note_at(&page, [250.0, 250.0], source_id),
+            topmost_standard_note_at(&page, &projected_rects, [250.0, 250.0], source_id),
             Some(lower_id)
         );
     }
@@ -23542,7 +23828,7 @@ mod tests {
         let outside_id = outside.id;
         workspace.active_page_mut().add_tile(outside);
 
-        let visible = assistant_visible_tile_ids(&workspace);
+        let visible = assistant_visible_tile_ids(&workspace, UnixMicros::ZERO);
 
         assert!(!visible.contains(&pile_id));
         assert!(!visible.contains(&inside_id));
