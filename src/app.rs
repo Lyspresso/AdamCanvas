@@ -265,12 +265,15 @@ enum HistoryEntry {
     },
     /// Undo removes the stop; redo re-creates it from the kept draft. The
     /// re-created stop gets a fresh id, so redo rewrites `node_id` in the
-    /// entry it pushes back.
+    /// entry it pushes back — and in every other entry that captured it.
     StopAdd {
         pathway_id: PathwayId,
         after_node_id: PathwayNodeId,
         node_id: PathwayNodeId,
         draft: PathwayNodeDraft,
+        /// Speed pinned onto the (after → new) leg; see
+        /// [`apply_pathway_stop_add`].
+        leg_speed: Option<f64>,
     },
 }
 
@@ -313,14 +316,46 @@ impl History {
         after_node_id: PathwayNodeId,
         node_id: PathwayNodeId,
         draft: PathwayNodeDraft,
+        leg_speed: Option<f64>,
     ) {
         self.push_undo(HistoryEntry::StopAdd {
             pathway_id,
             after_node_id,
             node_id,
             draft,
+            leg_speed,
         });
         self.redo.clear();
+    }
+
+    /// After a redo re-creates a stop under a fresh id, every entry still on
+    /// either stack that captured the old id must follow it, or later
+    /// replays would target a stop that no longer exists.
+    fn rewrite_node_id(&mut self, old: PathwayNodeId, new: PathwayNodeId) {
+        for entry in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            match entry {
+                HistoryEntry::Canvas(_) => {}
+                HistoryEntry::RailMove { from, to, .. } => {
+                    for map in [&mut *from, to] {
+                        if let Some(point) = map.remove(&old) {
+                            map.insert(new, point);
+                        }
+                    }
+                }
+                HistoryEntry::StopAdd {
+                    after_node_id,
+                    node_id,
+                    ..
+                } => {
+                    if *after_node_id == old {
+                        *after_node_id = new;
+                    }
+                    if *node_id == old {
+                        *node_id = new;
+                    }
+                }
+            }
+        }
     }
 
     fn push_undo(&mut self, entry: HistoryEntry) {
@@ -590,19 +625,64 @@ fn apply_pathway_rail_drag(
 /// Adds one stop after `after_node_id` through the editing service, resuming
 /// the route if the edit's own safety pause disabled it. Returns the new
 /// stop's id so history can target it.
+///
+/// `leg_speed` pins the new (after → new) leg to that speed. The engine
+/// preserves the split leg's speed for interior splits on its own, but a
+/// split of a repeating route's closing leg is classified as an append and
+/// would inherit the fastest forward speed instead — the caller that knows
+/// which leg was actually split passes its speed through. All-or-nothing on
+/// a draft clone.
 fn apply_pathway_stop_add(
     workspace: &mut Workspace,
     pathway_id: PathwayId,
     after_node_id: PathwayNodeId,
     draft: PathwayNodeDraft,
+    leg_speed: Option<f64>,
     now: UnixMicros,
     operation_id: Uuid,
 ) -> Result<PathwayNodeId, String> {
     commit_pathway_edit_with_resume(workspace, pathway_id, now, operation_id, |workspace| {
+        let mut draft_workspace = workspace.clone();
         let edit = PathwayEditContext::with_operation_id("Adam pathway stops", now, operation_id)
             .map_err(|error| error.to_string())?;
-        PathwayEditingService::create_node(workspace, pathway_id, Some(after_node_id), draft, edit)
-            .map_err(|error| error.to_string())
+        let node_id = PathwayEditingService::create_node(
+            &mut draft_workspace,
+            pathway_id,
+            Some(after_node_id),
+            draft,
+            edit,
+        )
+        .map_err(|error| error.to_string())?;
+        if let Some(speed) = leg_speed {
+            let segment_id = draft_workspace
+                .domain
+                .pathways
+                .pathway(pathway_id)
+                .and_then(|pathway| {
+                    pathway
+                        .segments
+                        .values()
+                        .find(|segment| {
+                            segment.from_node_id == after_node_id && segment.to_node_id == node_id
+                        })
+                        .map(|segment| segment.id)
+                });
+            if let Some(segment_id) = segment_id {
+                let edit =
+                    PathwayEditContext::with_operation_id("Adam pathway stops", now, operation_id)
+                        .map_err(|error| error.to_string())?;
+                PathwayEditingService::set_segment_speed(
+                    &mut draft_workspace,
+                    pathway_id,
+                    segment_id,
+                    speed,
+                    edit,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        *workspace = draft_workspace;
+        Ok(node_id)
     })
 }
 
@@ -6203,7 +6283,14 @@ impl AdamApp {
                 ui.label(RichText::new("Stops").strong());
                 for node in &ordered_nodes {
                     ui.horizontal(|ui| {
-                        let title = panel.stop_titles.entry(node.id).or_default();
+                        // Seed from the live node: a stop can arrive outside
+                        // any panel commit (rail double-click, redo), and an
+                        // empty/zero default here both misrenders and arms a
+                        // stale blur-commit.
+                        let title = panel
+                            .stop_titles
+                            .entry(node.id)
+                            .or_insert_with(|| node.title.clone());
                         let title_response =
                             ui.add(egui::TextEdit::singleline(title).desired_width(140.0));
                         if title_response.lost_focus() && title.trim() != node.title {
@@ -6239,7 +6326,10 @@ impl AdamApp {
                         }
 
                         if node.kind != PathwayNodeKind::Waypoint {
-                            let wait = panel.stop_waits.entry(node.id).or_default();
+                            let wait = panel
+                                .stop_waits
+                                .entry(node.id)
+                                .or_insert(node.wait_duration_seconds);
                             // clamp_existing_to_range(false) is load-bearing:
                             // the shared library can hold values outside the
                             // widget's range (another writer, EarlIt), and the
@@ -6312,7 +6402,10 @@ impl AdamApp {
                             ))
                             .color(colors.secondary_text),
                         );
-                        let speed = panel.speeds.entry(segment_id).or_insert(80.0);
+                        let speed = panel
+                            .speeds
+                            .entry(segment_id)
+                            .or_insert(segment.speed_points_per_second);
                         let speed_response = ui.add(
                             egui::DragValue::new(speed)
                                 .range(1.0..=1_000.0)
@@ -6432,7 +6525,7 @@ impl AdamApp {
                 wait,
             );
             let after_node_id = last.id;
-            self.add_pathway_stop(pathway_id, after_node_id, draft, context);
+            self.add_pathway_stop(pathway_id, after_node_id, draft, None, context);
             return;
         }
         let edit_context =
@@ -7309,12 +7402,15 @@ impl AdamApp {
                             PathwayNodeKind::Destination,
                             0.0,
                         ),
+                        // The split leg's own speed: keeps a split of the
+                        // loop-back leg from inheriting the forward speed.
+                        segment.speed_points_per_second,
                     ))
                 });
-            if let Some((pathway_id, after_node_id, draft)) = planted {
+            if let Some((pathway_id, after_node_id, draft, leg_speed)) = planted {
                 self.pathway_drag = None;
                 self.pathway_dock_preview = None;
-                self.add_pathway_stop(pathway_id, after_node_id, draft, context);
+                self.add_pathway_stop(pathway_id, after_node_id, draft, Some(leg_speed), context);
                 context.request_repaint();
                 return true;
             }
@@ -7459,6 +7555,7 @@ impl AdamApp {
         pathway_id: PathwayId,
         after_node_id: PathwayNodeId,
         draft: PathwayNodeDraft,
+        leg_speed: Option<f64>,
         context: &Context,
     ) {
         let parked_before = self.parked_rider_count(pathway_id);
@@ -7467,12 +7564,13 @@ impl AdamApp {
             pathway_id,
             after_node_id,
             draft.clone(),
+            leg_speed,
             unix_now_micros(),
             Uuid::new_v4(),
         ) {
             Ok(node_id) => {
                 self.history
-                    .record_stop_add(pathway_id, after_node_id, node_id, draft);
+                    .record_stop_add(pathway_id, after_node_id, node_id, draft, leg_speed);
                 // Splitting a leg parks the riders that were on it — engine
                 // law, and nothing lifts that state automatically. Say so, or
                 // the tile just sits there looking broken.
@@ -7563,6 +7661,7 @@ impl AdamApp {
                 after_node_id,
                 node_id,
                 draft,
+                leg_speed,
             } => {
                 let now = unix_now_micros();
                 if is_undo {
@@ -7579,6 +7678,7 @@ impl AdamApp {
                                 after_node_id,
                                 node_id,
                                 draft,
+                                leg_speed,
                             });
                             self.changed(true);
                         }
@@ -7588,25 +7688,36 @@ impl AdamApp {
                         }
                     }
                 } else {
+                    let parked_before = self.parked_rider_count(pathway_id);
                     match apply_pathway_stop_add(
                         &mut self.workspace,
                         pathway_id,
                         after_node_id,
                         draft.clone(),
+                        leg_speed,
                         now,
                         Uuid::new_v4(),
                     ) {
                         Ok(new_node_id) => {
-                            // The re-created stop has a fresh id; the entry
-                            // pushed back must target it or the next undo
-                            // would try to remove a stop that no longer
-                            // exists.
+                            // The re-created stop has a fresh id: the entry
+                            // pushed back must target it, and so must every
+                            // other stacked entry that captured the old id —
+                            // otherwise the rest of the redo chain replays
+                            // against a stop that no longer exists.
+                            self.history.rewrite_node_id(node_id, new_node_id);
                             self.history.push_undo(HistoryEntry::StopAdd {
                                 pathway_id,
                                 after_node_id,
                                 node_id: new_node_id,
                                 draft,
+                                leg_speed,
                             });
+                            if self.parked_rider_count(pathway_id) > parked_before {
+                                self.toast(
+                                    "Stop added — a tile riding that leg paused; drop it back on the rail to keep riding",
+                                    context,
+                                );
+                            }
                             self.changed(true);
                         }
                         Err(error) => {
@@ -14974,6 +15085,9 @@ fn draw_pathways(
             ) else {
                 continue;
             };
+            // A canvas-colored halo under the ink keeps the rail readable
+            // when it crosses ink-colored content — note text most of all.
+            painter.line_segment([start, end], Stroke::new(width + 2.0, colors.canvas));
             painter.line_segment([start, end], Stroke::new(width, color));
         }
 
@@ -14982,10 +15096,12 @@ fn draw_pathways(
             let Some(center) = world_point(node_point(node.id, node.point)) else {
                 continue;
             };
+            painter.circle_filled(center, radius + 1.5, colors.canvas);
             painter.circle_filled(center, radius, color);
             // An approval gate stops cargo until a person says go, so it is
             // the one stop that has to be recognisable at a glance.
             if node.kind == PathwayNodeKind::ApprovalGate {
+                painter.circle_stroke(center, radius + 4.0, Stroke::new(1.5, colors.canvas));
                 painter.circle_stroke(center, radius + 3.0, Stroke::new(1.5, color));
             }
         }
@@ -23738,6 +23854,7 @@ mod tests {
             pathway_id,
             first_id,
             draft.clone(),
+            Some(44.0),
             crate::domain::UnixMicros(5_000_000),
             Uuid::from_u128(201),
         )
@@ -23762,6 +23879,14 @@ mod tests {
         });
         assert_eq!(ordered[0].id, first_id);
         assert_eq!(ordered[1].id, node_id);
+        // The split leg's pinned speed lands on the (first → new) leg — the
+        // guard against a loop-back split inheriting the forward speed.
+        let pinned = pathway
+            .segments
+            .values()
+            .find(|segment| segment.from_node_id == first_id && segment.to_node_id == node_id)
+            .expect("the split must create a first → new leg");
+        assert_eq!(pinned.speed_points_per_second, 44.0);
         // Engine law: splitting the leg a rider is traveling removes its
         // active segment reference, which parks the rider as NeedsAttention —
         // and a plain reconcile tick must NOT quietly un-park it. The app
@@ -23810,6 +23935,7 @@ mod tests {
             pathway_id,
             first_id,
             draft,
+            Some(44.0),
             crate::domain::UnixMicros(7_000_000),
             Uuid::from_u128(203),
         )
@@ -23818,6 +23944,31 @@ mod tests {
         assert_eq!(pathway.nodes.len(), 3);
         assert_eq!(pathway.nodes[&redone_id].point, mid);
         assert_eq!(pathway.nodes[&redone_id].wait_duration_seconds, 12.0);
+    }
+
+    #[test]
+    fn conventional_stop_names_match_the_engine_convention() {
+        // The app predicts a name before inserting; the engine names appends
+        // itself. If the two formats ever drift, mixed routes get confusing
+        // sequences — pin them equal via a real engine append.
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let predicted = conventional_stop_name(pathway, PathwayNodeKind::Destination);
+        let end = pathway
+            .nodes
+            .values()
+            .map(|node| node.point)
+            .fold(PathwayPoint::new(0.0, 0.0), |_, point| point);
+        let appended = PathwayEditingService::append_node(
+            &mut workspace,
+            pathway_id,
+            PathwayNodeKind::Destination,
+            PathwayPoint::new(end.x + 120.0, end.y),
+            PathwayEditContext::new("test", crate::domain::UnixMicros(9_000_000)).unwrap(),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert_eq!(pathway.nodes[&appended].title, predicted);
     }
 
     #[test]
