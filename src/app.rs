@@ -82,7 +82,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use egui::{
     Align, Align2, Button, Color32, Context, CornerRadius, CursorIcon, FontData, FontDefinitions,
     FontFamily, FontId, Frame, Id, Key, Layout, Margin, Painter, PointerButton, Pos2, Rect,
-    Response, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
+    Response, RichText, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui, Vec2,
     epaint::text::{FontInsert, FontPriority, InsertFontFamily},
     pos2, vec2,
 };
@@ -740,6 +740,75 @@ fn apply_pathway_wait_for_all_stops(
         *workspace = draft_workspace;
         Ok(changed)
     })
+}
+
+/// The loop-back leg of a repeating route: last stop in travel order back to
+/// the first. `None` when the route does not repeat.
+fn closure_segment_id(pathway: &crate::domain::Pathway) -> Option<crate::domain::PathwaySegmentId> {
+    if !pathway.repeats || pathway.nodes.len() < 2 {
+        return None;
+    }
+    let mut ordered: Vec<_> = pathway.nodes.values().collect();
+    ordered.sort_by(|left, right| {
+        left.sort_index
+            .total_cmp(&right.sort_index)
+            .then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
+    });
+    let first = ordered.first()?.id;
+    let last = ordered.last()?.id;
+    pathway
+        .segments
+        .values()
+        .find(|segment| segment.from_node_id == last && segment.to_node_id == first)
+        .map(|segment| segment.id)
+}
+
+/// Resolves where a rail double-click should insert its stop.
+///
+/// On an out-and-back route the trip out and the loop-back leg sit on the
+/// same line, and the dock can return either. Splitting the loop-back leg
+/// turns the return trip into a visible detour while the authored track keeps
+/// running straight — which reads as "the old line was never deleted". When
+/// the click hit the loop-back leg but the point also lies on an authored
+/// leg, insert into that leg instead; a true circuit (return leg with its own
+/// geometry) keeps the closure insert.
+fn corrected_stop_insert(
+    pathway: &crate::domain::Pathway,
+    hit_segment_id: crate::domain::PathwaySegmentId,
+    route_point: PathwayPoint,
+) -> Option<(PathwayNodeId, f64)> {
+    let hit = pathway.segments.get(&hit_segment_id)?;
+    if closure_segment_id(pathway) != Some(hit_segment_id) {
+        return Some((hit.from_node_id, hit.speed_points_per_second));
+    }
+    for segment in pathway.segments.values() {
+        if segment.id == hit_segment_id {
+            continue;
+        }
+        let (Some(from), Some(to)) = (
+            pathway.nodes.get(&segment.from_node_id),
+            pathway.nodes.get(&segment.to_node_id),
+        ) else {
+            continue;
+        };
+        let leg = (to.point.x - from.point.x, to.point.y - from.point.y);
+        let length_squared = leg.0 * leg.0 + leg.1 * leg.1;
+        if length_squared < f64::EPSILON {
+            continue;
+        }
+        let offset = (route_point.x - from.point.x, route_point.y - from.point.y);
+        let t = (offset.0 * leg.0 + offset.1 * leg.1) / length_squared;
+        if !(0.0..=1.0).contains(&t) {
+            continue;
+        }
+        let nearest = (from.point.x + t * leg.0, from.point.y + t * leg.1);
+        let distance =
+            ((route_point.x - nearest.0).powi(2) + (route_point.y - nearest.1).powi(2)).sqrt();
+        if distance <= 0.5 {
+            return Some((segment.from_node_id, segment.speed_points_per_second));
+        }
+    }
+    Some((hit.from_node_id, hit.speed_points_per_second))
 }
 
 /// A conventional name for a stop added by the app, matching the editing
@@ -7392,19 +7461,22 @@ impl AdamApp {
                         return None;
                     };
                     let pathway = self.workspace.domain.pathways.pathway(target.pathway_id)?;
-                    let segment = pathway.segments.get(&segment_id)?;
+                    // On an out-and-back track the dock may hand us the
+                    // loop-back leg; the stop belongs on the authored track.
+                    // The split leg's own speed rides along so a loop-back
+                    // split can't inherit the forward speed.
+                    let (after_node_id, leg_speed) =
+                        corrected_stop_insert(pathway, segment_id, target.route_point)?;
                     Some((
                         target.pathway_id,
-                        segment.from_node_id,
+                        after_node_id,
                         PathwayNodeDraft::new(
                             target.route_point,
                             conventional_stop_name(pathway, PathwayNodeKind::Destination),
                             PathwayNodeKind::Destination,
                             0.0,
                         ),
-                        // The split leg's own speed: keeps a split of the
-                        // loop-back leg from inheriting the forward speed.
-                        segment.speed_points_per_second,
+                        leg_speed,
                     ))
                 });
             if let Some((pathway_id, after_node_id, draft, leg_speed)) = planted {
@@ -15072,17 +15144,34 @@ fn draw_pathways(
         };
         let width = (2.0 * camera.zoom).clamp(1.0, 4.0);
 
+        // The loop-back leg draws first, dashed and quieter: it is the way
+        // back, not an authored track, and must never read as a duplicate
+        // line. Where it coincides with the track, the solid legs paint over
+        // it entirely.
+        let closure_id = closure_segment_id(pathway);
+        let segment_endpoints = |segment: &crate::domain::PathwaySegment| {
+            let from = pathway.nodes.get(&segment.from_node_id)?;
+            let to = pathway.nodes.get(&segment.to_node_id)?;
+            Some((
+                world_point(node_point(segment.from_node_id, from.point))?,
+                world_point(node_point(segment.to_node_id, to.point))?,
+            ))
+        };
+        if let Some(closure) = closure_id.and_then(|id| pathway.segments.get(&id))
+            && let Some((start, end)) = segment_endpoints(closure)
+        {
+            painter.extend(Shape::dashed_line(
+                &[start, end],
+                Stroke::new(width, mix_color(color, colors.canvas, 0.45)),
+                8.0,
+                6.0,
+            ));
+        }
         for segment in pathway.segments.values() {
-            let (Some(from), Some(to)) = (
-                pathway.nodes.get(&segment.from_node_id),
-                pathway.nodes.get(&segment.to_node_id),
-            ) else {
+            if Some(segment.id) == closure_id {
                 continue;
-            };
-            let (Some(start), Some(end)) = (
-                world_point(node_point(segment.from_node_id, from.point)),
-                world_point(node_point(segment.to_node_id, to.point)),
-            ) else {
+            }
+            let Some((start, end)) = segment_endpoints(segment) else {
                 continue;
             };
             // A canvas-colored halo under the ink keeps the rail readable
@@ -23944,6 +24033,70 @@ mod tests {
         assert_eq!(pathway.nodes.len(), 3);
         assert_eq!(pathway.nodes[&redone_id].point, mid);
         assert_eq!(pathway.nodes[&redone_id].wait_duration_seconds, 12.0);
+    }
+
+    #[test]
+    fn double_click_on_an_out_and_back_track_splits_the_track_not_the_return() {
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        PathwayEditingService::set_repeats(
+            &mut workspace,
+            pathway_id,
+            true,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(3_000_000)).unwrap(),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let closure = closure_segment_id(pathway).expect("a repeating route has a loop-back leg");
+        let forward = pathway
+            .segments
+            .values()
+            .find(|segment| segment.id != closure)
+            .expect("the authored track leg");
+        let from = pathway.nodes[&forward.from_node_id].point;
+        let to = pathway.nodes[&forward.to_node_id].point;
+        let mid = PathwayPoint::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5);
+
+        // The dock may hand back the loop-back leg on a coincident track; the
+        // stop must land on the authored track either way, at its speed.
+        let via_closure = corrected_stop_insert(pathway, closure, mid).unwrap();
+        let via_track = corrected_stop_insert(pathway, forward.id, mid).unwrap();
+        assert_eq!(
+            via_closure,
+            (forward.from_node_id, forward.speed_points_per_second)
+        );
+        assert_eq!(via_closure, via_track);
+    }
+
+    #[test]
+    fn a_true_circuit_keeps_a_deliberate_return_leg_split() {
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        PathwayEditingService::set_repeats(
+            &mut workspace,
+            pathway_id,
+            true,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(3_000_000)).unwrap(),
+        )
+        .unwrap();
+        // Bend the route into a triangle: the loop-back leg gets its own
+        // visible geometry, so a click on it is a deliberate return split.
+        PathwayEditingService::append_node(
+            &mut workspace,
+            pathway_id,
+            PathwayNodeKind::Destination,
+            PathwayPoint::new(400.0, 600.0),
+            PathwayEditContext::new("test", crate::domain::UnixMicros(3_100_000)).unwrap(),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let closure = closure_segment_id(pathway).expect("still a repeating route");
+        let closure_segment = &pathway.segments[&closure];
+        let from = pathway.nodes[&closure_segment.from_node_id].point;
+        let to = pathway.nodes[&closure_segment.to_node_id].point;
+        let mid = PathwayPoint::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5);
+
+        let (after, speed) = corrected_stop_insert(pathway, closure, mid).unwrap();
+        assert_eq!(after, closure_segment.from_node_id);
+        assert_eq!(speed, closure_segment.speed_points_per_second);
     }
 
     #[test]
