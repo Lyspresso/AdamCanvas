@@ -54,8 +54,8 @@ use crate::{
     },
     ocr::{OcrQueueError, PhotoOcrRequest, PhotoOcrWorker, source_fingerprint},
     persistence::{
-        AppPaths, SaveOutcome, SaveWorker, backup_unreadable_library, load_workspace,
-        scrub_deleted_conversation_checkpoint_json,
+        AppPaths, SaveOutcome, SaveWorker, absorb_pathway_save_feedback,
+        backup_unreadable_library, load_workspace, scrub_deleted_conversation_checkpoint_json,
     },
     photo_details::{
         PhotoDossier, PhotoEnrichment, PhotoMetadata, PhotoOcrArtifact, PhotoRecord,
@@ -328,6 +328,12 @@ struct PanSession {
 struct Toast {
     message: &'static str,
     until: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitOrigin {
+    External,
+    PathwayReconciler,
 }
 
 #[derive(Clone, Debug)]
@@ -1029,6 +1035,10 @@ pub struct AdamApp {
     last_automation_persist: Instant,
     automation_initialized: bool,
     semantic_reconcile_needed: bool,
+    pathway_reconcile_requested: bool,
+    pathway_startup_reconcile_pending: bool,
+    pathway_next_wake: Option<UnixMicros>,
+    pathway_persistence_problem: Option<String>,
     show_grid: bool,
     /// Contact-sheet lens over the active page. `None` is the ordinary spatial
     /// canvas; the grid never writes tile geometry, so toggling is free.
@@ -1366,6 +1376,10 @@ impl AdamApp {
             last_automation_persist: Instant::now(),
             automation_initialized: false,
             semantic_reconcile_needed: true,
+            pathway_reconcile_requested: true,
+            pathway_startup_reconcile_pending: true,
+            pathway_next_wake: None,
+            pathway_persistence_problem: None,
             show_grid: false,
             grid_view: None,
             snap_to_grid: false,
@@ -1442,9 +1456,16 @@ impl AdamApp {
     }
 
     fn changed(&mut self, layout_changed: bool) {
+        self.changed_with_origin(layout_changed, CommitOrigin::External);
+    }
+
+    fn changed_with_origin(&mut self, layout_changed: bool, origin: CommitOrigin) {
         self.dirty_since = Some(Instant::now());
         self.spatial_dirty |= layout_changed;
-        self.semantic_reconcile_needed |= layout_changed;
+        if origin == CommitOrigin::External {
+            self.semantic_reconcile_needed |= layout_changed;
+            self.pathway_reconcile_requested = true;
+        }
         if self.saving_enabled {
             self.egui_context.request_repaint_after(AUTOSAVE_DELAY);
         }
@@ -1898,6 +1919,7 @@ impl AdamApp {
                 SaveOutcome::Saved {
                     learned_deleted_conversations,
                     learned_xai_storage_conversations,
+                    pathway_feedback,
                 } => {
                     if self.pending_save == Some(completion.request_id) {
                         self.pending_save = None;
@@ -1918,6 +1940,32 @@ impl AdamApp {
                         &learned_deleted_conversations,
                         context,
                     );
+                    match absorb_pathway_save_feedback(
+                        &mut self.workspace.domain.pathways,
+                        &pathway_feedback,
+                    ) {
+                        Ok(changed) => {
+                            self.pathway_persistence_problem = None;
+                            if changed {
+                                // The receipt describes state that is already
+                                // durable. Wake projection/reconciliation once
+                                // without marking it dirty and feeding it back
+                                // to the save worker.
+                                self.spatial_dirty = true;
+                                self.pathway_reconcile_requested = true;
+                                context.request_repaint();
+                            }
+                        }
+                        Err(error) => {
+                            log::error!(
+                                "could not absorb merged pathway save state: {error}"
+                            );
+                            self.pathway_persistence_problem = Some(format!(
+                                "Pathway sync could not reconcile concurrent history: {error}"
+                            ));
+                            context.request_repaint();
+                        }
+                    }
                 }
                 SaveOutcome::Superseded { by_request_id } => {
                     if self.pending_save == Some(completion.request_id) {
