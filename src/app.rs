@@ -339,6 +339,112 @@ struct PathwayRailDrag {
 /// click, matching the note tool's gesture threshold territory.
 const RAIL_DRAG_THRESHOLD_POINTS: f32 = 6.0;
 
+/// One completed settings-field edit, committed through the services.
+enum PathwaySettingsCommit {
+    Rename(String),
+    ToggleRun,
+    SetRepeats(bool),
+    NodeTitle(PathwayNodeId, String),
+    NodeKind(PathwayNodeId, PathwayNodeKind),
+    NodeWait(PathwayNodeId, f64),
+    SegmentSpeed(crate::domain::PathwaySegmentId, f64),
+    Delete,
+}
+
+/// Edit buffers for the pathway settings window.
+///
+/// Every field commits through the editing/engine services on its completion
+/// event (blur, drag end, selection) — never per keystroke or per drag tick,
+/// which would flood the append-only history with one event per frame. The
+/// buffers re-sync from the store after each commit so a service that
+/// normalizes a value (trimmed title, clamped speed) is reflected honestly.
+struct PathwaySettingsPanel {
+    pathway_id: PathwayId,
+    name: String,
+    stop_titles: BTreeMap<PathwayNodeId, String>,
+    stop_waits: BTreeMap<PathwayNodeId, f64>,
+    speeds: BTreeMap<crate::domain::PathwaySegmentId, f64>,
+    confirm_delete: bool,
+}
+
+impl PathwaySettingsPanel {
+    fn synced_from(workspace: &Workspace, pathway_id: PathwayId) -> Option<Self> {
+        let pathway = workspace.domain.pathways.pathway(pathway_id)?;
+        Some(Self {
+            pathway_id,
+            name: pathway.title.clone(),
+            stop_titles: pathway
+                .nodes
+                .iter()
+                .map(|(id, node)| (*id, node.title.clone()))
+                .collect(),
+            stop_waits: pathway
+                .nodes
+                .iter()
+                .map(|(id, node)| (*id, node.wait_duration_seconds))
+                .collect(),
+            speeds: pathway
+                .segments
+                .iter()
+                .map(|(id, segment)| (*id, segment.speed_points_per_second))
+                .collect(),
+            confirm_delete: false,
+        })
+    }
+}
+
+/// Runs one settings edit and restores the route's running state when the
+/// edit's safety pause was the only reason it stopped.
+///
+/// Graph-touching edits pause live cargo first — the plan's law — but a
+/// settings tweak should feel like adjusting the track, not pulling its
+/// power. Only an edit that actually flipped the route from enabled to
+/// disabled triggers the resume, so editing an already-paused route leaves
+/// it paused, exactly as the user left it.
+fn commit_pathway_edit_with_resume<T>(
+    workspace: &mut Workspace,
+    pathway_id: PathwayId,
+    now: UnixMicros,
+    operation_id: Uuid,
+    edit: impl FnOnce(&mut Workspace) -> Result<T, String>,
+) -> Result<T, String> {
+    let was_enabled = workspace
+        .domain
+        .pathways
+        .pathway(pathway_id)
+        .is_some_and(|pathway| pathway.is_enabled);
+    let value = edit(workspace)?;
+    let now_disabled = workspace
+        .domain
+        .pathways
+        .pathway(pathway_id)
+        .is_some_and(|pathway| !pathway.is_enabled);
+    if was_enabled && now_disabled {
+        // A resume failure must NOT fail the commit: the edit has already
+        // durably applied, and reporting failure would both lie and skip the
+        // dirty-marking that schedules the save. The route stays honestly
+        // paused (visible in the settings panel) and can be run manually.
+        match PathwayReconcileContext::with_operation_id(
+            "Adam pathway settings",
+            now,
+            PathwayReconcileCause::Live,
+            operation_id,
+        ) {
+            Ok(resume) => {
+                if let Err(error) =
+                    PathwayReconcileService::set_enabled(workspace, pathway_id, true, resume)
+                {
+                    log::warn!("pathway {pathway_id} stayed paused after a settings edit: {error}");
+                }
+            }
+            Err(error) => {
+                log::warn!("pathway {pathway_id} stayed paused after a settings edit: {error}");
+            }
+        }
+    }
+    Ok(value)
+}
+
 /// Mirrors the editing service's placement clamp (32-point canvas margin) so
 /// the drag preview lands exactly where the commit will.
 fn clamped_rail_point(point: PathwayPoint, page_size: [f32; 2]) -> PathwayPoint {
@@ -835,6 +941,8 @@ enum CanvasMenuAction {
     ToggleGrid,
     ToggleGridView,
     ToggleSnap,
+    PathwaySettings(Uuid),
+    PathwayToggleRun(Uuid),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1176,6 +1284,10 @@ pub struct AdamApp {
     /// the highlight instead of flickering between overlapping rails.
     pathway_dock_preview: Option<PathwayDockTarget>,
     pathway_drag: Option<PathwayRailDrag>,
+    pathway_settings: Option<PathwaySettingsPanel>,
+    /// The rail under the pointer when the canvas context menu opened, frozen
+    /// at that click so the menu's pathway section cannot retarget mid-hover.
+    pathway_menu_target: Option<PathwayId>,
     note_draft: Option<NoteDraft>,
     text_note_drop_target: Option<Uuid>,
     page_size_edit_active: bool,
@@ -1538,6 +1650,8 @@ impl AdamApp {
             pathway_enrollment_review: None,
             pathway_dock_preview: None,
             pathway_drag: None,
+            pathway_settings: None,
+            pathway_menu_target: None,
             note_draft: None,
             text_note_drop_target: None,
             page_size_edit_active: false,
@@ -3028,6 +3142,7 @@ impl AdamApp {
             || self.pending_tag_delete.is_some()
             || self.details_tile.is_some()
             || self.pile_settings.is_some()
+            || self.pathway_settings.is_some()
             || self.open_chat.is_some()
             || self.trash_open
             || self.agents.open
@@ -4449,8 +4564,53 @@ impl AdamApp {
                 self.show_drop_overlay(&context, &painter, view, colors);
                 self.show_pathway_enrollment_sheet(&context, colors);
 
+                if canvas_response.secondary_clicked() {
+                    self.pathway_menu_target = context
+                        .input(|input| input.pointer.interact_pos())
+                        .filter(|pointer| view.contains(*pointer))
+                        .and_then(|pointer| {
+                            let world = camera.screen_to_world(pointer, view);
+                            PathwayDockGeometry::prepare(&self.workspace, page_id)
+                                .target(
+                                    PathwayPoint::new(f64::from(world[0]), f64::from(world[1])),
+                                    f64::from(camera.zoom),
+                                    None,
+                                )
+                                .map(|target| target.pathway_id)
+                        });
+                }
+                let menu_pathway = self.pathway_menu_target.and_then(|pathway_id| {
+                    self.workspace
+                        .domain
+                        .pathways
+                        .pathway(pathway_id)
+                        .map(|pathway| (pathway_id, pathway.title.clone(), pathway.is_enabled))
+                });
                 let mut canvas_action = None;
                 canvas_response.context_menu(|ui| {
+                    if let Some((pathway_id, title, is_enabled)) = &menu_pathway {
+                        ui.label(
+                            RichText::new(title.as_str())
+                                .small()
+                                .color(colors.secondary_text),
+                        );
+                        if ui.button("Pathway Settings…").clicked() {
+                            canvas_action = Some(CanvasMenuAction::PathwaySettings(*pathway_id));
+                            ui.close();
+                        }
+                        if ui
+                            .button(if *is_enabled {
+                                "Pause Pathway"
+                            } else {
+                                "Run Pathway"
+                            })
+                            .clicked()
+                        {
+                            canvas_action = Some(CanvasMenuAction::PathwayToggleRun(*pathway_id));
+                            ui.close();
+                        }
+                        ui.separator();
+                    }
                     if ui.button("Import…").clicked() {
                         canvas_action = Some(CanvasMenuAction::Import);
                         ui.close();
@@ -4541,6 +4701,13 @@ impl AdamApp {
                     Some(CanvasMenuAction::ToggleGrid) => self.show_grid = !self.show_grid,
                     Some(CanvasMenuAction::ToggleGridView) => self.toggle_grid_view(),
                     Some(CanvasMenuAction::ToggleSnap) => self.snap_to_grid = !self.snap_to_grid,
+                    Some(CanvasMenuAction::PathwaySettings(pathway_id)) => {
+                        self.pathway_settings =
+                            PathwaySettingsPanel::synced_from(&self.workspace, pathway_id);
+                    }
+                    Some(CanvasMenuAction::PathwayToggleRun(pathway_id)) => {
+                        self.toggle_pathway_running(pathway_id, &context);
+                    }
                     None => {}
                 }
             });
@@ -5717,6 +5884,461 @@ impl AdamApp {
         let radius = (7.0 * camera.zoom).clamp(5.0, 12.0);
         painter.circle_stroke(center, radius + 3.0, Stroke::new(2.0, colors.accent));
         painter.circle_filled(center, radius * 0.45, colors.accent);
+    }
+
+    /// Runs a paused route, or pauses a running one, from the context menu.
+    fn toggle_pathway_running(&mut self, pathway_id: PathwayId, context: &Context) {
+        let Some(enabled) = self
+            .workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .map(|pathway| pathway.is_enabled)
+        else {
+            return;
+        };
+        let Ok(engine_context) = PathwayReconcileContext::new(
+            "Adam pathway settings",
+            unix_now_micros(),
+            PathwayReconcileCause::Live,
+        ) else {
+            return;
+        };
+        match PathwayReconcileService::set_enabled(
+            &mut self.workspace,
+            pathway_id,
+            !enabled,
+            engine_context,
+        ) {
+            Ok(_) => {
+                self.changed(true);
+                self.toast(
+                    if enabled {
+                        "Pathway paused — its tiles hold their positions"
+                    } else {
+                        "Pathway running"
+                    },
+                    context,
+                );
+            }
+            Err(error) => {
+                log::warn!("could not toggle pathway {pathway_id}: {error}");
+                self.toast("The pathway could not be switched", context);
+            }
+        }
+    }
+
+    /// The pathway settings window: rename, run/pause, loop, per-stop and
+    /// per-segment editing, and deletion.
+    ///
+    /// Every commit goes through the editing or engine service on a field's
+    /// completion event; the window then re-syncs its buffers so normalized
+    /// values (trimmed names, clamped speeds) are shown honestly. Edits that
+    /// pause live cargo are resumed by `commit_pathway_edit_with_resume`
+    /// unless the route was already paused before the edit.
+    fn show_pathway_settings(&mut self, context: &Context) {
+        let Some(mut panel) = self.pathway_settings.take() else {
+            return;
+        };
+        let Some(pathway) = self
+            .workspace
+            .domain
+            .pathways
+            .pathway(panel.pathway_id)
+            .cloned()
+        else {
+            return;
+        };
+        let colors = self.theme(context);
+        let mut open = true;
+        let mut commit: Option<PathwaySettingsCommit> = None;
+
+        let mut ordered_nodes: Vec<_> = pathway.nodes.values().collect();
+        ordered_nodes.sort_by(|left, right| {
+            let order = if left.sort_index == right.sort_index {
+                std::cmp::Ordering::Equal
+            } else {
+                left.sort_index.total_cmp(&right.sort_index)
+            };
+            order.then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
+        });
+        let node_title = |node_id: PathwayNodeId| -> &str {
+            pathway
+                .nodes
+                .get(&node_id)
+                .map(|node| node.title.as_str())
+                .unwrap_or("?")
+        };
+
+        egui::Window::new("Pathway Settings")
+            .id(Id::new(("adam-pathway-settings", panel.pathway_id)))
+            .open(&mut open)
+            .default_width(430.0)
+            .resizable(true)
+            .show(context, |ui| {
+                ui.label(RichText::new("Identity").strong());
+                let name_response =
+                    ui.add(egui::TextEdit::singleline(&mut panel.name).hint_text("Pathway name"));
+                if name_response.lost_focus() && panel.name.trim() != pathway.title {
+                    commit = Some(PathwaySettingsCommit::Rename(panel.name.clone()));
+                }
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("Running").strong());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(if pathway.is_enabled {
+                            "Running — tiles ride on the clock".to_owned()
+                        } else {
+                            pathway
+                                .disabled_reason
+                                .clone()
+                                .unwrap_or_else(|| "Paused".to_owned())
+                        })
+                        .color(colors.secondary_text),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(if pathway.is_enabled { "Pause" } else { "Run" })
+                        .clicked()
+                    {
+                        commit = Some(PathwaySettingsCommit::ToggleRun);
+                    }
+                    let mut repeats = pathway.repeats;
+                    if ui
+                        .checkbox(&mut repeats, "Loops back to the start")
+                        .on_hover_text(
+                            "The last stop connects to the first with a real travelled leg",
+                        )
+                        .changed()
+                    {
+                        commit = Some(PathwaySettingsCommit::SetRepeats(repeats));
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("Stops").strong());
+                for node in &ordered_nodes {
+                    ui.horizontal(|ui| {
+                        let title = panel.stop_titles.entry(node.id).or_default();
+                        let title_response =
+                            ui.add(egui::TextEdit::singleline(title).desired_width(140.0));
+                        if title_response.lost_focus() && title.trim() != node.title {
+                            commit = Some(PathwaySettingsCommit::NodeTitle(node.id, title.clone()));
+                        }
+
+                        let mut kind = node.kind;
+                        egui::ComboBox::from_id_salt(("adam-pathway-node-kind", node.id))
+                            .selected_text(match kind {
+                                PathwayNodeKind::Waypoint => "Waypoint",
+                                PathwayNodeKind::Destination => "Destination",
+                                PathwayNodeKind::ApprovalGate => "Approval gate",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut kind,
+                                    PathwayNodeKind::Waypoint,
+                                    "Waypoint",
+                                );
+                                ui.selectable_value(
+                                    &mut kind,
+                                    PathwayNodeKind::Destination,
+                                    "Destination",
+                                );
+                                ui.selectable_value(
+                                    &mut kind,
+                                    PathwayNodeKind::ApprovalGate,
+                                    "Approval gate",
+                                );
+                            });
+                        if kind != node.kind {
+                            commit = Some(PathwaySettingsCommit::NodeKind(node.id, kind));
+                        }
+
+                        if node.kind != PathwayNodeKind::Waypoint {
+                            let wait = panel.stop_waits.entry(node.id).or_default();
+                            // clamp_existing_to_range(false) is load-bearing:
+                            // the shared library can hold values outside the
+                            // widget's range (another writer, EarlIt), and the
+                            // default would silently rewrite them on display —
+                            // then a look-only click would commit the rewrite.
+                            let wait_response = ui.add(
+                                egui::DragValue::new(wait)
+                                    .range(0.0..=86_400.0)
+                                    .clamp_existing_to_range(false)
+                                    .speed(0.5)
+                                    .suffix(" s wait"),
+                            );
+                            if (wait_response.drag_stopped() || wait_response.lost_focus())
+                                && (*wait - node.wait_duration_seconds).abs() > f64::EPSILON
+                            {
+                                commit = Some(PathwaySettingsCommit::NodeWait(node.id, *wait));
+                            }
+                        }
+                    });
+                }
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("Speeds").strong());
+                // Present legs in route order, matching the Stops list, not
+                // the map's id order.
+                let node_order: HashMap<PathwayNodeId, usize> = ordered_nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, node)| (node.id, index))
+                    .collect();
+                let mut ordered_segments: Vec<_> = pathway.segments.values().collect();
+                ordered_segments.sort_by_key(|segment| {
+                    (node_order.get(&segment.from_node_id).copied(), segment.id)
+                });
+                for segment in ordered_segments {
+                    let segment_id = segment.id;
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} → {}",
+                                node_title(segment.from_node_id),
+                                node_title(segment.to_node_id),
+                            ))
+                            .color(colors.secondary_text),
+                        );
+                        let speed = panel.speeds.entry(segment_id).or_insert(80.0);
+                        let speed_response = ui.add(
+                            egui::DragValue::new(speed)
+                                .range(1.0..=1_000.0)
+                                .clamp_existing_to_range(false)
+                                .speed(1.0)
+                                .suffix(" pts/s"),
+                        );
+                        if (speed_response.drag_stopped() || speed_response.lost_focus())
+                            && (*speed - segment.speed_points_per_second).abs() > f64::EPSILON
+                        {
+                            commit = Some(PathwaySettingsCommit::SegmentSpeed(segment_id, *speed));
+                        }
+                    });
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if panel.confirm_delete {
+                        ui.label(
+                            RichText::new("Tiles stay where they are; history is kept.")
+                                .color(colors.secondary_text),
+                        );
+                        if ui
+                            .add(Button::new(
+                                RichText::new("Delete Pathway").color(colors.danger),
+                            ))
+                            .clicked()
+                        {
+                            commit = Some(PathwaySettingsCommit::Delete);
+                        }
+                        if ui.button("Keep it").clicked() {
+                            panel.confirm_delete = false;
+                        }
+                    } else if ui
+                        .add(Button::new(
+                            RichText::new("Delete Pathway…").color(colors.danger),
+                        ))
+                        .clicked()
+                    {
+                        panel.confirm_delete = true;
+                    }
+                });
+            });
+
+        if let Some(commit) = commit {
+            self.apply_pathway_settings_commit(panel.pathway_id, commit, context);
+            // Re-sync so normalized values replace whatever was typed. The
+            // decision to close is made from what actually happened: a REFUSED
+            // delete leaves the route in place and the window open — closing
+            // would read as agreeing to a delete the service just rejected.
+            // synced_from returns None once the route is truly gone. Closing
+            // the window still commits a pending blur-edit, but must not
+            // resurrect the window it just closed.
+            if open {
+                self.pathway_settings =
+                    PathwaySettingsPanel::synced_from(&self.workspace, panel.pathway_id);
+            }
+        } else if open {
+            self.pathway_settings = Some(panel);
+        }
+    }
+
+    fn apply_pathway_settings_commit(
+        &mut self,
+        pathway_id: PathwayId,
+        commit: PathwaySettingsCommit,
+        context: &Context,
+    ) {
+        let now = unix_now_micros();
+        let operation_id = Uuid::new_v4();
+        let edit_context =
+            |now| PathwayEditContext::with_operation_id("Adam pathway settings", now, operation_id);
+        let outcome: Result<bool, String> = match commit {
+            PathwaySettingsCommit::Rename(name) => edit_context(now)
+                .map_err(|error| error.to_string())
+                .and_then(|edit| {
+                    PathwayEditingService::rename_pathway(
+                        &mut self.workspace,
+                        pathway_id,
+                        name,
+                        edit,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .map(|_| false),
+            PathwaySettingsCommit::ToggleRun => {
+                self.toggle_pathway_running(pathway_id, context);
+                return;
+            }
+            PathwaySettingsCommit::SetRepeats(repeats) => commit_pathway_edit_with_resume(
+                &mut self.workspace,
+                pathway_id,
+                now,
+                operation_id,
+                |workspace| {
+                    edit_context(now)
+                        .map_err(|error| error.to_string())
+                        .and_then(|edit| {
+                            PathwayEditingService::set_repeats(workspace, pathway_id, repeats, edit)
+                                .map_err(|error| error.to_string())
+                        })
+                },
+            )
+            .map(|_| true),
+            PathwaySettingsCommit::NodeTitle(node_id, _)
+            | PathwaySettingsCommit::NodeKind(node_id, _)
+            | PathwaySettingsCommit::NodeWait(node_id, _)
+                if !self
+                    .workspace
+                    .domain
+                    .pathways
+                    .pathway(pathway_id)
+                    .is_some_and(|pathway| pathway.nodes.contains_key(&node_id)) =>
+            {
+                Err(format!("stop {node_id} no longer exists"))
+            }
+            PathwaySettingsCommit::NodeTitle(node_id, title) => {
+                let (kind, wait) = self
+                    .workspace
+                    .domain
+                    .pathways
+                    .pathway(pathway_id)
+                    .and_then(|pathway| pathway.nodes.get(&node_id))
+                    .map(|node| (node.kind, node.wait_duration_seconds))
+                    .expect("checked above");
+                commit_pathway_edit_with_resume(
+                    &mut self.workspace,
+                    pathway_id,
+                    now,
+                    operation_id,
+                    |workspace| {
+                        edit_context(now)
+                            .map_err(|error| error.to_string())
+                            .and_then(|edit| {
+                                PathwayEditingService::set_node_properties(
+                                    workspace, pathway_id, node_id, title, kind, wait, edit,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                    },
+                )
+                .map(|_| false)
+            }
+            PathwaySettingsCommit::NodeKind(node_id, kind) => {
+                let (title, wait) = self
+                    .workspace
+                    .domain
+                    .pathways
+                    .pathway(pathway_id)
+                    .and_then(|pathway| pathway.nodes.get(&node_id))
+                    .map(|node| (node.title.clone(), node.wait_duration_seconds))
+                    .expect("checked above");
+                commit_pathway_edit_with_resume(
+                    &mut self.workspace,
+                    pathway_id,
+                    now,
+                    operation_id,
+                    |workspace| {
+                        edit_context(now)
+                            .map_err(|error| error.to_string())
+                            .and_then(|edit| {
+                                PathwayEditingService::set_node_properties(
+                                    workspace, pathway_id, node_id, title, kind, wait, edit,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                    },
+                )
+                .map(|_| true)
+            }
+            PathwaySettingsCommit::NodeWait(node_id, wait) => {
+                let (title, kind) = self
+                    .workspace
+                    .domain
+                    .pathways
+                    .pathway(pathway_id)
+                    .and_then(|pathway| pathway.nodes.get(&node_id))
+                    .map(|node| (node.title.clone(), node.kind))
+                    .expect("checked above");
+                commit_pathway_edit_with_resume(
+                    &mut self.workspace,
+                    pathway_id,
+                    now,
+                    operation_id,
+                    |workspace| {
+                        edit_context(now)
+                            .map_err(|error| error.to_string())
+                            .and_then(|edit| {
+                                PathwayEditingService::set_node_properties(
+                                    workspace, pathway_id, node_id, title, kind, wait, edit,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                    },
+                )
+                .map(|_| true)
+            }
+            PathwaySettingsCommit::SegmentSpeed(segment_id, speed) => {
+                commit_pathway_edit_with_resume(
+                    &mut self.workspace,
+                    pathway_id,
+                    now,
+                    operation_id,
+                    |workspace| {
+                        edit_context(now)
+                            .map_err(|error| error.to_string())
+                            .and_then(|edit| {
+                                PathwayEditingService::set_segment_speed(
+                                    workspace, pathway_id, segment_id, speed, edit,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                    },
+                )
+                .map(|_| true)
+            }
+            PathwaySettingsCommit::Delete => edit_context(now)
+                .map_err(|error| error.to_string())
+                .and_then(|edit| {
+                    PathwayEditingService::delete_pathway(&mut self.workspace, pathway_id, edit)
+                        .map_err(|error| error.to_string())
+                })
+                .map(|_| {
+                    self.toast("Pathway deleted — its tiles stay put", context);
+                    true
+                }),
+        };
+        match outcome {
+            Ok(layout_changed) => self.changed(layout_changed),
+            Err(error) => {
+                log::warn!("pathway settings change refused: {error}");
+                self.toast("That change could not be applied", context);
+            }
+        }
     }
 
     /// Confirms a reviewed enrollment.
@@ -13613,6 +14235,7 @@ impl eframe::App for AdamApp {
         self.show_tag_picker(&context);
         self.show_tag_management(&context);
         self.show_pile_settings(&context);
+        self.show_pathway_settings(&context);
         self.show_trash(&context);
         self.show_pathway_problem_row(&context);
         self.show_toast(&context);
@@ -22491,6 +23114,118 @@ mod tests {
         assert!(
             assignment.current_segment_id.is_some(),
             "an At-This-Spot drop joins mid-segment, not at a node"
+        );
+    }
+
+    #[test]
+    fn settings_edits_resume_a_running_route_but_respect_a_paused_one() {
+        // Running route: a loop toggle pauses cargo for the graph edit and the
+        // wrapper brings the route back, exactly like the rail drag does.
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        assert!(
+            workspace
+                .domain
+                .pathways
+                .pathway(pathway_id)
+                .unwrap()
+                .is_enabled
+        );
+        commit_pathway_edit_with_resume(
+            &mut workspace,
+            pathway_id,
+            crate::domain::UnixMicros(5_000_000),
+            Uuid::from_u128(80),
+            |workspace| {
+                PathwayEditingService::set_repeats(
+                    workspace,
+                    pathway_id,
+                    true,
+                    PathwayEditContext::with_operation_id(
+                        "test",
+                        crate::domain::UnixMicros(5_000_000),
+                        Uuid::from_u128(80),
+                    )
+                    .unwrap(),
+                )
+                .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert!(pathway.repeats);
+        assert!(
+            pathway.is_enabled,
+            "a settings edit on a running route must hand it back running"
+        );
+
+        // Paused route: the same edit leaves it paused — the wrapper resumes
+        // only when its own edit was what stopped the route.
+        let (mut paused, paused_id, _, _) = rail_drag_fixture();
+        let pause = PathwayReconcileContext::with_operation_id(
+            "test",
+            crate::domain::UnixMicros(6_000_000),
+            PathwayReconcileCause::Live,
+            Uuid::from_u128(81),
+        )
+        .unwrap();
+        PathwayReconcileService::set_enabled(&mut paused, paused_id, false, pause).unwrap();
+        commit_pathway_edit_with_resume(
+            &mut paused,
+            paused_id,
+            crate::domain::UnixMicros(7_000_000),
+            Uuid::from_u128(82),
+            |workspace| {
+                PathwayEditingService::set_repeats(
+                    workspace,
+                    paused_id,
+                    true,
+                    PathwayEditContext::with_operation_id(
+                        "test",
+                        crate::domain::UnixMicros(7_000_000),
+                        Uuid::from_u128(82),
+                    )
+                    .unwrap(),
+                )
+                .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+        assert!(
+            !paused
+                .domain
+                .pathways
+                .pathway(paused_id)
+                .unwrap()
+                .is_enabled,
+            "a route the user paused stays paused through a settings edit"
+        );
+    }
+
+    #[test]
+    fn settings_resume_wrapper_propagates_edit_failures_untouched() {
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        let before_enabled = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .is_enabled;
+        let result: Result<(), String> = commit_pathway_edit_with_resume(
+            &mut workspace,
+            pathway_id,
+            crate::domain::UnixMicros(8_000_000),
+            Uuid::from_u128(83),
+            |_| Err("refused".to_owned()),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            workspace
+                .domain
+                .pathways
+                .pathway(pathway_id)
+                .unwrap()
+                .is_enabled,
+            before_enabled
         );
     }
 
