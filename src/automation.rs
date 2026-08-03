@@ -92,36 +92,6 @@ impl CanvasGeometrySnapshot {
         true
     }
 
-    /// Returns the temporary P3 view for Adam's existing mutating automation
-    /// pass.
-    ///
-    /// Rendering and read-only pile membership use projected rider rects. The
-    /// 1 Hz reconciler must not turn those samples into durable tag/progress
-    /// writes before P4 owns exact pathway boundary transitions, so only
-    /// pathway-projected objects are restored to their store-backed rects in
-    /// this cloned, reconciliation-only view.
-    pub(crate) fn durable_reconciliation_view(mut self, workspace: &Workspace) -> Self {
-        let durable_rects = workspace
-            .pages
-            .iter()
-            .flat_map(|page| {
-                page.tiles
-                    .iter()
-                    .map(move |tile| ((page.id, tile.id), tile.rect))
-            })
-            .collect::<BTreeMap<_, _>>();
-        for object in &mut self.objects {
-            if self.projected_tile_ids.contains(&object.id)
-                && let Some(rect) = durable_rects.get(&(object.page_id, object.id))
-            {
-                object.rect = *rect;
-            }
-        }
-        self.projected_tile_ids.clear();
-        self.motion_by_page.clear();
-        self
-    }
-
     /// Returns the next active-page repaint delay, bounded by the frame
     /// cadence and the earliest moving rider's state boundary.
     ///
@@ -140,6 +110,19 @@ impl CanvasGeometrySnapshot {
                 .unwrap_or(PATHWAY_FRAME_INTERVAL),
         )
     }
+}
+
+/// Whether one automation observation may copy canvas pile geometry into the
+/// durable pile domain.
+///
+/// Exact pathway boundary passes operate on a transient geometry snapshot and
+/// must use [`PileGeometryPolicy::Preserve`]: pathway projection is allowed to
+/// affect membership, but can never write `Pile::rect` as a side effect.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PileGeometryPolicy {
+    #[default]
+    Synchronize,
+    Preserve,
 }
 
 /// One settled observation of canvas state.
@@ -162,6 +145,13 @@ pub struct ReconcileRequest<'a> {
     /// rule is created/imported. Normal interaction and import observations use
     /// `NewEntry`.
     pub initial_membership: InitialMembership,
+    /// Restrict every automation mutation to these pages. `None` reconciles
+    /// all pages. Claims, overrides, progress, and pile geometry belonging to
+    /// pages outside the set remain byte-identical.
+    pub page_scope: Option<&'a BTreeSet<PageId>>,
+    /// Pathway reconciliation uses transient exact-boundary geometry and must
+    /// not feed it back into durable pile rectangles.
+    pub pile_geometry_policy: PileGeometryPolicy,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -312,11 +302,19 @@ pub fn reconcile_workspace(
     let mut next = original.clone();
     let mut report = ReconcileReport::default();
 
-    sync_pile_geometry(&mut next, request.objects, &mut report);
-    advance_overrides(&mut next, request.objects, &mut report);
+    if request.pile_geometry_policy == PileGeometryPolicy::Synchronize {
+        sync_pile_geometry(&mut next, request.objects, request.page_scope, &mut report);
+    }
+    advance_overrides(&mut next, request.objects, request.page_scope, &mut report);
 
-    let memberships = resolve_pile_memberships(&next.piles, request.objects);
-    reconcile_inherited_tags(&mut next, &memberships, request.now, &mut report)?;
+    let memberships = resolve_scoped_pile_memberships(&next, request.objects, request.page_scope);
+    reconcile_inherited_tags(
+        &mut next,
+        &memberships,
+        request.now,
+        request.page_scope,
+        &mut report,
+    )?;
     report.memberships = memberships;
     reconcile_progress(&mut next, request, &mut report)?;
 
@@ -330,12 +328,12 @@ pub fn reconcile_workspace(
 fn sync_pile_geometry(
     domain: &mut DomainState,
     objects: &[CanvasObject],
+    page_scope: Option<&BTreeSet<PageId>>,
     report: &mut ReconcileReport,
 ) {
-    for object in objects
-        .iter()
-        .filter(|object| object.tile_type == DomainTileType::Pile)
-    {
+    for object in objects.iter().filter(|object| {
+        object.tile_type == DomainTileType::Pile && page_is_in_scope(page_scope, object.page_id)
+    }) {
         let Some(pile) = domain.piles.get_mut(&object.id) else {
             continue;
         };
@@ -351,10 +349,19 @@ fn sync_pile_geometry(
 fn advance_overrides(
     domain: &mut DomainState,
     objects: &[CanvasObject],
+    page_scope: Option<&BTreeSet<PageId>>,
     report: &mut ReconcileReport,
 ) {
-    let by_id: BTreeMap<_, _> = objects.iter().map(|object| (object.id, object)).collect();
-    for pile in domain.piles.values_mut() {
+    let by_id: BTreeMap<_, _> = objects
+        .iter()
+        .filter(|object| page_is_in_scope(page_scope, object.page_id))
+        .map(|object| (object.id, object))
+        .collect();
+    for pile in domain
+        .piles
+        .values_mut()
+        .filter(|pile| page_is_in_scope(page_scope, pile.page_id))
+    {
         let override_ids: Vec<_> = pile.overrides.keys().copied().collect();
         for tile_id in override_ids {
             let Some(object) = by_id.get(&tile_id) else {
@@ -379,15 +386,50 @@ fn advance_overrides(
     }
 }
 
+fn page_is_in_scope(page_scope: Option<&BTreeSet<PageId>>, page_id: PageId) -> bool {
+    page_scope.is_none_or(|pages| pages.contains(&page_id))
+}
+
+fn resolve_scoped_pile_memberships(
+    domain: &DomainState,
+    objects: &[CanvasObject],
+    page_scope: Option<&BTreeSet<PageId>>,
+) -> BTreeMap<PileId, BTreeSet<TileId>> {
+    let Some(page_scope) = page_scope else {
+        return resolve_pile_memberships(&domain.piles, objects);
+    };
+
+    let piles = domain
+        .piles
+        .iter()
+        .filter(|(_, pile)| page_scope.contains(&pile.page_id))
+        .map(|(id, pile)| (*id, pile.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let objects = objects
+        .iter()
+        .filter(|object| page_scope.contains(&object.page_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    resolve_pile_memberships(&piles, &objects)
+}
+
 fn reconcile_inherited_tags(
     domain: &mut DomainState,
     memberships: &BTreeMap<PileId, BTreeSet<TileId>>,
     now: UnixMillis,
+    page_scope: Option<&BTreeSet<PageId>>,
     report: &mut ReconcileReport,
 ) -> Result<(), DomainError> {
+    let scoped_pile_ids = domain
+        .piles
+        .values()
+        .filter(|pile| page_is_in_scope(page_scope, pile.page_id))
+        .map(|pile| pile.id)
+        .collect::<BTreeSet<_>>();
     let expected: BTreeSet<_> = domain
         .piles
         .values()
+        .filter(|pile| scoped_pile_ids.contains(&pile.id))
         .flat_map(|pile| {
             memberships
                 .get(&pile.id)
@@ -399,21 +441,19 @@ fn reconcile_inherited_tags(
 
     // Remove only the pile-owned inherited claim. A manual, tag-tile, earned,
     // or assistant claim for the same normalized tag remains intact.
-    let existing_claims: Vec<_> = domain
-        .tags
-        .assignments
-        .iter()
-        .flat_map(|(tile_id, assignments)| {
-            assignments.iter().flat_map(move |(tag_id, assignment)| {
-                assignment.claims.iter().filter_map(move |claim| {
-                    let TagSource::PileInherited { pile_id } = &claim.source else {
-                        return None;
-                    };
-                    Some((*tile_id, *tag_id, *pile_id))
-                })
-            })
-        })
-        .collect();
+    let mut existing_claims = Vec::new();
+    for (tile_id, assignments) in &domain.tags.assignments {
+        for (tag_id, assignment) in assignments {
+            for claim in &assignment.claims {
+                let TagSource::PileInherited { pile_id } = &claim.source else {
+                    continue;
+                };
+                if page_scope.is_none() || scoped_pile_ids.contains(pile_id) {
+                    existing_claims.push((*tile_id, *tag_id, *pile_id));
+                }
+            }
+        }
+    }
 
     for (tile_id, tag_id, pile_id) in existing_claims {
         if !expected.contains(&(tile_id, tag_id, pile_id))
@@ -447,7 +487,11 @@ fn reconcile_progress(
 ) -> Result<(), DomainError> {
     let mut evaluations = Vec::new();
 
-    for pile in domain.piles.values() {
+    for pile in domain
+        .piles
+        .values()
+        .filter(|pile| page_is_in_scope(request.page_scope, pile.page_id))
+    {
         let Some(rule) = pile.auto_tag_rule.as_ref() else {
             continue;
         };
@@ -477,7 +521,11 @@ fn reconcile_progress(
         }
 
         let members = report.memberships.get(&pile.id);
-        for object in request.objects {
+        for object in request
+            .objects
+            .iter()
+            .filter(|object| page_is_in_scope(request.page_scope, object.page_id))
+        {
             let was_tracked = pile.progress.contains_key(&object.id);
             let eligible = object.id != pile.id
                 && object.page_id == pile.page_id
@@ -632,10 +680,10 @@ mod tests {
     use super::*;
     use crate::{
         domain::{
-            ApplyMode, AutoTagRule, AutoTagSettings, ContainmentMode, DomainTileType, PaletteColor,
-            Pathway, PathwayAssignment, PathwayAssignmentState, PathwayNode, PathwayNodeKind,
-            PathwayPoint, PathwaySegment, Pile, RuleDuration, RuleState, TagSource, TileTypeFilter,
-            TimeUnit,
+            ApplyMode, AutoTagRule, AutoTagSettings, ContainmentMode, DomainTileType,
+            IgnoreUntilReentryPhase, PaletteColor, Pathway, PathwayAssignment,
+            PathwayAssignmentState, PathwayNode, PathwayNodeKind, PathwayPoint, PathwaySegment,
+            Pile, PileOverride, RuleDuration, RuleState, TagSource, TileTypeFilter, TimeUnit,
         },
         model::{Tile, WorldRect},
         spatial::SpatialIndex,
@@ -803,6 +851,8 @@ mod tests {
             active_elapsed_ms: milliseconds,
             settled,
             initial_membership: InitialMembership::NewEntry,
+            page_scope: None,
+            pile_geometry_policy: PileGeometryPolicy::Synchronize,
         }
     }
 
@@ -1065,7 +1115,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_reconciliation_does_not_sample_pathway_motion_before_p4() {
+    fn projected_pathway_membership_reconciles_without_pile_writeback() {
         let mut fixture = motion_fixture();
         let pile_id = id(10_050);
         let tag_id = id(10_051);
@@ -1090,37 +1140,76 @@ mod tests {
             "read-only canvas pile tests use the rider's projected position"
         );
 
-        let reconciliation = projected.durable_reconciliation_view(&fixture.workspace);
-        assert!(
-            !resolve_pile_memberships(&fixture.workspace.domain.piles, reconciliation.objects())
-                .get(&pile_id)
-                .is_some_and(|members| members.contains(&fixture.tile_id)),
-            "the temporary P3 durable pass cannot sample a pathway crossing"
-        );
-        let before = serde_json::to_vec(&fixture.workspace).unwrap();
+        let pile_rect_before = rect_bits(fixture.workspace.domain.piles[&pile_id].rect);
         let report = reconcile_workspace(
             &mut fixture.workspace,
             ReconcileRequest {
-                objects: reconciliation.objects(),
+                objects: projected.objects(),
                 now: at.to_unix_millis_floor(),
                 active_elapsed_ms: 1_000,
                 settled: true,
                 initial_membership: InitialMembership::NewEntry,
+                page_scope: None,
+                pile_geometry_policy: PileGeometryPolicy::Preserve,
             },
         )
         .unwrap();
 
-        assert!(!report.changed);
-        assert_eq!(serde_json::to_vec(&fixture.workspace).unwrap(), before);
+        assert!(report.changed);
+        assert_eq!(report.pile_rect_updates, 0);
+        assert_eq!(
+            rect_bits(fixture.workspace.domain.piles[&pile_id].rect),
+            pile_rect_before
+        );
         assert!(
             fixture
                 .workspace
                 .domain
                 .tags
                 .assignment(fixture.tile_id, tag_id)
-                .is_none()
+                .is_some()
         );
         assert!(fixture.workspace.domain.pathways.events().is_empty());
+    }
+
+    #[test]
+    fn preserve_geometry_policy_keeps_pile_rect_bits_identical() {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let pile_id = id(10_060);
+        let durable_rect = WorldRect::new(8_000.25, -8_100.5, 420.75, 310.125);
+        add_pile(
+            &mut workspace,
+            pile_id,
+            durable_rect,
+            "Preserved",
+            id(10_061),
+        );
+        let before = rect_bits(workspace.domain.piles[&pile_id].rect);
+        let objects = [object(
+            10_060,
+            page_id,
+            WorldRect::new(1.125, 2.25, 30.5, 40.75),
+            DomainTileType::Pile,
+        )];
+
+        let report = reconcile_workspace(
+            &mut workspace,
+            ReconcileRequest {
+                objects: &objects,
+                now: UnixMillis(1),
+                active_elapsed_ms: 0,
+                settled: true,
+                initial_membership: InitialMembership::NewEntry,
+                page_scope: None,
+                pile_geometry_policy: PileGeometryPolicy::Preserve,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.pile_rect_updates, 0);
+        assert!(!report.changed);
+        assert_eq!(rect_bits(workspace.domain.piles[&pile_id].rect), before);
     }
 
     #[test]
@@ -1179,6 +1268,8 @@ mod tests {
                 active_elapsed_ms: 0,
                 settled: true,
                 initial_membership: InitialMembership::NewEntry,
+                page_scope: None,
+                pile_geometry_policy: PileGeometryPolicy::Synchronize,
             },
         )
         .unwrap();
@@ -1416,6 +1507,31 @@ mod tests {
         assert_eq!(
             geometry.repaint_after(fixture.page_id, long_motion_at),
             None
+        );
+
+        let future_start = long_motion_at.saturating_add_micros(5_000_000);
+        let assignment = fixture
+            .workspace
+            .domain
+            .pathways
+            .assignments
+            .get_mut(&fixture.assignment_id)
+            .unwrap();
+        assignment.segment_started_at = Some(future_start);
+        let pathway = fixture
+            .workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&fixture.pathway_id)
+            .unwrap();
+        pathway.is_enabled = true;
+        let geometry = canvas_objects_from_workspace(&fixture.workspace, long_motion_at, |_| None);
+        assert!(geometry.is_projected(fixture.tile_id));
+        assert_eq!(
+            geometry.repaint_after(fixture.page_id, long_motion_at),
+            None,
+            "future motion waits for P4's one start wake instead of polling frames"
         );
     }
 
@@ -1731,6 +1847,124 @@ mod tests {
             .filter(|claim| matches!(claim.source, TagSource::PileEarned { .. }))
             .count();
         assert_eq!(earned, 0);
+    }
+
+    #[test]
+    fn page_scope_leaves_other_page_geometry_claims_overrides_and_progress_untouched() {
+        let mut workspace = Workspace::new();
+        let page_a = workspace.active_page;
+        let page_b = id(90_001);
+        let pile_a = id(90_010);
+        let pile_b = id(90_011);
+        let tag_a = id(90_020);
+        let tag_b = id(90_021);
+        let tile_a = id(90_030);
+        let tile_b = id(90_031);
+        let original_rect_a = WorldRect::new(0.0, 0.0, 100.0, 100.0);
+        let original_rect_b = WorldRect::new(200.0, 0.0, 100.0, 100.0);
+        add_pile(&mut workspace, pile_a, original_rect_a, "A", tag_a);
+        add_pile(&mut workspace, pile_b, original_rect_b, "B", tag_b);
+        workspace.domain.piles.get_mut(&pile_b).unwrap().page_id = page_b;
+        for (pile_id, rule_id) in [(pile_a, id(90_040)), (pile_b, id(90_041))] {
+            workspace
+                .domain
+                .piles
+                .get_mut(&pile_id)
+                .unwrap()
+                .auto_tag_rule = Some(
+                AutoTagRule::new(
+                    rule_id,
+                    RuleState::On,
+                    AutoTagSettings::default(),
+                    UnixMillis::ZERO,
+                )
+                .unwrap(),
+            );
+        }
+        let inside = [
+            object(
+                pile_a.as_u128(),
+                page_a,
+                original_rect_a,
+                DomainTileType::Pile,
+            ),
+            object(
+                pile_b.as_u128(),
+                page_b,
+                original_rect_b,
+                DomainTileType::Pile,
+            ),
+            object(
+                tile_a.as_u128(),
+                page_a,
+                WorldRect::new(10.0, 10.0, 20.0, 20.0),
+                DomainTileType::Content(TileKind::Note),
+            ),
+            object(
+                tile_b.as_u128(),
+                page_b,
+                WorldRect::new(210.0, 10.0, 20.0, 20.0),
+                DomainTileType::Content(TileKind::Note),
+            ),
+        ];
+        reconcile_workspace(&mut workspace, request(&inside, 0, true)).unwrap();
+        workspace
+            .domain
+            .piles
+            .get_mut(&pile_b)
+            .unwrap()
+            .overrides
+            .insert(
+                tile_b,
+                PileOverride::IgnoreUntilReentry {
+                    phase: IgnoreUntilReentryPhase::WaitingForExit,
+                },
+            );
+        let unscoped_pile_before = workspace.domain.piles[&pile_b].clone();
+        let unscoped_claim_before = workspace.domain.tags.assignment(tile_b, tag_b).cloned();
+
+        let moved_rect_a = WorldRect::new(1.25, 2.5, 101.0, 102.0);
+        let moved_rect_b = WorldRect::new(300.25, 2.5, 101.0, 102.0);
+        let outside = [
+            object(pile_a.as_u128(), page_a, moved_rect_a, DomainTileType::Pile),
+            object(pile_b.as_u128(), page_b, moved_rect_b, DomainTileType::Pile),
+            object(
+                tile_a.as_u128(),
+                page_a,
+                WorldRect::new(1_000.0, 1_000.0, 20.0, 20.0),
+                DomainTileType::Content(TileKind::Note),
+            ),
+            object(
+                tile_b.as_u128(),
+                page_b,
+                WorldRect::new(1_000.0, 1_000.0, 20.0, 20.0),
+                DomainTileType::Content(TileKind::Note),
+            ),
+        ];
+        let page_scope = BTreeSet::from([page_a]);
+        let report = reconcile_workspace(
+            &mut workspace,
+            ReconcileRequest {
+                objects: &outside,
+                now: UnixMillis(1_000),
+                active_elapsed_ms: 1_000,
+                settled: true,
+                initial_membership: InitialMembership::NewEntry,
+                page_scope: Some(&page_scope),
+                pile_geometry_policy: PileGeometryPolicy::Synchronize,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(workspace.domain.piles[&pile_a].rect, moved_rect_a);
+        assert_eq!(workspace.domain.piles[&pile_b], unscoped_pile_before);
+        assert!(workspace.domain.tags.assignment(tile_a, tag_a).is_none());
+        assert_eq!(
+            workspace.domain.tags.assignment(tile_b, tag_b).cloned(),
+            unscoped_claim_before
+        );
+        assert!(report.memberships.contains_key(&pile_a));
+        assert!(!report.memberships.contains_key(&pile_b));
     }
 
     #[test]

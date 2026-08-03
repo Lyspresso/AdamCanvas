@@ -18,7 +18,7 @@ use crate::{
     artifact_library::{self, ArtifactLibraryState, LibraryTarget},
     assets::AssetStore,
     automation::{
-        CanvasGeometrySnapshot, ReconcileRequest, canvas_objects_from_workspace,
+        CanvasGeometrySnapshot, PileGeometryPolicy, ReconcileRequest, canvas_objects_from_workspace,
         reconcile_workspace,
     },
     chat_core::{
@@ -2205,8 +2205,7 @@ impl AdamApp {
         let before_piles = self.workspace.domain.piles.clone();
         let before_tags = self.workspace.domain.tags.clone();
         let now = unix_now_micros();
-        let geometry = canvas_objects_from_workspace(&self.workspace, now, |_| None)
-            .durable_reconciliation_view(&self.workspace);
+        let geometry = canvas_objects_from_workspace(&self.workspace, now, |_| None);
         let active_elapsed_ms = self
             .last_automation_tick
             .elapsed()
@@ -2226,6 +2225,8 @@ impl AdamApp {
                 active_elapsed_ms,
                 settled,
                 initial_membership,
+                page_scope: None,
+                pile_geometry_policy: PileGeometryPolicy::Synchronize,
             },
         );
         let mut meaningful_automation_change = false;
