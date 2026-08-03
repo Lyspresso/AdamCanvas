@@ -1949,6 +1949,8 @@ impl AdamApp {
         self.drag = None;
         self.resize = None;
         self.marquee = None;
+        self.pathway_drag = None;
+        self.pathway_dock_preview = None;
         self.note_draft = None;
         self.text_note_drop_target = None;
         self.spatial_dirty = true;
@@ -7211,7 +7213,11 @@ impl AdamApp {
                 }
                 self.restore_workspace(snapshot);
             }
-            HistoryEntry::RailMove { pathway_id, from, to } => {
+            HistoryEntry::RailMove {
+                pathway_id,
+                from,
+                to,
+            } => {
                 let target = if is_undo { &from } else { &to };
                 match apply_pathway_rail_drag(
                     &mut self.workspace,
@@ -7221,7 +7227,11 @@ impl AdamApp {
                     Uuid::new_v4(),
                 ) {
                     Ok(()) => {
-                        let entry = HistoryEntry::RailMove { pathway_id, from, to };
+                        let entry = HistoryEntry::RailMove {
+                            pathway_id,
+                            from,
+                            to,
+                        };
                         if is_undo {
                             self.history.push_redo(entry);
                         } else {
@@ -7247,14 +7257,26 @@ impl AdamApp {
 
     fn perform_undo(&mut self, context: &Context) {
         if let Some(entry) = self.history.pop_undo() {
+            self.cancel_rail_gesture_for_history();
             self.apply_history_entry(entry, true, context);
         }
     }
 
     fn perform_redo(&mut self, context: &Context) {
         if let Some(entry) = self.history.pop_redo() {
+            self.cancel_rail_gesture_for_history();
             self.apply_history_entry(entry, false, context);
         }
+    }
+
+    /// History must never apply underneath a held rail: the session's frozen
+    /// `original_nodes` would go stale, its release commit would re-apply the
+    /// undone positions, and `record_rail_move`'s redo-clear would destroy the
+    /// entry that undo had just parked. The session is preview-only, so
+    /// dropping it is a clean cancel — the same rationale as Escape.
+    fn cancel_rail_gesture_for_history(&mut self) {
+        self.pathway_drag = None;
+        self.pathway_dock_preview = None;
     }
 
     fn handle_background_interaction(
@@ -23278,7 +23300,11 @@ mod tests {
     #[test]
     fn undoing_a_rail_move_returns_the_route_and_its_rider_to_the_old_rail() {
         let (mut workspace, pathway_id, _, assignment_id) = rail_drag_fixture();
-        let originals: BTreeMap<_, _> = workspace.domain.pathways.pathway(pathway_id).unwrap()
+        let originals: BTreeMap<_, _> = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
             .nodes
             .iter()
             .map(|(id, node)| (*id, node.point))
