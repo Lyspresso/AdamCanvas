@@ -3850,6 +3850,96 @@ mod tests {
     }
 
     #[test]
+    fn offline_catch_up_replays_the_final_partial_pile_crossing_exactly() {
+        let mut fixture = fixture(10.0, 10.0, UnixMicros::ZERO);
+        let closure_id = id(70);
+        {
+            let pathway = fixture
+                .workspace
+                .domain
+                .pathways
+                .pathways
+                .get_mut(&fixture.pathway_id)
+                .unwrap();
+            pathway.repeats = true;
+            pathway.segments.insert(
+                closure_id,
+                PathwaySegment::new(
+                    closure_id,
+                    fixture.end_id,
+                    fixture.start_id,
+                    1.0,
+                    10.0,
+                    UnixMicros::ZERO,
+                )
+                .unwrap(),
+            );
+        }
+        let pile_id = add_center_pile_at(&mut fixture, 800, 4.0);
+        fixture
+            .workspace
+            .domain
+            .piles
+            .get_mut(&pile_id)
+            .unwrap()
+            .auto_tag_rule = Some(
+            AutoTagRule::new(
+                id(801),
+                RuleState::On,
+                AutoTagSettings::default(),
+                UnixMillis::ZERO,
+            )
+            .unwrap(),
+        );
+
+        // The pre-pass rebases 3,599 whole two-second laps. The exact P4
+        // planner then owns the remainder, including the entry 400 ms into
+        // the final forward segment rather than approximating it at launch.
+        let now = UnixMicros(7_200_500_000);
+        let startup = PathwayReconcileContext::with_operation_id(
+            "test",
+            now,
+            PathwayReconcileCause::StartupBacklog,
+            id(997),
+        )
+        .unwrap();
+        let report = PathwayReconcileService::reconcile(&mut fixture.workspace, startup).unwrap();
+
+        assert_eq!(report.skipped_lap_count, 3_599);
+        assert!(report.breaker_pathway_ids.is_empty());
+        let entries = fixture
+            .workspace
+            .domain
+            .pathways
+            .events()
+            .iter()
+            .filter(|event| {
+                event.kind == PathwayEventKind::PileEntered
+                    && event.payload.pile_id == Some(pile_id)
+            })
+            .map(|event| event.at)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries.last(),
+            Some(&UnixMicros(7_200_400_000)),
+            "the final partial lap must use the analytic pile-crossing instant"
+        );
+        assert_eq!(
+            fixture.workspace.domain.piles[&pile_id].progress[&fixture.tile_id].last_observed_at,
+            UnixMillis(7_200_400),
+            "MembershipProgress must receive the solved crossing at its millisecond seam"
+        );
+        assert!(
+            fixture.workspace.domain.tags.assignments[&fixture.tile_id]
+                .values()
+                .any(|assignment| assignment.claims.iter().any(|claim| matches!(
+                    claim.source,
+                    TagSource::PileInherited { pile_id: claimed } if claimed == pile_id
+                )))
+        );
+    }
+
+    #[test]
     fn lap_skip_rejects_gates_broken_walks_nonreturning_cycles_and_short_laps() {
         let mut fixture = fixture(10.0, 10.0, UnixMicros::ZERO);
         let closure_id = id(70);
