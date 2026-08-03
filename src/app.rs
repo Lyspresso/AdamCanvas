@@ -251,45 +251,85 @@ impl Camera {
     }
 }
 
+/// One undoable step. Canvas layout undoes by snapshot restore; a rail move
+/// undoes by applying the INVERSE move through the editing service. The
+/// pathway ledger is append-only audit state and is never rewound as data —
+/// "undo" of a rail move is a brand-new, fully audited edit that happens to
+/// land the stops back where they were.
+enum HistoryEntry {
+    Canvas(Workspace),
+    RailMove {
+        pathway_id: PathwayId,
+        from: BTreeMap<PathwayNodeId, PathwayPoint>,
+        to: BTreeMap<PathwayNodeId, PathwayPoint>,
+    },
+}
+
 #[derive(Default)]
 struct History {
-    undo: Vec<Workspace>,
-    redo: Vec<Workspace>,
+    undo: Vec<HistoryEntry>,
+    redo: Vec<HistoryEntry>,
 }
 
 impl History {
     fn checkpoint(&mut self, workspace: &Workspace) {
-        if self.undo.last().is_some_and(|last| last == workspace) {
+        if self
+            .undo
+            .last()
+            .is_some_and(|last| matches!(last, HistoryEntry::Canvas(prev) if prev == workspace))
+        {
             return;
         }
-        self.undo.push(workspace.clone());
-        if self.undo.len() > HISTORY_LIMIT {
-            self.undo.remove(0);
-        }
+        self.push_undo(HistoryEntry::Canvas(workspace.clone()));
         self.redo.clear();
     }
 
-    fn undo(&mut self, current: &Workspace) -> Option<Workspace> {
-        let previous = self.undo.pop()?;
-        self.redo.push(current.clone());
-        Some(previous)
+    fn record_rail_move(
+        &mut self,
+        pathway_id: PathwayId,
+        from: BTreeMap<PathwayNodeId, PathwayPoint>,
+        to: BTreeMap<PathwayNodeId, PathwayPoint>,
+    ) {
+        self.push_undo(HistoryEntry::RailMove {
+            pathway_id,
+            from,
+            to,
+        });
+        self.redo.clear();
     }
 
-    fn redo(&mut self, current: &Workspace) -> Option<Workspace> {
-        let next = self.redo.pop()?;
-        self.undo.push(current.clone());
-        Some(next)
+    fn push_undo(&mut self, entry: HistoryEntry) {
+        self.undo.push(entry);
+        if self.undo.len() > HISTORY_LIMIT {
+            self.undo.remove(0);
+        }
+    }
+
+    fn pop_undo(&mut self) -> Option<HistoryEntry> {
+        self.undo.pop()
+    }
+
+    fn push_redo(&mut self, entry: HistoryEntry) {
+        self.redo.push(entry);
+    }
+
+    fn pop_redo(&mut self) -> Option<HistoryEntry> {
+        self.redo.pop()
     }
 
     fn forget_conversation(&mut self, conversation_id: Uuid) {
-        for workspace in self.undo.iter_mut().chain(self.redo.iter_mut()) {
-            purge_ai_conversation_from_workspace(workspace, conversation_id);
+        for entry in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            if let HistoryEntry::Canvas(workspace) = entry {
+                purge_ai_conversation_from_workspace(workspace, conversation_id);
+            }
         }
     }
 
     fn replace_file_path(&mut self, source: &PathBuf, managed_path: &PathBuf) {
-        for workspace in self.undo.iter_mut().chain(self.redo.iter_mut()) {
-            replace_workspace_file_path(workspace, source, managed_path);
+        for entry in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            if let HistoryEntry::Canvas(workspace) = entry {
+                replace_workspace_file_path(workspace, source, managed_path);
+            }
         }
     }
 }
@@ -2601,6 +2641,14 @@ impl AdamApp {
                     report.problems.sort();
                     report.problems.dedup();
                 }
+                // Detachment is durable and has no other surface yet; without
+                // this the tile just silently stops riding.
+                if report.detached_count > 0 {
+                    self.toast(
+                        "A tile came off its pathway — drop it back on the rail to re-hook it",
+                        context,
+                    );
+                }
                 self.pathway_reconcile_report = report;
                 if let Some(wake) = self.pathway_next_wake {
                     request_repaint_at_micros(context, now, wake);
@@ -3155,14 +3203,9 @@ impl AdamApp {
             input.modifiers.command && input.modifiers.shift && input.key_pressed(Key::Z)
         });
         if undo && !text_is_active {
-            if let Some(workspace) = self.history.undo(&self.workspace) {
-                self.restore_workspace(workspace);
-            }
-        } else if redo
-            && !text_is_active
-            && let Some(workspace) = self.history.redo(&self.workspace)
-        {
-            self.restore_workspace(workspace);
+            self.perform_undo(context);
+        } else if redo && !text_is_active {
+            self.perform_redo(context);
         }
 
         if text_is_active {
@@ -7134,19 +7177,83 @@ impl AdamApp {
             Uuid::new_v4(),
         ) {
             Ok(()) => {
-                // Checkpoint AFTER the move, deliberately. Pathway edits are
-                // exempt from undo, so a pre-move snapshot would make Cmd+Z
-                // restore riders' pre-pause tile rects while the rail stayed
-                // put — arming the external-movement check to detach them at
-                // stale, backwards positions. A post-move snapshot makes the
-                // natural "undo the rail move" press a harmless no-op instead.
-                self.checkpoint();
+                // Not a canvas checkpoint: restoring a tile snapshot around a
+                // moved rail would put riders' rects at odds with the route
+                // and arm the external-movement detach. Undo of a rail move
+                // instead applies the inverse move through the same
+                // all-or-nothing service commit, which re-seats riders itself.
+                self.history.record_rail_move(
+                    session.pathway_id,
+                    session.original_nodes.clone(),
+                    session.preview_nodes.clone(),
+                );
                 self.changed(true);
             }
             Err(error) => {
                 log::warn!("could not move the pathway: {error}");
                 self.toast("The pathway could not be moved", context);
             }
+        }
+    }
+
+    /// Applies one popped history entry in the given direction. Canvas
+    /// snapshots restore; rail moves re-run through the editing service. A
+    /// rail entry that can no longer apply (route or stop since deleted) is
+    /// consumed with a toast rather than left to block the stack.
+    fn apply_history_entry(&mut self, entry: HistoryEntry, is_undo: bool, context: &Context) {
+        match entry {
+            HistoryEntry::Canvas(snapshot) => {
+                let current = HistoryEntry::Canvas(self.workspace.clone());
+                if is_undo {
+                    self.history.push_redo(current);
+                } else {
+                    self.history.push_undo(current);
+                }
+                self.restore_workspace(snapshot);
+            }
+            HistoryEntry::RailMove { pathway_id, from, to } => {
+                let target = if is_undo { &from } else { &to };
+                match apply_pathway_rail_drag(
+                    &mut self.workspace,
+                    pathway_id,
+                    target,
+                    unix_now_micros(),
+                    Uuid::new_v4(),
+                ) {
+                    Ok(()) => {
+                        let entry = HistoryEntry::RailMove { pathway_id, from, to };
+                        if is_undo {
+                            self.history.push_redo(entry);
+                        } else {
+                            self.history.push_undo(entry);
+                        }
+                        self.changed(true);
+                    }
+                    Err(error) => {
+                        log::warn!("could not replay the pathway move: {error}");
+                        self.toast(
+                            if is_undo {
+                                "That pathway move can no longer be undone"
+                            } else {
+                                "That pathway move can no longer be redone"
+                            },
+                            context,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn perform_undo(&mut self, context: &Context) {
+        if let Some(entry) = self.history.pop_undo() {
+            self.apply_history_entry(entry, true, context);
+        }
+    }
+
+    fn perform_redo(&mut self, context: &Context) {
+        if let Some(entry) = self.history.pop_redo() {
+            self.apply_history_entry(entry, false, context);
         }
     }
 
@@ -22649,13 +22756,16 @@ mod tests {
             .link_tile(tile_id, conversation_id)
             .unwrap();
         history.checkpoint(&workspace);
-        history.redo.push(workspace.clone());
+        history.redo.push(HistoryEntry::Canvas(workspace.clone()));
 
         history.forget_conversation(conversation_id);
 
         assert_eq!(history.undo.len(), 1);
         assert_eq!(history.redo.len(), 1);
-        for snapshot in history.undo.iter().chain(&history.redo) {
+        for entry in history.undo.iter().chain(&history.redo) {
+            let HistoryEntry::Canvas(snapshot) = entry else {
+                panic!("this test records only canvas snapshots");
+            };
             assert!(
                 !snapshot
                     .domain
@@ -22726,7 +22836,9 @@ mod tests {
             .title = "Current route".into();
         let current_pathways = workspace.domain.pathways.clone();
 
-        let mut restored = history.undo(&workspace).unwrap();
+        let Some(HistoryEntry::Canvas(mut restored)) = history.pop_undo() else {
+            panic!("expected a canvas snapshot on the undo stack");
+        };
         carry_forward_pathways(&workspace, &mut restored);
 
         assert!(restored.active_page().tile(added_tile_id).is_none());
@@ -22790,13 +22902,19 @@ mod tests {
             .unwrap();
         let expected_pathways = current.domain.pathways.clone();
 
-        let mut undone = history.undo(&current).unwrap();
+        let Some(HistoryEntry::Canvas(mut undone)) = history.pop_undo() else {
+            panic!("expected a canvas snapshot on the undo stack");
+        };
+        history.push_redo(HistoryEntry::Canvas(current.clone()));
         carry_forward_pathways(&current, &mut undone);
         let undone = undone.normalized();
         assert!(undone.page(pathway_page_id).is_none());
         assert_eq!(undone.domain.pathways, expected_pathways);
 
-        let mut redone = history.redo(&undone).unwrap();
+        let Some(HistoryEntry::Canvas(mut redone)) = history.pop_redo() else {
+            panic!("expected a canvas snapshot on the redo stack");
+        };
+        history.push_undo(HistoryEntry::Canvas(undone.clone()));
         carry_forward_pathways(&undone, &mut redone);
         let redone = redone.normalized();
         assert!(redone.page(pathway_page_id).is_some());
@@ -23155,6 +23273,79 @@ mod tests {
             (after.y - before.y).abs() > 10.0,
             "the reshaped leg must actually move the rider off its old projection"
         );
+    }
+
+    #[test]
+    fn undoing_a_rail_move_returns_the_route_and_its_rider_to_the_old_rail() {
+        let (mut workspace, pathway_id, _, assignment_id) = rail_drag_fixture();
+        let originals: BTreeMap<_, _> = workspace.domain.pathways.pathway(pathway_id).unwrap()
+            .nodes
+            .iter()
+            .map(|(id, node)| (*id, node.point))
+            .collect();
+        let moved: BTreeMap<_, _> = originals
+            .iter()
+            .map(|(id, point)| (*id, PathwayPoint::new(point.x + 150.0, point.y + 90.0)))
+            .collect();
+        apply_pathway_rail_drag(
+            &mut workspace,
+            pathway_id,
+            &moved,
+            crate::domain::UnixMicros(5_000_000),
+            Uuid::from_u128(101),
+        )
+        .unwrap();
+
+        // Undo = the inverse move through the same service commit.
+        apply_pathway_rail_drag(
+            &mut workspace,
+            pathway_id,
+            &originals,
+            crate::domain::UnixMicros(6_000_000),
+            Uuid::from_u128(102),
+        )
+        .unwrap();
+
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        for (node_id, node) in &pathway.nodes {
+            assert_eq!(node.point, originals[node_id], "stop {node_id} must return");
+        }
+        assert!(pathway.is_enabled, "the route must come back running");
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(
+            assignment.state,
+            crate::domain::PathwayAssignmentState::Moving,
+            "the rider must still be riding after undo"
+        );
+    }
+
+    #[test]
+    fn history_keeps_rail_moves_and_canvas_snapshots_in_one_ordered_stack() {
+        let mut history = History::default();
+        let workspace = Workspace::new();
+        history.checkpoint(&workspace);
+        let node_id = Uuid::from_u128(7);
+        history.record_rail_move(
+            Uuid::from_u128(1),
+            BTreeMap::from([(node_id, PathwayPoint::new(10.0, 10.0))]),
+            BTreeMap::from([(node_id, PathwayPoint::new(90.0, 40.0))]),
+        );
+        // The rail move must not be deduplicated against the snapshot, and a
+        // fresh checkpoint after it must still dedupe against nothing but a
+        // matching snapshot.
+        history.checkpoint(&workspace);
+        assert_eq!(history.undo.len(), 3);
+        assert!(matches!(
+            history.undo[1],
+            HistoryEntry::RailMove { pathway_id, .. } if pathway_id == Uuid::from_u128(1)
+        ));
+        // Pop order comes back newest-first, rail move in the middle.
+        assert!(matches!(history.pop_undo(), Some(HistoryEntry::Canvas(_))));
+        let Some(HistoryEntry::RailMove { from, to, .. }) = history.pop_undo() else {
+            panic!("the rail move must come back intact");
+        };
+        assert_eq!(from[&node_id], PathwayPoint::new(10.0, 10.0));
+        assert_eq!(to[&node_id], PathwayPoint::new(90.0, 40.0));
     }
 
     #[test]
