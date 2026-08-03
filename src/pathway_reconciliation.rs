@@ -11,7 +11,8 @@ use crate::{
         canvas_objects_from_workspace, reconcile_workspace,
     },
     domain::{
-        ContainmentMode, DomainError, InitialMembership, PageId, Pathway, PathwayAssignment,
+        ContainmentMode, DomainError, InitialMembership, PATHWAY_DISABLED_MISSING_PAGE_REASON,
+        PATHWAY_DISABLED_REPAIRED_GRAPH_REASON, PageId, Pathway, PathwayAssignment,
         PathwayAssignmentId, PathwayAssignmentState, PathwayEvent, PathwayEventKind,
         PathwayEventPayload, PathwayId, PathwayNode, PathwayNodeId, PathwayNodeKind, PathwayPoint,
         PathwaySegmentId, PileId, TileId, UnixMicros,
@@ -1794,16 +1795,23 @@ fn breaker_code_for_reason(reason: &str) -> Option<&'static str> {
     }
 }
 
+fn is_known_invalid_route_reason(reason: &str) -> bool {
+    // Deliberate P2 graph-edit pauses and user pauses are disabled states, not
+    // problems. Only engine-owned diagnostics and canonical load repairs show.
+    reason.starts_with(INVALID_ROUTE_PREFIX)
+        || matches!(
+            reason,
+            PATHWAY_DISABLED_MISSING_PAGE_REASON | PATHWAY_DISABLED_REPAIRED_GRAPH_REASON
+        )
+}
+
 fn current_problems(workspace: &Workspace) -> Vec<PathwayProblem> {
     let mut problems = BTreeSet::new();
     for pathway in workspace.domain.pathways.pathways.values() {
         if let Some(reason) = pathway.disabled_reason.as_deref() {
             if let Some(code) = breaker_code_for_reason(reason) {
                 problems.insert(PathwayProblem::breaker(pathway.id, code, reason));
-            } else if reason.starts_with(INVALID_ROUTE_PREFIX)
-                || reason.contains("missing")
-                || reason.contains("requires review")
-            {
+            } else if is_known_invalid_route_reason(reason) {
                 problems.insert(PathwayProblem::invalid(Some(pathway.id), None, reason));
             }
         }
@@ -2633,6 +2641,107 @@ mod tests {
     }
 
     #[test]
+    fn exact_engine_pass_and_sampled_tick_partition_wall_time() {
+        let mut fixture = fixture(100.0, 1.0, UnixMicros::ZERO);
+        let pile_id = add_pile(&mut fixture, ContainmentMode::AnyOverlap, true);
+        let settings = AutoTagSettings {
+            count_while_closed: false,
+            ..AutoTagSettings::default()
+        };
+        fixture
+            .workspace
+            .domain
+            .piles
+            .get_mut(&pile_id)
+            .unwrap()
+            .auto_tag_rule =
+            Some(AutoTagRule::new(id(42), RuleState::On, settings, UnixMillis::ZERO).unwrap());
+
+        let entered_at = UnixMicros(35_000_000);
+        PathwayReconcileService::reconcile(
+            &mut fixture.workspace,
+            context(entered_at.0).with_active_elapsed_ms(0),
+        )
+        .unwrap();
+        let before_exact = UnixMicros(39_000_000);
+        let geometry = canvas_objects_from_workspace(&fixture.workspace, before_exact, |_| None);
+        reconcile_workspace(
+            &mut fixture.workspace,
+            ReconcileRequest {
+                objects: geometry.objects(),
+                now: before_exact.to_unix_millis_floor(),
+                active_elapsed_ms: 4_000,
+                settled: true,
+                initial_membership: InitialMembership::NewEntry,
+                page_scope: None,
+                pile_geometry_policy: PileGeometryPolicy::Synchronize,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fixture.workspace.domain.piles[&pile_id].progress[&fixture.tile_id]
+                .continuous_elapsed_ms,
+            4_000
+        );
+
+        // The rider is already inside when the mandatory center-inside audit
+        // boundary is solved. The exact pass owns 39-40 seconds and advances
+        // last_observed_at; the sampled pass then owns 40-41 seconds. Its
+        // wall-delta clamp makes the two intervals disjoint.
+        let mut forwarded_budget = fixture.workspace.clone();
+        let mut zero_budget = fixture.workspace;
+        let exact_at = UnixMicros(40_000_000);
+        let forwarded_report = PathwayReconcileService::reconcile(
+            &mut forwarded_budget,
+            context(exact_at.0).with_active_elapsed_ms(1_000),
+        )
+        .unwrap();
+        let zero_report = PathwayReconcileService::reconcile(
+            &mut zero_budget,
+            context(exact_at.0).with_active_elapsed_ms(0),
+        )
+        .unwrap();
+        assert_eq!(forwarded_report.transition_count, 1);
+        assert_eq!(zero_report.transition_count, 1);
+
+        let sampled_at = exact_at.saturating_add_micros(1_000_000);
+        let sample = |workspace: &mut Workspace| {
+            let geometry = canvas_objects_from_workspace(workspace, sampled_at, |_| None);
+            reconcile_workspace(
+                workspace,
+                ReconcileRequest {
+                    objects: geometry.objects(),
+                    now: sampled_at.to_unix_millis_floor(),
+                    // The sampled cursor still spans 39-41 seconds because
+                    // the exact pass did not advance it. Its two-second
+                    // budget is clamped to the one-second wall interval since
+                    // the exact observation at 40 seconds.
+                    active_elapsed_ms: 2_000,
+                    settled: true,
+                    initial_membership: InitialMembership::NewEntry,
+                    page_scope: None,
+                    pile_geometry_policy: PileGeometryPolicy::Synchronize,
+                },
+            )
+            .unwrap();
+        };
+        sample(&mut forwarded_budget);
+        sample(&mut zero_budget);
+
+        assert_eq!(
+            forwarded_budget.domain.piles[&pile_id].progress[&fixture.tile_id]
+                .continuous_elapsed_ms,
+            6_000,
+            "exact and sampled passes must preserve both disjoint wall-time intervals"
+        );
+        assert_eq!(
+            zero_budget.domain.piles[&pile_id].progress[&fixture.tile_id].continuous_elapsed_ms,
+            5_000,
+            "zeroing the exact budget drops dwell before the exact observation cursor advances"
+        );
+    }
+
+    #[test]
     fn center_inside_configuration_emits_one_deduplicated_audit_crossing() {
         let mut fixture = fixture(100.0, 1.0, UnixMicros::ZERO);
         let pile_id = add_pile(&mut fixture, ContainmentMode::CenterInside, true);
@@ -3456,5 +3565,67 @@ mod tests {
             event_count
         );
         assert_eq!(first.problems, second.problems);
+    }
+
+    #[test]
+    fn disabled_route_problems_match_only_known_automatic_reasons() {
+        let mut fixture = fixture(10.0, 1.0, UnixMicros::ZERO);
+        fixture
+            .workspace
+            .domain
+            .pathways
+            .assignments
+            .remove(&fixture.assignment_id);
+        let pathway = fixture
+            .workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&fixture.pathway_id)
+            .unwrap();
+        pathway.is_enabled = false;
+
+        for reason in [
+            PATHWAY_DISABLED_MISSING_PAGE_REASON,
+            PATHWAY_DISABLED_REPAIRED_GRAPH_REASON,
+            "Pathway record needs attention: the repeating pathway has no closing segment.",
+        ] {
+            fixture
+                .workspace
+                .domain
+                .pathways
+                .pathways
+                .get_mut(&fixture.pathway_id)
+                .unwrap()
+                .disabled_reason = Some(reason.into());
+            assert_eq!(
+                current_problems(&fixture.workspace),
+                vec![PathwayProblem::invalid(
+                    Some(fixture.pathway_id),
+                    None,
+                    reason
+                )]
+            );
+        }
+
+        for reason in [
+            "Paused for pathway graph editing.",
+            "Pathway paused by the user.",
+            "A future integration is missing optional provider metadata.",
+            "A future policy requires review before enabling.",
+        ] {
+            fixture
+                .workspace
+                .domain
+                .pathways
+                .pathways
+                .get_mut(&fixture.pathway_id)
+                .unwrap()
+                .disabled_reason = Some(reason.into());
+            assert!(
+                current_problems(&fixture.workspace).is_empty(),
+                "unexpected problem projection for {reason:?}"
+            );
+        }
     }
 }

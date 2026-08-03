@@ -409,6 +409,10 @@ fn pathway_poll_decision(
     }
 }
 
+fn pathway_reconcile_active_elapsed_ms(elapsed: Duration) -> i64 {
+    elapsed.as_millis().min(i64::MAX as u128) as i64
+}
+
 #[derive(Clone, Debug)]
 struct AiWorkspaceFile {
     name: String,
@@ -2301,14 +2305,18 @@ impl AdamApp {
             PathwayReconcileCause::Live
         };
         let reconcile_context = match PathwayReconcileContext::new("Adam", now, cause) {
-            Ok(context) => context
-                .with_active_elapsed_ms(
-                    self.last_automation_tick
-                        .elapsed()
-                        .as_millis()
-                        .min(i64::MAX as u128) as i64,
-                )
-                .with_settled(true),
+            Ok(context) => {
+                // Exact batches advance each scoped progress row's
+                // `last_observed_at`; sampled automation then wall-delta clamps
+                // its budget, so it cannot charge that interval twice. Moving
+                // the global cursor here would instead drop dwell for piles on
+                // pages that this exact, page-scoped pass did not evaluate.
+                context
+                    .with_active_elapsed_ms(pathway_reconcile_active_elapsed_ms(
+                        self.last_automation_tick.elapsed(),
+                    ))
+                    .with_settled(true)
+            }
             Err(error) => {
                 self.pathway_runtime_problem =
                     Some(format!("Pathway reconciliation could not start: {error}"));
@@ -24120,6 +24128,15 @@ mod tests {
     fn pathway_owned_commits_do_not_wake_the_reconciler() {
         assert!(CommitOrigin::External.wakes_pathway_reconciler());
         assert!(!CommitOrigin::PathwayReconciler.wakes_pathway_reconciler());
+    }
+
+    #[test]
+    fn exact_pathway_poll_forwards_elapsed_time_with_saturating_conversion() {
+        assert_eq!(
+            pathway_reconcile_active_elapsed_ms(Duration::from_millis(1_250)),
+            1_250
+        );
+        assert_eq!(pathway_reconcile_active_elapsed_ms(Duration::MAX), i64::MAX);
     }
 
     #[test]
