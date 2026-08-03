@@ -40,6 +40,7 @@ const BREAKER_LIVE_REASON: &str =
     "Pathway reconciliation stopped a likely runaway or over-dense route after 10,000 transitions.";
 const BREAKER_STARTUP_REASON: &str = "Pathway reconciliation stopped long-offline replay after 10,000 transitions; compact catch-up arrives in Pathways P5.";
 const INVALID_RECORD_CODE: &str = "invalid_pathway_record";
+const INVALID_ROUTE_PREFIX: &str = "Pathway record needs attention: ";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum PathwayReconcileCause {
@@ -224,7 +225,15 @@ impl PathwayReconcileService {
         }
 
         if enabled {
-            enable_pathway(&mut draft, pathway_id, &context, &mut report)?;
+            let pathway = draft.domain.pathways.pathways[&pathway_id].clone();
+            if pathway_invalid_reason(&draft, pathway_id, &pathway).is_some() {
+                // Enabling malformed persisted state is a recoverable product
+                // condition, not a service error. Project it into the visible
+                // problem list and leave the route safely disabled.
+                flag_invalid_records(&mut draft, &context, &mut report)?;
+            } else {
+                enable_pathway(&mut draft, pathway_id, &context, &mut report)?;
+            }
         } else {
             let currently_enabled = draft.domain.pathways.pathways[&pathway_id].is_enabled;
             if currently_enabled {
@@ -472,6 +481,7 @@ fn merge_report(target: &mut PathwayReconcileReport, source: PathwayReconcileRep
 
 #[derive(Clone, Debug)]
 struct BoundaryAction {
+    at: UnixMicros,
     pile_id: PileId,
     enters: bool,
     mode: ContainmentMode,
@@ -656,6 +666,7 @@ fn next_moving_transition(
                 raw_boundaries.push((
                     at,
                     BoundaryAction {
+                        at,
                         pile_id: pile.id,
                         enters: boundary.enters,
                         mode,
@@ -679,12 +690,7 @@ fn next_moving_transition(
             .then_with(|| left.1.pile_id.as_bytes().cmp(right.1.pile_id.as_bytes()))
             .then_with(|| containment_rank(left.1.mode).cmp(&containment_rank(right.1.mode)))
     });
-    if let Some(first_at) = raw_boundaries.first().map(|entry| entry.0) {
-        let actions = raw_boundaries
-            .into_iter()
-            .take_while(|entry| entry.0 == first_at)
-            .map(|entry| entry.1)
-            .collect::<Vec<_>>();
+    if let Some((first_at, actions)) = earliest_boundary_actions(raw_boundaries) {
         candidates.push((first_at, TransitionKind::PileBoundaries(actions)));
     }
 
@@ -696,6 +702,22 @@ fn next_moving_transition(
         pathway_id: pathway.id,
         kind,
     })
+}
+
+fn earliest_boundary_actions(
+    raw_boundaries: Vec<(UnixMicros, BoundaryAction)>,
+) -> Option<(UnixMicros, Vec<BoundaryAction>)> {
+    let first_at = raw_boundaries.first()?.0;
+    let actions = raw_boundaries
+        .into_iter()
+        // Candidate filtering rejects anything at or before
+        // `last_reconciled_at + 1 us`. Keep boundary siblings solved at T and
+        // T+1 us in one bundle so applying T cannot erase T+1 on the next
+        // planner pass.
+        .take_while(|entry| entry.0.0.saturating_sub(first_at.0) <= CANDIDATE_DATE_FILTER_MICROS)
+        .map(|entry| entry.1)
+        .collect::<Vec<_>>();
+    Some((first_at, actions))
 }
 
 fn containment_rank(mode: ContainmentMode) -> u8 {
@@ -765,6 +787,11 @@ fn apply_transition(
                 .ok_or_else(|| {
                     DomainError::InvalidPathway("an empty boundary bundle was planned".into())
                 })?;
+            let reconciled_at = actions
+                .iter()
+                .map(|action| action.at)
+                .max()
+                .unwrap_or(transition.at);
             layout_changed |= materialize_assignment(
                 workspace,
                 transition.pathway_id,
@@ -778,15 +805,15 @@ fn apply_transition(
                     .assignments
                     .get_mut(&transition.assignment_id)
                     .expect("planned assignment remains in the transaction");
-                assignment.last_reconciled_at = transition.at;
-                assignment.modified_at = transition.at;
+                assignment.last_reconciled_at = reconciled_at;
+                assignment.modified_at = reconciled_at;
             }
             for action in actions {
                 append_event(
                     workspace,
                     transition.pathway_id,
                     context,
-                    transition.at,
+                    action.at,
                     if action.enters {
                         PathwayEventKind::PileEntered
                     } else {
@@ -1032,9 +1059,34 @@ fn depart(
         return Ok(());
     }
     let Some(segment) = pathway_projection::outgoing_segment(&pathway, node.id).cloned() else {
-        complete_assignment(workspace, pathway_id, assignment_id, node, at, context)?;
+        if pathway.repeats {
+            mark_needs_attention_at(
+                workspace,
+                pathway_id,
+                assignment_id,
+                "This repeating pathway has no valid closing segment from its final stop.",
+                at,
+                context,
+            )?;
+        } else {
+            complete_assignment(workspace, pathway_id, assignment_id, node, at, context)?;
+        }
         return Ok(());
     };
+    if !segment.speed_points_per_second.is_finite()
+        || segment.speed_points_per_second < 1.0
+        || segment_geometry(&pathway, &segment).is_none()
+    {
+        mark_needs_attention_at(
+            workspace,
+            pathway_id,
+            assignment_id,
+            "The next pathway segment or its destination is invalid.",
+            at,
+            context,
+        )?;
+        return Ok(());
+    }
     let before = workspace.domain.pathways.assignments[&assignment_id].state;
     {
         let assignment = workspace
@@ -1072,6 +1124,57 @@ fn depart(
             explanation: "The rider started the next pathway segment.".into(),
             before_state: Some(before),
             after_state: Some(PathwayAssignmentState::Moving),
+            ..PathwayEventPayload::default()
+        },
+    )?;
+    Ok(())
+}
+
+fn mark_needs_attention_at(
+    workspace: &mut Workspace,
+    pathway_id: PathwayId,
+    assignment_id: PathwayAssignmentId,
+    reason: &str,
+    at: UnixMicros,
+    context: &PathwayReconcileContext,
+) -> Result<(), PathwayReconcileError> {
+    let assignment = workspace.domain.pathways.assignments[&assignment_id].clone();
+    {
+        let stored = workspace
+            .domain
+            .pathways
+            .assignments
+            .get_mut(&assignment_id)
+            .expect("selected assignment remains in the transaction");
+        if assignment.state != PathwayAssignmentState::NeedsAttention
+            && !(assignment.state == PathwayAssignmentState::Paused
+                && stored.previous_state.is_some())
+        {
+            stored.previous_state = Some(assignment.state);
+        }
+        stored.state = PathwayAssignmentState::NeedsAttention;
+        stored.segment_started_at = None;
+        stored.wait_until = None;
+        stored.blocked_at = None;
+        stored.paused_at = None;
+        stored.last_reconciled_at = at;
+        stored.modified_at = at;
+        stored.needs_attention_reason = Some(reason.into());
+    }
+    append_event(
+        workspace,
+        pathway_id,
+        context,
+        at,
+        PathwayEventKind::ConfigurationChanged,
+        PathwayEventPayload {
+            assignment_id: Some(assignment_id),
+            tile_id: Some(assignment.tile_id),
+            node_id: assignment.current_node_id,
+            segment_id: assignment.current_segment_id,
+            explanation: reason.into(),
+            before_state: Some(assignment.state),
+            after_state: Some(PathwayAssignmentState::NeedsAttention),
             ..PathwayEventPayload::default()
         },
     )?;
@@ -1319,11 +1422,120 @@ fn assignment_invalid_reason(
     None
 }
 
+fn pathway_node_cmp(left: &PathwayNode, right: &PathwayNode) -> std::cmp::Ordering {
+    let sort_order = if left.sort_index == right.sort_index {
+        std::cmp::Ordering::Equal
+    } else {
+        left.sort_index.total_cmp(&right.sort_index)
+    };
+    sort_order.then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
+}
+
+fn pathway_invalid_reason(
+    workspace: &Workspace,
+    map_id: PathwayId,
+    pathway: &Pathway,
+) -> Option<String> {
+    if map_id != pathway.id {
+        return Some("the pathway map key does not match its record id".into());
+    }
+    if workspace.page(pathway.page_id).is_none() {
+        return Some("the pathway page is missing".into());
+    }
+    if pathway.nodes.len() < 2 {
+        return Some("the pathway has fewer than two stops".into());
+    }
+    for (node_id, node) in &pathway.nodes {
+        if *node_id != node.id
+            || !node.point.is_finite()
+            || !node.sort_index.is_finite()
+            || !node.wait_duration_seconds.is_finite()
+            || node.wait_duration_seconds < 0.0
+        {
+            return Some(format!("stop {node_id} is malformed"));
+        }
+    }
+    for (segment_id, segment) in &pathway.segments {
+        if *segment_id != segment.id
+            || !segment.sort_index.is_finite()
+            || !segment.speed_points_per_second.is_finite()
+            || segment.speed_points_per_second < 1.0
+            || !pathway.nodes.contains_key(&segment.from_node_id)
+            || !pathway.nodes.contains_key(&segment.to_node_id)
+            || segment_geometry(pathway, segment).is_none()
+        {
+            return Some(format!("segment {segment_id} is malformed"));
+        }
+    }
+    if pathway.repeats {
+        let first = pathway
+            .nodes
+            .values()
+            .min_by(|left, right| pathway_node_cmp(left, right));
+        let last = pathway
+            .nodes
+            .values()
+            .max_by(|left, right| pathway_node_cmp(left, right));
+        let has_closure = first.zip(last).is_some_and(|(first, last)| {
+            pathway
+                .segments
+                .values()
+                .any(|segment| segment.from_node_id == last.id && segment.to_node_id == first.id)
+        });
+        if !has_closure {
+            return Some("the repeating pathway has no closing segment".into());
+        }
+    }
+    None
+}
+
 fn flag_invalid_records(
     workspace: &mut Workspace,
     context: &PathwayReconcileContext,
     report: &mut PathwayReconcileReport,
 ) -> Result<(), PathwayReconcileError> {
+    let pathway_records = workspace
+        .domain
+        .pathways
+        .pathways
+        .iter()
+        .map(|(map_id, pathway)| (*map_id, pathway.clone()))
+        .collect::<Vec<_>>();
+    for (map_id, pathway) in pathway_records {
+        let Some(detail) = pathway_invalid_reason(workspace, map_id, &pathway) else {
+            continue;
+        };
+        let reason = format!("{INVALID_ROUTE_PREFIX}{detail}.");
+        report
+            .problems
+            .push(PathwayProblem::invalid(Some(map_id), None, &reason));
+        let unchanged =
+            !pathway.is_enabled && pathway.disabled_reason.as_deref() == Some(reason.as_str());
+        if unchanged {
+            continue;
+        }
+        let stored = workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&map_id)
+            .expect("selected pathway remains in the transaction");
+        stored.is_enabled = false;
+        stored.disabled_reason = Some(reason.clone());
+        stored.modified_at = context.now;
+        append_event(
+            workspace,
+            map_id,
+            context,
+            context.now,
+            PathwayEventKind::ConfigurationChanged,
+            PathwayEventPayload {
+                explanation: reason,
+                ..PathwayEventPayload::default()
+            },
+        )?;
+    }
+
     let assignment_ids = workspace
         .domain
         .pathways
@@ -1333,15 +1545,34 @@ fn flag_invalid_records(
         .collect::<Vec<_>>();
     for assignment_id in assignment_ids {
         let assignment = workspace.domain.pathways.assignments[&assignment_id].clone();
+        let route_reason = workspace
+            .domain
+            .pathways
+            .pathways
+            .get(&assignment.pathway_id)
+            .and_then(|pathway| pathway.disabled_reason.as_deref())
+            .filter(|_| {
+                matches!(
+                    assignment.state,
+                    PathwayAssignmentState::Moving
+                        | PathwayAssignmentState::Waiting
+                        | PathwayAssignmentState::Blocked
+                        | PathwayAssignmentState::Paused
+                )
+            })
+            .and_then(|reason| reason.strip_prefix(INVALID_ROUTE_PREFIX))
+            .map(|detail| format!("This assignment stopped because its pathway {detail}"));
         let reason = if !workspace
             .domain
             .pathways
             .pathways
             .contains_key(&assignment.pathway_id)
         {
-            Some("The assignment's pathway definition is missing.")
+            Some("The assignment's pathway definition is missing.".to_owned())
+        } else if route_reason.is_some() {
+            route_reason
         } else {
-            assignment_invalid_reason(workspace, &assignment)
+            assignment_invalid_reason(workspace, &assignment).map(str::to_owned)
         };
         let Some(reason) = reason else { continue };
         if assignment.state == PathwayAssignmentState::Detached {
@@ -1350,10 +1581,10 @@ fn flag_invalid_records(
         report.problems.push(PathwayProblem::invalid(
             Some(assignment.pathway_id),
             Some(assignment_id),
-            reason,
+            &reason,
         ));
         if assignment.state == PathwayAssignmentState::NeedsAttention
-            && assignment.needs_attention_reason.as_deref() == Some(reason)
+            && assignment.needs_attention_reason.as_deref() == Some(reason.as_str())
         {
             continue;
         }
@@ -1398,7 +1629,7 @@ fn flag_invalid_records(
             stored.paused_at = None;
             stored.last_reconciled_at = context.now;
             stored.modified_at = context.now;
-            stored.needs_attention_reason = Some(reason.into());
+            stored.needs_attention_reason = Some(reason.clone());
         }
         if workspace
             .domain
@@ -1415,7 +1646,7 @@ fn flag_invalid_records(
                 PathwayEventPayload {
                     assignment_id: Some(assignment_id),
                     tile_id: Some(assignment.tile_id),
-                    explanation: reason.into(),
+                    explanation: reason,
                     before_state: Some(before),
                     after_state: Some(PathwayAssignmentState::NeedsAttention),
                     ..PathwayEventPayload::default()
@@ -1432,10 +1663,7 @@ fn trip_breaker(
     context: &PathwayReconcileContext,
     report: &mut PathwayReconcileReport,
 ) -> Result<(), PathwayReconcileError> {
-    let pathway_ids = batch
-        .iter()
-        .map(|transition| transition.pathway_id)
-        .collect::<BTreeSet<_>>();
+    let pathway_ids = breaker_offending_pathways(workspace, batch, context)?;
     let (code, reason) = match context.cause {
         PathwayReconcileCause::Live => (BREAKER_LIVE_CODE, BREAKER_LIVE_REASON),
         PathwayReconcileCause::StartupBacklog => (BREAKER_STARTUP_CODE, BREAKER_STARTUP_REASON),
@@ -1529,6 +1757,35 @@ fn trip_breaker(
     Ok(())
 }
 
+fn breaker_offending_pathways(
+    workspace: &Workspace,
+    batch: &[TransitionBundle],
+    context: &PathwayReconcileContext,
+) -> Result<BTreeSet<PathwayId>, PathwayReconcileError> {
+    let batch_pathway_ids = batch
+        .iter()
+        .map(|transition| transition.pathway_id)
+        .collect::<BTreeSet<_>>();
+    let mut simulated = workspace.clone();
+    for transition in batch {
+        let _ = apply_transition(&mut simulated, transition, context)?;
+    }
+    let still_due = due_transitions(&simulated, context.now)
+        .into_iter()
+        .map(|transition| transition.pathway_id)
+        .filter(|pathway_id| batch_pathway_ids.contains(pathway_id))
+        .collect::<BTreeSet<_>>();
+    // A single enormous atomic batch may itself exceed the cap without any
+    // route remaining due afterward. It still needs a visible stop rather
+    // than retrying the same batch forever. In the ordinary mixed case, only
+    // routes that continue producing due work are breaker offenders.
+    Ok(if still_due.is_empty() {
+        batch_pathway_ids
+    } else {
+        still_due
+    })
+}
+
 fn breaker_code_for_reason(reason: &str) -> Option<&'static str> {
     match reason {
         BREAKER_LIVE_REASON => Some(BREAKER_LIVE_CODE),
@@ -1543,7 +1800,10 @@ fn current_problems(workspace: &Workspace) -> Vec<PathwayProblem> {
         if let Some(reason) = pathway.disabled_reason.as_deref() {
             if let Some(code) = breaker_code_for_reason(reason) {
                 problems.insert(PathwayProblem::breaker(pathway.id, code, reason));
-            } else if reason.contains("missing") || reason.contains("requires review") {
+            } else if reason.starts_with(INVALID_ROUTE_PREFIX)
+                || reason.contains("missing")
+                || reason.contains("requires review")
+            {
                 problems.insert(PathwayProblem::invalid(Some(pathway.id), None, reason));
             }
         }
@@ -2220,6 +2480,29 @@ mod tests {
     }
 
     #[test]
+    fn one_microsecond_boundary_siblings_share_one_planner_bundle() {
+        let action = |at, pile| BoundaryAction {
+            at: UnixMicros(at),
+            pile_id: id(pile),
+            enters: true,
+            mode: ContainmentMode::CenterInside,
+            progress: at as f64 / 1_000.0,
+            route_point: PathwayPoint::new(at as f64, 0.0),
+        };
+        let (at, actions) = earliest_boundary_actions(vec![
+            (UnixMicros(1_000), action(1_000, 500)),
+            (UnixMicros(1_001), action(1_001, 501)),
+            (UnixMicros(1_002), action(1_002, 502)),
+        ])
+        .unwrap();
+        assert_eq!(at, UnixMicros(1_000));
+        assert_eq!(
+            actions.iter().map(|action| action.at).collect::<Vec<_>>(),
+            vec![UnixMicros(1_000), UnixMicros(1_001)]
+        );
+    }
+
+    #[test]
     fn same_instant_assignment_order_is_canonical_in_both_insert_orders() {
         fn run(reverse: bool) -> Vec<PathwayAssignmentId> {
             let mut fixture = fixture(1.0, 1_000.0, UnixMicros::ZERO);
@@ -2601,6 +2884,71 @@ mod tests {
     }
 
     #[test]
+    fn depart_with_a_dangling_target_stops_visibly_instead_of_wedging() {
+        let mut fixture = fixture(10.0, 1.0, UnixMicros::ZERO);
+        let invalid_segment_id = id(601);
+        {
+            let pathway = fixture
+                .workspace
+                .domain
+                .pathways
+                .pathways
+                .get_mut(&fixture.pathway_id)
+                .unwrap();
+            pathway.nodes.get_mut(&fixture.end_id).unwrap().kind = PathwayNodeKind::ApprovalGate;
+            pathway.segments.insert(
+                invalid_segment_id,
+                PathwaySegment::new(
+                    invalid_segment_id,
+                    fixture.end_id,
+                    id(602),
+                    1.0,
+                    10.0,
+                    UnixMicros::ZERO,
+                )
+                .unwrap(),
+            );
+        }
+        {
+            let assignment = fixture
+                .workspace
+                .domain
+                .pathways
+                .assignments
+                .get_mut(&fixture.assignment_id)
+                .unwrap();
+            assignment.state = PathwayAssignmentState::Blocked;
+            assignment.current_segment_id = None;
+            assignment.segment_started_at = None;
+            assignment.current_node_id = Some(fixture.end_id);
+            assignment.blocked_at = Some(UnixMicros(1));
+            assignment.materialized_route_point = PathwayPoint::new(10.0, 50.0);
+        }
+        let report = PathwayReconcileService::approve_gate(
+            &mut fixture.workspace,
+            fixture.pathway_id,
+            fixture.end_id,
+            None,
+            context(2),
+        )
+        .unwrap();
+        let assignment = &fixture.workspace.domain.pathways.assignments[&fixture.assignment_id];
+        assert_eq!(assignment.state, PathwayAssignmentState::NeedsAttention);
+        assert!(
+            assignment
+                .needs_attention_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("destination is invalid"))
+        );
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| problem.kind == PathwayProblemKind::InvalidRecord)
+        );
+    }
+
+    #[test]
     fn blocked_resume_preserves_the_gate_and_its_original_blocked_clock() {
         let mut fixture = fixture(10.0, 1.0, UnixMicros::ZERO);
         {
@@ -2685,6 +3033,40 @@ mod tests {
             .filter_map(|event| event.payload.node_id)
             .collect::<Vec<_>>();
         assert_eq!(arrivals, vec![fixture.end_id, fixture.start_id]);
+        assert!(
+            fixture
+                .workspace
+                .domain
+                .pathways
+                .events()
+                .iter()
+                .all(|event| event.kind != PathwayEventKind::Completed)
+        );
+    }
+
+    #[test]
+    fn repeating_route_without_a_closure_needs_attention_not_completion() {
+        let mut fixture = fixture(10.0, 10.0, UnixMicros::ZERO);
+        fixture
+            .workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&fixture.pathway_id)
+            .unwrap()
+            .repeats = true;
+        let report =
+            PathwayReconcileService::reconcile(&mut fixture.workspace, context(1_000_000)).unwrap();
+        let pathway = &fixture.workspace.domain.pathways.pathways[&fixture.pathway_id];
+        let assignment = &fixture.workspace.domain.pathways.assignments[&fixture.assignment_id];
+        assert!(!pathway.is_enabled);
+        assert_eq!(assignment.state, PathwayAssignmentState::NeedsAttention);
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| problem.message.contains("closing segment"))
+        );
         assert!(
             fixture
                 .workspace
@@ -2810,7 +3192,10 @@ mod tests {
             );
         }
         let (finite_pathway_id, finite_assignment_id) = add_finite_route(&mut fixture.workspace);
-        let report = reconcile_with_limit(&mut fixture.workspace, context(100), 3).unwrap();
+        // At t=2 the healthy route and the looping route form one atomic
+        // batch that crosses the cap. Only the route that remains due after a
+        // simulated application is a breaker offender.
+        let report = reconcile_with_limit(&mut fixture.workspace, context(100), 1).unwrap();
         assert_eq!(
             report.breaker_pathway_ids,
             BTreeSet::from([fixture.pathway_id])
@@ -2819,8 +3204,130 @@ mod tests {
         assert!(fixture.workspace.domain.pathways.pathways[&finite_pathway_id].is_enabled);
         assert_eq!(
             fixture.workspace.domain.pathways.assignments[&finite_assignment_id].state,
+            PathwayAssignmentState::Moving
+        );
+        let followup =
+            PathwayReconcileService::reconcile(&mut fixture.workspace, context(100)).unwrap();
+        assert!(followup.breaker_pathway_ids.is_empty());
+        assert_eq!(
+            fixture.workspace.domain.pathways.assignments[&finite_assignment_id].state,
             PathwayAssignmentState::Completed
         );
+    }
+
+    #[test]
+    fn enabling_missing_page_or_current_node_degrades_to_visible_attention() {
+        let mut missing_page = fixture(10.0, 1.0, UnixMicros::ZERO);
+        {
+            let pathway = missing_page
+                .workspace
+                .domain
+                .pathways
+                .pathways
+                .get_mut(&missing_page.pathway_id)
+                .unwrap();
+            pathway.is_enabled = false;
+            pathway.disabled_reason = Some("Paused for pathway graph editing.".into());
+            let assignment = missing_page
+                .workspace
+                .domain
+                .pathways
+                .assignments
+                .get_mut(&missing_page.assignment_id)
+                .unwrap();
+            assignment.state = PathwayAssignmentState::Paused;
+            assignment.previous_state = Some(PathwayAssignmentState::Moving);
+            assignment.paused_at = Some(UnixMicros(1));
+        }
+        missing_page.workspace.pages.clear();
+        let report = PathwayReconcileService::set_enabled(
+            &mut missing_page.workspace,
+            missing_page.pathway_id,
+            true,
+            context(2),
+        )
+        .unwrap();
+        assert_eq!(
+            missing_page.workspace.domain.pathways.assignments[&missing_page.assignment_id].state,
+            PathwayAssignmentState::NeedsAttention
+        );
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| problem.message.contains("page is missing"))
+        );
+
+        let mut missing_node = fixture(10.0, 1.0, UnixMicros::ZERO);
+        {
+            let pathway = missing_node
+                .workspace
+                .domain
+                .pathways
+                .pathways
+                .get_mut(&missing_node.pathway_id)
+                .unwrap();
+            pathway.is_enabled = false;
+            pathway.disabled_reason = Some("Paused for pathway graph editing.".into());
+            let assignment = missing_node
+                .workspace
+                .domain
+                .pathways
+                .assignments
+                .get_mut(&missing_node.assignment_id)
+                .unwrap();
+            assignment.state = PathwayAssignmentState::Paused;
+            assignment.previous_state = Some(PathwayAssignmentState::Moving);
+            assignment.current_segment_id = None;
+            assignment.segment_started_at = None;
+            assignment.current_node_id = Some(id(7_777));
+            assignment.paused_at = Some(UnixMicros(1));
+        }
+        let report = PathwayReconcileService::set_enabled(
+            &mut missing_node.workspace,
+            missing_node.pathway_id,
+            true,
+            context(2),
+        )
+        .unwrap();
+        assert_eq!(
+            missing_node.workspace.domain.pathways.assignments[&missing_node.assignment_id].state,
+            PathwayAssignmentState::NeedsAttention
+        );
+        assert!(
+            report
+                .problems
+                .iter()
+                .any(|problem| problem.assignment_id == Some(missing_node.assignment_id))
+        );
+    }
+
+    #[test]
+    fn malformed_enabled_route_without_assignments_is_still_visible() {
+        let mut fixture = fixture(10.0, 1.0, UnixMicros::ZERO);
+        fixture
+            .workspace
+            .domain
+            .pathways
+            .assignments
+            .remove(&fixture.assignment_id);
+        fixture
+            .workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&fixture.pathway_id)
+            .unwrap()
+            .nodes
+            .clear();
+        let report =
+            PathwayReconcileService::reconcile(&mut fixture.workspace, context(1)).unwrap();
+        assert!(!fixture.workspace.domain.pathways.pathways[&fixture.pathway_id].is_enabled);
+        assert!(report.problems.iter().any(|problem| {
+            problem.pathway_id == Some(fixture.pathway_id)
+                && problem.assignment_id.is_none()
+                && problem.kind == PathwayProblemKind::InvalidRecord
+        }));
     }
 
     #[test]
