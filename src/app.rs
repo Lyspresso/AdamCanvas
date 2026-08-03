@@ -19,7 +19,7 @@ use crate::{
     assets::AssetStore,
     automation::{
         CanvasGeometrySnapshot, PileGeometryPolicy, ReconcileRequest,
-        canvas_objects_from_workspace, reconcile_workspace,
+        canvas_objects_from_workspace, overlay_pathway_rail_preview, reconcile_workspace,
     },
     chat_core::{
         ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, AgentGroupKind,
@@ -4293,6 +4293,18 @@ impl AdamApp {
                     self.drag.as_ref(),
                     self.resize.as_ref(),
                 );
+                // A rail being dragged is drawn at its preview nodes; its
+                // riders must be projected along that same preview or cargo
+                // visibly stays behind until the commit snaps it over.
+                if let Some(session) = self.pathway_drag.as_ref() {
+                    overlay_pathway_rail_preview(
+                        &mut geometry,
+                        &self.workspace,
+                        session.pathway_id,
+                        &session.preview_nodes,
+                        pathway_now,
+                    );
+                }
                 let projected_rects = geometry.page_rects(page_id).collect::<Vec<_>>();
                 debug_assert_eq!(
                     projected_rects.len(),
@@ -23062,6 +23074,86 @@ mod tests {
         assert_eq!(
             workspace.domain.pathways.pathway(pathway_id).unwrap().nodes[&node_id].point,
             predicted
+        );
+    }
+
+    #[test]
+    fn rail_drag_preview_carries_riders_with_the_moving_rail() {
+        let (workspace, pathway_id, tile_id, _) = rail_drag_fixture();
+        let page_id = workspace.active_page;
+        let at = crate::domain::UnixMicros(2_500_000);
+        let mut geometry = canvas_objects_from_workspace(&workspace, at, |_| None);
+        let before = geometry.rect_for(page_id, tile_id).unwrap();
+
+        // A preview naming a route this page does not have must change nothing.
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let shifted: BTreeMap<_, _> = pathway
+            .nodes
+            .iter()
+            .map(|(id, node)| {
+                (
+                    *id,
+                    PathwayPoint::new(node.point.x + 150.0, node.point.y + 90.0),
+                )
+            })
+            .collect();
+        overlay_pathway_rail_preview(
+            &mut geometry,
+            &workspace,
+            Uuid::from_u128(999),
+            &shifted,
+            at,
+        );
+        assert_eq!(geometry.rect_for(page_id, tile_id).unwrap(), before);
+
+        // A uniform rail translation must carry the rider by exactly the same
+        // delta, whatever leg of the route it is on.
+        overlay_pathway_rail_preview(&mut geometry, &workspace, pathway_id, &shifted, at);
+        let after = geometry.rect_for(page_id, tile_id).unwrap();
+        assert!((after.x - (before.x + 150.0)).abs() < 1e-3);
+        assert!((after.y - (before.y + 90.0)).abs() < 1e-3);
+        assert_eq!(after.w, before.w);
+        assert_eq!(after.h, before.h);
+    }
+
+    #[test]
+    fn rail_drag_preview_of_one_stop_reprojects_riders_along_the_reshaped_leg() {
+        // A single grabbed stop is the partial-preview path: the session map
+        // holds one node and the overlay must merge it over the durable route,
+        // then re-project by travelled distance — not offset the rider by the
+        // node's delta.
+        let (workspace, pathway_id, tile_id, assignment_id) = rail_drag_fixture();
+        let page_id = workspace.active_page;
+        let at = crate::domain::UnixMicros(2_500_000);
+        let mut geometry = canvas_objects_from_workspace(&workspace, at, |_| None);
+        let before = geometry.rect_for(page_id, tile_id).unwrap();
+
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let start = crate::pathway_projection::first_node(pathway).unwrap();
+        let segment = crate::pathway_projection::outgoing_segment(pathway, start.id).unwrap();
+        let end = &pathway.nodes[&segment.to_node_id];
+        // Swing the destination stop perpendicular to the leg so direction,
+        // length, and the rider's projected point all genuinely change.
+        let moved_end = PathwayPoint::new(end.point.x, end.point.y + 240.0);
+        let preview = BTreeMap::from([(segment.to_node_id, moved_end)]);
+        overlay_pathway_rail_preview(&mut geometry, &workspace, pathway_id, &preview, at);
+        let after = geometry.rect_for(page_id, tile_id).unwrap();
+
+        // Independent expectation: same distance travelled, new leg geometry.
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(assignment.segment_start_progress, 0.0);
+        let elapsed = (at.0 - assignment.segment_started_at.unwrap().0) as f64 / 1_000_000.0;
+        let travelled = elapsed * segment.speed_points_per_second;
+        let leg_x = moved_end.x - start.point.x;
+        let leg_y = moved_end.y - start.point.y;
+        let progress = (travelled / (leg_x * leg_x + leg_y * leg_y).sqrt()).min(1.0);
+        let expected_x = start.point.x + progress * leg_x;
+        let expected_y = start.point.y + progress * leg_y;
+        assert!((f64::from(after.x + after.w * 0.5) - expected_x).abs() < 1e-2);
+        assert!((f64::from(after.y + after.h * 0.5) - expected_y).abs() < 1e-2);
+        assert!(
+            (after.y - before.y).abs() > 10.0,
+            "the reshaped leg must actually move the rider off its old projection"
         );
     }
 

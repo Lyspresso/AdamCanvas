@@ -249,6 +249,55 @@ where
     snapshot
 }
 
+/// Re-projects one pathway's riders along preview node positions so cargo
+/// visually travels with a rail that is being dragged, instead of holding the
+/// durable geometry until the move commits.
+///
+/// `preview_nodes` may be partial (a single grabbed stop); nodes absent from
+/// it keep their durable positions. The workspace is never written — this only
+/// retargets rects inside the frame-local snapshot.
+pub fn overlay_pathway_rail_preview(
+    snapshot: &mut CanvasGeometrySnapshot,
+    workspace: &Workspace,
+    pathway_id: crate::domain::PathwayId,
+    preview_nodes: &BTreeMap<crate::domain::PathwayNodeId, crate::domain::PathwayPoint>,
+    at: UnixMicros,
+) {
+    let Some(pathway) = workspace.domain.pathways.pathways.get(&pathway_id) else {
+        return;
+    };
+    let mut previewed = pathway.clone();
+    for (node_id, point) in preview_nodes {
+        if let Some(node) = previewed.nodes.get_mut(node_id) {
+            node.point = *point;
+        }
+    }
+    let assignment_by_tile = workspace
+        .domain
+        .pathways
+        .authoritative_assignments_by_tile();
+    for page in &workspace.pages {
+        if page.id != previewed.page_id {
+            continue;
+        }
+        for tile in &page.tiles {
+            if workspace.domain.piles.contains_key(&tile.id) || tile.kind() == TileKind::Pile {
+                continue;
+            }
+            let Some(assignment) = assignment_by_tile.get(&tile.id).copied() else {
+                continue;
+            };
+            if assignment.pathway_id != pathway_id || assignment.page_id != page.id {
+                continue;
+            }
+            let projected = pathway_projection::position(assignment, &previewed, at);
+            if let Some(rect) = rect_centered_at(tile.rect, projected.tile_center) {
+                let _ = snapshot.overlay_rect(page.id, tile.id, rect);
+            }
+        }
+    }
+}
+
 fn rect_centered_at(base: WorldRect, center: crate::domain::PathwayPoint) -> Option<WorldRect> {
     let center_x = finite_f32(center.x)?;
     let center_y = finite_f32(center.y)?;
