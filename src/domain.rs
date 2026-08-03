@@ -4119,6 +4119,11 @@ impl PathwaySegment {
     }
 }
 
+/// Persistence-boundary repairs use these stable route-level diagnostics.
+pub(crate) const PATHWAY_DISABLED_MISSING_PAGE_REASON: &str = "Pathway page is missing.";
+pub(crate) const PATHWAY_DISABLED_REPAIRED_GRAPH_REASON: &str =
+    "Pathway graph was repaired and requires review.";
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Pathway {
@@ -4497,7 +4502,7 @@ impl PathwayStore {
             let page_is_missing = !valid_page_ids.contains(&pathway.page_id);
             if page_is_missing {
                 pathway.is_enabled = false;
-                pathway.disabled_reason = Some("Pathway page is missing.".into());
+                pathway.disabled_reason = Some(PATHWAY_DISABLED_MISSING_PAGE_REASON.into());
             }
 
             let node_count = pathway.nodes.len();
@@ -4536,8 +4541,7 @@ impl PathwayStore {
                 structurally_repaired_pathway_ids.insert(*pathway_id);
                 if !page_is_missing {
                     pathway.is_enabled = false;
-                    pathway.disabled_reason =
-                        Some("Pathway graph was repaired and requires review.".into());
+                    pathway.disabled_reason = Some(PATHWAY_DISABLED_REPAIRED_GRAPH_REASON.into());
                 }
             }
         }

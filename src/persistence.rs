@@ -1,5 +1,5 @@
 use crate::{
-    domain::{ConversationStore, PathwayStore, Pile, TrashActor},
+    domain::{ConversationStore, PathwayMergeError, PathwayStore, Pile, TrashActor},
     model::{Tile, TileContent, Workspace},
 };
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
@@ -1383,7 +1383,32 @@ enum SaveCommand {
     Stop,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathwaySaveFeedback {
+    /// The exact pathway snapshot submitted by this process.
+    pub submitted: PathwayStore,
+    /// The pathway snapshot that reached durable storage after cross-process merging.
+    pub merged: PathwayStore,
+}
+
+/// Absorbs the pathways learned by a successful save without discarding
+/// pathway transitions that happened locally after the submitted snapshot.
+///
+/// Build the three-way result before replacing `live`: a conflicting immutable
+/// event therefore leaves the caller's live store byte-for-byte unchanged.
+pub(crate) fn absorb_pathway_save_feedback(
+    live: &mut PathwayStore,
+    feedback: &PathwaySaveFeedback,
+) -> Result<bool, PathwayMergeError> {
+    let absorbed = PathwayStore::merge_persisted(&feedback.submitted, live, &feedback.merged)?;
+    if *live == absorbed {
+        return Ok(false);
+    }
+    *live = absorbed;
+    Ok(true)
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum SaveOutcome {
     Saved {
         /// Tombstones discovered while merging with another Adam process.
@@ -1393,6 +1418,10 @@ pub enum SaveOutcome {
         /// Existing live conversations whose xAI server-storage disclosure
         /// was learned while merging another Adam process's snapshot.
         learned_xai_storage_conversations: Vec<Uuid>,
+        /// Submitted and durable pathway snapshots used by the UI thread to
+        /// absorb concurrent engine changes without making merged state the
+        /// save worker's next local baseline.
+        pathway_feedback: Box<PathwaySaveFeedback>,
     },
     Superseded {
         by_request_id: u64,
@@ -1400,7 +1429,7 @@ pub enum SaveOutcome {
     Failed(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SaveCompletion {
     pub request_id: u64,
     pub outcome: SaveOutcome,
@@ -1638,6 +1667,10 @@ fn save_and_acknowledge(
             SaveOutcome::Saved {
                 learned_deleted_conversations,
                 learned_xai_storage_conversations,
+                pathway_feedback: Box::new(PathwaySaveFeedback {
+                    submitted: workspace.domain.pathways.clone(),
+                    merged: merged.domain.pathways,
+                }),
             }
         }
         Err(error) => {
@@ -2248,6 +2281,7 @@ mod tests {
             SaveOutcome::Saved {
                 learned_deleted_conversations: Vec::new(),
                 learned_xai_storage_conversations: Vec::new(),
+                pathway_feedback: empty_pathway_feedback(),
             }
         );
         assert!(paths.library.exists());
@@ -2306,6 +2340,7 @@ mod tests {
             SaveOutcome::Saved {
                 learned_deleted_conversations: Vec::new(),
                 learned_xai_storage_conversations: Vec::new(),
+                pathway_feedback: empty_pathway_feedback(),
             }
         );
 
@@ -2316,6 +2351,7 @@ mod tests {
             SaveOutcome::Saved {
                 learned_deleted_conversations: Vec::new(),
                 learned_xai_storage_conversations: Vec::new(),
+                pathway_feedback: empty_pathway_feedback(),
             }
         );
         fresh_worker.stop();
@@ -2362,6 +2398,7 @@ mod tests {
             SaveOutcome::Saved {
                 learned_deleted_conversations: vec![conversation_id],
                 learned_xai_storage_conversations: Vec::new(),
+                pathway_feedback: empty_pathway_feedback(),
             }
         );
         stale_worker.stop();
@@ -2386,6 +2423,7 @@ mod tests {
             SaveOutcome::Saved {
                 learned_deleted_conversations: vec![conversation_id],
                 learned_xai_storage_conversations: Vec::new(),
+                pathway_feedback: empty_pathway_feedback(),
             }
         );
 
@@ -2399,6 +2437,7 @@ mod tests {
             SaveOutcome::Saved {
                 learned_deleted_conversations: vec![conversation_id],
                 learned_xai_storage_conversations: Vec::new(),
+                pathway_feedback: empty_pathway_feedback(),
             }
         );
         stale_worker.stop();
@@ -2446,6 +2485,7 @@ mod tests {
             SaveOutcome::Saved {
                 learned_deleted_conversations: Vec::new(),
                 learned_xai_storage_conversations: vec![conversation_id],
+                pathway_feedback: empty_pathway_feedback(),
             }
         );
         assert!(
@@ -2467,6 +2507,7 @@ mod tests {
             SaveOutcome::Saved {
                 learned_deleted_conversations: Vec::new(),
                 learned_xai_storage_conversations: vec![conversation_id],
+                pathway_feedback: empty_pathway_feedback(),
             }
         );
         stale_worker.stop();
@@ -2505,6 +2546,7 @@ mod tests {
             SaveOutcome::Saved {
                 learned_deleted_conversations: Vec::new(),
                 learned_xai_storage_conversations: Vec::new(),
+                pathway_feedback: empty_pathway_feedback(),
             }
         );
 
@@ -2519,6 +2561,7 @@ mod tests {
             SaveOutcome::Saved {
                 learned_deleted_conversations: Vec::new(),
                 learned_xai_storage_conversations: Vec::new(),
+                pathway_feedback: empty_pathway_feedback(),
             }
         );
         stale_worker.stop();
@@ -3590,10 +3633,126 @@ mod tests {
                 outcome: SaveOutcome::Saved {
                     learned_deleted_conversations: Vec::new(),
                     learned_xai_storage_conversations: Vec::new(),
+                    pathway_feedback: empty_pathway_feedback(),
                 },
             }
         );
         assert_eq!(load_workspace(&paths).unwrap().active_page().name, "second");
+    }
+
+    #[test]
+    fn pathway_save_feedback_no_op_preserves_live_store() {
+        let pathway_id = Uuid::from_u128(79_100);
+        let submitted = workspace_with_pathway(pathway_id).domain.pathways;
+        let feedback = PathwaySaveFeedback {
+            submitted: submitted.clone(),
+            merged: submitted.clone(),
+        };
+        let mut live = submitted.clone();
+
+        assert!(!absorb_pathway_save_feedback(&mut live, &feedback).unwrap());
+        assert_eq!(live, submitted);
+    }
+
+    #[test]
+    fn pathway_save_feedback_retains_post_submit_local_and_remote_events() {
+        let pathway_id = Uuid::from_u128(79_200);
+        let submitted = workspace_with_pathway(pathway_id).domain.pathways;
+        let mut live = submitted.clone();
+        live.append_event(pathway_event(79_201, pathway_id, "post-submit local"))
+            .unwrap();
+        let mut merged = submitted.clone();
+        merged
+            .append_event(pathway_event(79_202, pathway_id, "remote"))
+            .unwrap();
+        let feedback = PathwaySaveFeedback { submitted, merged };
+
+        assert!(absorb_pathway_save_feedback(&mut live, &feedback).unwrap());
+        assert_eq!(
+            live.events()
+                .iter()
+                .map(|event| event.id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([Uuid::from_u128(79_201), Uuid::from_u128(79_202)])
+        );
+    }
+
+    #[test]
+    fn pathway_save_feedback_conflict_leaves_live_store_unchanged() {
+        let pathway_id = Uuid::from_u128(79_300);
+        let submitted = workspace_with_pathway(pathway_id).domain.pathways;
+        let mut live = submitted.clone();
+        live.append_event(pathway_event(79_301, pathway_id, "local body"))
+            .unwrap();
+        let before = live.clone();
+        let mut merged = submitted.clone();
+        merged
+            .append_event(pathway_event(79_301, pathway_id, "remote body"))
+            .unwrap();
+        let feedback = PathwaySaveFeedback { submitted, merged };
+
+        assert_eq!(
+            absorb_pathway_save_feedback(&mut live, &feedback),
+            Err(PathwayMergeError::ConflictingEvent(Uuid::from_u128(79_301)))
+        );
+        assert_eq!(live, before);
+    }
+
+    #[test]
+    fn queued_pathway_save_uses_submitted_snapshot_as_causal_baseline() {
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths::at(temporary.path());
+        let pathway_id = Uuid::from_u128(79_400);
+        let base = workspace_with_pathway(pathway_id);
+        save_workspace_atomic(&paths, &base).unwrap();
+        let mut worker = SaveWorker::start_with_base(paths.clone(), base.clone());
+
+        let mut remote = base.clone();
+        remote
+            .domain
+            .pathways
+            .append_event(pathway_event(79_401, pathway_id, "remote"))
+            .unwrap();
+        save_workspace_merged(&paths, &base, &remote).unwrap();
+
+        let first_request = worker.request_tracked(base.clone()).unwrap();
+        let first = wait_for_completion(&worker, first_request);
+        let SaveOutcome::Saved {
+            pathway_feedback, ..
+        } = first.outcome
+        else {
+            panic!("first save should succeed");
+        };
+        assert_eq!(pathway_feedback.submitted, base.domain.pathways);
+        assert_eq!(pathway_feedback.merged.events().len(), 1);
+
+        // Queue another pre-feedback snapshot. The worker baseline must remain
+        // the first submitted store, not the merged receipt the UI has not yet
+        // absorbed, or this local history would appear to drop the remote row.
+        let mut second_local = base.clone();
+        second_local
+            .domain
+            .pathways
+            .append_event(pathway_event(79_402, pathway_id, "second local"))
+            .unwrap();
+        let second_request = worker.request_tracked(second_local).unwrap();
+        let second = wait_for_completion(&worker, second_request);
+        let SaveOutcome::Saved {
+            pathway_feedback, ..
+        } = second.outcome
+        else {
+            panic!("second save should succeed");
+        };
+        assert_eq!(
+            pathway_feedback
+                .merged
+                .events()
+                .iter()
+                .map(|event| event.id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([Uuid::from_u128(79_401), Uuid::from_u128(79_402)])
+        );
+        worker.stop();
     }
 
     #[test]
@@ -3938,6 +4097,13 @@ mod tests {
             )
             .unwrap();
         workspace
+    }
+
+    fn empty_pathway_feedback() -> Box<PathwaySaveFeedback> {
+        Box::new(PathwaySaveFeedback {
+            submitted: PathwayStore::default(),
+            merged: PathwayStore::default(),
+        })
     }
 
     fn pathway_event(event_id: u128, pathway_id: Uuid, actor: &str) -> PathwayEvent {

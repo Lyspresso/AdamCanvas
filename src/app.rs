@@ -18,8 +18,8 @@ use crate::{
     artifact_library::{self, ArtifactLibraryState, LibraryTarget},
     assets::AssetStore,
     automation::{
-        CanvasGeometrySnapshot, ReconcileRequest, canvas_objects_from_workspace,
-        reconcile_workspace,
+        CanvasGeometrySnapshot, PileGeometryPolicy, ReconcileRequest,
+        canvas_objects_from_workspace, reconcile_workspace,
     },
     chat_core::{
         ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, AgentGroupKind,
@@ -53,9 +53,13 @@ use crate::{
         TileKind, Workspace, WorldRect,
     },
     ocr::{OcrQueueError, PhotoOcrRequest, PhotoOcrWorker, source_fingerprint},
+    pathway_reconciliation::{
+        PathwayProblem, PathwayProblemKind, PathwayReconcileCause, PathwayReconcileContext,
+        PathwayReconcileReport, PathwayReconcileService,
+    },
     persistence::{
-        AppPaths, SaveOutcome, SaveWorker, backup_unreadable_library, load_workspace,
-        scrub_deleted_conversation_checkpoint_json,
+        AppPaths, SaveOutcome, SaveWorker, absorb_pathway_save_feedback, backup_unreadable_library,
+        load_workspace, scrub_deleted_conversation_checkpoint_json,
     },
     photo_details::{
         PhotoDossier, PhotoEnrichment, PhotoMetadata, PhotoOcrArtifact, PhotoRecord,
@@ -118,6 +122,40 @@ fn unix_now_micros() -> UnixMicros {
         .map(|duration| duration.as_micros().min(i64::MAX as u128) as i64)
         .unwrap_or(0);
     UnixMicros(microseconds)
+}
+
+fn request_repaint_at_micros(context: &Context, now: UnixMicros, wake: UnixMicros) {
+    let delay = wake.0.saturating_sub(now.0);
+    if delay <= 0 {
+        context.request_repaint();
+    } else {
+        context.request_repaint_after(Duration::from_micros(delay as u64));
+    }
+}
+
+fn pathway_problem_messages(
+    persistence_problem: Option<&PathwayProblem>,
+    runtime_problem: Option<&str>,
+    reconcile_problems: &[PathwayProblem],
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut messages = Vec::new();
+    for message in persistence_problem
+        .map(|problem| problem.message.as_str())
+        .into_iter()
+        .chain(runtime_problem)
+        .chain(
+            reconcile_problems
+                .iter()
+                .map(|problem| problem.message.as_str()),
+        )
+    {
+        let message = message.trim();
+        if !message.is_empty() && seen.insert(message.to_owned()) {
+            messages.push(message.to_owned());
+        }
+    }
+    messages
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -328,6 +366,51 @@ struct PanSession {
 struct Toast {
     message: &'static str,
     until: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommitOrigin {
+    External,
+    PathwayReconciler,
+}
+
+impl CommitOrigin {
+    const fn wakes_pathway_reconciler(self) -> bool {
+        matches!(self, Self::External)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PathwayPollDecision {
+    Idle,
+    Schedule(UnixMicros),
+    WaitForSettled,
+    Reconcile,
+}
+
+fn pathway_poll_decision(
+    requested: bool,
+    startup_pending: bool,
+    next_wake: Option<UnixMicros>,
+    now: UnixMicros,
+    settled: bool,
+) -> PathwayPollDecision {
+    let reconcile_due = requested || startup_pending || next_wake.is_some_and(|wake| wake <= now);
+    if reconcile_due {
+        if settled {
+            PathwayPollDecision::Reconcile
+        } else {
+            PathwayPollDecision::WaitForSettled
+        }
+    } else if let Some(wake) = next_wake {
+        PathwayPollDecision::Schedule(wake)
+    } else {
+        PathwayPollDecision::Idle
+    }
+}
+
+fn pathway_reconcile_active_elapsed_ms(elapsed: Duration) -> i64 {
+    elapsed.as_millis().min(i64::MAX as u128) as i64
 }
 
 #[derive(Clone, Debug)]
@@ -1029,6 +1112,12 @@ pub struct AdamApp {
     last_automation_persist: Instant,
     automation_initialized: bool,
     semantic_reconcile_needed: bool,
+    pathway_reconcile_requested: bool,
+    pathway_startup_reconcile_pending: bool,
+    pathway_next_wake: Option<UnixMicros>,
+    pathway_persistence_problem: Option<PathwayProblem>,
+    pathway_runtime_problem: Option<String>,
+    pathway_reconcile_report: PathwayReconcileReport,
     show_grid: bool,
     /// Contact-sheet lens over the active page. `None` is the ordinary spatial
     /// canvas; the grid never writes tile geometry, so toggling is free.
@@ -1366,6 +1455,12 @@ impl AdamApp {
             last_automation_persist: Instant::now(),
             automation_initialized: false,
             semantic_reconcile_needed: true,
+            pathway_reconcile_requested: true,
+            pathway_startup_reconcile_pending: true,
+            pathway_next_wake: None,
+            pathway_persistence_problem: None,
+            pathway_runtime_problem: None,
+            pathway_reconcile_report: PathwayReconcileReport::default(),
             show_grid: false,
             grid_view: None,
             snap_to_grid: false,
@@ -1442,9 +1537,16 @@ impl AdamApp {
     }
 
     fn changed(&mut self, layout_changed: bool) {
+        self.changed_with_origin(layout_changed, CommitOrigin::External);
+    }
+
+    fn changed_with_origin(&mut self, layout_changed: bool, origin: CommitOrigin) {
         self.dirty_since = Some(Instant::now());
         self.spatial_dirty |= layout_changed;
-        self.semantic_reconcile_needed |= layout_changed;
+        if origin.wakes_pathway_reconciler() {
+            self.semantic_reconcile_needed |= layout_changed;
+            self.pathway_reconcile_requested = true;
+        }
         if self.saving_enabled {
             self.egui_context.request_repaint_after(AUTOSAVE_DELAY);
         }
@@ -1898,6 +2000,7 @@ impl AdamApp {
                 SaveOutcome::Saved {
                     learned_deleted_conversations,
                     learned_xai_storage_conversations,
+                    pathway_feedback,
                 } => {
                     if self.pending_save == Some(completion.request_id) {
                         self.pending_save = None;
@@ -1918,6 +2021,40 @@ impl AdamApp {
                         &learned_deleted_conversations,
                         context,
                     );
+                    match absorb_pathway_save_feedback(
+                        &mut self.workspace.domain.pathways,
+                        &pathway_feedback,
+                    ) {
+                        Ok(changed) => {
+                            self.pathway_persistence_problem = None;
+                            self.pathway_reconcile_report.problems.retain(|problem| {
+                                problem.kind != PathwayProblemKind::PersistenceFeedbackConflict
+                            });
+                            if changed {
+                                // The receipt describes state that is already
+                                // durable. Wake projection/reconciliation once
+                                // without marking it dirty and feeding it back
+                                // to the save worker.
+                                self.spatial_dirty = true;
+                                self.pathway_reconcile_requested = true;
+                                context.request_repaint();
+                            }
+                        }
+                        Err(error) => {
+                            log::error!("could not absorb merged pathway save state: {error}");
+                            let problem = PathwayProblem::persistence_feedback_conflict(format!(
+                                "Pathway sync could not reconcile concurrent history: {error}"
+                            ));
+                            self.pathway_persistence_problem = Some(problem.clone());
+                            self.pathway_reconcile_report.problems.retain(|existing| {
+                                existing.kind != PathwayProblemKind::PersistenceFeedbackConflict
+                            });
+                            self.pathway_reconcile_report.problems.push(problem);
+                            self.pathway_reconcile_report.problems.sort();
+                            self.pathway_reconcile_report.problems.dedup();
+                            context.request_repaint();
+                        }
+                    }
                 }
                 SaveOutcome::Superseded { by_request_id } => {
                     if self.pending_save == Some(completion.request_id) {
@@ -2137,6 +2274,93 @@ impl AdamApp {
         });
     }
 
+    fn poll_pathway_reconciliation(&mut self, context: &Context) {
+        let now = unix_now_micros();
+        let settled = self.drag.is_none() && self.resize.is_none();
+        match pathway_poll_decision(
+            self.pathway_reconcile_requested,
+            self.pathway_startup_reconcile_pending,
+            self.pathway_next_wake,
+            now,
+            settled,
+        ) {
+            PathwayPollDecision::Idle => return,
+            PathwayPollDecision::Schedule(wake) => {
+                request_repaint_at_micros(context, now, wake);
+                return;
+            }
+            PathwayPollDecision::WaitForSettled => {
+                context.request_repaint_after(Duration::from_millis(16));
+                return;
+            }
+            PathwayPollDecision::Reconcile => {}
+        }
+
+        // Pathway commits materialize durable tile positions. Match ordinary
+        // automation's settled contract so a drag/resize snapshot can never
+        // race one of those writes.
+        let cause = if self.pathway_startup_reconcile_pending {
+            PathwayReconcileCause::StartupBacklog
+        } else {
+            PathwayReconcileCause::Live
+        };
+        let reconcile_context = match PathwayReconcileContext::new("Adam", now, cause) {
+            Ok(context) => {
+                // Exact batches advance each scoped progress row's
+                // `last_observed_at`; sampled automation then wall-delta clamps
+                // its budget, so it cannot charge that interval twice. Moving
+                // the global cursor here would instead drop dwell for piles on
+                // pages that this exact, page-scoped pass did not evaluate.
+                context
+                    .with_active_elapsed_ms(pathway_reconcile_active_elapsed_ms(
+                        self.last_automation_tick.elapsed(),
+                    ))
+                    .with_settled(true)
+            }
+            Err(error) => {
+                self.pathway_runtime_problem =
+                    Some(format!("Pathway reconciliation could not start: {error}"));
+                context.request_repaint_after(Duration::from_secs(1));
+                return;
+            }
+        };
+
+        match PathwayReconcileService::reconcile(&mut self.workspace, reconcile_context) {
+            Ok(mut report) => {
+                self.pathway_startup_reconcile_pending = false;
+                self.pathway_reconcile_requested = false;
+                self.pathway_next_wake = report.next_wake;
+                self.pathway_runtime_problem = None;
+                if report.changed {
+                    // This durable change must autosave, but its origin must
+                    // not feed back into this reconciler or sampled automation.
+                    self.changed_with_origin(
+                        report.layout_changed,
+                        CommitOrigin::PathwayReconciler,
+                    );
+                }
+                if let Some(problem) = &self.pathway_persistence_problem {
+                    report.problems.push(problem.clone());
+                    report.problems.sort();
+                    report.problems.dedup();
+                }
+                self.pathway_reconcile_report = report;
+                if let Some(wake) = self.pathway_next_wake {
+                    request_repaint_at_micros(context, now, wake);
+                }
+            }
+            Err(error) => {
+                // The service is transactional: failure leaves the live
+                // workspace untouched. Keep the request pending and show one
+                // stable row until a later pass succeeds.
+                log::error!("pathway reconciliation failed: {error}");
+                self.pathway_runtime_problem =
+                    Some(format!("Pathway reconciliation needs attention: {error}"));
+                context.request_repaint_after(Duration::from_secs(1));
+            }
+        }
+    }
+
     fn poll_automation(&mut self, context: &Context) {
         let has_running_rule = self.workspace.domain.piles.values().any(|pile| {
             pile.auto_tag_rule
@@ -2157,8 +2381,7 @@ impl AdamApp {
         let before_piles = self.workspace.domain.piles.clone();
         let before_tags = self.workspace.domain.tags.clone();
         let now = unix_now_micros();
-        let geometry = canvas_objects_from_workspace(&self.workspace, now, |_| None)
-            .durable_reconciliation_view(&self.workspace);
+        let geometry = canvas_objects_from_workspace(&self.workspace, now, |_| None);
         let active_elapsed_ms = self
             .last_automation_tick
             .elapsed()
@@ -2178,6 +2401,8 @@ impl AdamApp {
                 active_elapsed_ms,
                 settled,
                 initial_membership,
+                page_scope: None,
+                pile_geometry_policy: PileGeometryPolicy::Synchronize,
             },
         );
         let mut meaningful_automation_change = false;
@@ -12520,6 +12745,45 @@ impl AdamApp {
         self.native_appearance = Some(preference);
     }
 
+    fn show_pathway_problem_row(&self, context: &Context) {
+        let messages = pathway_problem_messages(
+            self.pathway_persistence_problem.as_ref(),
+            self.pathway_runtime_problem.as_deref(),
+            &self.pathway_reconcile_report.problems,
+        );
+        let Some(message) = messages.first() else {
+            return;
+        };
+        let colors = self.theme(context);
+        egui::Area::new(Id::new("pathway-persistent-problem"))
+            .anchor(Align2::CENTER_TOP, vec2(0.0, TOOLBAR_HEIGHT + 12.0))
+            .interactable(false)
+            .show(context, |ui| {
+                Frame::NONE
+                    .fill(colors.floating)
+                    .stroke(Stroke::new(1.0, colors.danger))
+                    .corner_radius(10)
+                    .inner_margin(Margin::symmetric(14, 9))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("Pathways need attention")
+                                    .strong()
+                                    .color(colors.danger),
+                            );
+                            ui.separator();
+                            ui.label(RichText::new(message).color(colors.text));
+                            if messages.len() > 1 {
+                                ui.label(
+                                    RichText::new(format!("+{} more", messages.len() - 1))
+                                        .color(colors.secondary_text),
+                                );
+                            }
+                        });
+                    });
+            });
+    }
+
     fn show_toast(&mut self, context: &Context) {
         let Some(toast) = self.toast else {
             return;
@@ -12588,6 +12852,7 @@ impl eframe::App for AdamApp {
         }
         self.handle_shortcuts(context);
         self.handle_external_drops(context);
+        self.poll_pathway_reconciliation(context);
         self.poll_automation(context);
         self.poll_file_watch(context);
         self.poll_live_sheet(context);
@@ -12642,6 +12907,7 @@ impl eframe::App for AdamApp {
         self.show_tag_management(&context);
         self.show_pile_settings(&context);
         self.show_trash(&context);
+        self.show_pathway_problem_row(&context);
         self.show_toast(&context);
         // Tell the preview worker which tiles were actually painted this
         // frame so queued work from a pan/zoom can be discarded immediately.
@@ -23856,5 +24122,61 @@ mod tests {
                 .any(|part| part.as_os_str() == AI_CHAT_SANDBOX_SEGMENT),
             "the inspector caption keys off the sandbox path segment"
         );
+    }
+
+    #[test]
+    fn pathway_owned_commits_do_not_wake_the_reconciler() {
+        assert!(CommitOrigin::External.wakes_pathway_reconciler());
+        assert!(!CommitOrigin::PathwayReconciler.wakes_pathway_reconciler());
+    }
+
+    #[test]
+    fn exact_pathway_poll_forwards_elapsed_time_with_saturating_conversion() {
+        assert_eq!(
+            pathway_reconcile_active_elapsed_ms(Duration::from_millis(1_250)),
+            1_250
+        );
+        assert_eq!(pathway_reconcile_active_elapsed_ms(Duration::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn pathway_poll_uses_one_global_wake_and_waits_for_settled_state() {
+        let now = UnixMicros(1_000);
+        let wake = UnixMicros(2_000);
+        assert_eq!(
+            pathway_poll_decision(false, false, Some(wake), now, true),
+            PathwayPollDecision::Schedule(wake)
+        );
+        assert_eq!(
+            pathway_poll_decision(true, false, Some(wake), now, false),
+            PathwayPollDecision::WaitForSettled
+        );
+        assert_eq!(
+            pathway_poll_decision(false, false, Some(now), now, true),
+            PathwayPollDecision::Reconcile
+        );
+        assert_eq!(
+            pathway_poll_decision(false, false, None, now, true),
+            PathwayPollDecision::Idle
+        );
+    }
+
+    #[test]
+    fn pathway_problem_row_is_stable_and_deduplicated() {
+        let repeated = PathwayProblem::persistence_feedback_conflict("Concurrent pathway edit");
+        let messages = pathway_problem_messages(
+            Some(&repeated),
+            Some("Runtime pathway issue"),
+            &[repeated.clone(), repeated.clone()],
+        );
+
+        assert_eq!(
+            messages,
+            vec![
+                "Concurrent pathway edit".to_owned(),
+                "Runtime pathway issue".to_owned(),
+            ]
+        );
+        assert!(pathway_problem_messages(None, None, &[]).is_empty());
     }
 }

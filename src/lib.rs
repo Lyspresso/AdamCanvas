@@ -28,6 +28,7 @@ pub mod number_format;
 pub mod ocr;
 pub mod pathway_editing;
 pub mod pathway_projection;
+pub mod pathway_reconciliation;
 pub mod persistence;
 pub mod photo_details;
 pub mod platform;

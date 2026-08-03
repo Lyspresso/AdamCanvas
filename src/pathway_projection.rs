@@ -254,14 +254,19 @@ pub fn position(
                 let safe_length = geometry.length.max(SAFE_SEGMENT_LENGTH);
                 let speed = segment.speed_points_per_second.max(1.0);
                 let elapsed = now.elapsed_seconds_since(started_at);
+                let has_started = now >= started_at;
                 let start_progress = assignment.segment_start_progress.clamp(0.0, 1.0);
                 let travelled_progress = elapsed * speed / safe_length;
                 let resolved_progress = (start_progress + travelled_progress).min(1.0);
                 segment_progress = Some(resolved_progress);
-                is_animating = pathway.is_enabled && resolved_progress < 1.0;
+                // A future-stamped segment is stationary until its start. P4
+                // uses `next_state_at` below for the one start wake instead of
+                // scheduling static 16 ms render frames in the meantime.
+                is_animating = pathway.is_enabled && has_started && resolved_progress < 1.0;
                 let remaining_seconds = (1.0 - start_progress) * safe_length / speed;
-                next_state_at =
-                    Some(started_at.saturating_add_micros(duration_micros_ceil(remaining_seconds)));
+                let arrival_at =
+                    started_at.saturating_add_micros(duration_micros_ceil(remaining_seconds));
+                next_state_at = Some(if has_started { arrival_at } else { started_at });
                 interpolate(geometry.start, geometry.end, resolved_progress)
             } else {
                 assignment.materialized_route_point
@@ -745,6 +750,15 @@ mod tests {
         );
         assert_close(before.route_point.x, 100.0);
         assert_eq!(before.segment_progress, Some(0.0));
+        assert!(!before.is_animating);
+        assert_eq!(before.next_state_at, Some(started_at));
+
+        let at_start = position(&assignment, &pathway, started_at);
+        assert!(at_start.is_animating);
+        assert_eq!(
+            at_start.next_state_at,
+            Some(started_at.saturating_add_micros(10_000_000))
+        );
 
         assignment.segment_start_progress = 4.0;
         let past_end = position(&assignment, &pathway, started_at);
