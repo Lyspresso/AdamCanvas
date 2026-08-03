@@ -53,9 +53,10 @@ use crate::{
         TileKind, Workspace, WorldRect,
     },
     ocr::{OcrQueueError, PhotoOcrRequest, PhotoOcrWorker, source_fingerprint},
+    pathway_enrollment::{PathwayEnrollmentContext, PathwayEnrollmentService},
     pathway_reconciliation::{
         PathwayProblem, PathwayProblemKind, PathwayReconcileCause, PathwayReconcileContext,
-        PathwayReconcileReport, PathwayReconcileService,
+        PathwayReconcileReport, PathwayReconcileService, materialize_absorbed_assignments,
     },
     persistence::{
         AppPaths, SaveOutcome, SaveWorker, absorb_pathway_save_feedback, backup_unreadable_library,
@@ -1113,6 +1114,9 @@ pub struct AdamApp {
     automation_initialized: bool,
     semantic_reconcile_needed: bool,
     pathway_reconcile_requested: bool,
+    /// Set only by physical canvas edits (and startup), never by pathway-only
+    /// save feedback whose tile rect can legitimately lag semantic state.
+    pathway_external_geometry_check_requested: bool,
     pathway_startup_reconcile_pending: bool,
     pathway_next_wake: Option<UnixMicros>,
     pathway_persistence_problem: Option<PathwayProblem>,
@@ -1456,6 +1460,7 @@ impl AdamApp {
             automation_initialized: false,
             semantic_reconcile_needed: true,
             pathway_reconcile_requested: true,
+            pathway_external_geometry_check_requested: true,
             pathway_startup_reconcile_pending: true,
             pathway_next_wake: None,
             pathway_persistence_problem: None,
@@ -1546,6 +1551,7 @@ impl AdamApp {
         if origin.wakes_pathway_reconciler() {
             self.semantic_reconcile_needed |= layout_changed;
             self.pathway_reconcile_requested = true;
+            self.pathway_external_geometry_check_requested |= layout_changed;
         }
         if self.saving_enabled {
             self.egui_context.request_repaint_after(AUTOSAVE_DELAY);
@@ -2025,18 +2031,30 @@ impl AdamApp {
                         &mut self.workspace.domain.pathways,
                         &pathway_feedback,
                     ) {
-                        Ok(changed) => {
+                        Ok(absorption) => {
                             self.pathway_persistence_problem = None;
                             self.pathway_reconcile_report.problems.retain(|problem| {
                                 problem.kind != PathwayProblemKind::PersistenceFeedbackConflict
                             });
-                            if changed {
-                                // The receipt describes state that is already
-                                // durable. Wake projection/reconciliation once
-                                // without marking it dirty and feeding it back
-                                // to the save worker.
-                                self.spatial_dirty = true;
+                            if absorption.changed {
+                                // Pathway feedback has no page channel. Mirror
+                                // only assignments learned by this absorption
+                                // before any external-movement check can mistake
+                                // the stale local rect for a user drag.
+                                let layout_changed = materialize_absorbed_assignments(
+                                    &mut self.workspace,
+                                    &absorption.changed_assignment_ids,
+                                );
                                 self.pathway_reconcile_requested = true;
+                                if layout_changed {
+                                    // The semantic receipt is already durable,
+                                    // but this derived page repair is not. Save
+                                    // it without arming external detachment or
+                                    // feeding the reconciler back into itself.
+                                    self.changed_with_origin(true, CommitOrigin::PathwayReconciler);
+                                } else {
+                                    self.spatial_dirty = true;
+                                }
                                 context.request_repaint();
                             }
                         }
@@ -2316,6 +2334,10 @@ impl AdamApp {
                         self.last_automation_tick.elapsed(),
                     ))
                     .with_settled(true)
+                    .with_external_movement_check(
+                        self.pathway_external_geometry_check_requested
+                            || self.pathway_startup_reconcile_pending,
+                    )
             }
             Err(error) => {
                 self.pathway_runtime_problem =
@@ -2329,6 +2351,7 @@ impl AdamApp {
             Ok(mut report) => {
                 self.pathway_startup_reconcile_pending = false;
                 self.pathway_reconcile_requested = false;
+                self.pathway_external_geometry_check_requested = false;
                 self.pathway_next_wake = report.next_wake;
                 self.pathway_runtime_problem = None;
                 if report.changed {
@@ -6100,6 +6123,43 @@ impl AdamApp {
                 && drag.moved
             {
                 let ids: Vec<_> = drag.originals.keys().copied().collect();
+                let committed_rects = self
+                    .workspace
+                    .page(drag.page_id)
+                    .map(|page| {
+                        page.tiles
+                            .iter()
+                            .filter(|tile| drag.originals.contains_key(&tile.id))
+                            .map(|tile| (tile.id, tile.rect))
+                            .collect::<BTreeMap<_, _>>()
+                    })
+                    .unwrap_or_default();
+                let detach_result =
+                    PathwayEnrollmentContext::new("Adam canvas drag", unix_now_micros()).and_then(
+                        |detach_context| {
+                            PathwayEnrollmentService::detach_for_manual_drag(
+                                &mut self.workspace,
+                                drag.page_id,
+                                &committed_rects,
+                                detach_context,
+                            )
+                        },
+                    );
+                if let Err(error) = detach_result {
+                    if let Some(page) = self.workspace.page_mut(drag.page_id) {
+                        restore_tile_rects(page, &drag.durable_originals);
+                    }
+                    self.pathway_runtime_problem = Some(format!(
+                        "The drag was cancelled because pathway authority could not be released: {error}"
+                    ));
+                    self.marquee = None;
+                    self.page_drop_target = None;
+                    self.page_hover = None;
+                    self.drag_destination_page = None;
+                    self.text_note_drop_target = None;
+                    context.request_repaint();
+                    return;
+                }
                 let mut final_page = drag.page_id;
                 let mut moved_to_page = false;
                 let mut merged_into_note = false;

@@ -1,5 +1,8 @@
 use crate::{
-    domain::{ConversationStore, PathwayMergeError, PathwayStore, Pile, TrashActor},
+    domain::{
+        ConversationStore, PathwayEvent, PathwayEventKind, PathwayEventPayload, PathwayMergeError,
+        PathwayStore, Pile, TrashActor, UnixMicros,
+    },
     model::{Tile, TileContent, Workspace},
 };
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
@@ -13,6 +16,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -1383,12 +1387,124 @@ enum SaveCommand {
     Stop,
 }
 
+const PATHWAY_SAVE_ACTOR: &str = "Adam save worker";
+
+#[derive(Clone, Debug, PartialEq)]
+struct PendingPathwaySaveFailure {
+    first_failed_at: UnixMicros,
+    failure_count: u64,
+    pathway_ids: BTreeSet<Uuid>,
+}
+
+impl PendingPathwaySaveFailure {
+    fn record(pending: &mut Option<Self>, workspace: &Workspace, failed_at: UnixMicros) {
+        let pathway_ids = workspace
+            .domain
+            .pathways
+            .pathways
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        match pending {
+            Some(existing) => {
+                existing.failure_count = existing.failure_count.saturating_add(1);
+                existing.pathway_ids.extend(pathway_ids);
+            }
+            None => {
+                *pending = Some(Self {
+                    first_failed_at: failed_at,
+                    failure_count: 1,
+                    pathway_ids,
+                });
+            }
+        }
+    }
+}
+
+fn pathway_persistence_now() -> UnixMicros {
+    let micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_micros().min(i64::MAX as u128) as i64)
+        .unwrap_or(0);
+    UnixMicros(micros)
+}
+
+fn outgoing_with_pathway_save_recovery(
+    workspace: &Workspace,
+    pending: &PendingPathwaySaveFailure,
+    recovered_at: UnixMicros,
+) -> anyhow::Result<Workspace> {
+    let mut outgoing = workspace.clone();
+    let pathway_ids = pending
+        .pathway_ids
+        .iter()
+        .copied()
+        .filter(|pathway_id| outgoing.domain.pathways.pathways.contains_key(pathway_id))
+        .collect::<Vec<_>>();
+    if pathway_ids.is_empty() {
+        return Ok(outgoing);
+    }
+
+    let operation_id = Uuid::new_v4();
+    let attempts = format!(
+        "{} failed save attempt{}",
+        pending.failure_count,
+        if pending.failure_count == 1 { "" } else { "s" }
+    );
+    let failed_explanation = format!(
+        "Adam could not save pathway changes. Diagnostic details were omitted; recovery followed after {attempts}."
+    );
+    let recovered_explanation = format!("Adam recovered pathway saving after {attempts}.");
+
+    // Keep the ledger chronological across multiple pathways: all failures at
+    // the original failure instant precede all recoveries at this attempt.
+    for pathway_id in pathway_ids.iter().copied() {
+        outgoing.domain.pathways.append_event(PathwayEvent::new(
+            Uuid::new_v4(),
+            operation_id,
+            pathway_id,
+            pending.first_failed_at,
+            PATHWAY_SAVE_ACTOR,
+            PathwayEventKind::SaveFailed,
+            PathwayEventPayload {
+                explanation: failed_explanation.clone(),
+                ..PathwayEventPayload::default()
+            },
+        ))?;
+    }
+    for pathway_id in pathway_ids {
+        outgoing.domain.pathways.append_event(PathwayEvent::new(
+            Uuid::new_v4(),
+            operation_id,
+            pathway_id,
+            recovered_at,
+            PATHWAY_SAVE_ACTOR,
+            PathwayEventKind::SaveRecovered,
+            PathwayEventPayload {
+                explanation: recovered_explanation.clone(),
+                ..PathwayEventPayload::default()
+            },
+        ))?;
+    }
+    Ok(outgoing)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PathwaySaveFeedback {
     /// The exact pathway snapshot submitted by this process.
     pub submitted: PathwayStore,
     /// The pathway snapshot that reached durable storage after cross-process merging.
     pub merged: PathwayStore,
+}
+
+#[must_use]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PathwayFeedbackAbsorption {
+    pub changed: bool,
+    /// Assignments whose effective value changed in the three-way result.
+    /// The app materializes only these rows, so unrelated feedback cannot
+    /// conceal a real local move by snapping an unchanged rider back.
+    pub changed_assignment_ids: BTreeSet<Uuid>,
 }
 
 /// Absorbs the pathways learned by a successful save without discarding
@@ -1399,13 +1515,23 @@ pub struct PathwaySaveFeedback {
 pub(crate) fn absorb_pathway_save_feedback(
     live: &mut PathwayStore,
     feedback: &PathwaySaveFeedback,
-) -> Result<bool, PathwayMergeError> {
+) -> Result<PathwayFeedbackAbsorption, PathwayMergeError> {
     let absorbed = PathwayStore::merge_persisted(&feedback.submitted, live, &feedback.merged)?;
     if *live == absorbed {
-        return Ok(false);
+        return Ok(PathwayFeedbackAbsorption::default());
     }
+    let changed_assignment_ids = absorbed
+        .assignments
+        .iter()
+        .filter_map(|(assignment_id, assignment)| {
+            (live.assignments.get(assignment_id) != Some(assignment)).then_some(*assignment_id)
+        })
+        .collect();
     *live = absorbed;
-    Ok(true)
+    Ok(PathwayFeedbackAbsorption {
+        changed: true,
+        changed_assignment_ids,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1531,6 +1657,7 @@ fn save_loop(
     receiver: Receiver<SaveCommand>,
     completions: Sender<SaveCompletion>,
 ) {
+    let mut pending_pathway_failure = None;
     while let Ok(command) = receiver.recv() {
         match command {
             SaveCommand::Save {
@@ -1581,8 +1708,15 @@ fn save_loop(
                     request_id,
                     &completions,
                     false,
+                    &mut pending_pathway_failure,
                 );
                 if shutdown {
+                    // A failed final save cannot durably describe its own
+                    // failure: the destination is unavailable and this
+                    // worker-owned evidence dies with the process. A later
+                    // successful attempt in the same worker is the earliest
+                    // honest point at which SaveFailed/SaveRecovered can be
+                    // written as an atomic pair.
                     break;
                 }
             }
@@ -1597,6 +1731,7 @@ fn save_loop(
                     request_id,
                     &completions,
                     true,
+                    &mut pending_pathway_failure,
                 );
                 break;
             }
@@ -1612,8 +1747,15 @@ fn save_and_acknowledge(
     request_id: u64,
     completions: &Sender<SaveCompletion>,
     during_shutdown: bool,
+    pending_pathway_failure: &mut Option<PendingPathwaySaveFailure>,
 ) {
-    let outcome = match save_workspace_merged(paths, base, workspace) {
+    let attempted_at = pathway_persistence_now();
+    let save_result = match pending_pathway_failure.as_ref() {
+        Some(pending) => outgoing_with_pathway_save_recovery(workspace, pending, attempted_at)
+            .and_then(|outgoing| save_workspace_merged(paths, base, &outgoing)),
+        None => save_workspace_merged(paths, base, workspace),
+    };
+    let outcome = match save_result {
         Ok(merged) => {
             let learned_deleted_conversations = merged
                 .domain
@@ -1664,6 +1806,11 @@ fn save_and_acknowledge(
                     .copied(),
             );
             base.domain.conversations.normalize_in_place();
+            // The recovery rows live only in the durable/merged side of
+            // feedback. `workspace` remains the exact app snapshot and the
+            // worker baseline remains that submitted snapshot, preserving
+            // P4's three-way feedback contract.
+            *pending_pathway_failure = None;
             SaveOutcome::Saved {
                 learned_deleted_conversations,
                 learned_xai_storage_conversations,
@@ -1674,6 +1821,11 @@ fn save_and_acknowledge(
             }
         }
         Err(error) => {
+            PendingPathwaySaveFailure::record(
+                pending_pathway_failure,
+                workspace,
+                pathway_persistence_now(),
+            );
             if during_shutdown {
                 log::error!("could not save Adam library during shutdown: {error:#}");
             } else {
@@ -2302,6 +2454,169 @@ mod tests {
 
         assert!(matches!(completion.outcome, SaveOutcome::Failed(_)));
         worker.stop();
+    }
+
+    #[test]
+    fn pending_pathway_failure_retains_first_time_count_and_scope() {
+        let first_pathway_id = Uuid::from_u128(77_001);
+        let second_pathway_id = Uuid::from_u128(77_002);
+        let first = workspace_with_pathway(first_pathway_id);
+        let mut second = first.clone();
+        second
+            .domain
+            .pathways
+            .insert_pathway(
+                Pathway::new(
+                    second_pathway_id,
+                    second.active_page,
+                    "Second persistence route",
+                    "#0A84FF",
+                    UnixMicros(2_000_001),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+        let mut pending = None;
+        PendingPathwaySaveFailure::record(&mut pending, &first, UnixMicros(100));
+        PendingPathwaySaveFailure::record(&mut pending, &second, UnixMicros(200));
+        let pending = pending.unwrap();
+        assert_eq!(pending.first_failed_at, UnixMicros(100));
+        assert_eq!(pending.failure_count, 2);
+        assert_eq!(
+            pending.pathway_ids,
+            BTreeSet::from([first_pathway_id, second_pathway_id])
+        );
+
+        let outgoing =
+            outgoing_with_pathway_save_recovery(&second, &pending, UnixMicros(300)).unwrap();
+        let events = outgoing.domain.pathways.events();
+        assert_eq!(events.len(), 4);
+        assert!(events[..2].iter().all(|event| {
+            event.kind == PathwayEventKind::SaveFailed && event.at == UnixMicros(100)
+        }));
+        assert!(events[2..].iter().all(|event| {
+            event.kind == PathwayEventKind::SaveRecovered && event.at == UnixMicros(300)
+        }));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.payload.explanation.contains("2 failed save attempts"))
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.operation_id == events[0].operation_id)
+        );
+    }
+
+    #[test]
+    fn save_worker_journals_fail_fail_success_without_mutating_feedback_base() {
+        let temporary = tempfile::tempdir().unwrap();
+        let blocked_root = temporary.path().join("private-path-must-not-be-persisted");
+        let paths = AppPaths::at(blocked_root.clone());
+        let pathway_id = Uuid::from_u128(77_100);
+        let workspace = workspace_with_pathway(pathway_id);
+        save_workspace_atomic(&paths, &workspace).unwrap();
+        let mut worker = SaveWorker::start_with_base(paths.clone(), workspace.clone());
+        let parked_library = temporary.path().join("parked-library");
+        fs::rename(&blocked_root, &parked_library).unwrap();
+        fs::write(&blocked_root, b"file blocks directory creation").unwrap();
+
+        for _ in 0..2 {
+            let request_id = worker.request_tracked(workspace.clone()).unwrap();
+            assert!(matches!(
+                wait_for_completion(&worker, request_id).outcome,
+                SaveOutcome::Failed(_)
+            ));
+        }
+
+        fs::remove_file(&blocked_root).unwrap();
+        fs::rename(&parked_library, &blocked_root).unwrap();
+        let request_id = worker.request_tracked(workspace.clone()).unwrap();
+        let completion = wait_for_completion(&worker, request_id);
+        let SaveOutcome::Saved {
+            pathway_feedback, ..
+        } = completion.outcome
+        else {
+            panic!("recovery save should succeed");
+        };
+        worker.stop();
+
+        assert_eq!(&pathway_feedback.submitted, &workspace.domain.pathways);
+        assert!(pathway_feedback.submitted.events().is_empty());
+        let events = pathway_feedback.merged.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, PathwayEventKind::SaveFailed);
+        assert_eq!(events[1].kind, PathwayEventKind::SaveRecovered);
+        assert_eq!(events[0].pathway_id, pathway_id);
+        assert_eq!(events[1].pathway_id, pathway_id);
+        assert_eq!(events[0].operation_id, events[1].operation_id);
+        assert!(events[0].at <= events[1].at);
+        assert_eq!(
+            events[0].payload.explanation,
+            "Adam could not save pathway changes. Diagnostic details were omitted; recovery followed after 2 failed save attempts."
+        );
+        assert_eq!(
+            events[1].payload.explanation,
+            "Adam recovered pathway saving after 2 failed save attempts."
+        );
+
+        let persisted_journal = serde_json::to_string(events).unwrap();
+        assert!(
+            !persisted_journal.contains(blocked_root.to_string_lossy().as_ref()),
+            "persisted pathway journal unexpectedly contains a local path"
+        );
+        assert_eq!(
+            load_workspace(&paths).unwrap().domain.pathways.events(),
+            events
+        );
+
+        let mut live = workspace.domain.pathways.clone();
+        assert!(
+            absorb_pathway_save_feedback(&mut live, &pathway_feedback)
+                .unwrap()
+                .changed
+        );
+        assert_eq!(live, pathway_feedback.merged);
+    }
+
+    #[test]
+    fn save_recovery_without_pathways_writes_no_pathway_journal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let blocked_root = temporary.path().join("not-a-directory");
+        fs::write(&blocked_root, b"file blocks directory creation").unwrap();
+        let paths = AppPaths::at(blocked_root.clone());
+        let workspace = Workspace::default();
+        let mut worker = SaveWorker::start_with_base(paths.clone(), workspace.clone());
+
+        let failed_request = worker.request_tracked(workspace.clone()).unwrap();
+        assert!(matches!(
+            wait_for_completion(&worker, failed_request).outcome,
+            SaveOutcome::Failed(_)
+        ));
+        fs::remove_file(&blocked_root).unwrap();
+
+        let recovered_request = worker.request_tracked(workspace.clone()).unwrap();
+        let recovered = wait_for_completion(&worker, recovered_request);
+        let SaveOutcome::Saved {
+            pathway_feedback, ..
+        } = recovered.outcome
+        else {
+            panic!("recovery save should succeed");
+        };
+        worker.stop();
+
+        assert_eq!(&pathway_feedback.submitted, &workspace.domain.pathways);
+        assert!(pathway_feedback.merged.events().is_empty());
+        assert!(
+            load_workspace(&paths)
+                .unwrap()
+                .domain
+                .pathways
+                .events()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3650,14 +3965,35 @@ mod tests {
         };
         let mut live = submitted.clone();
 
-        assert!(!absorb_pathway_save_feedback(&mut live, &feedback).unwrap());
+        assert!(
+            !absorb_pathway_save_feedback(&mut live, &feedback)
+                .unwrap()
+                .changed
+        );
         assert_eq!(live, submitted);
     }
 
     #[test]
     fn pathway_save_feedback_retains_post_submit_local_and_remote_events() {
         let pathway_id = Uuid::from_u128(79_200);
-        let submitted = workspace_with_pathway(pathway_id).domain.pathways;
+        let workspace = workspace_with_pathway(pathway_id);
+        let mut submitted = workspace.domain.pathways;
+        submitted
+            .insert_assignment(
+                PathwayAssignment::new(
+                    Uuid::from_u128(79_210),
+                    pathway_id,
+                    Uuid::from_u128(79_211),
+                    workspace.active_page,
+                    PathwayAssignmentState::Paused,
+                    PathwayPoint::ZERO,
+                    PathwayPoint::ZERO,
+                    PathwayPoint::ZERO,
+                    UnixMicros(1_000_002),
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let mut live = submitted.clone();
         live.append_event(pathway_event(79_201, pathway_id, "post-submit local"))
             .unwrap();
@@ -3667,7 +4003,12 @@ mod tests {
             .unwrap();
         let feedback = PathwaySaveFeedback { submitted, merged };
 
-        assert!(absorb_pathway_save_feedback(&mut live, &feedback).unwrap());
+        let absorption = absorb_pathway_save_feedback(&mut live, &feedback).unwrap();
+        assert!(absorption.changed);
+        assert!(
+            absorption.changed_assignment_ids.is_empty(),
+            "event-only feedback must not snap an unchanged rider back"
+        );
         assert_eq!(
             live.events()
                 .iter()

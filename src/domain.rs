@@ -4018,7 +4018,7 @@ pub enum PathwayAssignmentState {
     NeedsAttention,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PathwayEventKind {
     Assigned,
@@ -4258,6 +4258,8 @@ pub struct PathwayEventPayload {
     pub node_id: Option<PathwayNodeId>,
     pub segment_id: Option<PathwaySegmentId>,
     pub pile_id: Option<PileId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub containment_mode: Option<ContainmentMode>,
     pub explanation: String,
     pub before_state: Option<PathwayAssignmentState>,
     pub after_state: Option<PathwayAssignmentState>,
@@ -4465,6 +4467,30 @@ impl PathwayStore {
         &self.events
     }
 
+    /// Projects the append-only ledger for user-facing history while
+    /// suppressing semantically identical timeline rows minted by two Adam
+    /// processes reconciling the same durable transition concurrently.
+    ///
+    /// The raw ledger remains immutable and available through [`Self::events`].
+    /// Only transition kinds owned exclusively by the reconcile planner are
+    /// folded; commands such as approval, enrollment, resume, and offline
+    /// catch-up retain their distinct actor and operation provenance. Node,
+    /// segment, pile, and containment-mode identifiers are part of the
+    /// identity, so simultaneous but distinct crossings never collapse into
+    /// one history row.
+    pub fn semantic_history_events(&self) -> Vec<&PathwayEvent> {
+        let mut seen = BTreeSet::new();
+        self.events
+            .iter()
+            .filter(|event| {
+                if !is_deduplicable_pathway_transition(event.kind) {
+                    return true;
+                }
+                seen.insert(PathwayTransitionHistoryKey::from(*event))
+            })
+            .collect()
+    }
+
     pub fn pathway(&self, id: PathwayId) -> Option<&Pathway> {
         self.pathways.get(&id)
     }
@@ -4480,6 +4506,29 @@ impl PathwayStore {
         self.assignments
             .values()
             .filter(move |assignment| assignment.pathway_id == pathway_id)
+    }
+
+    /// Chooses the one pathway row that currently owns each tile's projected
+    /// geometry. Concurrent processes can enroll the same tile before either
+    /// sees the other's write, so persisted state can temporarily contain more
+    /// than one live row. The newest reconciliation clock wins, with canonical
+    /// assignment UUID order as the deterministic same-instant tie-break.
+    pub(crate) fn authoritative_assignments_by_tile(&self) -> BTreeMap<TileId, &PathwayAssignment> {
+        let mut assignments = BTreeMap::<TileId, &PathwayAssignment>::new();
+        for assignment in self
+            .assignments
+            .values()
+            .filter(|assignment| assignment.state != PathwayAssignmentState::Detached)
+        {
+            let replace = assignments.get(&assignment.tile_id).is_none_or(|current| {
+                (assignment.last_reconciled_at, assignment.id)
+                    > (current.last_reconciled_at, current.id)
+            });
+            if replace {
+                assignments.insert(assignment.tile_id, assignment);
+            }
+        }
+        assignments
     }
 
     /// Repairs only decode-time scalar and reference invariants. Route
@@ -4679,6 +4728,76 @@ impl PathwayStore {
             events,
         })
     }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PathwayTransitionHistoryKey {
+    pathway_id: PathwayId,
+    assignment_id: Option<PathwayAssignmentId>,
+    tile_id: Option<TileId>,
+    kind: PathwayEventKind,
+    at: UnixMicros,
+    node_id: Option<PathwayNodeId>,
+    segment_id: Option<PathwaySegmentId>,
+    pile_id: Option<PileId>,
+    containment_mode: Option<u8>,
+    before_state: Option<u8>,
+    after_state: Option<u8>,
+}
+
+impl From<&PathwayEvent> for PathwayTransitionHistoryKey {
+    fn from(event: &PathwayEvent) -> Self {
+        Self {
+            pathway_id: event.pathway_id,
+            assignment_id: event.payload.assignment_id,
+            tile_id: event.payload.tile_id,
+            kind: event.kind,
+            at: event.at,
+            node_id: event.payload.node_id,
+            segment_id: event.payload.segment_id,
+            pile_id: event.payload.pile_id,
+            containment_mode: event
+                .payload
+                .containment_mode
+                .map(pathway_containment_mode_rank),
+            before_state: event
+                .payload
+                .before_state
+                .map(pathway_assignment_state_rank),
+            after_state: event.payload.after_state.map(pathway_assignment_state_rank),
+        }
+    }
+}
+
+const fn pathway_containment_mode_rank(mode: ContainmentMode) -> u8 {
+    match mode {
+        ContainmentMode::CenterInside => 0,
+        ContainmentMode::MajorityOverlap => 1,
+        ContainmentMode::CompletelyInside => 2,
+        ContainmentMode::AnyOverlap => 3,
+    }
+}
+
+const fn pathway_assignment_state_rank(state: PathwayAssignmentState) -> u8 {
+    match state {
+        PathwayAssignmentState::Moving => 0,
+        PathwayAssignmentState::Waiting => 1,
+        PathwayAssignmentState::Blocked => 2,
+        PathwayAssignmentState::Paused => 3,
+        PathwayAssignmentState::Completed => 4,
+        PathwayAssignmentState::Detached => 5,
+        PathwayAssignmentState::NeedsAttention => 6,
+    }
+}
+
+fn is_deduplicable_pathway_transition(kind: PathwayEventKind) -> bool {
+    matches!(
+        kind,
+        PathwayEventKind::PileEntered
+            | PathwayEventKind::PileExited
+            | PathwayEventKind::DestinationReached
+            | PathwayEventKind::WaitCompleted
+    )
 }
 
 pub(crate) fn validate_pathway_title(value: impl Into<String>) -> Result<String, DomainError> {
@@ -8205,6 +8324,199 @@ mod tests {
                 ..PathwayEventPayload::default()
             },
         )
+    }
+
+    #[test]
+    fn pathway_history_projection_deduplicates_only_identical_engine_transitions() {
+        let (mut store, pathway_id) = pathway_fixture();
+        let assignment_id = id(8_010);
+        let tile_id = id(8_011);
+
+        let event = |event_id: u128,
+                     operation_id: u128,
+                     actor: &str,
+                     kind: PathwayEventKind,
+                     node_id: Option<Uuid>,
+                     pile_id: Option<Uuid>| {
+            let mut event = pathway_event(event_id, pathway_id, 2_000_000, kind);
+            event.operation_id = id(operation_id);
+            event.actor = actor.into();
+            event.payload.assignment_id = Some(assignment_id);
+            event.payload.tile_id = Some(tile_id);
+            event.payload.node_id = node_id;
+            event.payload.pile_id = pile_id;
+            event
+        };
+
+        for event in [
+            event(
+                8_200,
+                8_300,
+                "engine-a",
+                PathwayEventKind::PileEntered,
+                None,
+                Some(id(8_400)),
+            ),
+            event(
+                8_201,
+                8_301,
+                "engine-b",
+                PathwayEventKind::PileEntered,
+                None,
+                Some(id(8_400)),
+            ),
+            event(
+                8_202,
+                8_302,
+                "engine-b",
+                PathwayEventKind::PileEntered,
+                None,
+                Some(id(8_401)),
+            ),
+            event(
+                8_203,
+                8_303,
+                "engine-a",
+                PathwayEventKind::DestinationReached,
+                Some(id(8_002)),
+                None,
+            ),
+            event(
+                8_204,
+                8_304,
+                "engine-b",
+                PathwayEventKind::DestinationReached,
+                Some(id(8_002)),
+                None,
+            ),
+            event(
+                8_205,
+                8_305,
+                "engine-b",
+                PathwayEventKind::DestinationReached,
+                Some(id(8_003)),
+                None,
+            ),
+            event(
+                8_206,
+                8_306,
+                "command-a",
+                PathwayEventKind::WaitStarted,
+                Some(id(8_002)),
+                None,
+            ),
+            event(
+                8_207,
+                8_307,
+                "command-b",
+                PathwayEventKind::WaitStarted,
+                Some(id(8_002)),
+                None,
+            ),
+        ] {
+            store.append_event(event).unwrap();
+        }
+
+        assert_eq!(store.events().len(), 8, "the durable ledger is immutable");
+        let history = store.semantic_history_events();
+        assert_eq!(history.len(), 6);
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| event.kind == PathwayEventKind::PileEntered)
+                .count(),
+            2,
+            "distinct pile crossings must remain visible"
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| event.kind == PathwayEventKind::DestinationReached)
+                .count(),
+            2,
+            "distinct destination nodes must remain visible"
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| event.kind == PathwayEventKind::WaitStarted)
+                .count(),
+            2,
+            "command-originated rows keep their operation provenance"
+        );
+    }
+
+    #[test]
+    fn pathway_history_projection_preserves_same_instant_containment_modes() {
+        let (mut store, pathway_id) = pathway_fixture();
+        let assignment_id = id(8_010);
+        let tile_id = id(8_011);
+        let pile_id = id(8_400);
+        let event = |event_id: u128, operation_id: u128, mode| {
+            let mut event = pathway_event(
+                event_id,
+                pathway_id,
+                2_000_000,
+                PathwayEventKind::PileEntered,
+            );
+            event.operation_id = id(operation_id);
+            event.actor = format!("engine-{operation_id}");
+            event.payload.assignment_id = Some(assignment_id);
+            event.payload.tile_id = Some(tile_id);
+            event.payload.pile_id = Some(pile_id);
+            event.payload.containment_mode = Some(mode);
+            event
+        };
+
+        store
+            .append_event(event(8_200, 8_300, ContainmentMode::CenterInside))
+            .unwrap();
+        store
+            .append_event(event(8_201, 8_301, ContainmentMode::AnyOverlap))
+            .unwrap();
+        store
+            .append_event(event(8_202, 8_302, ContainmentMode::AnyOverlap))
+            .unwrap();
+
+        assert_eq!(
+            store.events().len(),
+            3,
+            "raw provenance remains append-only"
+        );
+        let history = store.semantic_history_events();
+        assert_eq!(history.len(), 2);
+        assert!(
+            history.iter().any(|event| {
+                event.payload.containment_mode == Some(ContainmentMode::CenterInside)
+            }) && history.iter().any(|event| {
+                event.payload.containment_mode == Some(ContainmentMode::AnyOverlap)
+            }),
+            "different boundary contracts remain visible while same-mode engine duplicates fold"
+        );
+    }
+
+    #[test]
+    fn pathway_event_payload_containment_mode_is_backward_compatible() {
+        let legacy: PathwayEventPayload =
+            serde_json::from_value(json!({"explanation": "legacy crossing"})).unwrap();
+        assert_eq!(legacy.containment_mode, None);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("containmentMode")
+                .is_none(),
+            "ordinary and legacy events must not grow a null schema member"
+        );
+
+        let current = PathwayEventPayload {
+            containment_mode: Some(ContainmentMode::AnyOverlap),
+            explanation: "typed crossing".into(),
+            ..PathwayEventPayload::default()
+        };
+        assert_eq!(
+            serde_json::to_value(current).unwrap()["containmentMode"],
+            json!("any_overlap")
+        );
     }
 
     #[test]
