@@ -7,11 +7,12 @@
 
 use crate::{
     domain::{
-        DomainError, PageId, Pathway, PathwayAssignmentState, PathwayEvent, PathwayEventKind,
-        PathwayEventPayload, PathwayId, PathwayNode, PathwayNodeId, PathwayNodeKind, PathwayPoint,
-        PathwaySegment, PathwaySegmentId, TileId, UnixMicros, validate_pathway_title,
+        DomainError, PageId, Pathway, PathwayAssignment, PathwayAssignmentId,
+        PathwayAssignmentState, PathwayEvent, PathwayEventKind, PathwayEventPayload, PathwayId,
+        PathwayNode, PathwayNodeId, PathwayNodeKind, PathwayPoint, PathwaySegment,
+        PathwaySegmentId, TileId, UnixMicros, validate_pathway_title,
     },
-    model::Workspace,
+    model::{TileKind, Workspace},
     pathway_projection,
 };
 use std::{
@@ -35,6 +36,11 @@ pub enum PathwayEditingError {
     MissingNode(PathwayNodeId),
     #[error("pathway segment {0} does not exist")]
     MissingSegment(PathwaySegmentId),
+    #[error("pathway assignment {assignment_id} cannot be materialized: {reason}")]
+    UnsafeMaterialization {
+        assignment_id: PathwayAssignmentId,
+        reason: &'static str,
+    },
     #[error("a pathway must retain at least two nodes")]
     TooFewNodes,
     #[error("a pathway edit actor cannot be empty")]
@@ -242,8 +248,16 @@ impl PathwayEditingService {
                 .pathway(pathway_id)
                 .cloned()
                 .ok_or(DomainError::MissingPathway(pathway_id))?;
+            validate_delete_materialization(draft, pathway_id, &old_pathway, context.now)?;
             pause_for_graph_edit(draft, pathway_id, &context)?;
-            materialize_before_delete(draft, &old_pathway, context.now);
+            materialize_before_delete(draft, pathway_id, &old_pathway, context.now);
+            draft
+                .domain
+                .pathways
+                .pathways
+                .get_mut(&pathway_id)
+                .expect("pathway remains until its deletion event is durable")
+                .modified_at = context.now;
             append_configuration_event(
                 draft,
                 pathway_id,
@@ -360,8 +374,23 @@ impl PathwayEditingService {
             if old_pathway.nodes.len() <= 2 {
                 return Err(PathwayEditingError::TooFewNodes);
             }
-            let old_closures = closure_records(&old_pathway);
+            let mut old_closures = closure_records(&old_pathway);
+            let preview_removed_segment_ids = {
+                let mut preview = old_pathway.clone();
+                preview.nodes.remove(&node_id);
+                rebuild_segments(&mut preview, context.now, &BTreeMap::new())?
+                    .into_iter()
+                    .map(|segment| segment.id)
+                    .collect::<BTreeSet<_>>()
+            };
             pause_for_graph_edit(draft, pathway_id, &context)?;
+            materialize_completed_assignments_for_removed_references(
+                draft,
+                &old_pathway,
+                &preview_removed_segment_ids,
+                &BTreeSet::from([node_id]),
+                context.now,
+            );
             let removed_segments = {
                 let pathway = draft
                     .domain
@@ -374,6 +403,21 @@ impl PathwayEditingService {
                 pathway.modified_at = context.now;
                 removed
             };
+            let new_pathway = draft
+                .domain
+                .pathways
+                .pathway(pathway_id)
+                .expect("rebuilt pathway remains in the transactional draft");
+            if let Some(new_last_id) = ordered_node_ids(new_pathway).last().copied() {
+                let new_last = &new_pathway.nodes[&new_last_id];
+                for closure in &mut old_closures {
+                    if closure.from_node_id == node_id {
+                        closure.from_node_id = new_last_id;
+                        closure.from_point = new_last.point;
+                        closure.from_title = new_last.title.clone();
+                    }
+                }
+            }
             finish_removed_references(
                 draft,
                 pathway_id,
@@ -607,7 +651,7 @@ fn insert_node(
             )?;
             pathway.nodes.insert(node_id, node);
 
-            if auto_named {
+            if auto_named || insert_index == old_order.len() {
                 speed_overrides.insert((old_last, node_id), forward_speed);
             }
             if pathway.repeats {
@@ -755,44 +799,71 @@ fn pause_for_graph_edit(
         .pathway(pathway_id)
         .cloned()
         .ok_or(DomainError::MissingPathway(pathway_id))?;
-    let assignment_ids = workspace
+    let assignment_keys = workspace
         .domain
         .pathways
-        .assignments_for_pathway(pathway_id)
-        .filter(|assignment| is_live_state(assignment.state))
-        .map(|assignment| assignment.id)
+        .assignments
+        .iter()
+        .filter(|(_, assignment)| {
+            assignment.pathway_id == pathway_id && is_live_state(assignment.state)
+        })
+        .map(|(key, _)| *key)
         .collect::<Vec<_>>();
-    for assignment_id in &assignment_ids {
-        let assignment = workspace.domain.pathways.assignments[assignment_id].clone();
+    for assignment_key in &assignment_keys {
+        let assignment = workspace.domain.pathways.assignments[assignment_key].clone();
         let before_state = assignment.state;
-        let projection = pathway_projection::position(&assignment, &old_pathway, context.now);
-        let materialized_tile_point = projection
-            .tile_center
-            .is_finite()
-            .then(|| {
+        // Disabled routes hold position. A malformed disabled+Moving record
+        // is still paused for safety, but authoring must not advance it merely
+        // because its stale clock says time elapsed.
+        let should_project =
+            old_pathway.is_enabled || before_state != PathwayAssignmentState::Moving;
+        let projection = should_project
+            .then(|| pathway_projection::position(&assignment, &old_pathway, context.now));
+        let held_physical_position = if should_project {
+            None
+        } else {
+            Some(
+                physical_assignment_position(workspace, old_pathway.page_id, &assignment).ok_or(
+                    PathwayEditingError::UnsafeMaterialization {
+                        assignment_id: *assignment_key,
+                        reason: "a disabled moving assignment has no safe physical tile position",
+                    },
+                )?,
+            )
+        };
+        let materialized_tile_point = projection.and_then(|projection| {
+            projection.tile_center.is_finite().then(|| {
                 materialize_tile_center(
                     workspace,
+                    old_pathway.page_id,
                     assignment.page_id,
                     assignment.tile_id,
                     projection.tile_center,
                 )
-            })
-            .flatten();
+            })?
+        });
         let (event_assignment_id, event_tile_id) = {
             let assignment = workspace
                 .domain
                 .pathways
                 .assignments
-                .get_mut(assignment_id)
+                .get_mut(assignment_key)
                 .expect("collected assignment remains in the transactional draft");
-            if projection.route_point.is_finite() {
+            if let Some((route_point, tile_point)) = held_physical_position {
+                assignment.materialized_route_point = route_point;
+                assignment.materialized_tile_point = tile_point;
+            } else if let Some(projection) = projection
+                && projection.route_point.is_finite()
+            {
                 assignment.materialized_route_point = projection.route_point;
             }
             if let Some(point) = materialized_tile_point {
                 assignment.materialized_tile_point = point;
             }
             if before_state == PathwayAssignmentState::Moving {
-                if let Some(progress) = projection.segment_progress {
+                if let Some(progress) =
+                    projection.and_then(|projection| projection.segment_progress)
+                {
                     assignment.segment_start_progress = progress;
                 }
                 assignment.segment_started_at = None;
@@ -820,7 +891,7 @@ fn pause_for_graph_edit(
             },
         )?;
     }
-    if !assignment_ids.is_empty() {
+    if !assignment_keys.is_empty() {
         let pathway = workspace
             .domain
             .pathways
@@ -843,19 +914,98 @@ fn is_live_state(state: PathwayAssignmentState) -> bool {
     )
 }
 
-fn materialize_before_delete(workspace: &mut Workspace, pathway: &Pathway, now: UnixMicros) {
+fn validate_delete_materialization(
+    workspace: &Workspace,
+    pathway_id: PathwayId,
+    pathway: &Pathway,
+    now: UnixMicros,
+) -> Result<(), PathwayEditingError> {
     let assignments = workspace
         .domain
         .pathways
-        .assignments_for_pathway(pathway.id)
+        .assignments
+        .iter()
+        .filter(|(_, assignment)| {
+            assignment.pathway_id == pathway_id
+                && assignment.state != PathwayAssignmentState::Detached
+        })
+        .collect::<Vec<_>>();
+    if assignments.is_empty() {
+        return Ok(());
+    }
+    let page = workspace
+        .page(pathway.page_id)
+        .ok_or(PathwayEditingError::MissingPage(pathway.page_id))?;
+    for (assignment_key, assignment) in assignments {
+        let unsafe_materialization = |reason| PathwayEditingError::UnsafeMaterialization {
+            assignment_id: *assignment_key,
+            reason,
+        };
+        if assignment.page_id != pathway.page_id {
+            return Err(unsafe_materialization(
+                "the assignment and pathway pages differ",
+            ));
+        }
+        let tile = page
+            .tile(assignment.tile_id)
+            .ok_or_else(|| unsafe_materialization("the assigned tile is missing"))?;
+        if tile.kind() == TileKind::Pile {
+            continue;
+        }
+        if !tile.rect.is_finite() {
+            return Err(unsafe_materialization("the assigned tile frame is invalid"));
+        }
+        if assignment.state == PathwayAssignmentState::Moving && !pathway.is_enabled {
+            continue;
+        }
+        let projection = pathway_projection::position(assignment, pathway, now);
+        let Some(center_x) = finite_f32(projection.tile_center.x) else {
+            return Err(unsafe_materialization(
+                "the projected horizontal position is invalid",
+            ));
+        };
+        let Some(center_y) = finite_f32(projection.tile_center.y) else {
+            return Err(unsafe_materialization(
+                "the projected vertical position is invalid",
+            ));
+        };
+        let old_center = tile.rect.center();
+        let delta = [center_x - old_center[0], center_y - old_center[1]];
+        if !delta[0].is_finite()
+            || !delta[1].is_finite()
+            || !(tile.rect.x + delta[0]).is_finite()
+            || !(tile.rect.y + delta[1]).is_finite()
+        {
+            return Err(unsafe_materialization(
+                "the projected tile frame is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn materialize_before_delete(
+    workspace: &mut Workspace,
+    pathway_id: PathwayId,
+    pathway: &Pathway,
+    now: UnixMicros,
+) {
+    let assignments = workspace
+        .domain
+        .pathways
+        .assignments_for_pathway(pathway_id)
         .filter(|assignment| assignment.state != PathwayAssignmentState::Detached)
         .cloned()
         .collect::<Vec<_>>();
     for assignment in assignments {
+        if assignment.state == PathwayAssignmentState::Moving && !pathway.is_enabled {
+            continue;
+        }
         let projection = pathway_projection::position(&assignment, pathway, now);
         if projection.tile_center.is_finite() {
             materialize_tile_center(
                 workspace,
+                pathway.page_id,
                 assignment.page_id,
                 assignment.tile_id,
                 projection.tile_center,
@@ -864,16 +1014,84 @@ fn materialize_before_delete(workspace: &mut Workspace, pathway: &Pathway, now: 
     }
 }
 
+/// Node removal can invalidate the only positional reference held by a
+/// completed assignment. Capture that old-graph destination after active
+/// riders are paused, but before any node or segment is removed.
+fn materialize_completed_assignments_for_removed_references(
+    workspace: &mut Workspace,
+    pathway: &Pathway,
+    removed_segments: &BTreeSet<PathwaySegmentId>,
+    removed_nodes: &BTreeSet<PathwayNodeId>,
+    now: UnixMicros,
+) {
+    let assignments = workspace
+        .domain
+        .pathways
+        .assignments
+        .iter()
+        .filter(|(_, assignment)| {
+            assignment.pathway_id == pathway.id
+                && assignment.state == PathwayAssignmentState::Completed
+                && (assignment
+                    .current_segment_id
+                    .is_some_and(|id| removed_segments.contains(&id))
+                    || assignment
+                        .current_node_id
+                        .is_some_and(|id| removed_nodes.contains(&id)))
+        })
+        .map(|(key, assignment)| (*key, assignment.clone()))
+        .collect::<Vec<_>>();
+    for (assignment_key, assignment) in assignments {
+        if assignment.page_id != pathway.page_id {
+            continue;
+        }
+        let projection = pathway_projection::position(&assignment, pathway, now);
+        let can_materialize_tile = workspace
+            .page(assignment.page_id)
+            .and_then(|page| page.tile(assignment.tile_id))
+            .is_some_and(|tile| tile.kind() != TileKind::Pile && tile.rect.is_finite());
+        let materialized_tile_point = (can_materialize_tile && projection.tile_center.is_finite())
+            .then(|| {
+                materialize_tile_center(
+                    workspace,
+                    pathway.page_id,
+                    assignment.page_id,
+                    assignment.tile_id,
+                    projection.tile_center,
+                )
+            })
+            .flatten();
+        let stored = workspace
+            .domain
+            .pathways
+            .assignments
+            .get_mut(&assignment_key)
+            .expect("collected assignment remains in the transactional draft");
+        if projection.route_point.is_finite() {
+            stored.materialized_route_point = projection.route_point;
+        }
+        if let Some(point) = materialized_tile_point {
+            stored.materialized_tile_point = point;
+        }
+        stored.last_reconciled_at = now;
+        stored.modified_at = now;
+    }
+}
+
 fn materialize_tile_center(
     workspace: &mut Workspace,
-    page_id: PageId,
+    pathway_page_id: PageId,
+    assignment_page_id: PageId,
     tile_id: TileId,
     center: PathwayPoint,
 ) -> Option<PathwayPoint> {
+    if pathway_page_id != assignment_page_id {
+        return None;
+    }
     let center_x = finite_f32(center.x)?;
     let center_y = finite_f32(center.y)?;
-    let tile = workspace.page_mut(page_id)?.tile_mut(tile_id)?;
-    if !tile.rect.is_finite() {
+    let tile = workspace.page_mut(assignment_page_id)?.tile_mut(tile_id)?;
+    if tile.kind() == TileKind::Pile || !tile.rect.is_finite() {
         return None;
     }
     let old_center = tile.rect.center();
@@ -894,6 +1112,29 @@ fn finite_f32(value: f64) -> Option<f32> {
     }
     let value = value as f32;
     value.is_finite().then_some(value)
+}
+
+fn physical_assignment_position(
+    workspace: &Workspace,
+    pathway_page_id: PageId,
+    assignment: &PathwayAssignment,
+) -> Option<(PathwayPoint, PathwayPoint)> {
+    if assignment.page_id != pathway_page_id {
+        return None;
+    }
+    let tile = workspace
+        .page(assignment.page_id)?
+        .tile(assignment.tile_id)?;
+    if tile.kind() == TileKind::Pile || !tile.rect.is_finite() {
+        return None;
+    }
+    let center = tile.rect.center();
+    let route_point = PathwayPoint::new(
+        f64::from(center[0]) - assignment.path_offset.x,
+        f64::from(center[1]) - assignment.path_offset.y,
+    );
+    let tile_point = PathwayPoint::new(f64::from(tile.rect.x), f64::from(tile.rect.y));
+    (route_point.is_finite() && tile_point.is_finite()).then_some((route_point, tile_point))
 }
 
 #[derive(Clone, Debug)]
@@ -965,27 +1206,43 @@ fn relocate_closure_riders(
     closures: &[ClosureRecord],
     context: &PathwayEditContext,
 ) -> Result<(), PathwayEditingError> {
+    let pathway_page_id = workspace
+        .domain
+        .pathways
+        .pathway(pathway_id)
+        .ok_or(DomainError::MissingPathway(pathway_id))?
+        .page_id;
     let by_segment = closures
         .iter()
         .map(|closure| (closure.segment_id, closure))
         .collect::<BTreeMap<_, _>>();
-    let assignment_ids = workspace
+    let assignment_keys = workspace
         .domain
         .pathways
-        .assignments_for_pathway(pathway_id)
-        .filter(|assignment| {
-            assignment
-                .current_segment_id
-                .is_some_and(|segment_id| by_segment.contains_key(&segment_id))
+        .assignments
+        .iter()
+        .filter(|(_, assignment)| {
+            let targets_pile = workspace
+                .page(assignment.page_id)
+                .and_then(|page| page.tile(assignment.tile_id))
+                .is_some_and(|tile| tile.kind() == TileKind::Pile);
+            assignment.pathway_id == pathway_id
+                && assignment.page_id == pathway_page_id
+                && !targets_pile
+                && assignment
+                    .current_segment_id
+                    .is_some_and(|segment_id| by_segment.contains_key(&segment_id))
                 && !matches!(
                     assignment.state,
-                    PathwayAssignmentState::Detached | PathwayAssignmentState::Completed
+                    PathwayAssignmentState::Detached
+                        | PathwayAssignmentState::Completed
+                        | PathwayAssignmentState::NeedsAttention
                 )
         })
-        .map(|assignment| assignment.id)
+        .map(|(key, _)| *key)
         .collect::<Vec<_>>();
-    for assignment_id in assignment_ids {
-        let existing = workspace.domain.pathways.assignments[&assignment_id].clone();
+    for assignment_key in assignment_keys {
+        let existing = workspace.domain.pathways.assignments[&assignment_key].clone();
         let segment_id = existing
             .current_segment_id
             .expect("closure rider was selected by segment id");
@@ -998,14 +1255,20 @@ fn relocate_closure_riders(
         let materialized_tile_point = tile_center
             .is_finite()
             .then(|| {
-                materialize_tile_center(workspace, existing.page_id, existing.tile_id, tile_center)
+                materialize_tile_center(
+                    workspace,
+                    pathway_page_id,
+                    existing.page_id,
+                    existing.tile_id,
+                    tile_center,
+                )
             })
             .flatten();
         let assignment = workspace
             .domain
             .pathways
             .assignments
-            .get_mut(&assignment_id)
+            .get_mut(&assignment_key)
             .expect("selected assignment remains in the transactional draft");
         assignment.state = PathwayAssignmentState::Waiting;
         assignment.current_segment_id = None;
@@ -1055,26 +1318,28 @@ fn mark_removed_references_needs_attention(
     removed_nodes: &BTreeSet<PathwayNodeId>,
     context: &PathwayEditContext,
 ) -> Result<(), PathwayEditingError> {
-    let assignment_ids = workspace
+    let assignment_keys = workspace
         .domain
         .pathways
-        .assignments_for_pathway(pathway_id)
-        .filter(|assignment| {
-            assignment
-                .current_segment_id
-                .is_some_and(|id| removed_segments.contains(&id))
-                || assignment
-                    .current_node_id
-                    .is_some_and(|id| removed_nodes.contains(&id))
+        .assignments
+        .iter()
+        .filter(|(_, assignment)| {
+            assignment.pathway_id == pathway_id
+                && (assignment
+                    .current_segment_id
+                    .is_some_and(|id| removed_segments.contains(&id))
+                    || assignment
+                        .current_node_id
+                        .is_some_and(|id| removed_nodes.contains(&id)))
         })
-        .map(|assignment| assignment.id)
+        .map(|(key, _)| *key)
         .collect::<Vec<_>>();
-    for assignment_id in assignment_ids {
+    for assignment_key in assignment_keys {
         let assignment = workspace
             .domain
             .pathways
             .assignments
-            .get_mut(&assignment_id)
+            .get_mut(&assignment_key)
             .expect("selected assignment remains in the transactional draft");
         let before_state = assignment.state;
         let removed_segment_id = assignment
@@ -1092,21 +1357,27 @@ fn mark_removed_references_needs_attention(
             assignment.current_node_id = None;
         }
         if assignment.state != PathwayAssignmentState::Detached {
-            if !(assignment.state == PathwayAssignmentState::Paused
-                && assignment.previous_state.is_some())
+            if assignment.state != PathwayAssignmentState::NeedsAttention
+                && !(assignment.state == PathwayAssignmentState::Paused
+                    && assignment.previous_state.is_some())
             {
                 assignment.previous_state = Some(assignment.state);
             }
+            let already_needed_attention =
+                assignment.state == PathwayAssignmentState::NeedsAttention;
             assignment.state = PathwayAssignmentState::NeedsAttention;
             assignment.wait_until = None;
             assignment.blocked_at = None;
             assignment.paused_at = None;
-            assignment.needs_attention_reason =
-                Some("A pathway edit removed this assignment's active graph reference.".into());
+            if !already_needed_attention || assignment.needs_attention_reason.is_none() {
+                assignment.needs_attention_reason =
+                    Some("A pathway edit removed this assignment's active graph reference.".into());
+            }
         }
         assignment.last_reconciled_at = context.now;
         assignment.modified_at = context.now;
         let after_state = assignment.state;
+        let event_assignment_id = assignment.id;
         let tile_id = assignment.tile_id;
         append_event(
             workspace,
@@ -1115,7 +1386,7 @@ fn mark_removed_references_needs_attention(
             SAFETY_ACTOR,
             PathwayEventKind::ConfigurationChanged,
             PathwayEventPayload {
-                assignment_id: Some(assignment_id),
+                assignment_id: Some(event_assignment_id),
                 tile_id: Some(tile_id),
                 node_id: removed_node_id,
                 segment_id: removed_segment_id,
@@ -1163,8 +1434,12 @@ fn rebuild_segments(
         {
             Some(mut segment) => {
                 segment.sort_index = source_sort;
+                // Exact-pair preservation is a persistence contract, not an
+                // invocation of the editor's 1...1000 input bound. Imported
+                // and future-authored finite speeds above that UI bound must
+                // survive unrelated graph edits byte-for-byte.
                 segment.speed_points_per_second =
-                    validated_speed(override_speed.unwrap_or(segment.speed_points_per_second))?;
+                    override_speed.unwrap_or(segment.speed_points_per_second);
                 segment.modified_at = now;
                 segment
             }
@@ -1354,4 +1629,1243 @@ fn validated_speed(value: f64) -> Result<f64, PathwayEditingError> {
         return Err(DomainError::InvalidPathway("segment speed must be finite".into()).into());
     }
     Ok(value.clamp(1.0, MAX_SEGMENT_SPEED))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        domain::{PathwayAssignment, PathwayAssignmentId},
+        model::{Tile, TileContent, WorldRect},
+    };
+
+    fn id(value: u128) -> Uuid {
+        Uuid::from_u128(value)
+    }
+
+    fn context(at: i64, operation: u128) -> PathwayEditContext {
+        PathwayEditContext::with_operation_id("test-user", UnixMicros(at), id(operation)).unwrap()
+    }
+
+    fn workspace_with_pathway() -> (Workspace, PathwayId) {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let pathway_id = PathwayEditingService::create_pathway(
+            &mut workspace,
+            page_id,
+            PathwayPoint::new(100.0, 120.0),
+            context(1_000_000, 1),
+        )
+        .unwrap();
+        (workspace, pathway_id)
+    }
+
+    fn pair_map(pathway: &Pathway) -> BTreeMap<(PathwayNodeId, PathwayNodeId), &PathwaySegment> {
+        pathway
+            .segments
+            .values()
+            .map(|segment| ((segment.from_node_id, segment.to_node_id), segment))
+            .collect()
+    }
+
+    fn add_assignment(
+        workspace: &mut Workspace,
+        pathway_id: PathwayId,
+        state: PathwayAssignmentState,
+        current_segment_id: Option<PathwaySegmentId>,
+        current_node_id: Option<PathwayNodeId>,
+        at: UnixMicros,
+    ) -> (PathwayAssignmentId, TileId) {
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let page_id = pathway.page_id;
+        let fallback_point = current_node_id
+            .and_then(|node_id| pathway.nodes.get(&node_id))
+            .map_or(PathwayPoint::new(100.0, 120.0), |node| node.point);
+        let mut tile = Tile::note(
+            "Cargo",
+            "",
+            WorldRect::new(
+                fallback_point.x as f32 - 10.0,
+                fallback_point.y as f32 - 10.0,
+                20.0,
+                20.0,
+            ),
+        );
+        let tile_id = id(50_000 + workspace.active_page().tiles.len() as u128);
+        tile.id = tile_id;
+        let tile_top_left = PathwayPoint::new(f64::from(tile.rect.x), f64::from(tile.rect.y));
+        workspace.page_mut(page_id).unwrap().add_tile(tile);
+        let assignment_id = id(60_000 + workspace.domain.pathways.assignments.len() as u128);
+        let mut assignment = PathwayAssignment::new(
+            assignment_id,
+            pathway_id,
+            tile_id,
+            page_id,
+            state,
+            PathwayPoint::ZERO,
+            fallback_point,
+            tile_top_left,
+            at,
+        )
+        .unwrap();
+        assignment.current_segment_id = current_segment_id;
+        assignment.current_node_id = current_node_id;
+        assignment.segment_started_at = (state == PathwayAssignmentState::Moving).then_some(at);
+        workspace
+            .domain
+            .pathways
+            .insert_assignment(assignment)
+            .unwrap();
+        (assignment_id, tile_id)
+    }
+
+    #[test]
+    fn create_pathway_builds_a_canonical_two_stop_route_and_audit_row() {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let operation_id = id(101);
+        let pathway_id = PathwayEditingService::create_pathway(
+            &mut workspace,
+            page_id,
+            PathwayPoint::new(-500.0, 120.0),
+            PathwayEditContext::with_operation_id(
+                "  canvas-user  ",
+                UnixMicros(2_000_000),
+                operation_id,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let ordered = ordered_node_ids(pathway);
+        assert_eq!(pathway.title, "Pathway 1");
+        assert_eq!(pathway.nodes.len(), 2);
+        assert_eq!(pathway.segments.len(), 1);
+        assert_eq!(pathway.nodes[&ordered[0]].point.x, CANVAS_MARGIN);
+        assert_eq!(pathway.nodes[&ordered[0]].title, "Start");
+        assert_eq!(pathway.nodes[&ordered[1]].title, "Destination 1");
+        let segment = pathway.segments.values().next().unwrap();
+        assert_eq!(segment.from_node_id, ordered[0]);
+        assert_eq!(segment.to_node_id, ordered[1]);
+        assert_eq!(segment.speed_points_per_second, DEFAULT_SEGMENT_SPEED);
+        assert_eq!(pathway.created_at, UnixMicros(2_000_000));
+        assert_eq!(pathway.modified_at, UnixMicros(2_000_000));
+
+        let events = workspace.domain.pathways.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, PathwayEventKind::ConfigurationChanged);
+        assert_eq!(events[0].actor, "canvas-user");
+        assert_eq!(events[0].at, UnixMicros(2_000_000));
+        assert_eq!(events[0].operation_id, operation_id);
+    }
+
+    #[test]
+    fn rename_is_metadata_only_and_works_while_its_page_is_missing() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let segment_id = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .segments[&workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .segments
+            .keys()
+            .next()
+            .copied()
+            .unwrap()]
+            .id;
+        let (assignment_id, _) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Moving,
+            Some(segment_id),
+            None,
+            UnixMicros(1_000_000),
+        );
+        workspace.pages.clear();
+
+        assert!(
+            PathwayEditingService::rename_pathway(
+                &mut workspace,
+                pathway_id,
+                "  Missing-page route  ",
+                context(2_000_000, 102),
+            )
+            .unwrap()
+        );
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert_eq!(pathway.title, "Missing-page route");
+        assert_eq!(pathway.modified_at, UnixMicros(2_000_000));
+        assert_eq!(
+            workspace
+                .domain
+                .pathways
+                .assignment(assignment_id)
+                .unwrap()
+                .state,
+            PathwayAssignmentState::Moving
+        );
+        assert!(pathway.is_enabled);
+        assert_eq!(
+            workspace.domain.pathways.events().last().unwrap().actor,
+            "test-user"
+        );
+    }
+
+    #[test]
+    fn invalid_custom_node_rolls_back_the_pause_and_every_other_change() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let segment_id = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .segments
+            .keys()
+            .next()
+            .copied()
+            .unwrap();
+        add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Moving,
+            Some(segment_id),
+            None,
+            UnixMicros(1_000_000),
+        );
+        let before = workspace.clone();
+
+        let error = PathwayEditingService::create_node(
+            &mut workspace,
+            pathway_id,
+            None,
+            PathwayNodeDraft::new(
+                PathwayPoint::new(300.0, 300.0),
+                "   ",
+                PathwayNodeKind::Waypoint,
+                0.0,
+            ),
+            context(2_000_000, 103),
+        )
+        .unwrap_err();
+        assert_eq!(error, PathwayEditingError::Domain(DomainError::EmptyName));
+        assert_eq!(workspace, before);
+    }
+
+    #[test]
+    fn custom_node_insertion_rebuilds_only_the_changed_adjacencies() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let old_pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let old_order = ordered_node_ids(old_pathway);
+        let old_segment_id = old_pathway.segments.values().next().unwrap().id;
+        let inserted_id = PathwayEditingService::create_node(
+            &mut workspace,
+            pathway_id,
+            Some(old_order[0]),
+            PathwayNodeDraft::new(
+                PathwayPoint::new(250.0, 180.0),
+                "Review",
+                PathwayNodeKind::ApprovalGate,
+                42.0,
+            ),
+            context(2_000_000, 104),
+        )
+        .unwrap();
+
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let order = ordered_node_ids(pathway);
+        assert_eq!(order, vec![old_order[0], inserted_id, old_order[1]]);
+        assert_eq!(pathway.nodes[&inserted_id].title, "Review");
+        assert_eq!(pathway.nodes[&inserted_id].wait_duration_seconds, 42.0);
+        assert_eq!(pathway.segments.len(), 2);
+        assert!(!pathway.segments.contains_key(&old_segment_id));
+        assert_eq!(
+            pair_map(pathway).keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([(order[0], order[1]), (order[1], order[2])])
+        );
+    }
+
+    #[test]
+    fn append_on_a_loop_pauses_first_and_relocates_the_closure_rider() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        PathwayEditingService::set_repeats(
+            &mut workspace,
+            pathway_id,
+            true,
+            context(2_000_000, 105),
+        )
+        .unwrap();
+        let old_pathway = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .clone();
+        let old_order = ordered_node_ids(&old_pathway);
+        let closure = pair_map(&old_pathway)[&(old_order[1], old_order[0])];
+        let closure_id = closure.id;
+        PathwayEditingService::set_segment_speed(
+            &mut workspace,
+            pathway_id,
+            closure_id,
+            222.0,
+            context(2_500_000, 106),
+        )
+        .unwrap();
+        let (assignment_id, tile_id) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Moving,
+            Some(closure_id),
+            None,
+            UnixMicros(3_000_000),
+        );
+        let first_new_event = workspace.domain.pathways.events().len();
+        let operation_id = id(107);
+        let new_node_id = PathwayEditingService::append_node(
+            &mut workspace,
+            pathway_id,
+            PathwayNodeKind::Destination,
+            PathwayPoint::new(700.0, 120.0),
+            PathwayEditContext::with_operation_id("test-user", UnixMicros(4_000_000), operation_id)
+                .unwrap(),
+        )
+        .unwrap();
+
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let order = ordered_node_ids(pathway);
+        assert_eq!(order.last(), Some(&new_node_id));
+        assert!(!pathway.segments.contains_key(&closure_id));
+        assert_eq!(
+            pair_map(pathway)[&(new_node_id, order[0])].speed_points_per_second,
+            222.0
+        );
+        assert!(!pathway.is_enabled);
+
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(assignment.state, PathwayAssignmentState::Waiting);
+        assert_eq!(
+            assignment.previous_state,
+            Some(PathwayAssignmentState::Moving)
+        );
+        assert_eq!(assignment.current_segment_id, None);
+        assert_eq!(assignment.current_node_id, Some(old_order[1]));
+        assert_eq!(assignment.segment_started_at, None);
+        assert_eq!(assignment.segment_start_progress, 0.0);
+        assert_eq!(assignment.wait_until, Some(UnixMicros(4_000_000)));
+        assert_eq!(assignment.paused_at, None);
+        assert_eq!(
+            assignment.materialized_route_point,
+            old_pathway.nodes[&old_order[1]].point
+        );
+        let tile = workspace
+            .page(old_pathway.page_id)
+            .unwrap()
+            .tile(tile_id)
+            .unwrap();
+        assert_eq!(
+            [tile.rect.x, tile.rect.y],
+            [
+                old_pathway.nodes[&old_order[1]].point.x as f32 - 10.0,
+                old_pathway.nodes[&old_order[1]].point.y as f32 - 10.0,
+            ]
+        );
+
+        let events = &workspace.domain.pathways.events()[first_new_event..];
+        assert_eq!(
+            events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            vec![
+                PathwayEventKind::Paused,
+                PathwayEventKind::ConfigurationChanged,
+                PathwayEventKind::ConfigurationChanged,
+            ]
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.operation_id == operation_id)
+        );
+        assert_eq!(events[0].actor, SAFETY_ACTOR);
+        assert_eq!(events[1].actor, SAFETY_ACTOR);
+        assert_eq!(events[2].actor, "test-user");
+    }
+
+    #[test]
+    fn disabling_repeats_relocates_even_an_already_paused_closure_rider() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        PathwayEditingService::set_repeats(
+            &mut workspace,
+            pathway_id,
+            true,
+            context(2_000_000, 108),
+        )
+        .unwrap();
+        let pathway = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .clone();
+        let ordered = ordered_node_ids(&pathway);
+        let closure_id = pair_map(&pathway)[&(ordered[1], ordered[0])].id;
+        let (assignment_id, _) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Paused,
+            Some(closure_id),
+            None,
+            UnixMicros(2_000_000),
+        );
+
+        PathwayEditingService::set_repeats(
+            &mut workspace,
+            pathway_id,
+            false,
+            context(3_000_000, 109),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert!(!pathway.repeats);
+        assert_eq!(pathway.segments.len(), 1);
+        assert!(!pathway.segments.contains_key(&closure_id));
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(assignment.state, PathwayAssignmentState::Waiting);
+        assert_eq!(assignment.current_node_id, Some(ordered[1]));
+        assert_eq!(assignment.wait_until, Some(UnixMicros(3_000_000)));
+    }
+
+    #[test]
+    fn moving_a_node_materializes_against_the_old_graph_before_mutating_it() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let old_pathway = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .clone();
+        let ordered = ordered_node_ids(&old_pathway);
+        let segment = pair_map(&old_pathway)[&(ordered[0], ordered[1])];
+        let (assignment_id, tile_id) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Moving,
+            Some(segment.id),
+            None,
+            UnixMicros(1_000_000),
+        );
+        let midpoint_time = UnixMicros(3_000_000);
+        let expected = pathway_projection::position(
+            workspace.domain.pathways.assignment(assignment_id).unwrap(),
+            &old_pathway,
+            midpoint_time,
+        );
+
+        PathwayEditingService::move_node(
+            &mut workspace,
+            pathway_id,
+            ordered[1],
+            PathwayPoint::new(900.0, 500.0),
+            context(midpoint_time.0, 110),
+        )
+        .unwrap();
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(assignment.state, PathwayAssignmentState::Paused);
+        assert_eq!(assignment.materialized_route_point, expected.route_point);
+        assert_eq!(
+            assignment.segment_start_progress,
+            expected.segment_progress.unwrap()
+        );
+        let tile = workspace
+            .page(old_pathway.page_id)
+            .unwrap()
+            .tile(tile_id)
+            .unwrap();
+        assert!((f64::from(tile.rect.center()[0]) - expected.tile_center.x).abs() < 1e-4);
+        assert!((f64::from(tile.rect.center()[1]) - expected.tile_center.y).abs() < 1e-4);
+        assert_eq!(
+            workspace.domain.pathways.pathway(pathway_id).unwrap().nodes[&ordered[1]].point,
+            PathwayPoint::new(900.0, 500.0)
+        );
+    }
+
+    #[test]
+    fn removing_a_node_preserves_surviving_pair_identity_and_safes_affected_riders() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let third = PathwayEditingService::append_node(
+            &mut workspace,
+            pathway_id,
+            PathwayNodeKind::Destination,
+            PathwayPoint::new(700.0, 120.0),
+            context(2_000_000, 111),
+        )
+        .unwrap();
+        let fourth = PathwayEditingService::append_node(
+            &mut workspace,
+            pathway_id,
+            PathwayNodeKind::Waypoint,
+            PathwayPoint::new(900.0, 120.0),
+            context(3_000_000, 112),
+        )
+        .unwrap();
+        let old_pathway = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .clone();
+        let order = ordered_node_ids(&old_pathway);
+        assert_eq!(order[2], third);
+        assert_eq!(order[3], fourth);
+        let pairs = pair_map(&old_pathway);
+        let removed_leg = pairs[&(order[1], order[2])].id;
+        let surviving = pairs[&(order[2], order[3])].clone();
+        workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&pathway_id)
+            .unwrap()
+            .segments
+            .get_mut(&surviving.id)
+            .unwrap()
+            .speed_points_per_second = 5_000.0;
+        let (assignment_id, _) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Moving,
+            Some(removed_leg),
+            None,
+            UnixMicros(3_500_000),
+        );
+
+        PathwayEditingService::remove_node(
+            &mut workspace,
+            pathway_id,
+            order[1],
+            context(4_000_000, 114),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let pairs = pair_map(pathway);
+        assert_eq!(pairs[&(order[2], order[3])].id, surviving.id);
+        assert_eq!(
+            pairs[&(order[2], order[3])].created_at,
+            surviving.created_at
+        );
+        assert_eq!(
+            pairs[&(order[2], order[3])].speed_points_per_second,
+            5_000.0
+        );
+        assert_eq!(pairs[&(order[0], order[2])].speed_points_per_second, 80.0);
+        assert_eq!(pathway.modified_at, UnixMicros(4_000_000));
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(assignment.state, PathwayAssignmentState::NeedsAttention);
+        assert_eq!(
+            assignment.previous_state,
+            Some(PathwayAssignmentState::Moving)
+        );
+        assert_eq!(assignment.current_segment_id, None);
+        assert!(assignment.needs_attention_reason.is_some());
+        assert_eq!(assignment.modified_at, UnixMicros(4_000_000));
+    }
+
+    #[test]
+    fn segment_speed_is_bounded_finite_and_pauses_live_cargo() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let segment_id = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .segments
+            .keys()
+            .next()
+            .copied()
+            .unwrap();
+        let first_node_id =
+            ordered_node_ids(workspace.domain.pathways.pathway(pathway_id).unwrap())[0];
+        let (assignment_id, _) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Waiting,
+            None,
+            Some(first_node_id),
+            UnixMicros(1_000_000),
+        );
+        PathwayEditingService::set_segment_speed(
+            &mut workspace,
+            pathway_id,
+            segment_id,
+            9_999.0,
+            context(2_000_000, 115),
+        )
+        .unwrap();
+        assert_eq!(
+            workspace
+                .domain
+                .pathways
+                .pathway(pathway_id)
+                .unwrap()
+                .segments[&segment_id]
+                .speed_points_per_second,
+            MAX_SEGMENT_SPEED
+        );
+        assert_eq!(
+            workspace
+                .domain
+                .pathways
+                .assignment(assignment_id)
+                .unwrap()
+                .state,
+            PathwayAssignmentState::Paused
+        );
+        let before = workspace.clone();
+        assert!(
+            PathwayEditingService::set_segment_speed(
+                &mut workspace,
+                pathway_id,
+                segment_id,
+                f64::NAN,
+                context(3_000_000, 116),
+            )
+            .is_err()
+        );
+        assert_eq!(workspace, before);
+    }
+
+    #[test]
+    fn graph_edits_tolerate_an_enabled_pathway_whose_page_is_missing() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let node_id = ordered_node_ids(workspace.domain.pathways.pathway(pathway_id).unwrap())[0];
+        let segment_id = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .segments
+            .keys()
+            .next()
+            .copied()
+            .unwrap();
+        let (assignment_id, _) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Moving,
+            Some(segment_id),
+            None,
+            UnixMicros(1_000_000),
+        );
+        workspace.pages.clear();
+
+        PathwayEditingService::move_node(
+            &mut workspace,
+            pathway_id,
+            node_id,
+            PathwayPoint::new(12.0, 18.0),
+            context(2_000_000, 117),
+        )
+        .unwrap();
+        assert_eq!(
+            workspace.domain.pathways.pathway(pathway_id).unwrap().nodes[&node_id].point,
+            PathwayPoint::new(12.0, 18.0)
+        );
+        assert_eq!(
+            workspace
+                .domain
+                .pathways
+                .assignment(assignment_id)
+                .unwrap()
+                .state,
+            PathwayAssignmentState::Paused
+        );
+    }
+
+    #[test]
+    fn delete_materializes_cargo_and_keeps_orphan_audit_history() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let pathway = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .clone();
+        let order = ordered_node_ids(&pathway);
+        let segment = pair_map(&pathway)[&(order[0], order[1])];
+        let (assignment_id, tile_id) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Moving,
+            Some(segment.id),
+            None,
+            UnixMicros(1_000_000),
+        );
+        let now = UnixMicros(2_000_000);
+        let expected = pathway_projection::position(
+            workspace.domain.pathways.assignment(assignment_id).unwrap(),
+            &pathway,
+            now,
+        );
+        let first_new_event = workspace.domain.pathways.events().len();
+
+        PathwayEditingService::delete_pathway(&mut workspace, pathway_id, context(now.0, 118))
+            .unwrap();
+        assert!(workspace.domain.pathways.pathway(pathway_id).is_none());
+        assert!(
+            workspace
+                .domain
+                .pathways
+                .assignment(assignment_id)
+                .is_none()
+        );
+        let tile = workspace
+            .page(pathway.page_id)
+            .unwrap()
+            .tile(tile_id)
+            .unwrap();
+        assert!((f64::from(tile.rect.center()[0]) - expected.tile_center.x).abs() < 1e-4);
+        assert!((f64::from(tile.rect.center()[1]) - expected.tile_center.y).abs() < 1e-4);
+        let events = &workspace.domain.pathways.events()[first_new_event..];
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, PathwayEventKind::Paused);
+        assert_eq!(events[1].kind, PathwayEventKind::ConfigurationChanged);
+        assert!(events.iter().all(|event| event.pathway_id == pathway_id));
+    }
+
+    #[test]
+    fn removing_a_loop_final_node_relocates_its_closure_rider_to_the_new_final_node() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let removed_final = PathwayEditingService::append_node(
+            &mut workspace,
+            pathway_id,
+            PathwayNodeKind::Destination,
+            PathwayPoint::new(700.0, 120.0),
+            context(2_000_000, 120),
+        )
+        .unwrap();
+        PathwayEditingService::set_repeats(
+            &mut workspace,
+            pathway_id,
+            true,
+            context(3_000_000, 121),
+        )
+        .unwrap();
+        let old_pathway = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .clone();
+        let old_order = ordered_node_ids(&old_pathway);
+        assert_eq!(old_order[2], removed_final);
+        let closure_id = pair_map(&old_pathway)[&(removed_final, old_order[0])].id;
+        let (assignment_id, _) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Moving,
+            Some(closure_id),
+            None,
+            UnixMicros(3_000_000),
+        );
+
+        PathwayEditingService::remove_node(
+            &mut workspace,
+            pathway_id,
+            removed_final,
+            context(4_000_000, 122),
+        )
+        .unwrap();
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(assignment.state, PathwayAssignmentState::Waiting);
+        assert_eq!(assignment.current_node_id, Some(old_order[1]));
+        assert_eq!(assignment.current_segment_id, None);
+        assert_eq!(assignment.wait_until, Some(UnixMicros(4_000_000)));
+        assert_eq!(
+            assignment.materialized_route_point,
+            old_pathway.nodes[&old_order[1]].point
+        );
+    }
+
+    #[test]
+    fn removing_a_completed_destination_materializes_it_before_clearing_the_reference() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let removed_node = PathwayEditingService::append_node(
+            &mut workspace,
+            pathway_id,
+            PathwayNodeKind::Destination,
+            PathwayPoint::new(700.0, 420.0),
+            context(2_000_000, 123),
+        )
+        .unwrap();
+        let destination =
+            workspace.domain.pathways.pathway(pathway_id).unwrap().nodes[&removed_node].point;
+        let (assignment_id, tile_id) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Completed,
+            None,
+            Some(removed_node),
+            UnixMicros(2_000_000),
+        );
+        {
+            let assignment = workspace
+                .domain
+                .pathways
+                .assignments
+                .get_mut(&assignment_id)
+                .unwrap();
+            assignment.materialized_route_point = PathwayPoint::ZERO;
+            assignment.materialized_tile_point = PathwayPoint::ZERO;
+        }
+        workspace
+            .page_mut(workspace.active_page)
+            .unwrap()
+            .tile_mut(tile_id)
+            .unwrap()
+            .rect = WorldRect::new(0.0, 0.0, 20.0, 20.0);
+
+        PathwayEditingService::remove_node(
+            &mut workspace,
+            pathway_id,
+            removed_node,
+            context(3_000_000, 124),
+        )
+        .unwrap();
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(assignment.state, PathwayAssignmentState::NeedsAttention);
+        assert_eq!(
+            assignment.previous_state,
+            Some(PathwayAssignmentState::Completed)
+        );
+        assert_eq!(assignment.current_node_id, None);
+        assert_eq!(assignment.materialized_route_point, destination);
+        let tile = workspace.active_page().tile(tile_id).unwrap();
+        assert_eq!(
+            tile.rect.center(),
+            [destination.x as f32, destination.y as f32]
+        );
+    }
+
+    #[test]
+    fn missing_page_completed_destination_keeps_its_old_graph_position() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let removed_node = PathwayEditingService::append_node(
+            &mut workspace,
+            pathway_id,
+            PathwayNodeKind::Destination,
+            PathwayPoint::new(720.0, 440.0),
+            context(2_000_000, 132),
+        )
+        .unwrap();
+        let destination =
+            workspace.domain.pathways.pathway(pathway_id).unwrap().nodes[&removed_node].point;
+        let (assignment_id, _) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Completed,
+            None,
+            Some(removed_node),
+            UnixMicros(2_000_000),
+        );
+        workspace
+            .domain
+            .pathways
+            .assignments
+            .get_mut(&assignment_id)
+            .unwrap()
+            .materialized_route_point = PathwayPoint::ZERO;
+        workspace.pages.clear();
+
+        PathwayEditingService::remove_node(
+            &mut workspace,
+            pathway_id,
+            removed_node,
+            context(3_000_000, 133),
+        )
+        .unwrap();
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(assignment.state, PathwayAssignmentState::NeedsAttention);
+        assert_eq!(assignment.materialized_route_point, destination);
+        assert_eq!(assignment.current_node_id, None);
+    }
+
+    #[test]
+    fn removed_reference_cleanup_preserves_existing_needs_attention_provenance() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        PathwayEditingService::set_repeats(
+            &mut workspace,
+            pathway_id,
+            true,
+            context(2_000_000, 125),
+        )
+        .unwrap();
+        let pathway = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .clone();
+        let order = ordered_node_ids(&pathway);
+        let closure_id = pair_map(&pathway)[&(order[1], order[0])].id;
+        let (assignment_id, _) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::NeedsAttention,
+            Some(closure_id),
+            None,
+            UnixMicros(2_000_000),
+        );
+        {
+            let assignment = workspace
+                .domain
+                .pathways
+                .assignments
+                .get_mut(&assignment_id)
+                .unwrap();
+            assignment.previous_state = Some(PathwayAssignmentState::Moving);
+            assignment.needs_attention_reason = Some("Existing diagnosis".into());
+        }
+
+        PathwayEditingService::set_repeats(
+            &mut workspace,
+            pathway_id,
+            false,
+            context(3_000_000, 126),
+        )
+        .unwrap();
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(assignment.state, PathwayAssignmentState::NeedsAttention);
+        assert_eq!(
+            assignment.previous_state,
+            Some(PathwayAssignmentState::Moving)
+        );
+        assert_eq!(
+            assignment.needs_attention_reason.as_deref(),
+            Some("Existing diagnosis")
+        );
+        assert_eq!(assignment.current_segment_id, None);
+    }
+
+    #[test]
+    fn malformed_assignment_map_keys_are_tolerated_without_panicking() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let pathway = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .clone();
+        let order = ordered_node_ids(&pathway);
+        let segment_id = pair_map(&pathway)[&(order[0], order[1])].id;
+        let (record_id, _) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Moving,
+            Some(segment_id),
+            None,
+            UnixMicros(1_000_000),
+        );
+        let malformed_key = id(999_999);
+        let record = workspace
+            .domain
+            .pathways
+            .assignments
+            .remove(&record_id)
+            .unwrap();
+        workspace
+            .domain
+            .pathways
+            .assignments
+            .insert(malformed_key, record);
+
+        PathwayEditingService::move_node(
+            &mut workspace,
+            pathway_id,
+            order[1],
+            PathwayPoint::new(800.0, 300.0),
+            context(2_000_000, 127),
+        )
+        .unwrap();
+        assert_eq!(
+            workspace.domain.pathways.assignments[&malformed_key].state,
+            PathwayAssignmentState::Paused
+        );
+        assert_eq!(
+            workspace
+                .domain
+                .pathways
+                .events()
+                .last()
+                .unwrap()
+                .payload
+                .node_id,
+            Some(order[1])
+        );
+    }
+
+    #[test]
+    fn pathway_authoring_never_moves_a_pile_tile() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let pathway = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .clone();
+        let order = ordered_node_ids(&pathway);
+        let (assignment_id, tile_id) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Waiting,
+            None,
+            Some(order[0]),
+            UnixMicros(1_000_000),
+        );
+        let page_id = pathway.page_id;
+        let pile_id = id(128_000);
+        let tile = workspace
+            .page_mut(page_id)
+            .unwrap()
+            .tile_mut(tile_id)
+            .unwrap();
+        tile.content = TileContent::Pile { pile_id };
+        tile.rect = WorldRect::new(333.0, 444.0, 50.0, 60.0);
+        let before_rect = tile.rect;
+
+        PathwayEditingService::move_node(
+            &mut workspace,
+            pathway_id,
+            order[1],
+            PathwayPoint::new(850.0, 300.0),
+            context(2_000_000, 128),
+        )
+        .unwrap();
+        assert_eq!(
+            workspace.page(page_id).unwrap().tile(tile_id).unwrap().rect,
+            before_rect
+        );
+        assert_eq!(
+            workspace
+                .domain
+                .pathways
+                .assignment(assignment_id)
+                .unwrap()
+                .state,
+            PathwayAssignmentState::Paused
+        );
+    }
+
+    #[test]
+    fn page_mismatched_assignments_cannot_move_a_tile_on_the_wrong_page() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let pathway = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .clone();
+        let order = ordered_node_ids(&pathway);
+        let (assignment_id, tile_id) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Waiting,
+            None,
+            Some(order[0]),
+            UnixMicros(1_000_000),
+        );
+        let second_page_id = workspace.create_page("Other page");
+        let mut decoy = Tile::note(
+            "Same id, wrong page",
+            "",
+            WorldRect::new(900.0, 900.0, 20.0, 20.0),
+        );
+        decoy.id = tile_id;
+        workspace.page_mut(second_page_id).unwrap().add_tile(decoy);
+        workspace
+            .domain
+            .pathways
+            .assignments
+            .get_mut(&assignment_id)
+            .unwrap()
+            .page_id = second_page_id;
+        let wrong_page_rect = workspace
+            .page(second_page_id)
+            .unwrap()
+            .tile(tile_id)
+            .unwrap()
+            .rect;
+
+        PathwayEditingService::move_node(
+            &mut workspace,
+            pathway_id,
+            order[1],
+            PathwayPoint::new(850.0, 300.0),
+            context(2_000_000, 134),
+        )
+        .unwrap();
+        assert_eq!(
+            workspace
+                .page(second_page_id)
+                .unwrap()
+                .tile(tile_id)
+                .unwrap()
+                .rect,
+            wrong_page_rect
+        );
+        assert_eq!(
+            workspace
+                .domain
+                .pathways
+                .assignment(assignment_id)
+                .unwrap()
+                .state,
+            PathwayAssignmentState::Paused
+        );
+    }
+
+    #[test]
+    fn delete_with_cargo_and_a_missing_page_fails_atomically() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let segment_id = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .segments
+            .keys()
+            .next()
+            .copied()
+            .unwrap();
+        add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Moving,
+            Some(segment_id),
+            None,
+            UnixMicros(1_000_000),
+        );
+        let page_id = workspace.active_page;
+        workspace.pages.clear();
+        let before = workspace.clone();
+
+        assert_eq!(
+            PathwayEditingService::delete_pathway(
+                &mut workspace,
+                pathway_id,
+                context(2_000_000, 129),
+            ),
+            Err(PathwayEditingError::MissingPage(page_id))
+        );
+        assert_eq!(workspace, before);
+    }
+
+    #[test]
+    fn disabled_moving_records_freeze_from_the_physical_tile_for_edit_and_delete() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let pathway = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .clone();
+        let order = ordered_node_ids(&pathway);
+        let segment_id = pair_map(&pathway)[&(order[0], order[1])].id;
+        let (assignment_id, tile_id) = add_assignment(
+            &mut workspace,
+            pathway_id,
+            PathwayAssignmentState::Moving,
+            Some(segment_id),
+            None,
+            UnixMicros(1_000_000),
+        );
+        workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&pathway_id)
+            .unwrap()
+            .is_enabled = false;
+        {
+            let assignment = workspace
+                .domain
+                .pathways
+                .assignments
+                .get_mut(&assignment_id)
+                .unwrap();
+            assignment.materialized_route_point = PathwayPoint::new(9_000.0, 9_000.0);
+            assignment.materialized_tile_point = PathwayPoint::new(8_990.0, 8_990.0);
+        }
+        workspace
+            .page_mut(pathway.page_id)
+            .unwrap()
+            .tile_mut(tile_id)
+            .unwrap()
+            .rect = WorldRect::new(400.0, 500.0, 20.0, 20.0);
+        let mut deletion_workspace = workspace.clone();
+
+        PathwayEditingService::move_node(
+            &mut workspace,
+            pathway_id,
+            order[1],
+            PathwayPoint::new(800.0, 300.0),
+            context(5_000_000, 130),
+        )
+        .unwrap();
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(assignment.state, PathwayAssignmentState::Paused);
+        assert_eq!(
+            assignment.materialized_route_point,
+            PathwayPoint::new(410.0, 510.0)
+        );
+        assert_eq!(
+            assignment.materialized_tile_point,
+            PathwayPoint::new(400.0, 500.0)
+        );
+        assert_eq!(
+            workspace
+                .page(pathway.page_id)
+                .unwrap()
+                .tile(tile_id)
+                .unwrap()
+                .rect,
+            WorldRect::new(400.0, 500.0, 20.0, 20.0)
+        );
+
+        PathwayEditingService::delete_pathway(
+            &mut deletion_workspace,
+            pathway_id,
+            context(5_000_000, 131),
+        )
+        .unwrap();
+        assert_eq!(
+            deletion_workspace
+                .page(pathway.page_id)
+                .unwrap()
+                .tile(tile_id)
+                .unwrap()
+                .rect,
+            WorldRect::new(400.0, 500.0, 20.0, 20.0)
+        );
+    }
+
+    #[test]
+    fn minimum_node_rejection_is_atomic() {
+        let (mut workspace, pathway_id) = workspace_with_pathway();
+        let node_id = ordered_node_ids(workspace.domain.pathways.pathway(pathway_id).unwrap())[0];
+        let before = workspace.clone();
+        assert_eq!(
+            PathwayEditingService::remove_node(
+                &mut workspace,
+                pathway_id,
+                node_id,
+                context(2_000_000, 119),
+            ),
+            Err(PathwayEditingError::TooFewNodes)
+        );
+        assert_eq!(workspace, before);
+    }
 }
