@@ -799,6 +799,19 @@ fn pause_for_graph_edit(
         .pathway(pathway_id)
         .cloned()
         .ok_or(DomainError::MissingPathway(pathway_id))?;
+    let has_nonterminal_assignment =
+        workspace
+            .domain
+            .pathways
+            .assignments
+            .values()
+            .any(|assignment| {
+                assignment.pathway_id == pathway_id
+                    && !matches!(
+                        assignment.state,
+                        PathwayAssignmentState::Detached | PathwayAssignmentState::Completed
+                    )
+            });
     let assignment_keys = workspace
         .domain
         .pathways
@@ -891,7 +904,12 @@ fn pause_for_graph_edit(
             },
         )?;
     }
-    if !assignment_keys.is_empty() {
+    // An enabled graph with any enrolled cargo must stop before its topology
+    // changes, even when every rider was already Paused or NeedsAttention.
+    // A malformed disabled graph can still carry an actively advancing state,
+    // which we transition above and relabel here. Preserve the existing
+    // diagnostic when an already-disabled graph has only safe states.
+    if (old_pathway.is_enabled && has_nonterminal_assignment) || !assignment_keys.is_empty() {
         let pathway = workspace
             .domain
             .pathways
@@ -2031,6 +2049,7 @@ mod tests {
         .unwrap();
         let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
         assert!(!pathway.repeats);
+        assert!(!pathway.is_enabled);
         assert_eq!(pathway.segments.len(), 1);
         assert!(!pathway.segments.contains_key(&closure_id));
         let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
@@ -2529,6 +2548,16 @@ mod tests {
             assignment.previous_state = Some(PathwayAssignmentState::Moving);
             assignment.needs_attention_reason = Some("Existing diagnosis".into());
         }
+        {
+            let pathway = workspace
+                .domain
+                .pathways
+                .pathways
+                .get_mut(&pathway_id)
+                .unwrap();
+            pathway.is_enabled = false;
+            pathway.disabled_reason = Some("Pathway page is missing.".into());
+        }
 
         PathwayEditingService::set_repeats(
             &mut workspace,
@@ -2548,6 +2577,12 @@ mod tests {
             Some("Existing diagnosis")
         );
         assert_eq!(assignment.current_segment_id, None);
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert!(!pathway.is_enabled);
+        assert_eq!(
+            pathway.disabled_reason.as_deref(),
+            Some("Pathway page is missing.")
+        );
     }
 
     #[test]
