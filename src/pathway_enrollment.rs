@@ -628,22 +628,54 @@ impl PathwayEnrollmentService {
         context: PathwayEnrollmentContext,
     ) -> Result<PathwayDetachResult, PathwayEnrollmentError> {
         let mut draft = workspace.clone();
-        let assignment_ids = draft
+        let active_by_tile = draft
             .domain
             .pathways
             .assignments
             .values()
             .filter(|assignment| assignment.state != PathwayAssignmentState::Detached)
-            .filter_map(|assignment| {
-                let actual = find_tile_rect(&draft, assignment.tile_id);
+            .fold(
+                BTreeMap::<TileId, Vec<PathwayAssignmentId>>::new(),
+                |mut grouped, assignment| {
+                    grouped
+                        .entry(assignment.tile_id)
+                        .or_default()
+                        .push(assignment.id);
+                    grouped
+                },
+            );
+        let authorities = draft
+            .domain
+            .pathways
+            .authoritative_assignments_by_tile()
+            .into_iter()
+            .map(|(tile_id, assignment)| (tile_id, assignment.id))
+            .collect::<BTreeMap<_, _>>();
+        let assignment_ids = active_by_tile
+            .into_iter()
+            .flat_map(|(tile_id, assignment_ids)| {
+                let authority_id = authorities[&tile_id];
+                let authority = &draft.domain.pathways.assignments[&authority_id];
+                let actual = find_tile_rect(&draft, tile_id);
                 let moved = actual.is_none_or(|(actual_page_id, rect)| {
-                    let dx = f64::from(rect.x) - assignment.materialized_tile_point.x;
-                    let dy = f64::from(rect.y) - assignment.materialized_tile_point.y;
+                    let dx = f64::from(rect.x) - authority.materialized_tile_point.x;
+                    let dy = f64::from(rect.y) - authority.materialized_tile_point.y;
                     !valid_tile_rect(rect)
-                        || actual_page_id != assignment.page_id
+                        || actual_page_id != authority.page_id
                         || dx.hypot(dy) > EXTERNAL_MOVE_TOLERANCE
                 });
-                moved.then_some((assignment.id, actual))
+                // Concurrent enrollments can temporarily leave several live
+                // rows for one tile. Matching the deterministic projection
+                // authority proves there was no external move; a real move
+                // releases every row so an older loser cannot snap back.
+                moved
+                    .then_some(
+                        assignment_ids
+                            .into_iter()
+                            .map(move |assignment_id| (assignment_id, actual)),
+                    )
+                    .into_iter()
+                    .flatten()
             })
             .collect::<Vec<_>>();
         let mut result = PathwayDetachResult::default();
@@ -1133,6 +1165,11 @@ mod tests {
     use crate::{
         domain::{PathwayNode, PathwaySegment},
         model::{Tile, TileContent},
+        pathway_reconciliation::{
+            PathwayReconcileCause, PathwayReconcileContext, PathwayReconcileService,
+            materialize_absorbed_assignments,
+        },
+        persistence::{PathwaySaveFeedback, absorb_pathway_save_feedback},
     };
 
     fn id(value: u128) -> Uuid {
@@ -1474,6 +1511,405 @@ mod tests {
                 .any(|event| {
                     event.kind == PathwayEventKind::WaitStarted
                         && event.payload.assignment_id == Some(result.assignment_ids[0])
+                })
+        );
+    }
+
+    #[test]
+    fn absorbed_enrollment_materializes_before_an_unrelated_external_check() {
+        let fixture = fixture(true);
+        let mut process_a = fixture.workspace.clone();
+        let mut process_b = fixture.workspace;
+        let submitted = process_b.domain.pathways.clone();
+        let target = PathwayDockGeometry::prepare(&process_a, fixture.page_id)
+            .target(PathwayPoint::new(100.0, 200.0), 1.0, None)
+            .unwrap();
+        let review = PathwayEnrollmentService::review(
+            &process_a,
+            target,
+            BTreeSet::from([fixture.first_tile]),
+        )
+        .unwrap();
+        let enrolled = PathwayEnrollmentService::enroll(
+            &mut process_a,
+            &review,
+            PathwayEnrollmentChoice::AtBeginning,
+            PathwayEnrollmentContext::with_operation_id("process A", UnixMicros(200), id(90))
+                .unwrap(),
+        )
+        .unwrap();
+        let assignment_id = enrolled.assignment_ids[0];
+        let feedback = PathwaySaveFeedback {
+            submitted,
+            merged: process_a.domain.pathways.clone(),
+        };
+
+        let absorption =
+            absorb_pathway_save_feedback(&mut process_b.domain.pathways, &feedback).unwrap();
+        assert!(absorption.changed);
+        assert_eq!(
+            absorption.changed_assignment_ids,
+            BTreeSet::from([assignment_id])
+        );
+        let absorbed_point =
+            process_b.domain.pathways.assignments[&assignment_id].materialized_tile_point;
+        let stale_rect = process_b
+            .page(fixture.page_id)
+            .unwrap()
+            .tile(fixture.first_tile)
+            .unwrap()
+            .rect;
+        assert!(
+            (f64::from(stale_rect.x) - absorbed_point.x)
+                .hypot(f64::from(stale_rect.y) - absorbed_point.y)
+                > EXTERNAL_MOVE_TOLERANCE,
+            "process B must begin with the stale page geometry that caused the regression"
+        );
+
+        let absorbed_store = process_b.domain.pathways.clone();
+        assert!(materialize_absorbed_assignments(
+            &mut process_b,
+            &absorption.changed_assignment_ids,
+        ));
+        assert_eq!(
+            process_b.domain.pathways, absorbed_store,
+            "feedback materialization must not mutate semantic state or audit history"
+        );
+        let materialized_rect = process_b
+            .page(fixture.page_id)
+            .unwrap()
+            .tile(fixture.first_tile)
+            .unwrap()
+            .rect;
+        assert_eq!(
+            materialized_rect.x.to_bits(),
+            (absorbed_point.x as f32).to_bits()
+        );
+        assert_eq!(
+            materialized_rect.y.to_bits(),
+            (absorbed_point.y as f32).to_bits()
+        );
+
+        // A later unrelated canvas edit arms the real external-movement check.
+        // The absorbed rider must not be blamed for B's formerly stale rect.
+        process_b
+            .page_mut(fixture.page_id)
+            .unwrap()
+            .tile_mut(fixture.second_tile)
+            .unwrap()
+            .rect
+            .x += 17.0;
+        let unrelated_x = process_b
+            .page(fixture.page_id)
+            .unwrap()
+            .tile(fixture.second_tile)
+            .unwrap()
+            .rect
+            .x;
+        let reconcile = PathwayReconcileContext::with_operation_id(
+            "process B",
+            UnixMicros(200),
+            PathwayReconcileCause::Live,
+            id(91),
+        )
+        .unwrap()
+        .with_external_movement_check(true);
+        let report = PathwayReconcileService::reconcile(&mut process_b, reconcile).unwrap();
+
+        assert_eq!(report.detached_count, 0);
+        assert_ne!(
+            process_b.domain.pathways.assignments[&assignment_id].state,
+            PathwayAssignmentState::Detached
+        );
+        assert!(process_b.domain.pathways.events().iter().all(|event| {
+            event.kind != PathwayEventKind::Detached
+                || event.payload.assignment_id != Some(assignment_id)
+        }));
+        let final_rect = process_b
+            .page(fixture.page_id)
+            .unwrap()
+            .tile(fixture.first_tile)
+            .unwrap()
+            .rect;
+        assert_eq!(final_rect.x.to_bits(), (absorbed_point.x as f32).to_bits());
+        assert_eq!(final_rect.y.to_bits(), (absorbed_point.y as f32).to_bits());
+        assert_eq!(
+            process_b
+                .page(fixture.page_id)
+                .unwrap()
+                .tile(fixture.second_tile)
+                .unwrap()
+                .rect
+                .x,
+            unrelated_x
+        );
+    }
+
+    #[test]
+    fn concurrent_enrollments_share_one_authority_and_only_real_moves_detach() {
+        let mut fixture = fixture(true);
+        let second_pathway_id = id(100);
+        let second_start_id = id(101);
+        let second_end_id = id(102);
+        let second_segment_id = id(103);
+        let mut second_pathway = Pathway::new(
+            second_pathway_id,
+            fixture.page_id,
+            "Parallel",
+            "#FF453A",
+            UnixMicros(100),
+        )
+        .unwrap();
+        second_pathway.is_enabled = true;
+        second_pathway.nodes.insert(
+            second_start_id,
+            PathwayNode::new(
+                second_start_id,
+                PathwayPoint::new(100.0, 600.0),
+                0.0,
+                "Start",
+                PathwayNodeKind::Destination,
+                0.0,
+                UnixMicros(100),
+            )
+            .unwrap(),
+        );
+        second_pathway.nodes.insert(
+            second_end_id,
+            PathwayNode::new(
+                second_end_id,
+                PathwayPoint::new(1_100.0, 600.0),
+                1.0,
+                "Finish",
+                PathwayNodeKind::Destination,
+                0.0,
+                UnixMicros(100),
+            )
+            .unwrap(),
+        );
+        second_pathway.segments.insert(
+            second_segment_id,
+            PathwaySegment::new(
+                second_segment_id,
+                second_start_id,
+                second_end_id,
+                0.0,
+                100.0,
+                UnixMicros(100),
+            )
+            .unwrap(),
+        );
+        fixture
+            .workspace
+            .domain
+            .pathways
+            .insert_pathway(second_pathway)
+            .unwrap();
+        fixture
+            .workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&fixture.pathway_id)
+            .unwrap()
+            .nodes
+            .get_mut(&fixture.start_id)
+            .unwrap()
+            .wait_duration_seconds = 0.0;
+        let base = fixture.workspace.domain.pathways.clone();
+        let mut process_a = fixture.workspace.clone();
+        let mut process_b = fixture.workspace;
+
+        let enroll = |workspace: &mut Workspace,
+                      point: PathwayPoint,
+                      operation_id: Uuid,
+                      actor: &str| {
+            let target = PathwayDockGeometry::prepare(workspace, fixture.page_id)
+                .target(point, 1.0, None)
+                .unwrap();
+            let review = PathwayEnrollmentService::review(
+                workspace,
+                target,
+                BTreeSet::from([fixture.first_tile]),
+            )
+            .unwrap();
+            PathwayEnrollmentService::enroll(
+                workspace,
+                &review,
+                PathwayEnrollmentChoice::AtBeginning,
+                PathwayEnrollmentContext::with_operation_id(actor, UnixMicros(200), operation_id)
+                    .unwrap(),
+            )
+            .unwrap()
+            .assignment_ids[0]
+        };
+        let assignment_a = enroll(
+            &mut process_a,
+            PathwayPoint::new(100.0, 200.0),
+            id(110),
+            "process A",
+        );
+        let assignment_b = enroll(
+            &mut process_b,
+            PathwayPoint::new(100.0, 600.0),
+            id(111),
+            "process B",
+        );
+        let submitted_a = process_a.domain.pathways.clone();
+        let submitted_b = process_b.domain.pathways.clone();
+        let merged_ab =
+            crate::domain::PathwayStore::merge_persisted(&base, &submitted_a, &submitted_b)
+                .unwrap();
+        let merged_ba =
+            crate::domain::PathwayStore::merge_persisted(&base, &submitted_b, &submitted_a)
+                .unwrap();
+        assert_eq!(merged_ab.pathways, merged_ba.pathways);
+        assert_eq!(merged_ab.assignments, merged_ba.assignments);
+        let authority_ab = merged_ab.authoritative_assignments_by_tile()[&fixture.first_tile].id;
+        let authority_ba = merged_ba.authoritative_assignments_by_tile()[&fixture.first_tile].id;
+        assert_eq!(
+            authority_ab, authority_ba,
+            "writer order cannot choose authority"
+        );
+        assert_eq!(
+            authority_ab,
+            assignment_a.max(assignment_b),
+            "equal clocks use canonical assignment UUID order"
+        );
+
+        let absorption_a = absorb_pathway_save_feedback(
+            &mut process_a.domain.pathways,
+            &PathwaySaveFeedback {
+                submitted: submitted_a,
+                merged: merged_ab.clone(),
+            },
+        )
+        .unwrap();
+        let absorption_b = absorb_pathway_save_feedback(
+            &mut process_b.domain.pathways,
+            &PathwaySaveFeedback {
+                submitted: submitted_b,
+                merged: merged_ba,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            BTreeSet::from([assignment_a, assignment_b]),
+            process_a
+                .domain
+                .pathways
+                .assignments
+                .keys()
+                .copied()
+                .collect()
+        );
+
+        let (winning_process, winning_absorption) = if authority_ab == assignment_a {
+            (&mut process_a, &absorption_a)
+        } else {
+            (&mut process_b, &absorption_b)
+        };
+        winning_process
+            .page_mut(fixture.page_id)
+            .unwrap()
+            .tile_mut(fixture.first_tile)
+            .unwrap()
+            .rect
+            .x += 1.0;
+        let pending_move_x = winning_process
+            .page(fixture.page_id)
+            .unwrap()
+            .tile(fixture.first_tile)
+            .unwrap()
+            .rect
+            .x;
+        assert!(
+            !winning_absorption
+                .changed_assignment_ids
+                .contains(&authority_ab),
+            "the process that already owned the winner learns only the losing row"
+        );
+        assert!(!materialize_absorbed_assignments(
+            winning_process,
+            &winning_absorption.changed_assignment_ids,
+        ));
+        assert_eq!(
+            winning_process
+                .page(fixture.page_id)
+                .unwrap()
+                .tile(fixture.first_tile)
+                .unwrap()
+                .rect
+                .x,
+            pending_move_x,
+            "feedback about a losing row cannot conceal a pending local move"
+        );
+        winning_process
+            .page_mut(fixture.page_id)
+            .unwrap()
+            .tile_mut(fixture.first_tile)
+            .unwrap()
+            .rect
+            .x -= 1.0;
+
+        materialize_absorbed_assignments(&mut process_a, &absorption_a.changed_assignment_ids);
+        materialize_absorbed_assignments(&mut process_b, &absorption_b.changed_assignment_ids);
+        let authority = process_a
+            .domain
+            .pathways
+            .authoritative_assignments_by_tile()[&fixture.first_tile];
+        let authority_point = authority.materialized_tile_point;
+        for process in [&process_a, &process_b] {
+            let rect = process
+                .page(fixture.page_id)
+                .unwrap()
+                .tile(fixture.first_tile)
+                .unwrap()
+                .rect;
+            assert_eq!(rect.x.to_bits(), (authority_point.x as f32).to_bits());
+            assert_eq!(rect.y.to_bits(), (authority_point.y as f32).to_bits());
+        }
+
+        for (index, process) in [&mut process_a, &mut process_b].into_iter().enumerate() {
+            let checked = PathwayEnrollmentService::detach_externally_moved(
+                process,
+                PathwayEnrollmentContext::with_operation_id(
+                    "external check",
+                    UnixMicros(300),
+                    id(120 + index as u128),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(checked.assignment_ids, Vec::<Uuid>::new());
+        }
+
+        process_b
+            .page_mut(fixture.page_id)
+            .unwrap()
+            .tile_mut(fixture.first_tile)
+            .unwrap()
+            .rect
+            .x += 1.0;
+        let detached = PathwayEnrollmentService::detach_externally_moved(
+            &mut process_b,
+            PathwayEnrollmentContext::with_operation_id("external check", UnixMicros(400), id(122))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            detached.assignment_ids.into_iter().collect::<BTreeSet<_>>(),
+            BTreeSet::from([assignment_a, assignment_b])
+        );
+        assert!(
+            process_b
+                .domain
+                .pathways
+                .assignments
+                .values()
+                .all(|assignment| {
+                    assignment.tile_id != fixture.first_tile
+                        || assignment.state == PathwayAssignmentState::Detached
                 })
         );
     }

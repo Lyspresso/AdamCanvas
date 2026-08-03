@@ -10,9 +10,9 @@
 use crate::{
     domain::{
         CanvasObject, DomainError, DomainState, DomainTileType, InitialMembership,
-        MembershipObservation, PageId, PathwayAssignment, PathwayAssignmentState, PileId,
-        RuleEffect, RuleState, TagClaim, TagId, TagName, TagSource, TagStore, TileId, UnixMicros,
-        UnixMillis, evaluate_membership_progress, observe_override, resolve_pile_memberships,
+        MembershipObservation, PageId, PileId, RuleEffect, RuleState, TagClaim, TagId, TagName,
+        TagSource, TagStore, TileId, UnixMicros, UnixMillis, evaluate_membership_progress,
+        observe_override, resolve_pile_memberships,
     },
     model::{Tile, TileKind, Workspace, WorldRect},
     pathway_projection,
@@ -193,24 +193,10 @@ pub fn canvas_objects_from_workspace<F>(
 where
     F: Fn(&Tile) -> Option<DomainTileType>,
 {
-    let mut assignment_by_tile = BTreeMap::<TileId, &PathwayAssignment>::new();
-    for assignment in workspace
+    let assignment_by_tile = workspace
         .domain
         .pathways
-        .assignments
-        .values()
-        .filter(|assignment| assignment.state != PathwayAssignmentState::Detached)
-    {
-        let replace = assignment_by_tile
-            .get(&assignment.tile_id)
-            .is_none_or(|current| {
-                (assignment.last_reconciled_at, assignment.id)
-                    > (current.last_reconciled_at, current.id)
-            });
-        if replace {
-            assignment_by_tile.insert(assignment.tile_id, assignment);
-        }
-    }
+        .authoritative_assignments_by_tile();
 
     let mut snapshot = CanvasGeometrySnapshot::default();
     for page in &workspace.pages {

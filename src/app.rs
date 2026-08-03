@@ -56,7 +56,7 @@ use crate::{
     pathway_enrollment::{PathwayEnrollmentContext, PathwayEnrollmentService},
     pathway_reconciliation::{
         PathwayProblem, PathwayProblemKind, PathwayReconcileCause, PathwayReconcileContext,
-        PathwayReconcileReport, PathwayReconcileService,
+        PathwayReconcileReport, PathwayReconcileService, materialize_absorbed_assignments,
     },
     persistence::{
         AppPaths, SaveOutcome, SaveWorker, absorb_pathway_save_feedback, backup_unreadable_library,
@@ -2031,18 +2031,30 @@ impl AdamApp {
                         &mut self.workspace.domain.pathways,
                         &pathway_feedback,
                     ) {
-                        Ok(changed) => {
+                        Ok(absorption) => {
                             self.pathway_persistence_problem = None;
                             self.pathway_reconcile_report.problems.retain(|problem| {
                                 problem.kind != PathwayProblemKind::PersistenceFeedbackConflict
                             });
-                            if changed {
-                                // The receipt describes state that is already
-                                // durable. Wake projection/reconciliation once
-                                // without marking it dirty and feeding it back
-                                // to the save worker.
-                                self.spatial_dirty = true;
+                            if absorption.changed {
+                                // Pathway feedback has no page channel. Mirror
+                                // only assignments learned by this absorption
+                                // before any external-movement check can mistake
+                                // the stale local rect for a user drag.
+                                let layout_changed = materialize_absorbed_assignments(
+                                    &mut self.workspace,
+                                    &absorption.changed_assignment_ids,
+                                );
                                 self.pathway_reconcile_requested = true;
+                                if layout_changed {
+                                    // The semantic receipt is already durable,
+                                    // but this derived page repair is not. Save
+                                    // it without arming external detachment or
+                                    // feeding the reconciler back into itself.
+                                    self.changed_with_origin(true, CommitOrigin::PathwayReconciler);
+                                } else {
+                                    self.spatial_dirty = true;
+                                }
                                 context.request_repaint();
                             }
                         }

@@ -1219,6 +1219,7 @@ fn apply_transition(
                             [&transition.assignment_id]
                             .current_segment_id,
                         pile_id: Some(action.pile_id),
+                        containment_mode: Some(action.mode),
                         explanation: format!(
                             "The projected route crossed this pile's {} {} boundary.",
                             containment_description(action.mode),
@@ -1724,6 +1725,68 @@ fn materialize_assignment(
             .and_then(|page| page.tile(tile_id))
             .expect("materialized tile remains")
             .rect)
+}
+
+/// Mirrors only newly absorbed assignment origins into the canvas model.
+///
+/// Cross-process pathway feedback has semantic state but no page channel. A
+/// remote materialization therefore has to repair the local tile origin before
+/// the next external-movement check, or the stale rect would be mistaken for a
+/// human move and detach the rider. The stored top-left is authoritative here:
+/// this pass never recomputes route geometry or mutates PathwayStore state.
+pub(crate) fn materialize_absorbed_assignments(
+    workspace: &mut Workspace,
+    assignment_ids: &BTreeSet<PathwayAssignmentId>,
+) -> bool {
+    let placements = workspace
+        .domain
+        .pathways
+        .authoritative_assignments_by_tile()
+        .into_values()
+        .filter_map(|assignment| {
+            // A changed losing row is not authority for the tile and must not
+            // snap a locally moved winner back before the movement detector
+            // sees it. A newly learned winner, including a concurrent
+            // enrollment winner, is the only safe feedback materialization.
+            if !assignment_ids.contains(&assignment.id)
+                || !assignment.materialized_tile_point.is_finite()
+                || !workspace
+                    .domain
+                    .pathways
+                    .pathways
+                    .get(&assignment.pathway_id)
+                    .is_some_and(|pathway| pathway.page_id == assignment.page_id)
+            {
+                return None;
+            }
+            let x = finite_f32(assignment.materialized_tile_point.x)?;
+            let y = finite_f32(assignment.materialized_tile_point.y)?;
+            Some((assignment.page_id, assignment.tile_id, x, y))
+        })
+        .collect::<Vec<_>>();
+
+    let mut changed = false;
+    for (page_id, tile_id, x, y) in placements {
+        let Some(tile) = workspace
+            .page_mut(page_id)
+            .and_then(|page| page.tile_mut(tile_id))
+        else {
+            continue;
+        };
+        if tile.kind() == TileKind::Pile
+            || !tile.rect.is_finite()
+            || tile.rect.w <= 0.0
+            || tile.rect.h <= 0.0
+        {
+            continue;
+        }
+        if tile.rect.x.to_bits() != x.to_bits() || tile.rect.y.to_bits() != y.to_bits() {
+            tile.rect.x = x;
+            tile.rect.y = y;
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn finite_f32(value: f64) -> Option<f32> {
@@ -3083,6 +3146,10 @@ mod tests {
             .unwrap();
         assert_eq!(event.at, UnixMicros(35_000_000));
         assert_eq!(event.payload.pile_id, Some(pile_id));
+        assert_eq!(
+            event.payload.containment_mode,
+            Some(ContainmentMode::AnyOverlap)
+        );
         assert!(
             fixture.workspace.domain.tags.assignments[&fixture.tile_id]
                 .values()

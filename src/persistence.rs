@@ -1497,6 +1497,16 @@ pub struct PathwaySaveFeedback {
     pub merged: PathwayStore,
 }
 
+#[must_use]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PathwayFeedbackAbsorption {
+    pub changed: bool,
+    /// Assignments whose effective value changed in the three-way result.
+    /// The app materializes only these rows, so unrelated feedback cannot
+    /// conceal a real local move by snapping an unchanged rider back.
+    pub changed_assignment_ids: BTreeSet<Uuid>,
+}
+
 /// Absorbs the pathways learned by a successful save without discarding
 /// pathway transitions that happened locally after the submitted snapshot.
 ///
@@ -1505,13 +1515,23 @@ pub struct PathwaySaveFeedback {
 pub(crate) fn absorb_pathway_save_feedback(
     live: &mut PathwayStore,
     feedback: &PathwaySaveFeedback,
-) -> Result<bool, PathwayMergeError> {
+) -> Result<PathwayFeedbackAbsorption, PathwayMergeError> {
     let absorbed = PathwayStore::merge_persisted(&feedback.submitted, live, &feedback.merged)?;
     if *live == absorbed {
-        return Ok(false);
+        return Ok(PathwayFeedbackAbsorption::default());
     }
+    let changed_assignment_ids = absorbed
+        .assignments
+        .iter()
+        .filter_map(|(assignment_id, assignment)| {
+            (live.assignments.get(assignment_id) != Some(assignment)).then_some(*assignment_id)
+        })
+        .collect();
     *live = absorbed;
-    Ok(true)
+    Ok(PathwayFeedbackAbsorption {
+        changed: true,
+        changed_assignment_ids,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2553,7 +2573,11 @@ mod tests {
         );
 
         let mut live = workspace.domain.pathways.clone();
-        assert!(absorb_pathway_save_feedback(&mut live, &pathway_feedback).unwrap());
+        assert!(
+            absorb_pathway_save_feedback(&mut live, &pathway_feedback)
+                .unwrap()
+                .changed
+        );
         assert_eq!(live, pathway_feedback.merged);
     }
 
@@ -3941,14 +3965,35 @@ mod tests {
         };
         let mut live = submitted.clone();
 
-        assert!(!absorb_pathway_save_feedback(&mut live, &feedback).unwrap());
+        assert!(
+            !absorb_pathway_save_feedback(&mut live, &feedback)
+                .unwrap()
+                .changed
+        );
         assert_eq!(live, submitted);
     }
 
     #[test]
     fn pathway_save_feedback_retains_post_submit_local_and_remote_events() {
         let pathway_id = Uuid::from_u128(79_200);
-        let submitted = workspace_with_pathway(pathway_id).domain.pathways;
+        let workspace = workspace_with_pathway(pathway_id);
+        let mut submitted = workspace.domain.pathways;
+        submitted
+            .insert_assignment(
+                PathwayAssignment::new(
+                    Uuid::from_u128(79_210),
+                    pathway_id,
+                    Uuid::from_u128(79_211),
+                    workspace.active_page,
+                    PathwayAssignmentState::Paused,
+                    PathwayPoint::ZERO,
+                    PathwayPoint::ZERO,
+                    PathwayPoint::ZERO,
+                    UnixMicros(1_000_002),
+                )
+                .unwrap(),
+            )
+            .unwrap();
         let mut live = submitted.clone();
         live.append_event(pathway_event(79_201, pathway_id, "post-submit local"))
             .unwrap();
@@ -3958,7 +4003,12 @@ mod tests {
             .unwrap();
         let feedback = PathwaySaveFeedback { submitted, merged };
 
-        assert!(absorb_pathway_save_feedback(&mut live, &feedback).unwrap());
+        let absorption = absorb_pathway_save_feedback(&mut live, &feedback).unwrap();
+        assert!(absorption.changed);
+        assert!(
+            absorption.changed_assignment_ids.is_empty(),
+            "event-only feedback must not snap an unchanged rider back"
+        );
         assert_eq!(
             live.events()
                 .iter()
