@@ -275,6 +275,17 @@ enum HistoryEntry {
         /// [`apply_pathway_stop_add`].
         leg_speed: Option<f64>,
     },
+    /// Undo re-inserts the removed stop (fresh id, rewritten across the
+    /// stacks) with both adjacent leg speeds restored; redo removes it again.
+    StopRemove {
+        pathway_id: PathwayId,
+        /// The stop it followed in travel order; `None` when it was first.
+        after_node_id: Option<PathwayNodeId>,
+        node_id: PathwayNodeId,
+        draft: PathwayNodeDraft,
+        incoming_speed: Option<f64>,
+        outgoing_speed: Option<f64>,
+    },
 }
 
 #[derive(Default)]
@@ -328,8 +339,8 @@ impl History {
         self.redo.clear();
     }
 
-    /// After a redo re-creates a stop under a fresh id, every entry still on
-    /// either stack that captured the old id must follow it, or later
+    /// After a replay re-creates a stop under a fresh id, every entry still
+    /// on either stack that captured the old id must follow it, or later
     /// replays would target a stop that no longer exists.
     fn rewrite_node_id(&mut self, old: PathwayNodeId, new: PathwayNodeId) {
         for entry in self.undo.iter_mut().chain(self.redo.iter_mut()) {
@@ -354,8 +365,26 @@ impl History {
                         *node_id = new;
                     }
                 }
+                HistoryEntry::StopRemove {
+                    after_node_id,
+                    node_id,
+                    ..
+                } => {
+                    if *after_node_id == Some(old) {
+                        *after_node_id = Some(new);
+                    }
+                    if *node_id == old {
+                        *node_id = new;
+                    }
+                }
             }
         }
+    }
+
+    fn record_stop_remove(&mut self, entry: HistoryEntry) {
+        debug_assert!(matches!(entry, HistoryEntry::StopRemove { .. }));
+        self.push_undo(entry);
+        self.redo.clear();
     }
 
     fn push_undo(&mut self, entry: HistoryEntry) {
@@ -451,6 +480,7 @@ enum PathwaySettingsCommit {
     /// Appends a stop at the end of the route; the wait comes from the
     /// panel's default-wait buffer.
     AddStop(f64),
+    RemoveStop(PathwayNodeId),
     /// Sets every stop's wait to one value (waypoints stay at zero).
     SetAllWaits(f64),
     Delete,
@@ -635,9 +665,10 @@ fn apply_pathway_rail_drag(
 fn apply_pathway_stop_add(
     workspace: &mut Workspace,
     pathway_id: PathwayId,
-    after_node_id: PathwayNodeId,
+    after_node_id: Option<PathwayNodeId>,
     draft: PathwayNodeDraft,
     leg_speed: Option<f64>,
+    outgoing_speed: Option<f64>,
     now: UnixMicros,
     operation_id: Uuid,
 ) -> Result<PathwayNodeId, String> {
@@ -648,12 +679,30 @@ fn apply_pathway_stop_add(
         let node_id = PathwayEditingService::create_node(
             &mut draft_workspace,
             pathway_id,
-            Some(after_node_id),
+            after_node_id,
             draft,
             edit,
         )
         .map_err(|error| error.to_string())?;
-        if let Some(speed) = leg_speed {
+        // Pin the incoming leg (after → new) and outgoing leg (new → next)
+        // speeds when the caller knows them: a fresh insert keeps the split
+        // leg's own pace, and a re-inserted stop must hand both its legs
+        // back their exact old speeds.
+        let outgoing_to = outgoing_speed.and_then(|_| {
+            draft_workspace
+                .domain
+                .pathways
+                .pathway(pathway_id)?
+                .segments
+                .values()
+                .find(|segment| segment.from_node_id == node_id)
+                .map(|segment| segment.to_node_id)
+        });
+        let pins = [
+            leg_speed.and_then(|speed| after_node_id.map(|after| ((after, node_id), speed))),
+            outgoing_speed.and_then(|speed| outgoing_to.map(|to| ((node_id, to), speed))),
+        ];
+        for ((from, to), speed) in pins.into_iter().flatten() {
             let segment_id = draft_workspace
                 .domain
                 .pathways
@@ -662,9 +711,7 @@ fn apply_pathway_stop_add(
                     pathway
                         .segments
                         .values()
-                        .find(|segment| {
-                            segment.from_node_id == after_node_id && segment.to_node_id == node_id
-                        })
+                        .find(|segment| segment.from_node_id == from && segment.to_node_id == to)
                         .map(|segment| segment.id)
                 });
             if let Some(segment_id) = segment_id {
@@ -1257,6 +1304,7 @@ enum CanvasMenuAction {
     ToggleSnap,
     PathwaySettings(Uuid),
     PathwayToggleRun(Uuid),
+    PathwayRemoveStop(Uuid, Uuid),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1601,7 +1649,7 @@ pub struct AdamApp {
     pathway_settings: Option<PathwaySettingsPanel>,
     /// The rail under the pointer when the canvas context menu opened, frozen
     /// at that click so the menu's pathway section cannot retarget mid-hover.
-    pathway_menu_target: Option<PathwayId>,
+    pathway_menu_target: Option<(PathwayId, Option<PathwayNodeId>)>,
     note_draft: Option<NoteDraft>,
     text_note_drop_target: Option<Uuid>,
     page_size_edit_active: bool,
@@ -4907,19 +4955,36 @@ impl AdamApp {
                                     f64::from(camera.zoom),
                                     None,
                                 )
-                                .map(|target| target.pathway_id)
+                                .map(|target| {
+                                    let node = match target.anchor {
+                                        PathwayDockAnchor::Node(node_id) => Some(node_id),
+                                        PathwayDockAnchor::Segment(_) => None,
+                                    };
+                                    (target.pathway_id, node)
+                                })
                         });
                 }
-                let menu_pathway = self.pathway_menu_target.and_then(|pathway_id| {
+                let menu_pathway = self.pathway_menu_target.and_then(|(pathway_id, node_id)| {
                     self.workspace
                         .domain
                         .pathways
                         .pathway(pathway_id)
-                        .map(|pathway| (pathway_id, pathway.title.clone(), pathway.is_enabled))
+                        .map(|pathway| {
+                            (
+                                pathway_id,
+                                pathway.title.clone(),
+                                pathway.is_enabled,
+                                // Only offer removal for a dot that still exists
+                                // on a route that can spare it.
+                                node_id
+                                    .filter(|node_id| pathway.nodes.contains_key(node_id))
+                                    .map(|node_id| (node_id, pathway.nodes.len() > 2)),
+                            )
+                        })
                 });
                 let mut canvas_action = None;
                 canvas_response.context_menu(|ui| {
-                    if let Some((pathway_id, title, is_enabled)) = &menu_pathway {
+                    if let Some((pathway_id, title, is_enabled, node)) = &menu_pathway {
                         ui.label(
                             RichText::new(title.as_str())
                                 .small()
@@ -4939,6 +5004,22 @@ impl AdamApp {
                         {
                             canvas_action = Some(CanvasMenuAction::PathwayToggleRun(*pathway_id));
                             ui.close();
+                        }
+                        if let Some((node_id, can_remove)) = node {
+                            let button =
+                                ui.add_enabled(*can_remove, Button::new("Remove This Stop"));
+                            let button = if *can_remove {
+                                button
+                            } else {
+                                button.on_disabled_hover_text("A pathway needs at least two stops")
+                            };
+                            if button.clicked() {
+                                canvas_action = Some(CanvasMenuAction::PathwayRemoveStop(
+                                    *pathway_id,
+                                    *node_id,
+                                ));
+                                ui.close();
+                            }
                         }
                         ui.separator();
                     }
@@ -5038,6 +5119,9 @@ impl AdamApp {
                     }
                     Some(CanvasMenuAction::PathwayToggleRun(pathway_id)) => {
                         self.toggle_pathway_running(pathway_id, &context);
+                    }
+                    Some(CanvasMenuAction::PathwayRemoveStop(pathway_id, node_id)) => {
+                        self.remove_pathway_stop(pathway_id, node_id, &context);
                     }
                     None => {}
                 }
@@ -6417,6 +6501,24 @@ impl AdamApp {
                                 commit = Some(PathwaySettingsCommit::NodeWait(node.id, *wait));
                             }
                         }
+
+                        let can_remove = ordered_nodes.len() > 2;
+                        let remove = ui.add_enabled(
+                            can_remove,
+                            Button::new(RichText::new("✕").color(if can_remove {
+                                colors.danger
+                            } else {
+                                colors.tertiary_text
+                            })),
+                        );
+                        let remove = if can_remove {
+                            remove.on_hover_text("Remove this stop")
+                        } else {
+                            remove.on_disabled_hover_text("A pathway needs at least two stops")
+                        };
+                        if remove.clicked() {
+                            commit = Some(PathwaySettingsCommit::RemoveStop(node.id));
+                        }
                     });
                 }
 
@@ -6551,8 +6653,12 @@ impl AdamApp {
     ) {
         let now = unix_now_micros();
         let operation_id = Uuid::new_v4();
-        // Adding a stop goes through the shared entry point so it lands in
-        // history exactly like a double-click on the rail does.
+        // Stop add/remove go through the shared entry points so they land in
+        // history exactly like the canvas gestures do.
+        if let PathwaySettingsCommit::RemoveStop(node_id) = commit {
+            self.remove_pathway_stop(pathway_id, node_id, context);
+            return;
+        }
         if let PathwaySettingsCommit::AddStop(wait) = commit {
             let Some(pathway) = self.workspace.domain.pathways.pathway(pathway_id) else {
                 return;
@@ -6632,7 +6738,7 @@ impl AdamApp {
             )
             .map(|_| true),
             // Intercepted above; kept for match completeness.
-            PathwaySettingsCommit::AddStop(_) => return,
+            PathwaySettingsCommit::AddStop(_) | PathwaySettingsCommit::RemoveStop(_) => return,
             PathwaySettingsCommit::SetAllWaits(wait) => apply_pathway_wait_for_all_stops(
                 &mut self.workspace,
                 pathway_id,
@@ -7634,9 +7740,10 @@ impl AdamApp {
         match apply_pathway_stop_add(
             &mut self.workspace,
             pathway_id,
-            after_node_id,
+            Some(after_node_id),
             draft.clone(),
             leg_speed,
+            None,
             unix_now_micros(),
             Uuid::new_v4(),
         ) {
@@ -7657,6 +7764,87 @@ impl AdamApp {
             Err(error) => {
                 log::warn!("could not add a pathway stop: {error}");
                 self.toast("A stop could not be added there", context);
+            }
+        }
+    }
+
+    /// Removes one stop through the service and records it so Cmd+Z puts it
+    /// back — position, name, kind, wait, and both adjacent leg speeds.
+    fn remove_pathway_stop(
+        &mut self,
+        pathway_id: PathwayId,
+        node_id: PathwayNodeId,
+        context: &Context,
+    ) {
+        // Capture what undo needs BEFORE the removal rebuilds the graph.
+        let Some(pathway) = self.workspace.domain.pathways.pathway(pathway_id) else {
+            return;
+        };
+        let Some(node) = pathway.nodes.get(&node_id) else {
+            return;
+        };
+        let draft = PathwayNodeDraft::new(
+            node.point,
+            node.title.clone(),
+            node.kind,
+            node.wait_duration_seconds,
+        );
+        let mut ordered: Vec<_> = pathway.nodes.values().collect();
+        ordered.sort_by(|left, right| {
+            left.sort_index
+                .total_cmp(&right.sort_index)
+                .then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
+        });
+        let index = ordered.iter().position(|candidate| candidate.id == node_id);
+        let after_node_id = index
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| ordered.get(index))
+            .map(|previous| previous.id);
+        let closure_id = closure_segment_id(pathway);
+        let leg_speed_between = |from: PathwayNodeId, to: PathwayNodeId| {
+            pathway
+                .segments
+                .values()
+                .find(|segment| {
+                    segment.from_node_id == from
+                        && segment.to_node_id == to
+                        && Some(segment.id) != closure_id
+                })
+                .map(|segment| segment.speed_points_per_second)
+        };
+        let incoming_speed = after_node_id.and_then(|after| leg_speed_between(after, node_id));
+        let outgoing_speed = index
+            .and_then(|index| ordered.get(index + 1))
+            .and_then(|next| leg_speed_between(node_id, next.id));
+
+        let parked_before = self.parked_rider_count(pathway_id);
+        match apply_pathway_stop_remove(
+            &mut self.workspace,
+            pathway_id,
+            node_id,
+            unix_now_micros(),
+            Uuid::new_v4(),
+        ) {
+            Ok(()) => {
+                self.history.record_stop_remove(HistoryEntry::StopRemove {
+                    pathway_id,
+                    after_node_id,
+                    node_id,
+                    draft,
+                    incoming_speed,
+                    outgoing_speed,
+                });
+                if self.parked_rider_count(pathway_id) > parked_before {
+                    self.toast(
+                        "Stop removed — a tile using it paused; drop it back on the rail to keep riding",
+                        context,
+                    );
+                }
+                self.changed(true);
+            }
+            Err(error) => {
+                log::warn!("could not remove the pathway stop: {error}");
+                self.toast("A pathway needs at least two stops", context);
             }
         }
     }
@@ -7764,9 +7952,10 @@ impl AdamApp {
                     match apply_pathway_stop_add(
                         &mut self.workspace,
                         pathway_id,
-                        after_node_id,
+                        Some(after_node_id),
                         draft.clone(),
                         leg_speed,
+                        None,
                         now,
                         Uuid::new_v4(),
                     ) {
@@ -7795,6 +7984,69 @@ impl AdamApp {
                         Err(error) => {
                             log::warn!("could not redo the added stop: {error}");
                             self.toast("That added stop can no longer be redone", context);
+                        }
+                    }
+                }
+            }
+            HistoryEntry::StopRemove {
+                pathway_id,
+                after_node_id,
+                node_id,
+                draft,
+                incoming_speed,
+                outgoing_speed,
+            } => {
+                let now = unix_now_micros();
+                if is_undo {
+                    match apply_pathway_stop_add(
+                        &mut self.workspace,
+                        pathway_id,
+                        after_node_id,
+                        draft.clone(),
+                        incoming_speed,
+                        outgoing_speed,
+                        now,
+                        Uuid::new_v4(),
+                    ) {
+                        Ok(new_node_id) => {
+                            self.history.rewrite_node_id(node_id, new_node_id);
+                            self.history.push_redo(HistoryEntry::StopRemove {
+                                pathway_id,
+                                after_node_id,
+                                node_id: new_node_id,
+                                draft,
+                                incoming_speed,
+                                outgoing_speed,
+                            });
+                            self.changed(true);
+                        }
+                        Err(error) => {
+                            log::warn!("could not undo the removed stop: {error}");
+                            self.toast("That removed stop can no longer be undone", context);
+                        }
+                    }
+                } else {
+                    match apply_pathway_stop_remove(
+                        &mut self.workspace,
+                        pathway_id,
+                        node_id,
+                        now,
+                        Uuid::new_v4(),
+                    ) {
+                        Ok(()) => {
+                            self.history.push_undo(HistoryEntry::StopRemove {
+                                pathway_id,
+                                after_node_id,
+                                node_id,
+                                draft,
+                                incoming_speed,
+                                outgoing_speed,
+                            });
+                            self.changed(true);
+                        }
+                        Err(error) => {
+                            log::warn!("could not redo the removed stop: {error}");
+                            self.toast("That removed stop can no longer be redone", context);
                         }
                     }
                 }
@@ -23941,9 +24193,10 @@ mod tests {
         let node_id = apply_pathway_stop_add(
             &mut workspace,
             pathway_id,
-            first_id,
+            Some(first_id),
             draft.clone(),
             Some(44.0),
+            None,
             crate::domain::UnixMicros(5_000_000),
             Uuid::from_u128(201),
         )
@@ -24022,9 +24275,10 @@ mod tests {
         let redone_id = apply_pathway_stop_add(
             &mut workspace,
             pathway_id,
-            first_id,
+            Some(first_id),
             draft,
             Some(44.0),
+            None,
             crate::domain::UnixMicros(7_000_000),
             Uuid::from_u128(203),
         )
@@ -24097,6 +24351,114 @@ mod tests {
         let (after, speed) = corrected_stop_insert(pathway, closure, mid).unwrap();
         assert_eq!(after, closure_segment.from_node_id);
         assert_eq!(speed, closure_segment.speed_points_per_second);
+    }
+
+    #[test]
+    fn removing_a_stop_and_undoing_restores_position_properties_and_both_leg_speeds() {
+        // Build Start → Middle → End with distinct leg speeds, then remove
+        // Middle and re-insert it the way undo would.
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let first_id = crate::pathway_projection::first_node(pathway).unwrap().id;
+        let middle_point = PathwayPoint::new(360.0, 420.0);
+        let middle_id = apply_pathway_stop_add(
+            &mut workspace,
+            pathway_id,
+            Some(first_id),
+            PathwayNodeDraft::new(middle_point, "Middle", PathwayNodeKind::Destination, 7.0),
+            Some(21.0),
+            None,
+            crate::domain::UnixMicros(5_000_000),
+            Uuid::from_u128(401),
+        )
+        .unwrap();
+        // Give the outgoing leg its own speed so the round-trip must restore
+        // two distinct values.
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let outgoing = pathway
+            .segments
+            .values()
+            .find(|segment| segment.from_node_id == middle_id)
+            .unwrap()
+            .id;
+        PathwayEditingService::set_segment_speed(
+            &mut workspace,
+            pathway_id,
+            outgoing,
+            63.0,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(5_100_000)).unwrap(),
+        )
+        .unwrap();
+
+        apply_pathway_stop_remove(
+            &mut workspace,
+            pathway_id,
+            middle_id,
+            crate::domain::UnixMicros(6_000_000),
+            Uuid::from_u128(402),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert_eq!(pathway.nodes.len(), 2);
+        assert!(!pathway.nodes.contains_key(&middle_id));
+
+        // Undo = re-insert with both adjacent speeds pinned.
+        let restored_id = apply_pathway_stop_add(
+            &mut workspace,
+            pathway_id,
+            Some(first_id),
+            PathwayNodeDraft::new(middle_point, "Middle", PathwayNodeKind::Destination, 7.0),
+            Some(21.0),
+            Some(63.0),
+            crate::domain::UnixMicros(7_000_000),
+            Uuid::from_u128(403),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert_eq!(pathway.nodes.len(), 3);
+        let restored = &pathway.nodes[&restored_id];
+        assert_eq!(restored.point, middle_point);
+        assert_eq!(restored.title, "Middle");
+        assert_eq!(restored.wait_duration_seconds, 7.0);
+        let incoming = pathway
+            .segments
+            .values()
+            .find(|segment| segment.from_node_id == first_id && segment.to_node_id == restored_id)
+            .unwrap();
+        assert_eq!(incoming.speed_points_per_second, 21.0);
+        let outgoing = pathway
+            .segments
+            .values()
+            .find(|segment| segment.from_node_id == restored_id)
+            .unwrap();
+        assert_eq!(outgoing.speed_points_per_second, 63.0);
+    }
+
+    #[test]
+    fn a_two_stop_route_refuses_to_lose_another_stop() {
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let first_id = crate::pathway_projection::first_node(pathway).unwrap().id;
+        let error = apply_pathway_stop_remove(
+            &mut workspace,
+            pathway_id,
+            first_id,
+            crate::domain::UnixMicros(5_000_000),
+            Uuid::from_u128(410),
+        )
+        .unwrap_err();
+        assert!(!error.is_empty());
+        assert_eq!(
+            workspace
+                .domain
+                .pathways
+                .pathway(pathway_id)
+                .unwrap()
+                .nodes
+                .len(),
+            2,
+            "the refusal must leave the route untouched"
+        );
     }
 
     #[test]
