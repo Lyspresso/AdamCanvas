@@ -2305,7 +2305,10 @@ fn mark_resume_invalid(
 mod tests {
     use super::*;
     use crate::{
-        domain::{PaletteColor, PathwaySegment, Pile, TagSource, UnixMillis},
+        domain::{
+            AutoTagRule, AutoTagSettings, PaletteColor, PathwaySegment, Pile, RuleState, TagSource,
+            UnixMillis,
+        },
         model::Tile,
     };
     use std::collections::BTreeMap;
@@ -2566,6 +2569,21 @@ mod tests {
     fn exact_boundary_uses_nudged_overlay_and_never_writes_the_pile_rect() {
         let mut fixture = fixture(100.0, 1.0, UnixMicros::ZERO);
         let pile_id = add_pile(&mut fixture, ContainmentMode::AnyOverlap, true);
+        fixture
+            .workspace
+            .domain
+            .piles
+            .get_mut(&pile_id)
+            .unwrap()
+            .auto_tag_rule = Some(
+            AutoTagRule::new(
+                id(42),
+                RuleState::On,
+                AutoTagSettings::default(),
+                UnixMillis::ZERO,
+            )
+            .unwrap(),
+        );
         let pile_bits = {
             let rect = fixture.workspace.domain.piles[&pile_id].rect;
             [
@@ -2596,6 +2614,11 @@ mod tests {
                     claim.source,
                     TagSource::PileInherited { pile_id: claimed } if claimed == pile_id
                 )))
+        );
+        assert_eq!(
+            fixture.workspace.domain.piles[&pile_id].progress[&fixture.tile_id].last_observed_at,
+            UnixMillis(35_000),
+            "MembershipProgress must observe the exact solved crossing instant at its millisecond seam"
         );
         let rect = fixture.workspace.domain.piles[&pile_id].rect;
         assert_eq!(
