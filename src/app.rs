@@ -39,10 +39,10 @@ use crate::{
         AiQueuedTurn, AiWorkspaceMode, ApplyMode, ApprovalEvidence, AuthorizationDecision,
         AutoTagRule, AutoTagSettings, ContainmentMode, DomainActor, EarnedTagRemovalPolicy,
         ExistingTilesPolicy, HostArtifactOrigin, InitialMembership, MessageRole, PaletteColor,
-        PermissionMode, Pile, PileHistoryKind, RuleEditProgressPolicy, RuleState, TagClaim,
-        TagName, TagSource, TimeUnit, TimingMode, TrashActor, TrashItem, UnixMicros, UnixMillis,
-        ai_permission_verdict, apply_rule_edit, authorize_ai_action, auto_tag_rule_sentence,
-        resolve_pile_memberships,
+        PathwayNodeKind, PathwayPoint, PermissionMode, Pile, PileHistoryKind,
+        RuleEditProgressPolicy, RuleState, TagClaim, TagName, TagSource, TimeUnit, TimingMode,
+        TrashActor, TrashItem, UnixMicros, UnixMillis, ai_permission_verdict, apply_rule_edit,
+        authorize_ai_action, auto_tag_rule_sentence, resolve_pile_memberships,
     },
     dots::{self, ChromeRects},
     file_watch::{self, FileWatch},
@@ -53,7 +53,11 @@ use crate::{
         TileKind, Workspace, WorldRect,
     },
     ocr::{OcrQueueError, PhotoOcrRequest, PhotoOcrWorker, source_fingerprint},
-    pathway_enrollment::{PathwayEnrollmentContext, PathwayEnrollmentService},
+    pathway_editing::{PathwayEditContext, PathwayEditingService},
+    pathway_enrollment::{
+        PathwayDockGeometry, PathwayEnrollmentChoice, PathwayEnrollmentContext,
+        PathwayEnrollmentReview, PathwayEnrollmentService, PathwayFinishBehavior,
+    },
     pathway_reconciliation::{
         PathwayProblem, PathwayProblemKind, PathwayReconcileCause, PathwayReconcileContext,
         PathwayReconcileReport, PathwayReconcileService, materialize_absorbed_assignments,
@@ -746,6 +750,7 @@ enum CanvasQuickTool {
     Website,
     Import,
     Text,
+    Pathway,
 }
 
 impl CanvasQuickTool {
@@ -756,6 +761,7 @@ impl CanvasQuickTool {
             Self::Website => "Website",
             Self::Import => "Import",
             Self::Text => "Text",
+            Self::Pathway => "Pathway",
         }
     }
 
@@ -766,6 +772,9 @@ impl CanvasQuickTool {
             Self::Website => "W",
             Self::Import => "I",
             Self::Text => "T",
+            // "P" already reads as Pile, so the rail tool uses a direction
+            // arrow. Source Sans 3 ships U+2192, so it never falls back.
+            Self::Pathway => "→",
         }
     }
 }
@@ -1064,6 +1073,10 @@ pub struct AdamApp {
     link_input: String,
     pending_website_anchor: Option<[f32; 2]>,
     armed_canvas_tool: Option<ArmedCanvasQuickTool>,
+    /// A reviewed but unconfirmed enrollment. Holding the review here is what
+    /// makes docking review-first: the service re-validates the route revision
+    /// and the cargo frames when the user picks, so a stale sheet cannot apply.
+    pathway_enrollment_review: Option<PathwayEnrollmentReview>,
     note_draft: Option<NoteDraft>,
     text_note_drop_target: Option<Uuid>,
     page_size_edit_active: bool,
@@ -1423,6 +1436,7 @@ impl AdamApp {
             link_input: String::new(),
             pending_website_anchor: None,
             armed_canvas_tool: None,
+            pathway_enrollment_review: None,
             note_draft: None,
             text_note_drop_target: None,
             page_size_edit_active: false,
@@ -4025,6 +4039,9 @@ impl AdamApp {
                 let page_id = self.workspace.active_page;
                 let page_size = self.workspace.active_page().size;
                 draw_canvas_background(&painter, view, page_size, camera, self.show_grid, colors);
+                // Rails sit between the page and its cargo: a tile riding one
+                // must read as being on top of the rail, never under it.
+                draw_pathways(&painter, &self.workspace, page_id, camera, view, colors);
 
                 // One wall-clock sample and one immutable geometry snapshot
                 // drive every canvas read in this frame. Projection remains
@@ -4296,6 +4313,7 @@ impl AdamApp {
                 self.draw_minimap(&painter, view, camera, colors, &projected_rects);
                 self.show_canvas_status(ui, view, colors);
                 self.show_drop_overlay(&context, &painter, view, colors);
+                self.show_pathway_enrollment_sheet(&context, colors);
 
                 let mut canvas_action = None;
                 canvas_response.context_menu(|ui| {
@@ -5215,6 +5233,7 @@ impl AdamApp {
                                 CanvasQuickTool::Website,
                                 CanvasQuickTool::Import,
                                 CanvasQuickTool::Text,
+                                CanvasQuickTool::Pathway,
                             ] {
                                 let state = armed.filter(|state| state.tool == tool);
                                 let active = state.is_some();
@@ -5256,6 +5275,9 @@ impl AdamApp {
                                             .to_owned()
                                     } else if tool == CanvasQuickTool::Text {
                                         "Text\nClick and type directly · drag finished text onto a sticky note · double-click the tool to lock"
+                                            .to_owned()
+                                    } else if tool == CanvasQuickTool::Pathway {
+                                        "Pathway\nClick empty canvas to lay a new rail · select tiles first, then click a rail to put them on it\nTiles ride on the clock, even while Adam is closed"
                                             .to_owned()
                                     } else {
                                         format!(
@@ -5313,7 +5335,7 @@ impl AdamApp {
                                 .on_hover_text("Clear the active canvas tool")
                                 .clicked();
 
-                            for _ in 0..3 {
+                            for _ in 0..2 {
                                 ui.add_enabled(
                                     false,
                                     Button::new(RichText::new("").color(colors.tertiary_text))
@@ -5455,11 +5477,247 @@ impl AdamApp {
             CanvasQuickTool::Text => {
                 self.add_free_text_at(context, world, true);
             }
+            CanvasQuickTool::Pathway => {
+                self.place_or_join_pathway_at(context, world, camera.zoom);
+            }
         }
         if !armed.locked {
             self.armed_canvas_tool = None;
         }
         true
+    }
+
+    /// Lays a new rail, or offers the current selection a ride on the rail
+    /// under the pointer.
+    ///
+    /// Docking wins whenever the pointer is on an existing rail, so a
+    /// deliberate join can never silently stack a second route on top of the
+    /// first. Joining is review-first: this only prepares the choice.
+    fn place_or_join_pathway_at(&mut self, context: &Context, world: [f32; 2], magnification: f32) {
+        let page_id = self.workspace.active_page;
+        let pointer = PathwayPoint::new(f64::from(world[0]), f64::from(world[1]));
+        let dock = PathwayDockGeometry::prepare(&self.workspace, page_id).target(
+            pointer,
+            f64::from(magnification),
+            None,
+        );
+
+        if let Some(target) = dock {
+            let cargo = self
+                .selection
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.workspace
+                        .active_page()
+                        .tile(*id)
+                        .is_some_and(|tile| tile.kind() != TileKind::Pile)
+                })
+                .collect::<BTreeSet<_>>();
+            if cargo.is_empty() {
+                self.toast(
+                    "Select tiles first, then click a rail to put them on it",
+                    context,
+                );
+                return;
+            }
+            match PathwayEnrollmentService::review(&self.workspace, target, cargo) {
+                Ok(review) => self.pathway_enrollment_review = Some(review),
+                Err(error) => {
+                    log::warn!("pathway enrollment review refused: {error}");
+                    self.toast("Those tiles cannot ride this pathway", context);
+                }
+            }
+            return;
+        }
+
+        let Ok(edit_context) = PathwayEditContext::new("Adam canvas", unix_now_micros()) else {
+            return;
+        };
+        self.checkpoint();
+        match PathwayEditingService::create_pathway(
+            &mut self.workspace,
+            page_id,
+            pointer,
+            edit_context,
+        ) {
+            Ok(_) => {
+                self.changed(true);
+                self.toast("Pathway added — select tiles, then click the rail", context);
+            }
+            Err(error) => {
+                log::warn!("could not create a pathway: {error}");
+                self.toast("Could not add a pathway here", context);
+            }
+        }
+    }
+
+    /// Confirms a reviewed enrollment.
+    ///
+    /// The two choices are the product contract: join the route where the
+    /// pointer landed, or start it from the first stop. Confirming re-checks
+    /// the route revision and the cargo frames inside the service, so a sheet
+    /// left open while the canvas changed underneath refuses rather than
+    /// applying to stale geometry.
+    fn show_pathway_enrollment_sheet(&mut self, context: &Context, colors: Theme) {
+        let Some(review) = self.pathway_enrollment_review.clone() else {
+            return;
+        };
+        let mut chosen = None;
+        let mut cancelled = context.input(|input| input.key_pressed(Key::Escape));
+
+        egui::Window::new("Put tiles on this pathway")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(context, |ui| {
+                ui.set_max_width(360.0);
+                let tiles = review.tile_ids.len();
+                ui.label(
+                    RichText::new(format!(
+                        "{tiles} {} will ride “{}”",
+                        if tiles == 1 { "tile" } else { "tiles" },
+                        review.target.pathway_title,
+                    ))
+                    .size(15.0)
+                    .color(colors.text),
+                );
+                ui.add_space(6.0);
+
+                let behavior = &review.behavior;
+                let line = |ui: &mut Ui, text: String| {
+                    ui.label(RichText::new(text).size(13.0).color(colors.secondary_text));
+                };
+                if let Some((slowest, fastest)) = behavior.speed_range {
+                    line(
+                        ui,
+                        if (fastest - slowest).abs() < 0.5 {
+                            format!("Travels at {slowest:.0} points per second")
+                        } else {
+                            format!("Travels at {slowest:.0}–{fastest:.0} points per second")
+                        },
+                    );
+                }
+                if behavior.timed_stop_count > 0 {
+                    line(
+                        ui,
+                        format!(
+                            "Waits at {} {} for {:.0}s in total",
+                            behavior.timed_stop_count,
+                            if behavior.timed_stop_count == 1 {
+                                "stop"
+                            } else {
+                                "stops"
+                            },
+                            behavior.total_wait_seconds,
+                        ),
+                    );
+                }
+                if behavior.approval_gate_count > 0 {
+                    line(
+                        ui,
+                        format!(
+                            "Holds at {} approval {} until you say go",
+                            behavior.approval_gate_count,
+                            if behavior.approval_gate_count == 1 {
+                                "gate"
+                            } else {
+                                "gates"
+                            },
+                        ),
+                    );
+                }
+                line(
+                    ui,
+                    match &behavior.finish {
+                        PathwayFinishBehavior::Repeats => "Loops around and keeps going".to_owned(),
+                        PathwayFinishBehavior::StopsAt { title, .. } => {
+                            format!("Comes to rest at {title}")
+                        }
+                        PathwayFinishBehavior::Unconfigured => {
+                            "Has no finish configured yet".to_owned()
+                        }
+                    },
+                );
+                if !behavior.starts_immediately {
+                    ui.add_space(4.0);
+                    line(
+                        ui,
+                        "This pathway is paused — the tiles will wait on it until you resume."
+                            .to_owned(),
+                    );
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let spot_is_default =
+                        review.default_choice == PathwayEnrollmentChoice::AtThisSpot;
+                    if ui
+                        .add(
+                            Button::new(RichText::new("At This Spot").color(colors.text))
+                                .min_size(vec2(120.0, 30.0))
+                                .fill(if spot_is_default {
+                                    colors.selection_fill
+                                } else {
+                                    colors.tile
+                                }),
+                        )
+                        .on_hover_text("Join the pathway where you clicked")
+                        .clicked()
+                    {
+                        chosen = Some(PathwayEnrollmentChoice::AtThisSpot);
+                    }
+                    if ui
+                        .add(
+                            Button::new(RichText::new("At the Beginning").color(colors.text))
+                                .min_size(vec2(140.0, 30.0))
+                                .fill(if spot_is_default {
+                                    colors.tile
+                                } else {
+                                    colors.selection_fill
+                                }),
+                        )
+                        .on_hover_text("Start from the pathway's first stop")
+                        .clicked()
+                    {
+                        chosen = Some(PathwayEnrollmentChoice::AtBeginning);
+                    }
+                    cancelled |= ui
+                        .add(
+                            Button::new(RichText::new("Cancel").color(colors.secondary_text))
+                                .min_size(vec2(80.0, 30.0))
+                                .fill(colors.tile),
+                        )
+                        .clicked();
+                });
+            });
+
+        if let Some(choice) = chosen {
+            self.pathway_enrollment_review = None;
+            let Ok(enroll_context) =
+                PathwayEnrollmentContext::new("Adam canvas", unix_now_micros())
+            else {
+                return;
+            };
+            self.checkpoint();
+            match PathwayEnrollmentService::enroll(
+                &mut self.workspace,
+                &review,
+                choice,
+                enroll_context,
+            ) {
+                Ok(_) => {
+                    self.changed(true);
+                    self.toast("On the pathway — drag a tile off to take it back", context);
+                }
+                Err(error) => {
+                    log::warn!("pathway enrollment refused: {error}");
+                    self.toast("The pathway or tiles changed — try again", context);
+                }
+            }
+        } else if cancelled {
+            self.pathway_enrollment_review = None;
+        }
     }
 
     fn draw_note_draft(&self, painter: &Painter, camera: Camera, view: Rect, colors: Theme) {
@@ -13130,6 +13388,76 @@ fn tile_outline_stroke(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Parses a stored `#RRGGBB` route colour, falling back to the accent so a
+/// hand-edited library can never make a rail invisible.
+fn pathway_color(hex: &str, colors: Theme) -> Color32 {
+    u32::from_str_radix(hex.trim().trim_start_matches('#'), 16)
+        .ok()
+        .filter(|_| hex.trim().trim_start_matches('#').len() == 6)
+        .map_or(colors.accent, color_from_hex)
+}
+
+/// Draws every rail on the page underneath the tiles that ride it.
+///
+/// Rails are page geometry rather than decoration, so they are drawn whether
+/// or not the route is running; a paused or disabled route simply reads
+/// dimmer. Node and segment positions come straight from the durable graph —
+/// this function never consults projected cargo geometry.
+fn draw_pathways(
+    painter: &Painter,
+    workspace: &Workspace,
+    page_id: Uuid,
+    camera: Camera,
+    view: Rect,
+    colors: Theme,
+) {
+    let world_point = |point: PathwayPoint| -> Option<Pos2> {
+        (point.is_finite()).then(|| camera.world_to_screen([point.x as f32, point.y as f32], view))
+    };
+
+    for pathway in workspace
+        .domain
+        .pathways
+        .pathways
+        .values()
+        .filter(|pathway| pathway.page_id == page_id)
+    {
+        let base = pathway_color(&pathway.color_hex, colors);
+        let color = if pathway.is_enabled {
+            base
+        } else {
+            mix_color(base, colors.canvas, 0.55)
+        };
+        let width = (2.0 * camera.zoom).clamp(1.0, 4.0);
+
+        for segment in pathway.segments.values() {
+            let (Some(from), Some(to)) = (
+                pathway.nodes.get(&segment.from_node_id),
+                pathway.nodes.get(&segment.to_node_id),
+            ) else {
+                continue;
+            };
+            let (Some(start), Some(end)) = (world_point(from.point), world_point(to.point)) else {
+                continue;
+            };
+            painter.line_segment([start, end], Stroke::new(width, color));
+        }
+
+        let radius = (5.0 * camera.zoom).clamp(3.0, 9.0);
+        for node in pathway.nodes.values() {
+            let Some(center) = world_point(node.point) else {
+                continue;
+            };
+            painter.circle_filled(center, radius, color);
+            // An approval gate stops cargo until a person says go, so it is
+            // the one stop that has to be recognisable at a glance.
+            if node.kind == PathwayNodeKind::ApprovalGate {
+                painter.circle_stroke(center, radius + 3.0, Stroke::new(1.5, color));
+            }
+        }
+    }
+}
+
 fn draw_tile(
     ui: &mut Ui,
     painter: &Painter,
@@ -21449,6 +21777,90 @@ mod tests {
         assert_eq!(
             assignment.paused_at,
             Some(crate::domain::UnixMicros(2_000_006))
+        );
+    }
+
+    #[test]
+    fn pathway_rail_colour_falls_back_instead_of_drawing_nothing() {
+        let colors = Theme::new(false);
+        assert_eq!(
+            pathway_color("#0A84FF", colors),
+            Color32::from_rgb(0x0A, 0x84, 0xFF)
+        );
+        assert_eq!(
+            pathway_color("0A84FF", colors),
+            pathway_color("#0A84FF", colors)
+        );
+        // A hand-edited or truncated value must still paint a visible rail.
+        for broken in ["", "#", "#12345", "#GGGGGG", "#0A84FF00"] {
+            assert_eq!(pathway_color(broken, colors), colors.accent, "{broken:?}");
+        }
+    }
+
+    #[test]
+    fn pathway_quick_tool_is_offered_with_a_renderable_glyph() {
+        assert_eq!(CanvasQuickTool::Pathway.label(), "Pathway");
+        // Source Sans 3 ships U+2192; a tool glyph must never render as tofu,
+        // and it must not be mistaken for the Pile tool.
+        assert_eq!(CanvasQuickTool::Pathway.glyph(), "→");
+        assert_ne!(
+            CanvasQuickTool::Pathway.glyph(),
+            CanvasQuickTool::Pile.glyph()
+        );
+    }
+
+    /// Walks exactly what the canvas click does: lay a rail, dock a pointer
+    /// onto it, review, and confirm. Guards the wiring the toolbar depends on.
+    #[test]
+    fn pathway_tool_lays_a_rail_that_a_click_can_dock_and_enroll_onto() {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let tile = Tile::note("Cargo", "", WorldRect::new(600.0, 600.0, 80.0, 60.0));
+        let tile_id = tile.id;
+        workspace.active_page_mut().add_tile(tile);
+
+        let start = PathwayPoint::new(200.0, 300.0);
+        let pathway_id = PathwayEditingService::create_pathway(
+            &mut workspace,
+            page_id,
+            start,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(1_000)).unwrap(),
+        )
+        .unwrap();
+
+        // Clicking the start node must dock rather than lay a second rail.
+        let target = PathwayDockGeometry::prepare(&workspace, page_id)
+            .target(start, 1.0, None)
+            .expect("the freshly drawn rail must be dockable where it was drawn");
+        assert_eq!(target.pathway_id, pathway_id);
+        assert!(target.is_start_node);
+
+        let review = PathwayEnrollmentService::review(
+            &workspace,
+            target,
+            std::collections::BTreeSet::from([tile_id]),
+        )
+        .unwrap();
+        assert_eq!(review.default_choice, PathwayEnrollmentChoice::AtBeginning);
+
+        let result = PathwayEnrollmentService::enroll(
+            &mut workspace,
+            &review,
+            PathwayEnrollmentChoice::AtBeginning,
+            PathwayEnrollmentContext::new("test", crate::domain::UnixMicros(2_000)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.assignment_ids.len(), 1);
+        let assignment = workspace
+            .domain
+            .pathways
+            .assignment(result.assignment_ids[0])
+            .unwrap();
+        assert_eq!(assignment.pathway_id, pathway_id);
+        assert_eq!(assignment.tile_id, tile_id);
+        assert_ne!(
+            assignment.state,
+            crate::domain::PathwayAssignmentState::Detached
         );
     }
 
