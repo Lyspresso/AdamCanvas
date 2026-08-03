@@ -24219,7 +24219,7 @@ mod tests {
     }
 
     #[test]
-    fn adding_a_stop_mid_leg_parks_that_rider_and_survives_undo_redo() {
+    fn adding_a_stop_mid_leg_keeps_the_rider_riding_and_survives_undo_redo() {
         let (mut workspace, pathway_id, _, assignment_id) = rail_drag_fixture();
         let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
         let first = crate::pathway_projection::first_node(pathway).unwrap();
@@ -24268,16 +24268,27 @@ mod tests {
             .find(|segment| segment.from_node_id == first_id && segment.to_node_id == node_id)
             .expect("the split must create a first → new leg");
         assert_eq!(pinned.speed_points_per_second, 44.0);
-        // Engine law: splitting the leg a rider is traveling removes its
-        // active segment reference, which parks the rider as NeedsAttention —
-        // and a plain reconcile tick must NOT quietly un-park it. The app
-        // toasts a recovery hint (drop the tile back on the rail); if the
-        // engine ever learns split-continuity, this pin is the place to flip.
+        // Split-continuity: the rider whose leg was split silently re-joins
+        // the new geometry and comes back riding — the edit's pause and the
+        // resume both happen inside the add, and no needs-attention parking
+        // is ever visible to the user.
         let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
         assert_eq!(
             assignment.state,
-            crate::domain::PathwayAssignmentState::NeedsAttention,
-            "a split leg parks the rider that was on it"
+            crate::domain::PathwayAssignmentState::Moving,
+            "a split leg must not strand the rider that was on it"
+        );
+        let rejoined = assignment
+            .current_segment_id
+            .expect("the rider must be re-aimed at a surviving rail");
+        assert!(
+            workspace
+                .domain
+                .pathways
+                .pathway(pathway_id)
+                .unwrap()
+                .segments
+                .contains_key(&rejoined)
         );
         crate::pathway_reconciliation::PathwayReconcileService::reconcile(
             &mut workspace,
@@ -24291,10 +24302,10 @@ mod tests {
         )
         .unwrap();
         let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
-        assert_eq!(
+        assert_ne!(
             assignment.state,
             crate::domain::PathwayAssignmentState::NeedsAttention,
-            "reconcile must not silently revive a parked rider"
+            "reconcile must keep the adapted rider in service"
         );
 
         // Undo removes exactly that stop; redo re-creates it from the draft.

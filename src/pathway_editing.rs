@@ -1315,7 +1315,7 @@ fn finish_removed_references(
         paused_moving_assignments,
         context,
     )?;
-    mark_removed_references_needs_attention(
+    adapt_removed_reference_riders(
         workspace,
         pathway_id,
         &removed_segment_ids,
@@ -1441,13 +1441,27 @@ fn relocate_closure_riders(
     Ok(())
 }
 
-fn mark_removed_references_needs_attention(
+/// A rider whose active graph reference was removed by a rebuild silently
+/// re-joins the route at the nearest point of the new geometry instead of
+/// parking. This extends [`relocate_closure_riders`]' philosophy to every
+/// removed reference: the track changed under the train, so the train is put
+/// on the nearest rail — states are preserved (a paused rider stays paused
+/// with its references re-aimed so the ordinary resume machinery works; a
+/// rider already needing attention keeps its reason), and only when no
+/// finite rail exists to re-join does the old needs-attention parking apply.
+fn adapt_removed_reference_riders(
     workspace: &mut Workspace,
     pathway_id: PathwayId,
     removed_segments: &BTreeSet<PathwaySegmentId>,
     removed_nodes: &BTreeSet<PathwayNodeId>,
     context: &PathwayEditContext,
 ) -> Result<(), PathwayEditingError> {
+    let new_pathway = workspace
+        .domain
+        .pathways
+        .pathway(pathway_id)
+        .cloned()
+        .ok_or(DomainError::MissingPathway(pathway_id))?;
     let assignment_keys = workspace
         .domain
         .pathways
@@ -1465,19 +1479,42 @@ fn mark_removed_references_needs_attention(
         .map(|(key, _)| *key)
         .collect::<Vec<_>>();
     for assignment_key in assignment_keys {
+        let existing = workspace.domain.pathways.assignments[&assignment_key].clone();
+        let before_state = existing.state;
+        let removed_segment_id = existing
+            .current_segment_id
+            .filter(|id| removed_segments.contains(id));
+        let removed_node_id = existing
+            .current_node_id
+            .filter(|id| removed_nodes.contains(id));
+        let terminal = matches!(
+            before_state,
+            PathwayAssignmentState::Detached | PathwayAssignmentState::Completed
+        );
+        let rejoin = (!terminal)
+            .then(|| nearest_route_position(&new_pathway, existing.materialized_route_point))
+            .flatten();
+        let materialized_tile_point = rejoin.and_then(|(_, _, point)| {
+            let tile_center = PathwayPoint::new(
+                point.x + existing.path_offset.x,
+                point.y + existing.path_offset.y,
+            );
+            tile_center.is_finite().then(|| {
+                materialize_tile_center(
+                    workspace,
+                    new_pathway.page_id,
+                    existing.page_id,
+                    existing.tile_id,
+                    tile_center,
+                )
+            })?
+        });
         let assignment = workspace
             .domain
             .pathways
             .assignments
             .get_mut(&assignment_key)
             .expect("selected assignment remains in the transactional draft");
-        let before_state = assignment.state;
-        let removed_segment_id = assignment
-            .current_segment_id
-            .filter(|id| removed_segments.contains(id));
-        let removed_node_id = assignment
-            .current_node_id
-            .filter(|id| removed_nodes.contains(id));
         if removed_segment_id.is_some() {
             assignment.current_segment_id = None;
             assignment.segment_started_at = None;
@@ -1486,10 +1523,43 @@ fn mark_removed_references_needs_attention(
         if removed_node_id.is_some() {
             assignment.current_node_id = None;
         }
-        if !matches!(
-            assignment.state,
-            PathwayAssignmentState::Detached | PathwayAssignmentState::Completed
-        ) {
+        let mut adapted = false;
+        if let Some((segment_id, progress, point)) = rejoin
+            && !terminal
+        {
+            adapted = true;
+            assignment.current_segment_id = Some(segment_id);
+            assignment.current_node_id = None;
+            assignment.segment_start_progress = progress;
+            assignment.segment_started_at = None;
+            // A vanished stop's dwell or gate no longer applies; the rider's
+            // basis becomes plain travel from where it stands.
+            assignment.wait_until = None;
+            assignment.blocked_at = None;
+            match assignment.state {
+                PathwayAssignmentState::Paused => {
+                    assignment.previous_state = Some(PathwayAssignmentState::Moving);
+                }
+                PathwayAssignmentState::NeedsAttention => {
+                    // Keep the state and its reason; only the references are
+                    // re-aimed so a later recovery has somewhere to resume.
+                }
+                // Live states stay live on the new rail. Editing flows pause
+                // riders first, so this arm is defensive coherence.
+                _ => {
+                    assignment.state = PathwayAssignmentState::Moving;
+                    assignment.previous_state = None;
+                    assignment.segment_started_at = Some(context.now);
+                    assignment.paused_at = None;
+                    assignment.needs_attention_reason = None;
+                }
+            }
+            assignment.materialized_route_point = point;
+            if let Some(tile_point) = materialized_tile_point {
+                assignment.materialized_tile_point = tile_point;
+            }
+        } else if !terminal {
+            // No finite rail to re-join: the old parking, honestly labeled.
             if assignment.state != PathwayAssignmentState::NeedsAttention
                 && !(assignment.state == PathwayAssignmentState::Paused
                     && assignment.previous_state.is_some())
@@ -1512,10 +1582,13 @@ fn mark_removed_references_needs_attention(
         let after_state = assignment.state;
         let event_assignment_id = assignment.id;
         let tile_id = assignment.tile_id;
+        let event_segment_id = assignment.current_segment_id.or(removed_segment_id);
         let explanation = if after_state == PathwayAssignmentState::Completed {
             "A graph edit removed a completed rider's historical reference; it remains completed."
         } else if after_state == PathwayAssignmentState::Detached {
             "A graph edit removed a detached rider's historical reference."
+        } else if adapted {
+            "The route changed under this rider; it re-joined at the nearest point of the new track."
         } else {
             "A graph edit removed an active reference; this rider now needs attention."
         };
@@ -1529,7 +1602,7 @@ fn mark_removed_references_needs_attention(
                 assignment_id: Some(event_assignment_id),
                 tile_id: Some(tile_id),
                 node_id: removed_node_id,
-                segment_id: removed_segment_id,
+                segment_id: event_segment_id,
                 explanation: explanation.into(),
                 before_state: Some(before_state),
                 after_state: Some(after_state),
@@ -1538,6 +1611,62 @@ fn mark_removed_references_needs_attention(
         )?;
     }
     Ok(())
+}
+
+/// The nearest position on the route's current rails: `(segment, progress,
+/// point)`, minimizing perpendicular distance with clamped projection. Ties
+/// break on segment id so replays are deterministic. `None` when no segment
+/// has finite geometry to re-join.
+fn nearest_route_position(
+    pathway: &Pathway,
+    from_point: PathwayPoint,
+) -> Option<(PathwaySegmentId, f64, PathwayPoint)> {
+    if !from_point.is_finite() {
+        return None;
+    }
+    let mut best: Option<(f64, PathwaySegmentId, f64, PathwayPoint)> = None;
+    for segment in pathway.segments.values() {
+        let (Some(from), Some(to)) = (
+            pathway.nodes.get(&segment.from_node_id),
+            pathway.nodes.get(&segment.to_node_id),
+        ) else {
+            continue;
+        };
+        if !from.point.is_finite() || !to.point.is_finite() {
+            continue;
+        }
+        let leg = (to.point.x - from.point.x, to.point.y - from.point.y);
+        let length_squared = leg.0 * leg.0 + leg.1 * leg.1;
+        let progress = if length_squared < f64::EPSILON {
+            0.0
+        } else {
+            let offset = (from_point.x - from.point.x, from_point.y - from.point.y);
+            ((offset.0 * leg.0 + offset.1 * leg.1) / length_squared).clamp(0.0, 1.0)
+        };
+        let point = PathwayPoint::new(
+            from.point.x + progress * leg.0,
+            from.point.y + progress * leg.1,
+        );
+        if !point.is_finite() {
+            continue;
+        }
+        let distance_squared = (from_point.x - point.x).powi(2) + (from_point.y - point.y).powi(2);
+        if !distance_squared.is_finite() {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((best_distance, best_id, _, _)) => {
+                distance_squared < *best_distance
+                    || (distance_squared == *best_distance
+                        && segment.id.as_bytes() < best_id.as_bytes())
+            }
+        };
+        if better {
+            best = Some((distance_squared, segment.id, progress, point));
+        }
+    }
+    best.map(|(_, segment_id, progress, point)| (segment_id, progress, point))
 }
 
 fn rebuild_segments(
@@ -2723,14 +2852,24 @@ mod tests {
         );
         assert_eq!(pairs[&(order[0], order[2])].speed_points_per_second, 80.0);
         assert_eq!(pathway.modified_at, UnixMicros(4_000_000));
+        // The rider whose leg vanished silently re-joins the new track: it
+        // stays Paused (the edit's safety pause) with its references re-aimed
+        // at a surviving rail so the ordinary resume machinery can carry on —
+        // no needs-attention parking for an adaptable rider.
         let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
-        assert_eq!(assignment.state, PathwayAssignmentState::NeedsAttention);
+        assert_eq!(assignment.state, PathwayAssignmentState::Paused);
         assert_eq!(
             assignment.previous_state,
             Some(PathwayAssignmentState::Moving)
         );
-        assert_eq!(assignment.current_segment_id, None);
-        assert!(assignment.needs_attention_reason.is_some());
+        let rejoined = assignment.current_segment_id.expect("re-aimed at a rail");
+        assert!(
+            pathway.segments.contains_key(&rejoined),
+            "the re-aimed segment must exist on the rebuilt route"
+        );
+        assert!((0.0..=1.0).contains(&assignment.segment_start_progress));
+        assert!(assignment.needs_attention_reason.is_none());
+        assert!(assignment.materialized_route_point.is_finite());
         assert_eq!(assignment.modified_at, UnixMicros(4_000_000));
     }
 
