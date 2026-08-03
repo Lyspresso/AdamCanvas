@@ -1421,7 +1421,7 @@ pub enum SaveOutcome {
         /// Submitted and durable pathway snapshots used by the UI thread to
         /// absorb concurrent engine changes without making merged state the
         /// save worker's next local baseline.
-        pathway_feedback: PathwaySaveFeedback,
+        pathway_feedback: Box<PathwaySaveFeedback>,
     },
     Superseded {
         by_request_id: u64,
@@ -1667,10 +1667,10 @@ fn save_and_acknowledge(
             SaveOutcome::Saved {
                 learned_deleted_conversations,
                 learned_xai_storage_conversations,
-                pathway_feedback: PathwaySaveFeedback {
+                pathway_feedback: Box::new(PathwaySaveFeedback {
                     submitted: workspace.domain.pathways.clone(),
                     merged: merged.domain.pathways,
-                },
+                }),
             }
         }
         Err(error) => {
@@ -4099,11 +4099,11 @@ mod tests {
         workspace
     }
 
-    fn empty_pathway_feedback() -> PathwaySaveFeedback {
-        PathwaySaveFeedback {
+    fn empty_pathway_feedback() -> Box<PathwaySaveFeedback> {
+        Box::new(PathwaySaveFeedback {
             submitted: PathwayStore::default(),
             merged: PathwayStore::default(),
-        }
+        })
     }
 
     fn pathway_event(event_id: u128, pathway_id: Uuid, actor: &str) -> PathwayEvent {
