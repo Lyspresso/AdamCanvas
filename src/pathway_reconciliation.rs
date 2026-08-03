@@ -18,6 +18,9 @@ use crate::{
         PathwaySegmentId, PileId, TileId, UnixMicros,
     },
     model::{TileKind, Workspace, WorldRect},
+    pathway_enrollment::{
+        PathwayEnrollmentContext, PathwayEnrollmentService, PathwayEnrollmentStartInstruction,
+    },
     pathway_projection::{
         self, PathwayRect, PathwaySize, point_just_after_boundary, segment_geometry,
         tile_membership_boundaries,
@@ -60,6 +63,8 @@ pub enum PathwayReconcileError {
     MissingNode(PathwayNodeId),
     #[error("pathway node {0} is not an approval gate")]
     NotApprovalGate(PathwayNodeId),
+    #[error("pathway authority safety check failed: {0}")]
+    AuthoritySafety(String),
 }
 
 /// Identity and timing supplied by the host for one atomic service call.
@@ -71,6 +76,7 @@ pub struct PathwayReconcileContext {
     active_elapsed_ms: i64,
     settled: bool,
     cause: PathwayReconcileCause,
+    detect_external_movement: bool,
 }
 
 impl PathwayReconcileContext {
@@ -99,6 +105,7 @@ impl PathwayReconcileContext {
             active_elapsed_ms: 0,
             settled: true,
             cause,
+            detect_external_movement: false,
         })
     }
 
@@ -109,6 +116,14 @@ impl PathwayReconcileContext {
 
     pub fn with_settled(mut self, settled: bool) -> Self {
         self.settled = settled;
+        self
+    }
+
+    /// Enables the physical-vs-materialized authority check for a startup or
+    /// an externally-authored layout commit. Pathway save feedback must not
+    /// set this bit: it can legitimately advance only the semantic snapshot.
+    pub fn with_external_movement_check(mut self, enabled: bool) -> Self {
+        self.detect_external_movement = enabled;
         self
     }
 
@@ -199,6 +214,8 @@ pub struct PathwayReconcileReport {
     pub resumed_count: usize,
     /// Whole repeating laps summarized by launch-time offline catch-up.
     pub skipped_lap_count: u64,
+    /// Assignments released because physical canvas geometry took authority.
+    pub detached_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -209,6 +226,151 @@ pub enum PathwayApprovalStatus {
 }
 
 pub struct PathwayReconcileService;
+
+/// Starts reviewed enrollment rows through the same state machine used by
+/// reconciliation. The enrollment service calls this while its cloned
+/// workspace is still private, preserving all-or-nothing confirmation.
+pub(crate) fn start_enrolled_assignments(
+    workspace: &mut Workspace,
+    instructions: &[PathwayEnrollmentStartInstruction],
+    actor: &str,
+    operation_id: Uuid,
+) -> Result<(), PathwayReconcileError> {
+    for instruction in instructions {
+        let (pathway_id, assignment_id, at) = match *instruction {
+            PathwayEnrollmentStartInstruction::BeginAtNode {
+                pathway_id,
+                assignment_id,
+                at,
+                ..
+            }
+            | PathwayEnrollmentStartInstruction::BeginOnSegment {
+                pathway_id,
+                assignment_id,
+                at,
+                ..
+            } => (pathway_id, assignment_id, at),
+        };
+        let context = PathwayReconcileContext::with_operation_id(
+            actor,
+            at,
+            PathwayReconcileCause::Live,
+            operation_id,
+        )?;
+        let pathway = workspace
+            .domain
+            .pathways
+            .pathways
+            .get(&pathway_id)
+            .cloned()
+            .ok_or(DomainError::MissingPathway(pathway_id))?;
+        if !pathway.is_enabled {
+            return Err(DomainError::InvalidPathway(
+                "a reviewed enrollment tried to start on a paused pathway".into(),
+            )
+            .into());
+        }
+        let assignment = workspace
+            .domain
+            .pathways
+            .assignments
+            .get(&assignment_id)
+            .ok_or_else(|| {
+                DomainError::InvalidPathway(format!(
+                    "reviewed enrollment assignment {assignment_id} is missing"
+                ))
+            })?;
+        if assignment.pathway_id != pathway_id || assignment.page_id != pathway.page_id {
+            return Err(DomainError::InvalidPathway(format!(
+                "reviewed enrollment assignment {assignment_id} does not match its pathway"
+            ))
+            .into());
+        }
+
+        match *instruction {
+            PathwayEnrollmentStartInstruction::BeginAtNode { node_id, .. } => {
+                let node = pathway
+                    .nodes
+                    .get(&node_id)
+                    .cloned()
+                    .ok_or(PathwayReconcileError::MissingNode(node_id))?;
+                let stored = workspace
+                    .domain
+                    .pathways
+                    .assignments
+                    .get_mut(&assignment_id)
+                    .expect("validated enrollment assignment remains");
+                stored.previous_state = None;
+                stored.paused_at = None;
+                begin_at_node(workspace, pathway_id, assignment_id, &node, at, &context)?;
+            }
+            PathwayEnrollmentStartInstruction::BeginOnSegment {
+                segment_id,
+                progress,
+                ..
+            } => {
+                if !progress.is_finite() {
+                    return Err(DomainError::InvalidPathway(
+                        "reviewed enrollment segment progress is not finite".into(),
+                    )
+                    .into());
+                }
+                let segment = pathway
+                    .segments
+                    .get(&segment_id)
+                    .filter(|segment| {
+                        segment.speed_points_per_second.is_finite()
+                            && segment.speed_points_per_second >= 1.0
+                            && segment_geometry(&pathway, segment).is_some()
+                    })
+                    .ok_or_else(|| {
+                        DomainError::InvalidPathway(
+                            "reviewed enrollment segment is no longer valid".into(),
+                        )
+                    })?;
+                let tile_id = assignment.tile_id;
+                let before = assignment.state;
+                let stored = workspace
+                    .domain
+                    .pathways
+                    .assignments
+                    .get_mut(&assignment_id)
+                    .expect("validated enrollment assignment remains");
+                stored.state = PathwayAssignmentState::Moving;
+                stored.previous_state = None;
+                stored.current_node_id = None;
+                stored.current_segment_id = Some(segment.id);
+                stored.segment_started_at = Some(at);
+                stored.segment_start_progress = progress.clamp(0.0, 1.0);
+                stored.wait_until = None;
+                stored.blocked_at = None;
+                stored.paused_at = None;
+                stored.last_reconciled_at = at.saturating_add_micros(-DEPARTURE_BACKDATE_MICROS);
+                stored.modified_at = at;
+                stored.needs_attention_reason = None;
+                append_event(
+                    workspace,
+                    pathway_id,
+                    &context,
+                    at,
+                    PathwayEventKind::SegmentStarted,
+                    PathwayEventPayload {
+                        assignment_id: Some(assignment_id),
+                        tile_id: Some(tile_id),
+                        segment_id: Some(segment.id),
+                        explanation:
+                            "The enrolled rider started at the reviewed point on this segment."
+                                .into(),
+                        before_state: Some(before),
+                        after_state: Some(PathwayAssignmentState::Moving),
+                        ..PathwayEventPayload::default()
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
 
 impl PathwayReconcileService {
     pub fn reconcile(
@@ -416,6 +578,21 @@ fn reconcile_draft(
         return Ok(report);
     }
 
+    if context.detect_external_movement {
+        let detach_context = PathwayEnrollmentContext::with_operation_id(
+            context.actor.clone(),
+            context.now,
+            context.operation_id,
+        )
+        .map_err(|error| PathwayReconcileError::AuthoritySafety(error.to_string()))?;
+        let detached = PathwayEnrollmentService::detach_externally_moved(draft, detach_context)
+            .map_err(|error| PathwayReconcileError::AuthoritySafety(error.to_string()))?;
+        report.layout_changed |= detached.layout_changed;
+        report.detached_count = report
+            .detached_count
+            .saturating_add(detached.assignment_ids.len());
+        report.affected_page_ids.extend(detached.affected_page_ids);
+    }
     flag_invalid_records(draft, context, &mut report)?;
     if context.cause == PathwayReconcileCause::StartupBacklog {
         rebase_repeating_assignments(draft, context, &mut report)?;
@@ -677,6 +854,7 @@ fn merge_report(target: &mut PathwayReconcileReport, source: PathwayReconcileRep
     target.skipped_lap_count = target
         .skipped_lap_count
         .saturating_add(source.skipped_lap_count);
+    target.detached_count = target.detached_count.saturating_add(source.detached_count);
 }
 
 #[derive(Clone, Debug)]
@@ -4264,5 +4442,38 @@ mod tests {
                 "unexpected problem projection for {reason:?}"
             );
         }
+    }
+
+    #[test]
+    fn external_geometry_detachment_runs_only_when_the_host_requests_it() {
+        let mut fixture = fixture(10.0, 1.0, UnixMicros::ZERO);
+        fixture
+            .workspace
+            .active_page_mut()
+            .tile_mut(fixture.tile_id)
+            .unwrap()
+            .rect
+            .x += 0.75;
+
+        let ordinary =
+            PathwayReconcileService::reconcile(&mut fixture.workspace, context(1)).unwrap();
+        assert_eq!(ordinary.detached_count, 0);
+        assert_eq!(
+            fixture.workspace.domain.pathways.assignments[&fixture.assignment_id].state,
+            PathwayAssignmentState::Moving
+        );
+
+        let checked = PathwayReconcileService::reconcile(
+            &mut fixture.workspace,
+            context(2).with_external_movement_check(true),
+        )
+        .unwrap();
+        assert_eq!(checked.detached_count, 1);
+        assert!(checked.layout_changed);
+        assert_eq!(
+            fixture.workspace.domain.pathways.assignments[&fixture.assignment_id].state,
+            PathwayAssignmentState::Detached
+        );
+        assert_eq!(fixture.workspace.domain.pathways.assignments.len(), 1);
     }
 }

@@ -14,6 +14,7 @@ use crate::{
     },
     model::{TileKind, Workspace, WorldRect},
     pathway_projection::{first_node, segment_geometry},
+    pathway_reconciliation::start_enrolled_assignments,
 };
 use std::{
     cmp::Ordering,
@@ -418,6 +419,8 @@ pub enum PathwayEnrollmentError {
     StaleReview,
     #[error("pathway enrollment produced an invalid canvas position")]
     InvalidPlacement,
+    #[error("the reviewed pathway enrollment could not start: {0}")]
+    StartFailed(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -478,7 +481,7 @@ pub enum PathwayEnrollmentStartInstruction {
     },
 }
 
-#[must_use = "enabled-route start instructions must be handed to the P4 state machine"]
+#[must_use]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PathwayEnrollmentResult {
     pub assignment_ids: Vec<PathwayAssignmentId>,
@@ -537,12 +540,9 @@ impl PathwayEnrollmentService {
     /// Confirms a reviewed enrollment as one cloned-workspace transaction.
     ///
     /// New rows are first placed in the same coherent Paused representation
-    /// used for a disabled route. Disabled routes are complete at that point.
-    /// For enabled routes, `start_instructions` must be consumed by P4's
-    /// begin-at-node/segment state machine in the same eventual app command.
-    /// P4 currently exposes no public start-at-entry hook, so this value seam
-    /// avoids duplicating that state machine here and makes the integration gap
-    /// explicit and testable.
+    /// used for a disabled route. Enabled routes then enter P4's node/segment
+    /// state machine before the cloned workspace is committed, so a failed
+    /// start cannot leave a half-enrolled formation behind.
     pub fn enroll(
         workspace: &mut Workspace,
         review: &PathwayEnrollmentReview,
@@ -551,12 +551,20 @@ impl PathwayEnrollmentService {
     ) -> Result<PathwayEnrollmentResult, PathwayEnrollmentError> {
         let mut draft = workspace.clone();
         let result = enroll_draft(&mut draft, review, choice, &context)?;
+        start_enrolled_assignments(
+            &mut draft,
+            &result.start_instructions,
+            context.actor(),
+            context.operation_id(),
+        )
+        .map_err(|error| PathwayEnrollmentError::StartFailed(error.to_string()))?;
         *workspace = draft;
         Ok(result)
     }
 
-    /// Materializes the presentation rects captured at mouse-down and removes
-    /// route authority before ordinary drag deltas are written.
+    /// Commits the final visible drag rects and removes route authority in one
+    /// transaction. Adam calls this only after a real movement is released,
+    /// so a click or cancelled gesture cannot accidentally detach cargo.
     pub fn detach_for_manual_drag(
         workspace: &mut Workspace,
         page_id: PageId,
@@ -1016,7 +1024,8 @@ fn detach_assignment(
     if before.state == PathwayAssignmentState::Detached {
         return Ok(());
     }
-    let (materialized_tile_point, materialized_route_point) = actual.map_or(
+    let safe_actual = actual.filter(|(_, rect)| valid_tile_rect(*rect));
+    let (materialized_tile_point, materialized_route_point) = safe_actual.map_or(
         (
             before.materialized_tile_point,
             before.materialized_route_point,
@@ -1424,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_enrollment_returns_start_instruction_without_duplicating_p4() {
+    fn enabled_enrollment_starts_atomically_through_the_p4_state_machine() {
         let mut fixture = fixture(true);
         let target = segment_target(&fixture, PathwayPoint::new(700.0, 200.0));
         let review = PathwayEnrollmentService::review(
@@ -1451,8 +1460,64 @@ mod tests {
             .pathways
             .assignment(result.assignment_ids[0])
             .unwrap();
-        assert_eq!(assignment.state, PathwayAssignmentState::Paused);
+        assert_eq!(assignment.state, PathwayAssignmentState::Waiting);
         assert_eq!(assignment.current_node_id, Some(fixture.start_id));
+        assert_eq!(assignment.wait_until, Some(UnixMicros(2_000_200)));
+        assert_eq!(assignment.previous_state, None);
+        assert!(
+            fixture
+                .workspace
+                .domain
+                .pathways
+                .events()
+                .iter()
+                .any(|event| {
+                    event.kind == PathwayEventKind::WaitStarted
+                        && event.payload.assignment_id == Some(result.assignment_ids[0])
+                })
+        );
+    }
+
+    #[test]
+    fn enabled_mid_segment_enrollment_uses_the_departure_epsilon_protocol() {
+        let mut fixture = fixture(true);
+        let target = segment_target(&fixture, PathwayPoint::new(700.0, 200.0));
+        let review = PathwayEnrollmentService::review(
+            &fixture.workspace,
+            target,
+            BTreeSet::from([fixture.first_tile]),
+        )
+        .unwrap();
+        let result = PathwayEnrollmentService::enroll(
+            &mut fixture.workspace,
+            &review,
+            PathwayEnrollmentChoice::AtThisSpot,
+            PathwayEnrollmentContext::new("user", UnixMicros(200)).unwrap(),
+        )
+        .unwrap();
+        let assignment = fixture
+            .workspace
+            .domain
+            .pathways
+            .assignment(result.assignment_ids[0])
+            .unwrap();
+        assert_eq!(assignment.state, PathwayAssignmentState::Moving);
+        assert_eq!(assignment.current_segment_id, Some(fixture.segment_id));
+        assert_eq!(assignment.segment_started_at, Some(UnixMicros(200)));
+        assert_eq!(assignment.last_reconciled_at, UnixMicros(190));
+        assert!((assignment.segment_start_progress - 0.6).abs() < 1e-9);
+        assert!(
+            fixture
+                .workspace
+                .domain
+                .pathways
+                .events()
+                .iter()
+                .any(|event| {
+                    event.kind == PathwayEventKind::SegmentStarted
+                        && event.payload.assignment_id == Some(result.assignment_ids[0])
+                })
+        );
     }
 
     #[test]
@@ -1665,6 +1730,58 @@ mod tests {
                 .assignment(assignment_id)
                 .unwrap()
                 .state,
+            PathwayAssignmentState::Detached
+        );
+    }
+
+    #[test]
+    fn cross_page_move_detaches_even_when_world_coordinates_are_unchanged() {
+        let mut fixture = fixture(false);
+        let assignment_id = id(65);
+        fixture
+            .workspace
+            .domain
+            .pathways
+            .insert_assignment(
+                PathwayAssignment::new(
+                    assignment_id,
+                    fixture.pathway_id,
+                    fixture.first_tile,
+                    fixture.page_id,
+                    PathwayAssignmentState::Paused,
+                    PathwayPoint::ZERO,
+                    PathwayPoint::new(50.0, 40.0),
+                    PathwayPoint::new(0.0, 0.0),
+                    UnixMicros(100),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let tile = fixture
+            .workspace
+            .active_page_mut()
+            .remove_tile(fixture.first_tile)
+            .unwrap();
+        let second_page = fixture.workspace.create_page("Elsewhere");
+        fixture
+            .workspace
+            .page_mut(second_page)
+            .unwrap()
+            .add_tile(tile);
+
+        let detached = PathwayEnrollmentService::detach_externally_moved(
+            &mut fixture.workspace,
+            PathwayEnrollmentContext::new("external", UnixMicros(200)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(detached.assignment_ids, vec![assignment_id]);
+        assert!(detached.layout_changed);
+        assert_eq!(
+            detached.affected_page_ids,
+            BTreeSet::from([fixture.page_id, second_page])
+        );
+        assert_eq!(
+            fixture.workspace.domain.pathways.assignments[&assignment_id].state,
             PathwayAssignmentState::Detached
         );
     }
