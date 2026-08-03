@@ -285,6 +285,10 @@ enum HistoryEntry {
         draft: PathwayNodeDraft,
         incoming_speed: Option<f64>,
         outgoing_speed: Option<f64>,
+        /// The loop-back leg's speed, captured when removing an endpoint of a
+        /// repeating route: the rebuild resets the new closure to the default
+        /// speed, and undo must give the loop back its real pace.
+        closure_speed: Option<f64>,
     },
 }
 
@@ -669,6 +673,7 @@ fn apply_pathway_stop_add(
     draft: PathwayNodeDraft,
     leg_speed: Option<f64>,
     outgoing_speed: Option<f64>,
+    closure_speed: Option<f64>,
     now: UnixMicros,
     operation_id: Uuid,
 ) -> Result<PathwayNodeId, String> {
@@ -698,9 +703,16 @@ fn apply_pathway_stop_add(
                 .find(|segment| segment.from_node_id == node_id)
                 .map(|segment| segment.to_node_id)
         });
+        let closure_pair = closure_speed.and_then(|_| {
+            let pathway = draft_workspace.domain.pathways.pathway(pathway_id)?;
+            let closure = closure_segment_id(pathway)?;
+            let segment = pathway.segments.get(&closure)?;
+            Some((segment.from_node_id, segment.to_node_id))
+        });
         let pins = [
             leg_speed.and_then(|speed| after_node_id.map(|after| ((after, node_id), speed))),
             outgoing_speed.and_then(|speed| outgoing_to.map(|to| ((node_id, to), speed))),
+            closure_speed.and_then(|speed| closure_pair.map(|pair| (pair, speed))),
         ];
         for ((from, to), speed) in pins.into_iter().flatten() {
             let segment_id = draft_workspace
@@ -789,6 +801,21 @@ fn apply_pathway_wait_for_all_stops(
     })
 }
 
+/// Travel-order comparator matching the engine's own `indexed_cmp`: equal
+/// sort indices — including -0.0 vs +0.0 — fall through to the UUID
+/// tie-break. Bare `total_cmp` would order -0.0 before +0.0 and bypass it.
+fn travel_order(
+    left: &crate::domain::PathwayNode,
+    right: &crate::domain::PathwayNode,
+) -> std::cmp::Ordering {
+    let order = if left.sort_index == right.sort_index {
+        std::cmp::Ordering::Equal
+    } else {
+        left.sort_index.total_cmp(&right.sort_index)
+    };
+    order.then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
+}
+
 /// The loop-back leg of a repeating route: last stop in travel order back to
 /// the first. `None` when the route does not repeat.
 fn closure_segment_id(pathway: &crate::domain::Pathway) -> Option<crate::domain::PathwaySegmentId> {
@@ -796,11 +823,7 @@ fn closure_segment_id(pathway: &crate::domain::Pathway) -> Option<crate::domain:
         return None;
     }
     let mut ordered: Vec<_> = pathway.nodes.values().collect();
-    ordered.sort_by(|left, right| {
-        left.sort_index
-            .total_cmp(&right.sort_index)
-            .then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
-    });
+    ordered.sort_by(|left, right| travel_order(left, right));
     let first = ordered.first()?.id;
     let last = ordered.last()?.id;
     pathway
@@ -6369,14 +6392,7 @@ impl AdamApp {
         let mut commit: Option<PathwaySettingsCommit> = None;
 
         let mut ordered_nodes: Vec<_> = pathway.nodes.values().collect();
-        ordered_nodes.sort_by(|left, right| {
-            let order = if left.sort_index == right.sort_index {
-                std::cmp::Ordering::Equal
-            } else {
-                left.sort_index.total_cmp(&right.sort_index)
-            };
-            order.then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
-        });
+        ordered_nodes.sort_by(|left, right| travel_order(left, right));
         let node_title = |node_id: PathwayNodeId| -> &str {
             pathway
                 .nodes
@@ -6664,11 +6680,7 @@ impl AdamApp {
                 return;
             };
             let mut ordered: Vec<_> = pathway.nodes.values().collect();
-            ordered.sort_by(|left, right| {
-                left.sort_index
-                    .total_cmp(&right.sort_index)
-                    .then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
-            });
+            ordered.sort_by(|left, right| travel_order(left, right));
             let Some(last) = ordered.last() else {
                 return;
             };
@@ -7744,6 +7756,7 @@ impl AdamApp {
             draft.clone(),
             leg_speed,
             None,
+            None,
             unix_now_micros(),
             Uuid::new_v4(),
         ) {
@@ -7790,11 +7803,7 @@ impl AdamApp {
             node.wait_duration_seconds,
         );
         let mut ordered: Vec<_> = pathway.nodes.values().collect();
-        ordered.sort_by(|left, right| {
-            left.sort_index
-                .total_cmp(&right.sort_index)
-                .then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
-        });
+        ordered.sort_by(|left, right| travel_order(left, right));
         let index = ordered.iter().position(|candidate| candidate.id == node_id);
         let after_node_id = index
             .and_then(|index| index.checked_sub(1))
@@ -7816,6 +7825,14 @@ impl AdamApp {
         let outgoing_speed = index
             .and_then(|index| ordered.get(index + 1))
             .and_then(|next| leg_speed_between(node_id, next.id));
+        // Removing an endpoint of a repeating route rebuilds the loop-back
+        // leg at the default speed; capture its real pace while it exists so
+        // undo can hand it back.
+        let is_endpoint = index == Some(0) || index == Some(ordered.len().saturating_sub(1));
+        let closure_speed = closure_id
+            .filter(|_| is_endpoint)
+            .and_then(|id| pathway.segments.get(&id))
+            .map(|segment| segment.speed_points_per_second);
 
         let parked_before = self.parked_rider_count(pathway_id);
         match apply_pathway_stop_remove(
@@ -7833,6 +7850,7 @@ impl AdamApp {
                     draft,
                     incoming_speed,
                     outgoing_speed,
+                    closure_speed,
                 });
                 if self.parked_rider_count(pathway_id) > parked_before {
                     self.toast(
@@ -7924,6 +7942,7 @@ impl AdamApp {
                 leg_speed,
             } => {
                 let now = unix_now_micros();
+                let parked_before = self.parked_rider_count(pathway_id);
                 if is_undo {
                     match apply_pathway_stop_remove(
                         &mut self.workspace,
@@ -7940,6 +7959,12 @@ impl AdamApp {
                                 draft,
                                 leg_speed,
                             });
+                            if self.parked_rider_count(pathway_id) > parked_before {
+                                self.toast(
+                                    "Stop removed — a tile using it paused; drop it back on the rail to keep riding",
+                                    context,
+                                );
+                            }
                             self.changed(true);
                         }
                         Err(error) => {
@@ -7948,13 +7973,13 @@ impl AdamApp {
                         }
                     }
                 } else {
-                    let parked_before = self.parked_rider_count(pathway_id);
                     match apply_pathway_stop_add(
                         &mut self.workspace,
                         pathway_id,
                         Some(after_node_id),
                         draft.clone(),
                         leg_speed,
+                        None,
                         None,
                         now,
                         Uuid::new_v4(),
@@ -7995,8 +8020,10 @@ impl AdamApp {
                 draft,
                 incoming_speed,
                 outgoing_speed,
+                closure_speed,
             } => {
                 let now = unix_now_micros();
+                let parked_before = self.parked_rider_count(pathway_id);
                 if is_undo {
                     match apply_pathway_stop_add(
                         &mut self.workspace,
@@ -8005,6 +8032,7 @@ impl AdamApp {
                         draft.clone(),
                         incoming_speed,
                         outgoing_speed,
+                        closure_speed,
                         now,
                         Uuid::new_v4(),
                     ) {
@@ -8017,7 +8045,14 @@ impl AdamApp {
                                 draft,
                                 incoming_speed,
                                 outgoing_speed,
+                                closure_speed,
                             });
+                            if self.parked_rider_count(pathway_id) > parked_before {
+                                self.toast(
+                                    "Stop added — a tile riding that leg paused; drop it back on the rail to keep riding",
+                                    context,
+                                );
+                            }
                             self.changed(true);
                         }
                         Err(error) => {
@@ -8041,7 +8076,14 @@ impl AdamApp {
                                 draft,
                                 incoming_speed,
                                 outgoing_speed,
+                                closure_speed,
                             });
+                            if self.parked_rider_count(pathway_id) > parked_before {
+                                self.toast(
+                                    "Stop removed — a tile using it paused; drop it back on the rail to keep riding",
+                                    context,
+                                );
+                            }
                             self.changed(true);
                         }
                         Err(error) => {
@@ -24197,6 +24239,7 @@ mod tests {
             draft.clone(),
             Some(44.0),
             None,
+            None,
             crate::domain::UnixMicros(5_000_000),
             Uuid::from_u128(201),
         )
@@ -24214,11 +24257,7 @@ mod tests {
         assert_eq!(added.wait_duration_seconds, 12.0);
         // Route order: the new stop sits directly after the first.
         let mut ordered: Vec<_> = pathway.nodes.values().collect();
-        ordered.sort_by(|left, right| {
-            left.sort_index
-                .total_cmp(&right.sort_index)
-                .then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
-        });
+        ordered.sort_by(|left, right| travel_order(left, right));
         assert_eq!(ordered[0].id, first_id);
         assert_eq!(ordered[1].id, node_id);
         // The split leg's pinned speed lands on the (first → new) leg — the
@@ -24278,6 +24317,7 @@ mod tests {
             Some(first_id),
             draft,
             Some(44.0),
+            None,
             None,
             crate::domain::UnixMicros(7_000_000),
             Uuid::from_u128(203),
@@ -24368,6 +24408,7 @@ mod tests {
             PathwayNodeDraft::new(middle_point, "Middle", PathwayNodeKind::Destination, 7.0),
             Some(21.0),
             None,
+            None,
             crate::domain::UnixMicros(5_000_000),
             Uuid::from_u128(401),
         )
@@ -24410,6 +24451,7 @@ mod tests {
             PathwayNodeDraft::new(middle_point, "Middle", PathwayNodeKind::Destination, 7.0),
             Some(21.0),
             Some(63.0),
+            None,
             crate::domain::UnixMicros(7_000_000),
             Uuid::from_u128(403),
         )
@@ -24432,6 +24474,91 @@ mod tests {
             .find(|segment| segment.from_node_id == restored_id)
             .unwrap();
         assert_eq!(outgoing.speed_points_per_second, 63.0);
+    }
+
+    #[test]
+    fn undoing_an_endpoint_removal_gives_the_loop_back_leg_its_speed_back() {
+        // Looping A → B → C with the loop-back leg at 275. Removing C
+        // rebuilds the closure at the default speed (engine law); undo must
+        // hand the loop back its real pace via the captured closure pin.
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        PathwayEditingService::set_repeats(
+            &mut workspace,
+            pathway_id,
+            true,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(3_000_000)).unwrap(),
+        )
+        .unwrap();
+        let last_id = PathwayEditingService::append_node(
+            &mut workspace,
+            pathway_id,
+            PathwayNodeKind::Destination,
+            PathwayPoint::new(400.0, 600.0),
+            PathwayEditContext::new("test", crate::domain::UnixMicros(3_100_000)).unwrap(),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let closure = closure_segment_id(pathway).unwrap();
+        PathwayEditingService::set_segment_speed(
+            &mut workspace,
+            pathway_id,
+            closure,
+            275.0,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(3_200_000)).unwrap(),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let last = &pathway.nodes[&last_id];
+        let draft = PathwayNodeDraft::new(
+            last.point,
+            last.title.clone(),
+            last.kind,
+            last.wait_duration_seconds,
+        );
+        let mut ordered: Vec<_> = pathway.nodes.values().collect();
+        ordered.sort_by(|left, right| travel_order(left, right));
+        let predecessor = ordered[ordered.len() - 2].id;
+        let incoming = pathway
+            .segments
+            .values()
+            .find(|segment| segment.from_node_id == predecessor && segment.to_node_id == last_id)
+            .unwrap()
+            .speed_points_per_second;
+
+        apply_pathway_stop_remove(
+            &mut workspace,
+            pathway_id,
+            last_id,
+            crate::domain::UnixMicros(4_000_000),
+            Uuid::from_u128(501),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let rebuilt_closure = closure_segment_id(pathway).unwrap();
+        assert_ne!(
+            pathway.segments[&rebuilt_closure].speed_points_per_second, 275.0,
+            "engine law: an endpoint removal rebuilds the loop-back at default speed"
+        );
+
+        // Undo: re-insert with the captured closure pin.
+        apply_pathway_stop_add(
+            &mut workspace,
+            pathway_id,
+            Some(predecessor),
+            draft,
+            Some(incoming),
+            None,
+            Some(275.0),
+            crate::domain::UnixMicros(5_000_000),
+            Uuid::from_u128(502),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let restored_closure = closure_segment_id(pathway).unwrap();
+        assert_eq!(
+            pathway.segments[&restored_closure].speed_points_per_second, 275.0,
+            "undo must restore the loop-back leg's captured pace"
+        );
     }
 
     #[test]
