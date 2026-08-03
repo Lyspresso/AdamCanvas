@@ -193,7 +193,19 @@ pub struct PathwayReconcileReport {
     pub problems: Vec<PathwayProblem>,
     pub affected_page_ids: BTreeSet<PageId>,
     pub approved_count: usize,
+    /// Outcome of an explicit approval command. `approved_count == 0` alone
+    /// cannot tell the UI whether nobody was waiting or the route was paused.
+    pub approval_status: Option<PathwayApprovalStatus>,
     pub resumed_count: usize,
+    /// Whole repeating laps summarized by launch-time offline catch-up.
+    pub skipped_lap_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PathwayApprovalStatus {
+    Approved(usize),
+    RoutePaused,
+    NoMatchingRiders,
 }
 
 pub struct PathwayReconcileService;
@@ -317,7 +329,7 @@ impl PathwayReconcileService {
                 if gate.wait_duration_seconds > 0.0 {
                     let wait_until = context
                         .now
-                        .saturating_add_micros(duration_micros_ceil(gate.wait_duration_seconds));
+                        .saturating_add_micros(wait_duration_micros(gate.wait_duration_seconds));
                     let assignment = draft
                         .domain
                         .pathways
@@ -359,6 +371,13 @@ impl PathwayReconcileService {
                 report.approved_count += 1;
                 report.affected_page_ids.insert(pathway.page_id);
             }
+            report.approval_status = Some(if report.approved_count == 0 {
+                PathwayApprovalStatus::NoMatchingRiders
+            } else {
+                PathwayApprovalStatus::Approved(report.approved_count)
+            });
+        } else {
+            report.approval_status = Some(PathwayApprovalStatus::RoutePaused);
         }
         report.changed = draft != original;
         report.problems = current_problems(&draft);
@@ -398,6 +417,9 @@ fn reconcile_draft(
     }
 
     flag_invalid_records(draft, context, &mut report)?;
+    if context.cause == PathwayReconcileCause::StartupBacklog {
+        rebase_repeating_assignments(draft, context, &mut report)?;
+    }
     let active_start_ms = context
         .now
         .to_unix_millis_floor()
@@ -465,6 +487,177 @@ fn reconcile_draft(
     Ok(report)
 }
 
+/// Collapses only complete, provably periodic laps at launch. The ordinary
+/// transition loop remains responsible for the final partial lap, including
+/// every exact pile boundary and dwell/gate state it reaches.
+fn rebase_repeating_assignments(
+    workspace: &mut Workspace,
+    context: &PathwayReconcileContext,
+    report: &mut PathwayReconcileReport,
+) -> Result<(), PathwayReconcileError> {
+    let pathway_ids = workspace
+        .domain
+        .pathways
+        .pathways
+        .values()
+        .filter(|pathway| pathway.is_enabled && pathway.repeats)
+        .map(|pathway| pathway.id)
+        .collect::<Vec<_>>();
+
+    for pathway_id in pathway_ids {
+        let pathway = workspace.domain.pathways.pathways[&pathway_id].clone();
+        let assignment_ids = workspace
+            .domain
+            .pathways
+            .assignments
+            .values()
+            .filter(|assignment| assignment.pathway_id == pathway_id)
+            .map(|assignment| assignment.id)
+            .collect::<Vec<_>>();
+
+        for assignment_id in assignment_ids {
+            let assignment = workspace.domain.pathways.assignments[&assignment_id].clone();
+            let Some((anchor_node_id, reference_at)) = offline_lap_anchor(&pathway, &assignment)
+            else {
+                continue;
+            };
+            let Some(lap_micros) = repeating_lap_duration_micros(&pathway, anchor_node_id) else {
+                continue;
+            };
+            let elapsed = context.now.0.saturating_sub(reference_at.0);
+            if elapsed < lap_micros {
+                continue;
+            }
+            let laps = elapsed / lap_micros;
+            if laps < 1 {
+                continue;
+            }
+            let Some(shift_micros) = laps.checked_mul(lap_micros) else {
+                continue;
+            };
+            let Some(segment_started_at) =
+                shift_optional_timestamp(assignment.segment_started_at, shift_micros)
+            else {
+                continue;
+            };
+            let Some(wait_until) = shift_optional_timestamp(assignment.wait_until, shift_micros)
+            else {
+                continue;
+            };
+            let Some(last_reconciled_at) = assignment
+                .last_reconciled_at
+                .0
+                .checked_add(shift_micros)
+                .map(UnixMicros)
+            else {
+                continue;
+            };
+
+            let stored = workspace
+                .domain
+                .pathways
+                .assignments
+                .get_mut(&assignment_id)
+                .expect("selected assignment remains in the transaction");
+            stored.segment_started_at = segment_started_at;
+            stored.wait_until = wait_until;
+            stored.last_reconciled_at = last_reconciled_at;
+            stored.modified_at = context.now;
+
+            let skipped_laps = u64::try_from(laps).unwrap_or(u64::MAX);
+            append_event(
+                workspace,
+                pathway_id,
+                context,
+                context.now,
+                PathwayEventKind::OfflineCatchUp,
+                PathwayEventPayload {
+                    assignment_id: Some(assignment_id),
+                    tile_id: Some(assignment.tile_id),
+                    node_id: assignment.current_node_id,
+                    segment_id: assignment.current_segment_id,
+                    explanation: format!(
+                        "Summarized {skipped_laps} complete repeating lap{} from offline time; the final partial lap replays exactly.",
+                        if skipped_laps == 1 { "" } else { "s" }
+                    ),
+                    before_state: Some(assignment.state),
+                    after_state: Some(assignment.state),
+                    ..PathwayEventPayload::default()
+                },
+            )?;
+            report.skipped_lap_count = report.skipped_lap_count.saturating_add(skipped_laps);
+            report.affected_page_ids.insert(pathway.page_id);
+        }
+    }
+    Ok(())
+}
+
+fn offline_lap_anchor(
+    pathway: &Pathway,
+    assignment: &PathwayAssignment,
+) -> Option<(PathwayNodeId, UnixMicros)> {
+    match assignment.state {
+        PathwayAssignmentState::Moving => {
+            let segment = pathway.segment(assignment.current_segment_id?)?;
+            let geometry = segment_geometry(pathway, segment)?;
+            let started_at = assignment.segment_started_at?;
+            let remaining = 1.0 - assignment.segment_start_progress.clamp(0.0, 1.0);
+            let arrival_at = started_at.saturating_add_micros(segment_duration_micros(
+                geometry.length,
+                segment.speed_points_per_second,
+                remaining,
+            ));
+            Some((segment.to_node_id, arrival_at))
+        }
+        PathwayAssignmentState::Waiting => {
+            Some((assignment.current_node_id?, assignment.wait_until?))
+        }
+        PathwayAssignmentState::Blocked
+        | PathwayAssignmentState::Paused
+        | PathwayAssignmentState::Completed
+        | PathwayAssignmentState::Detached
+        | PathwayAssignmentState::NeedsAttention => None,
+    }
+}
+
+/// Returns one exact integer-microsecond lap, or `None` when analytical skip
+/// would cross a gate, leave/break the graph, enter a non-anchor cycle, or use
+/// a route shorter than the 50 ms safety floor.
+fn repeating_lap_duration_micros(pathway: &Pathway, anchor_node_id: PathwayNodeId) -> Option<i64> {
+    let mut total = 0_i64;
+    let mut current_node_id = anchor_node_id;
+    for _ in 0..pathway.nodes.len() {
+        let node = pathway.node(current_node_id)?;
+        if node.kind == PathwayNodeKind::ApprovalGate {
+            return None;
+        }
+        let segment = pathway_projection::outgoing_segment(pathway, current_node_id)?;
+        let geometry = segment_geometry(pathway, segment)?;
+        let dwell = wait_duration_micros(node.wait_duration_seconds);
+        let travel = segment_duration_micros(geometry.length, segment.speed_points_per_second, 1.0);
+        total = total.checked_add(dwell)?.checked_add(travel)?;
+        current_node_id = segment.to_node_id;
+        if current_node_id == anchor_node_id {
+            return (total > 50_000).then_some(total);
+        }
+    }
+    None
+}
+
+fn shift_optional_timestamp(
+    timestamp: Option<UnixMicros>,
+    shift_micros: i64,
+) -> Option<Option<UnixMicros>> {
+    match timestamp {
+        Some(timestamp) => timestamp
+            .0
+            .checked_add(shift_micros)
+            .map(UnixMicros)
+            .map(Some),
+        None => Some(None),
+    }
+}
+
 fn merge_report(target: &mut PathwayReconcileReport, source: PathwayReconcileReport) {
     target.changed |= source.changed;
     target.layout_changed |= source.layout_changed;
@@ -477,7 +670,13 @@ fn merge_report(target: &mut PathwayReconcileReport, source: PathwayReconcileRep
     target.automation_reports.extend(source.automation_reports);
     target.affected_page_ids.extend(source.affected_page_ids);
     target.approved_count = target.approved_count.saturating_add(source.approved_count);
+    if source.approval_status.is_some() {
+        target.approval_status = source.approval_status;
+    }
     target.resumed_count = target.resumed_count.saturating_add(source.resumed_count);
+    target.skipped_lap_count = target
+        .skipped_lap_count
+        .saturating_add(source.skipped_lap_count);
 }
 
 #[derive(Clone, Debug)]
@@ -586,8 +785,10 @@ fn next_moving_transition(
     let length = geometry.length.max(SAFE_SEGMENT_LENGTH);
     let speed = segment.speed_points_per_second.max(1.0);
     let start_progress = assignment.segment_start_progress.clamp(0.0, 1.0);
-    let arrival_at = started_at.saturating_add_micros(duration_micros_ceil(
-        (1.0 - start_progress) * length / speed,
+    let arrival_at = started_at.saturating_add_micros(segment_duration_micros(
+        length,
+        speed,
+        1.0 - start_progress,
     ));
     let mut candidates = vec![(
         arrival_at,
@@ -652,16 +853,16 @@ fn next_moving_transition(
                 if !seen.insert(key) {
                     continue;
                 }
-                let at = started_at.saturating_add_micros(duration_micros_ceil(
-                    (boundary.progress - start_progress) * length / speed,
+                let at = started_at.saturating_add_micros(segment_duration_micros(
+                    length,
+                    speed,
+                    boundary.progress - start_progress,
                 ));
-                // A candidate must be strictly more than one microsecond past
-                // the durable cursor. This prevents replay after time rounding.
-                if at
-                    <= assignment
-                        .last_reconciled_at
-                        .saturating_add_micros(CANDIDATE_DATE_FILTER_MICROS)
-                {
+                // The durable date cursor is strict, while the spatial
+                // progress window suppresses replay. Adding another date
+                // microsecond here swallows a legitimate T+2 us sibling after
+                // a T/T+1 us bundle advances the cursor to T+1.
+                if at <= assignment.last_reconciled_at {
                     continue;
                 }
                 raw_boundaries.push((
@@ -711,10 +912,9 @@ fn earliest_boundary_actions(
     let first_at = raw_boundaries.first()?.0;
     let actions = raw_boundaries
         .into_iter()
-        // Candidate filtering rejects anything at or before
-        // `last_reconciled_at + 1 us`. Keep boundary siblings solved at T and
-        // T+1 us in one bundle so applying T cannot erase T+1 on the next
-        // planner pass.
+        // Coalesce the one-microsecond rounding neighborhood. The durable
+        // cursor itself is now strict; the spatial progress window prevents
+        // replay without swallowing the next T+2 us sibling.
         .take_while(|entry| entry.0.0.saturating_sub(first_at.0) <= CANDIDATE_DATE_FILTER_MICROS)
         .map(|entry| entry.1)
         .collect::<Vec<_>>();
@@ -750,6 +950,20 @@ fn duration_micros_ceil(seconds: f64) -> i64 {
     } else {
         micros as i64
     }
+}
+
+/// Segment timing has one integer-microsecond seam shared by the live planner
+/// and P5's offline lap calculator. Keeping the safe-length, speed, progress,
+/// and ceil clamps here prevents analytic rebasing from drifting out of phase
+/// with the exact replay that follows it.
+fn segment_duration_micros(length: f64, speed: f64, progress: f64) -> i64 {
+    duration_micros_ceil(
+        progress.clamp(0.0, 1.0) * length.max(SAFE_SEGMENT_LENGTH) / speed.max(1.0),
+    )
+}
+
+fn wait_duration_micros(seconds: f64) -> i64 {
+    duration_micros_ceil(seconds.max(0.0))
 }
 
 fn add_points(left: PathwayPoint, right: PathwayPoint) -> PathwayPoint {
@@ -1003,7 +1217,7 @@ fn begin_at_node(
             },
         )?;
     } else if node.wait_duration_seconds > 0.0 {
-        let wait_until = at.saturating_add_micros(duration_micros_ceil(node.wait_duration_seconds));
+        let wait_until = at.saturating_add_micros(wait_duration_micros(node.wait_duration_seconds));
         let assignment = workspace
             .domain
             .pathways
@@ -1056,7 +1270,17 @@ fn depart(
         .ok_or(DomainError::MissingPathway(pathway_id))?;
     let tile_id = workspace.domain.pathways.assignments[&assignment_id].tile_id;
     if !pathway.is_enabled {
-        complete_assignment(workspace, pathway_id, assignment_id, node, at, context)?;
+        // Normal callers cannot reach this arm because pausing catches up
+        // before disabling. Persisted malformed states can, so fail visibly
+        // instead of silently completing a rider on a paused route.
+        mark_needs_attention_at(
+            workspace,
+            pathway_id,
+            assignment_id,
+            "This rider cannot depart while its pathway is paused.",
+            at,
+            context,
+        )?;
         return Ok(());
     }
     let Some(segment) = pathway_projection::outgoing_segment(&pathway, node.id).cloned() else {
@@ -2064,7 +2288,7 @@ fn enable_pathway(
                     // replaying the historical overdue deadline would trip the
                     // same startup breaker again immediately.
                     stored.wait_until =
-                        Some(context.now.saturating_add_micros(duration_micros_ceil(
+                        Some(context.now.saturating_add_micros(wait_duration_micros(
                             node.wait_duration_seconds,
                         )));
                 }
@@ -2573,6 +2797,72 @@ mod tests {
         pile_id
     }
 
+    fn add_center_pile_at(fixture: &mut Fixture, pile_value: u128, x: f32) -> PileId {
+        let pile_id = id(pile_value);
+        let tag_id = id(pile_value + 1_000);
+        fixture
+            .workspace
+            .domain
+            .tags
+            .ensure_tag(
+                tag_id,
+                format!("Pile {pile_value}"),
+                PaletteColor::Blue,
+                UnixMillis::ZERO,
+            )
+            .unwrap();
+        let rect = WorldRect::new(x, 40.0, 50.0, 20.0);
+        let mut pile = Pile::new(
+            pile_id,
+            fixture.workspace.active_page,
+            rect,
+            format!("Pile {pile_value}"),
+            tag_id,
+            PaletteColor::Blue,
+        )
+        .unwrap();
+        pile.containment = ContainmentMode::CenterInside;
+        fixture.workspace.domain.piles.insert(pile_id, pile);
+        fixture
+            .workspace
+            .active_page_mut()
+            .add_tile(Tile::pile(pile_id, "Pile", rect));
+        pile_id
+    }
+
+    #[test]
+    fn boundary_two_microseconds_after_a_bundled_sibling_is_not_swallowed() {
+        let mut fixture = fixture(100.0, 1_000_000.0, UnixMicros::ZERO);
+        let pile_ids = [
+            add_center_pile_at(&mut fixture, 500, 20.0),
+            add_center_pile_at(&mut fixture, 501, 21.0),
+            add_center_pile_at(&mut fixture, 502, 22.0),
+        ];
+
+        let report =
+            PathwayReconcileService::reconcile(&mut fixture.workspace, context(22)).unwrap();
+
+        assert_eq!(report.transition_count, 3);
+        assert_eq!(report.automation_reports.len(), 2);
+        let entries = fixture
+            .workspace
+            .domain
+            .pathways
+            .events()
+            .iter()
+            .filter(|event| event.kind == PathwayEventKind::PileEntered)
+            .map(|event| (event.at, event.payload.pile_id.unwrap()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries,
+            vec![
+                (UnixMicros(20), pile_ids[0]),
+                (UnixMicros(21), pile_ids[1]),
+                (UnixMicros(22), pile_ids[2]),
+            ]
+        );
+    }
+
     #[test]
     fn exact_boundary_uses_nudged_overlay_and_never_writes_the_pile_rect() {
         let mut fixture = fixture(100.0, 1.0, UnixMicros::ZERO);
@@ -3005,6 +3295,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(approved.approved_count, 1);
+        assert_eq!(
+            approved.approval_status,
+            Some(PathwayApprovalStatus::Approved(1))
+        );
         let assignment = &fixture.workspace.domain.pathways.assignments[&fixture.assignment_id];
         assert_eq!(assignment.state, PathwayAssignmentState::Waiting);
         assert_eq!(assignment.wait_until, Some(UnixMicros(4_000_000)));
@@ -3012,6 +3306,103 @@ mod tests {
         assert_eq!(
             fixture.workspace.domain.pathways.assignments[&fixture.assignment_id].state,
             PathwayAssignmentState::Completed
+        );
+    }
+
+    #[test]
+    fn approval_reports_paused_routes_and_empty_gate_selections() {
+        let mut fixture = fixture(10.0, 10.0, UnixMicros::ZERO);
+        fixture
+            .workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&fixture.pathway_id)
+            .unwrap()
+            .nodes
+            .get_mut(&fixture.end_id)
+            .unwrap()
+            .kind = PathwayNodeKind::ApprovalGate;
+
+        let empty = PathwayReconcileService::approve_gate(
+            &mut fixture.workspace,
+            fixture.pathway_id,
+            fixture.end_id,
+            None,
+            context(1),
+        )
+        .unwrap();
+        assert_eq!(
+            empty.approval_status,
+            Some(PathwayApprovalStatus::NoMatchingRiders)
+        );
+
+        fixture
+            .workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&fixture.pathway_id)
+            .unwrap()
+            .is_enabled = false;
+        let before = fixture.workspace.clone();
+        let paused = PathwayReconcileService::approve_gate(
+            &mut fixture.workspace,
+            fixture.pathway_id,
+            fixture.end_id,
+            None,
+            context(2),
+        )
+        .unwrap();
+        assert_eq!(
+            paused.approval_status,
+            Some(PathwayApprovalStatus::RoutePaused)
+        );
+        assert!(!paused.changed);
+        assert_eq!(fixture.workspace, before);
+    }
+
+    #[test]
+    fn disabled_departure_needs_attention_instead_of_completing() {
+        let mut fixture = fixture(10.0, 1.0, UnixMicros::ZERO);
+        fixture
+            .workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&fixture.pathway_id)
+            .unwrap()
+            .is_enabled = false;
+        let node = fixture.workspace.domain.pathways.pathways[&fixture.pathway_id].nodes
+            [&fixture.start_id]
+            .clone();
+
+        depart(
+            &mut fixture.workspace,
+            fixture.pathway_id,
+            fixture.assignment_id,
+            &node,
+            UnixMicros(10),
+            &context(10),
+        )
+        .unwrap();
+
+        let assignment = &fixture.workspace.domain.pathways.assignments[&fixture.assignment_id];
+        assert_eq!(assignment.state, PathwayAssignmentState::NeedsAttention);
+        assert!(
+            assignment
+                .needs_attention_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("paused"))
+        );
+        assert!(
+            fixture
+                .workspace
+                .domain
+                .pathways
+                .events()
+                .iter()
+                .all(|event| { event.kind != PathwayEventKind::Completed })
         );
     }
 
@@ -3151,6 +3542,7 @@ mod tests {
         let report =
             PathwayReconcileService::reconcile(&mut fixture.workspace, context(2_000_000)).unwrap();
         assert_eq!(report.transition_count, 2);
+        assert_eq!(report.skipped_lap_count, 0);
         let assignment = &fixture.workspace.domain.pathways.assignments[&fixture.assignment_id];
         assert_eq!(assignment.state, PathwayAssignmentState::Moving);
         assert_eq!(assignment.current_segment_id, Some(fixture.segment_id));
@@ -3174,6 +3566,251 @@ mod tests {
                 .iter()
                 .all(|event| event.kind != PathwayEventKind::Completed)
         );
+        assert!(
+            fixture
+                .workspace
+                .domain
+                .pathways
+                .events()
+                .iter()
+                .all(|event| event.kind != PathwayEventKind::OfflineCatchUp),
+            "ordinary live reconciliation must never use the launch-only lap prepass"
+        );
+    }
+
+    #[test]
+    fn multi_hour_repeat_catch_up_summarizes_whole_laps_and_replays_the_remainder() {
+        let mut fixture = fixture(10.0, 10.0, UnixMicros::ZERO);
+        let closure_id = id(70);
+        {
+            let pathway = fixture
+                .workspace
+                .domain
+                .pathways
+                .pathways
+                .get_mut(&fixture.pathway_id)
+                .unwrap();
+            pathway.repeats = true;
+            pathway
+                .nodes
+                .get_mut(&fixture.start_id)
+                .unwrap()
+                .wait_duration_seconds = 1.0;
+            pathway
+                .nodes
+                .get_mut(&fixture.end_id)
+                .unwrap()
+                .wait_duration_seconds = 2.0;
+            pathway.segments.insert(
+                closure_id,
+                PathwaySegment::new(
+                    closure_id,
+                    fixture.end_id,
+                    fixture.start_id,
+                    1.0,
+                    10.0,
+                    UnixMicros::ZERO,
+                )
+                .unwrap(),
+            );
+        }
+        let now = UnixMicros(10_804_500_000);
+        let startup = PathwayReconcileContext::with_operation_id(
+            "test",
+            now,
+            PathwayReconcileCause::StartupBacklog,
+            id(998),
+        )
+        .unwrap();
+
+        let report = PathwayReconcileService::reconcile(&mut fixture.workspace, startup).unwrap();
+
+        assert_eq!(report.skipped_lap_count, 2_160);
+        assert_eq!(report.transition_count, 3);
+        assert!(report.breaker_pathway_ids.is_empty());
+        let catch_up = fixture
+            .workspace
+            .domain
+            .pathways
+            .events()
+            .iter()
+            .filter(|event| event.kind == PathwayEventKind::OfflineCatchUp)
+            .collect::<Vec<_>>();
+        assert_eq!(catch_up.len(), 1);
+        assert!(catch_up[0].payload.explanation.contains("2160 complete"));
+        let arrivals = fixture
+            .workspace
+            .domain
+            .pathways
+            .events()
+            .iter()
+            .filter(|event| event.kind == PathwayEventKind::DestinationReached)
+            .map(|event| (event.at, event.payload.node_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arrivals,
+            vec![
+                (UnixMicros(10_801_000_000), Some(fixture.end_id)),
+                (UnixMicros(10_804_000_000), Some(fixture.start_id)),
+            ],
+            "the final partial lap must be replayed through exact arrivals"
+        );
+        let assignment = &fixture.workspace.domain.pathways.assignments[&fixture.assignment_id];
+        assert_eq!(assignment.state, PathwayAssignmentState::Waiting);
+        assert_eq!(assignment.current_node_id, Some(fixture.start_id));
+        assert_eq!(assignment.wait_until, Some(UnixMicros(10_805_000_000)));
+        assert_eq!(
+            fixture
+                .workspace
+                .active_page()
+                .tile(fixture.tile_id)
+                .unwrap()
+                .rect,
+            WorldRect::new(-5.0, 45.0, 10.0, 10.0),
+            "the exact final-lap arrival materializes the start node"
+        );
+    }
+
+    #[test]
+    fn lap_skip_rejects_gates_broken_walks_nonreturning_cycles_and_short_laps() {
+        let mut fixture = fixture(10.0, 10.0, UnixMicros::ZERO);
+        let closure_id = id(70);
+        {
+            let pathway = fixture
+                .workspace
+                .domain
+                .pathways
+                .pathways
+                .get_mut(&fixture.pathway_id)
+                .unwrap();
+            pathway.repeats = true;
+            pathway.segments.insert(
+                closure_id,
+                PathwaySegment::new(
+                    closure_id,
+                    fixture.end_id,
+                    fixture.start_id,
+                    1.0,
+                    10.0,
+                    UnixMicros::ZERO,
+                )
+                .unwrap(),
+            );
+        }
+        let route = &fixture.workspace.domain.pathways.pathways[&fixture.pathway_id];
+        assert_eq!(
+            repeating_lap_duration_micros(route, fixture.end_id),
+            Some(2_000_000)
+        );
+
+        fixture
+            .workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&fixture.pathway_id)
+            .unwrap()
+            .nodes
+            .get_mut(&fixture.end_id)
+            .unwrap()
+            .kind = PathwayNodeKind::ApprovalGate;
+        assert!(
+            repeating_lap_duration_micros(
+                &fixture.workspace.domain.pathways.pathways[&fixture.pathway_id],
+                fixture.end_id,
+            )
+            .is_none()
+        );
+
+        let pathway = fixture
+            .workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&fixture.pathway_id)
+            .unwrap();
+        pathway.nodes.get_mut(&fixture.end_id).unwrap().kind = PathwayNodeKind::Destination;
+        pathway.segments.remove(&closure_id);
+        assert!(repeating_lap_duration_micros(pathway, fixture.end_id).is_none());
+
+        let middle_id = id(71);
+        let to_middle_id = id(72);
+        let middle_to_start_id = id(73);
+        pathway.nodes.insert(
+            middle_id,
+            PathwayNode::new(
+                middle_id,
+                PathwayPoint::new(5.0, 60.0),
+                2.0,
+                "Middle",
+                PathwayNodeKind::Destination,
+                0.0,
+                UnixMicros::ZERO,
+            )
+            .unwrap(),
+        );
+        pathway.segments.insert(
+            closure_id,
+            PathwaySegment::new(
+                closure_id,
+                fixture.end_id,
+                fixture.start_id,
+                1.0,
+                10.0,
+                UnixMicros::ZERO,
+            )
+            .unwrap(),
+        );
+        pathway.segments.remove(&fixture.segment_id);
+        pathway.segments.insert(
+            to_middle_id,
+            PathwaySegment::new(
+                to_middle_id,
+                fixture.start_id,
+                middle_id,
+                0.0,
+                10.0,
+                UnixMicros::ZERO,
+            )
+            .unwrap(),
+        );
+        pathway.segments.insert(
+            middle_to_start_id,
+            PathwaySegment::new(
+                middle_to_start_id,
+                middle_id,
+                fixture.start_id,
+                2.0,
+                10.0,
+                UnixMicros::ZERO,
+            )
+            .unwrap(),
+        );
+        assert!(repeating_lap_duration_micros(pathway, fixture.end_id).is_none());
+
+        let mut short = self::fixture(0.01, 1_000.0, UnixMicros::ZERO);
+        let short_closure_id = id(74);
+        let pathway = short
+            .workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&short.pathway_id)
+            .unwrap();
+        pathway.repeats = true;
+        pathway.segments.insert(
+            short_closure_id,
+            PathwaySegment::new(
+                short_closure_id,
+                short.end_id,
+                short.start_id,
+                1.0,
+                1_000.0,
+                UnixMicros::ZERO,
+            )
+            .unwrap(),
+        );
+        assert!(repeating_lap_duration_micros(pathway, short.end_id).is_none());
     }
 
     #[test]
