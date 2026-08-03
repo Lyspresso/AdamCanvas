@@ -4677,7 +4677,7 @@ impl PathwayStore {
     }
 }
 
-fn validate_pathway_title(value: impl Into<String>) -> Result<String, DomainError> {
+pub(crate) fn validate_pathway_title(value: impl Into<String>) -> Result<String, DomainError> {
     let value = value.into().trim().to_owned();
     if value.is_empty() {
         return Err(DomainError::EmptyName);

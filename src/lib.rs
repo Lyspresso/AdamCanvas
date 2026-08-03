@@ -26,6 +26,7 @@ pub(crate) mod macos_vision;
 pub mod model;
 pub mod number_format;
 pub mod ocr;
+pub mod pathway_editing;
 pub mod pathway_projection;
 pub mod persistence;
 pub mod photo_details;
