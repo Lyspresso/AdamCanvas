@@ -1,5 +1,6 @@
-use crate::model::{CanvasPage, Tile, WorldRect};
+use crate::model::{CanvasPage, Tile, TileKind, WorldRect};
 use std::collections::HashMap;
+use uuid::Uuid;
 
 pub const DEFAULT_CELL_SIZE: f32 = 512.0;
 const MAX_ENUMERATED_CELLS: u64 = 4_096;
@@ -68,6 +69,20 @@ impl SpatialIndex {
         }
     }
 
+    /// Rebuilds only when the source-ordered geometry changed.
+    ///
+    /// Wall-clock pathway motion has no model mutation with which to mark the
+    /// index dirty, so canvas frames use this comparison to advance the index
+    /// through the final projected endpoint as well as the animated frames.
+    pub fn refresh_rects(&mut self, rects: impl IntoIterator<Item = WorldRect>) -> bool {
+        let rects = rects.into_iter().collect::<Vec<_>>();
+        if self.rects == rects {
+            return false;
+        }
+        self.rebuild_rects(rects);
+        true
+    }
+
     /// Appends a rectangle and returns the source index assigned to it.
     pub fn insert(&mut self, rect: WorldRect) -> usize {
         let index = self.rects.len();
@@ -120,6 +135,20 @@ impl SpatialIndex {
                 .is_some_and(|rect| rect.intersects(visible))
         });
         candidates
+    }
+
+    /// Maps an exact spatial query back through the page's source order while
+    /// excluding pile regions from ordinary canvas selection.
+    pub fn query_non_pile_tile_ids(&self, tiles: &[Tile], visible: WorldRect) -> Vec<Uuid> {
+        self.query_visible(visible)
+            .into_iter()
+            .filter_map(|index| {
+                tiles
+                    .get(index)
+                    .filter(|tile| tile.kind() != TileKind::Pile)
+                    .map(|tile| tile.id)
+            })
+            .collect()
     }
 
     fn index_rect(&mut self, index: usize, rect: WorldRect) {

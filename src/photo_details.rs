@@ -4,10 +4,11 @@
 //! provide optional enrichment gathered elsewhere, and this module combines it
 //! with the workspace's page, geometry, tag provenance, and pile membership.
 
-use crate::domain::{
-    CanvasObject, DomainTileType, PaletteColor, TagSource, UnixMillis, resolve_pile_memberships,
+use crate::{
+    automation::{CanvasGeometrySnapshot, canvas_objects_from_workspace},
+    domain::{PaletteColor, TagSource, UnixMicros, UnixMillis, resolve_pile_memberships},
+    model::{FileKind, TileContent, TileKind, Workspace, WorldRect},
 };
-use crate::model::{FileKind, TileContent, TileKind, Workspace, WorldRect};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, fmt::Write, sync::Arc};
 use uuid::Uuid;
@@ -327,6 +328,7 @@ impl PhotoDossier {
         workspace: &Workspace,
         tile_id: Uuid,
         mut enrichment: PhotoEnrichment,
+        at: UnixMicros,
     ) -> Result<Self, PhotoDetailsError> {
         let Some((page, tile)) = workspace.pages.iter().find_map(|page| {
             page.tiles
@@ -356,8 +358,10 @@ impl PhotoDossier {
             _ => "Untitled photo".into(),
         };
 
+        let geometry = canvas_objects_from_workspace(workspace, at, |_| None);
+        let projected_rect = geometry.rect_for(page.id, tile.id).unwrap_or(tile.rect);
         let tags = collect_tags(workspace, tile_id);
-        let piles = collect_piles(workspace, tile_id);
+        let piles = collect_piles(workspace, tile_id, &geometry);
         let visual_description = workspace
             .domain
             .photo_records
@@ -370,7 +374,7 @@ impl PhotoDossier {
             source_name,
             page_id: page.id,
             page_name: nonblank_or(&page.name, "Untitled page"),
-            geometry: safe_geometry(tile.rect),
+            geometry: safe_geometry(projected_rect),
             metadata: enrichment.metadata,
             summary: enrichment.summary.unwrap_or_default(),
             about: enrichment.about.unwrap_or_default(),
@@ -646,8 +650,9 @@ pub fn photo_dossier_markdown(
     workspace: &Workspace,
     tile_id: Uuid,
     enrichment: PhotoEnrichment,
+    at: UnixMicros,
 ) -> Result<String, PhotoDetailsError> {
-    Ok(PhotoDossier::from_workspace(workspace, tile_id, enrichment)?.to_markdown())
+    Ok(PhotoDossier::from_workspace(workspace, tile_id, enrichment, at)?.to_markdown())
 }
 
 /// Returns exactly the editable text between Adam's note markers. The markers
@@ -711,25 +716,12 @@ fn collect_tags(workspace: &Workspace, tile_id: Uuid) -> Vec<PhotoTagDetails> {
     tags
 }
 
-fn collect_piles(workspace: &Workspace, tile_id: Uuid) -> Vec<PhotoPileDetails> {
-    let objects: Vec<_> = workspace
-        .pages
-        .iter()
-        .flat_map(|page| {
-            page.tiles.iter().map(move |tile| CanvasObject {
-                id: tile.id,
-                page_id: page.id,
-                rect: tile.rect,
-                tile_type: match tile.content {
-                    TileContent::Pile { .. } => DomainTileType::Pile,
-                    TileContent::Tag { .. } => DomainTileType::Tag,
-                    TileContent::AiChat { .. } => DomainTileType::AiChat,
-                    _ => DomainTileType::Content(tile.kind()),
-                },
-            })
-        })
-        .collect();
-    let memberships = resolve_pile_memberships(&workspace.domain.piles, &objects);
+fn collect_piles(
+    workspace: &Workspace,
+    tile_id: Uuid,
+    geometry: &CanvasGeometrySnapshot,
+) -> Vec<PhotoPileDetails> {
+    let memberships = resolve_pile_memberships(&workspace.domain.piles, geometry.objects());
     let mut piles: Vec<_> = workspace
         .domain
         .piles
@@ -1033,8 +1025,11 @@ mod tests {
             user_notes: Some("Use for the cover.".into()),
         };
 
-        let first = photo_dossier_markdown(&workspace, id(10), enrichment.clone()).unwrap();
-        let second = photo_dossier_markdown(&workspace, id(10), enrichment).unwrap();
+        let first =
+            photo_dossier_markdown(&workspace, id(10), enrichment.clone(), UnixMicros::ZERO)
+                .unwrap();
+        let second =
+            photo_dossier_markdown(&workspace, id(10), enrichment, UnixMicros::ZERO).unwrap();
 
         assert_eq!(first, second);
         assert!(first.starts_with("# A lakeside reference photo."));
@@ -1065,8 +1060,13 @@ mod tests {
             id(10),
             WorldRect::new(f32::NAN, 5.0, f32::INFINITY, 20.0),
         ));
-        let markdown =
-            photo_dossier_markdown(&workspace, id(10), PhotoEnrichment::default()).unwrap();
+        let markdown = photo_dossier_markdown(
+            &workspace,
+            id(10),
+            PhotoEnrichment::default(),
+            UnixMicros::ZERO,
+        )
+        .unwrap();
 
         assert!(markdown.contains("IMG\\_0042.HEIC"));
         assert!(!markdown.contains("/private/library"));
@@ -1147,6 +1147,7 @@ mod tests {
                 ocr_text: Some("IF YOU'RE UNEMPLOYED".into()),
                 ..PhotoEnrichment::default()
             },
+            UnixMicros::ZERO,
         )
         .unwrap();
 
@@ -1179,6 +1180,7 @@ mod tests {
                 user_notes: Some(format!("before\n{USER_NOTES_END}\nafter")),
                 ..PhotoEnrichment::default()
             },
+            UnixMicros::ZERO,
         )
         .unwrap();
 
@@ -1194,14 +1196,24 @@ mod tests {
     fn missing_and_non_photo_tiles_return_specific_errors() {
         let mut workspace = Workspace::new();
         assert_eq!(
-            PhotoDossier::from_workspace(&workspace, id(99), PhotoEnrichment::default()),
+            PhotoDossier::from_workspace(
+                &workspace,
+                id(99),
+                PhotoEnrichment::default(),
+                UnixMicros::ZERO,
+            ),
             Err(PhotoDetailsError::MissingTile(id(99)))
         );
         let mut note = Tile::note("Not photo", "text", WorldRect::new(0.0, 0.0, 10.0, 10.0));
         note.id = id(50);
         workspace.active_page_mut().tiles.push(note);
         assert_eq!(
-            PhotoDossier::from_workspace(&workspace, id(50), PhotoEnrichment::default()),
+            PhotoDossier::from_workspace(
+                &workspace,
+                id(50),
+                PhotoEnrichment::default(),
+                UnixMicros::ZERO,
+            ),
             Err(PhotoDetailsError::NotAPhoto(id(50)))
         );
     }
