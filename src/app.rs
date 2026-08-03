@@ -39,10 +39,10 @@ use crate::{
         AiQueuedTurn, AiWorkspaceMode, ApplyMode, ApprovalEvidence, AuthorizationDecision,
         AutoTagRule, AutoTagSettings, ContainmentMode, DomainActor, EarnedTagRemovalPolicy,
         ExistingTilesPolicy, HostArtifactOrigin, InitialMembership, MessageRole, PaletteColor,
-        PathwayNodeKind, PathwayPoint, PermissionMode, Pile, PileHistoryKind,
-        RuleEditProgressPolicy, RuleState, TagClaim, TagName, TagSource, TimeUnit, TimingMode,
-        TrashActor, TrashItem, UnixMicros, UnixMillis, ai_permission_verdict, apply_rule_edit,
-        authorize_ai_action, auto_tag_rule_sentence, resolve_pile_memberships,
+        PathwayId, PathwayNodeId, PathwayNodeKind, PathwayPoint, PermissionMode, Pile,
+        PileHistoryKind, RuleEditProgressPolicy, RuleState, TagClaim, TagName, TagSource, TimeUnit,
+        TimingMode, TrashActor, TrashItem, UnixMicros, UnixMillis, ai_permission_verdict,
+        apply_rule_edit, authorize_ai_action, auto_tag_rule_sentence, resolve_pile_memberships,
     },
     dots::{self, ChromeRects},
     file_watch::{self, FileWatch},
@@ -55,8 +55,9 @@ use crate::{
     ocr::{OcrQueueError, PhotoOcrRequest, PhotoOcrWorker, source_fingerprint},
     pathway_editing::{PathwayEditContext, PathwayEditingService},
     pathway_enrollment::{
-        PathwayDockGeometry, PathwayEnrollmentChoice, PathwayEnrollmentContext,
-        PathwayEnrollmentReview, PathwayEnrollmentService, PathwayFinishBehavior,
+        PathwayDockAnchor, PathwayDockGeometry, PathwayDockTarget, PathwayEnrollmentChoice,
+        PathwayEnrollmentContext, PathwayEnrollmentReview, PathwayEnrollmentService,
+        PathwayFinishBehavior,
     },
     pathway_reconciliation::{
         PathwayProblem, PathwayProblemKind, PathwayReconcileCause, PathwayReconcileContext,
@@ -309,8 +310,101 @@ struct DragSession {
     /// Store-backed rects used only to cancel the gesture. Merely pressing a
     /// moving rider must never materialize its projected position.
     durable_originals: HashMap<Uuid, WorldRect>,
+    /// Route geometry flattened once at pointer-down, per the plan's dock
+    /// contract: every later pointer tick is pure arithmetic against these
+    /// values, and the hysteresis needs them to hold still. `None` when the
+    /// drag carries nothing that could ride (piles only).
+    dock: Option<PathwayDockGeometry>,
     text_source: Option<Uuid>,
     moved: bool,
+}
+
+/// One in-flight rail gesture: a grabbed stop, or the whole route grabbed by
+/// its line. `original_nodes` holds only the stops this gesture may move.
+/// Nothing durable changes until release; Escape simply drops the session.
+struct PathwayRailDrag {
+    pathway_id: PathwayId,
+    start_world: [f32; 2],
+    /// Screen-space anchor for click-vs-drag discrimination. Rail edits are
+    /// durable and undo-exempt, so a plain click's pixel jitter must never
+    /// count as movement — a world-unit threshold would at low zoom.
+    start_pointer: Pos2,
+    original_nodes: BTreeMap<PathwayNodeId, PathwayPoint>,
+    preview_nodes: BTreeMap<PathwayNodeId, PathwayPoint>,
+    page_size: [f32; 2],
+    moved: bool,
+}
+
+/// Screen pixels of travel before a rail grab counts as a move rather than a
+/// click, matching the note tool's gesture threshold territory.
+const RAIL_DRAG_THRESHOLD_POINTS: f32 = 6.0;
+
+/// Mirrors the editing service's placement clamp (32-point canvas margin) so
+/// the drag preview lands exactly where the commit will.
+fn clamped_rail_point(point: PathwayPoint, page_size: [f32; 2]) -> PathwayPoint {
+    const RAIL_CANVAS_MARGIN: f64 = 32.0;
+    if !point.is_finite() {
+        return point;
+    }
+    let width = f64::from(page_size[0]);
+    let height = f64::from(page_size[1]);
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return point;
+    }
+    PathwayPoint::new(
+        point.x.clamp(
+            RAIL_CANVAS_MARGIN,
+            (width - RAIL_CANVAS_MARGIN).max(RAIL_CANVAS_MARGIN),
+        ),
+        point.y.clamp(
+            RAIL_CANVAS_MARGIN,
+            (height - RAIL_CANVAS_MARGIN).max(RAIL_CANVAS_MARGIN),
+        ),
+    )
+}
+
+/// Applies a finished rail gesture as one all-or-nothing step, then restores
+/// the route's running state.
+///
+/// The editing service pauses live cargo before any graph change — that is
+/// the plan's law, not a choice — so a route that was enabled is re-enabled
+/// afterwards: reshaping the track should feel like bending it, not like
+/// pulling its power. The whole move runs on a clone first because pathway
+/// edits are exempt from undo by design (P1); a half-moved route would be
+/// unrecoverable.
+fn apply_pathway_rail_drag(
+    workspace: &mut Workspace,
+    pathway_id: PathwayId,
+    target_nodes: &BTreeMap<PathwayNodeId, PathwayPoint>,
+    now: UnixMicros,
+    operation_id: Uuid,
+) -> Result<(), String> {
+    let was_enabled = workspace
+        .domain
+        .pathways
+        .pathways
+        .get(&pathway_id)
+        .is_some_and(|pathway| pathway.is_enabled);
+    let mut draft = workspace.clone();
+    for (node_id, point) in target_nodes {
+        let edit = PathwayEditContext::with_operation_id("Adam rail drag", now, operation_id)
+            .map_err(|error| error.to_string())?;
+        PathwayEditingService::move_node(&mut draft, pathway_id, *node_id, *point, edit)
+            .map_err(|error| error.to_string())?;
+    }
+    if was_enabled {
+        let resume = PathwayReconcileContext::with_operation_id(
+            "Adam rail drag",
+            now,
+            PathwayReconcileCause::Live,
+            operation_id,
+        )
+        .map_err(|error| error.to_string())?;
+        PathwayReconcileService::set_enabled(&mut draft, pathway_id, true, resume)
+            .map_err(|error| error.to_string())?;
+    }
+    *workspace = draft;
+    Ok(())
 }
 
 struct ResizeSession {
@@ -1077,6 +1171,11 @@ pub struct AdamApp {
     /// makes docking review-first: the service re-validates the route revision
     /// and the cargo frames when the user picks, so a stale sheet cannot apply.
     pathway_enrollment_review: Option<PathwayEnrollmentReview>,
+    /// The rail the dragged tiles would join if dropped right now. Threaded
+    /// back into the resolver each tick so its hysteresis can hold and release
+    /// the highlight instead of flickering between overlapping rails.
+    pathway_dock_preview: Option<PathwayDockTarget>,
+    pathway_drag: Option<PathwayRailDrag>,
     note_draft: Option<NoteDraft>,
     text_note_drop_target: Option<Uuid>,
     page_size_edit_active: bool,
@@ -1437,6 +1536,8 @@ impl AdamApp {
             pending_website_anchor: None,
             armed_canvas_tool: None,
             pathway_enrollment_review: None,
+            pathway_dock_preview: None,
+            pathway_drag: None,
             note_draft: None,
             text_note_drop_target: None,
             page_size_edit_active: false,
@@ -1714,6 +1815,8 @@ impl AdamApp {
             self.drag_destination_page = None;
             self.note_draft = None;
             self.text_note_drop_target = None;
+            self.pathway_drag = None;
+            self.pathway_dock_preview = None;
             self.spatial_dirty = true;
             self.spatial_page = None;
             if changed_page {
@@ -2308,7 +2411,10 @@ impl AdamApp {
 
     fn poll_pathway_reconciliation(&mut self, context: &Context) {
         let now = unix_now_micros();
-        let settled = self.drag.is_none() && self.resize.is_none();
+        // A grabbed rail also defers the engine: its commit will pause and
+        // resume cargo itself, and an engine pass mid-gesture could disable
+        // the very route whose preview the user is holding.
+        let settled = self.drag.is_none() && self.resize.is_none() && self.pathway_drag.is_none();
         match pathway_poll_decision(
             self.pathway_reconcile_requested,
             self.pathway_startup_reconcile_pending,
@@ -3031,6 +3137,10 @@ impl AdamApp {
             self.text_note_drop_target = None;
             self.selection.clear();
             self.marquee = None;
+            // A rail gesture is preview-only, so cancelling is just dropping
+            // the session; nothing durable was written to restore.
+            self.pathway_drag = None;
+            self.pathway_dock_preview = None;
         }
     }
 
@@ -4041,7 +4151,19 @@ impl AdamApp {
                 draw_canvas_background(&painter, view, page_size, camera, self.show_grid, colors);
                 // Rails sit between the page and its cargo: a tile riding one
                 // must read as being on top of the rail, never under it.
-                draw_pathways(&painter, &self.workspace, page_id, camera, view, colors);
+                let rail_preview = self
+                    .pathway_drag
+                    .as_ref()
+                    .map(|session| (session.pathway_id, &session.preview_nodes));
+                draw_pathways(
+                    &painter,
+                    &self.workspace,
+                    page_id,
+                    camera,
+                    view,
+                    colors,
+                    rail_preview,
+                );
 
                 // One wall-clock sample and one immutable geometry snapshot
                 // drive every canvas read in this frame. Projection remains
@@ -4292,13 +4414,24 @@ impl AdamApp {
                         &geometry,
                         &projected_rect_by_tile,
                     );
-                    self.handle_background_interaction(
+                    // Rails claim the pointer before the background can start
+                    // a marquee underneath a grabbed stop or line.
+                    let rail_consumed = self.handle_pathway_rail_interaction(
                         &context,
                         &canvas_response,
                         camera,
                         view,
                         any_tile_pressed,
                     );
+                    if !rail_consumed {
+                        self.handle_background_interaction(
+                            &context,
+                            &canvas_response,
+                            camera,
+                            view,
+                            any_tile_pressed,
+                        );
+                    }
                 }
                 self.update_live_gestures(&context, camera, view, &projected_rect_by_tile);
                 self.draw_text_note_drop_target(
@@ -4309,6 +4442,7 @@ impl AdamApp {
                     &projected_rect_by_tile,
                 );
                 self.draw_marquee(&painter, camera, view, colors);
+                self.draw_pathway_dock_preview(&painter, camera, view, colors);
                 self.show_note_editor(ui, &context, camera, view, colors, &projected_rect_by_tile);
                 self.draw_minimap(&painter, view, camera, colors, &projected_rects);
                 self.show_canvas_status(ui, view, colors);
@@ -5060,6 +5194,12 @@ impl AdamApp {
             Some(_) => None,
             None => Some(GridViewState::default()),
         };
+        // The canvas stops running while the grid is open, so a rail gesture
+        // could never observe its release; a stranded session would freeze the
+        // engine and commit on the next unrelated click. Drop it instead —
+        // it is preview-only, so this cancels cleanly.
+        self.pathway_drag = None;
+        self.pathway_dock_preview = None;
     }
 
     /// Switches cell shape, keeping the wall anchored on whatever row is at
@@ -5277,7 +5417,7 @@ impl AdamApp {
                                         "Text\nClick and type directly · drag finished text onto a sticky note · double-click the tool to lock"
                                             .to_owned()
                                     } else if tool == CanvasQuickTool::Pathway {
-                                        "Pathway\nClick empty canvas to lay a new rail · select tiles first, then click a rail to put them on it\nTiles ride on the clock, even while Adam is closed"
+                                        "Pathway\nClick empty canvas to lay a new rail · drag tiles onto a rail to put them on it\nDrag a stop to move it · drag the line to move the whole route"
                                             .to_owned()
                                     } else {
                                         format!(
@@ -5494,6 +5634,11 @@ impl AdamApp {
     /// deliberate join can never silently stack a second route on top of the
     /// first. Joining is review-first: this only prepares the choice.
     fn place_or_join_pathway_at(&mut self, context: &Context, world: [f32; 2], magnification: f32) {
+        // A review sheet is already asking for a decision; a second offer
+        // would silently discard it, cargo list and all.
+        if self.pathway_enrollment_review.is_some() {
+            return;
+        }
         let page_id = self.workspace.active_page;
         let pointer = PathwayPoint::new(f64::from(world[0]), f64::from(world[1]));
         let dock = PathwayDockGeometry::prepare(&self.workspace, page_id).target(
@@ -5515,10 +5660,7 @@ impl AdamApp {
                 })
                 .collect::<BTreeSet<_>>();
             if cargo.is_empty() {
-                self.toast(
-                    "Select tiles first, then click a rail to put them on it",
-                    context,
-                );
+                self.toast("Drag tiles onto the rail to put them on it", context);
                 return;
             }
             match PathwayEnrollmentService::review(&self.workspace, target, cargo) {
@@ -5550,6 +5692,31 @@ impl AdamApp {
                 self.toast("Could not add a pathway here", context);
             }
         }
+    }
+
+    /// Shows where dragged tiles would join a rail: a ring at the entry point,
+    /// drawn above the cargo so the drop target stays visible underneath the
+    /// tile being dragged.
+    fn draw_pathway_dock_preview(
+        &self,
+        painter: &Painter,
+        camera: Camera,
+        view: Rect,
+        colors: Theme,
+    ) {
+        let Some(target) = &self.pathway_dock_preview else {
+            return;
+        };
+        if !target.route_point.is_finite() {
+            return;
+        }
+        let center = camera.world_to_screen(
+            [target.route_point.x as f32, target.route_point.y as f32],
+            view,
+        );
+        let radius = (7.0 * camera.zoom).clamp(5.0, 12.0);
+        painter.circle_stroke(center, radius + 3.0, Stroke::new(2.0, colors.accent));
+        painter.circle_filled(center, radius * 0.45, colors.accent);
     }
 
     /// Confirms a reviewed enrollment.
@@ -6200,6 +6367,155 @@ impl AdamApp {
         self.editing_note = None;
     }
 
+    /// Lets rails be reshaped directly: grab a stop to move it, grab the line
+    /// to move the whole route. Returns true while the pointer belongs to a
+    /// rail gesture so the background marquee cannot start underneath it.
+    fn handle_pathway_rail_interaction(
+        &mut self,
+        context: &Context,
+        canvas_response: &Response,
+        camera: Camera,
+        view: Rect,
+        any_tile_pressed: bool,
+    ) -> bool {
+        let pointer = context.input(|input| input.pointer.interact_pos());
+        let primary_pressed =
+            context.input(|input| input.pointer.button_pressed(PointerButton::Primary));
+        let primary_released =
+            context.input(|input| input.pointer.button_released(PointerButton::Primary));
+        let primary_down = context.input(|input| input.pointer.primary_down());
+        let space_down = context.input(|input| input.key_down(Key::Space));
+
+        if let Some(mut session) = self.pathway_drag.take() {
+            // A pan taking over mid-gesture (Space pressed after the grab), or
+            // a release this handler never observed (grid view, lost focus),
+            // must cancel rather than commit: an unwitnessed gesture cannot be
+            // the basis for a durable, undo-exempt route edit.
+            if self.pan.is_some() || space_down || (!primary_down && !primary_released) {
+                context.request_repaint();
+                return false;
+            }
+            if let Some(pointer) = pointer {
+                let world = camera.screen_to_world(pointer, view);
+                let delta = [
+                    world[0] - session.start_world[0],
+                    world[1] - session.start_world[1],
+                ];
+                session.moved |=
+                    pointer.distance(session.start_pointer) >= RAIL_DRAG_THRESHOLD_POINTS;
+                session.preview_nodes = session
+                    .original_nodes
+                    .iter()
+                    .map(|(node_id, point)| {
+                        let shifted = PathwayPoint::new(
+                            point.x + f64::from(delta[0]),
+                            point.y + f64::from(delta[1]),
+                        );
+                        (*node_id, clamped_rail_point(shifted, session.page_size))
+                    })
+                    .collect();
+                context.request_repaint();
+            }
+            if primary_released {
+                if session.moved {
+                    self.commit_pathway_rail_drag(&session, context);
+                }
+                context.request_repaint();
+                return true;
+            }
+            self.pathway_drag = Some(session);
+            return true;
+        }
+
+        if !primary_pressed
+            || space_down
+            || any_tile_pressed
+            || self.marquee.is_some()
+            || self.drag.is_some()
+            || self.resize.is_some()
+            || self.pan.is_some()
+            || self.editing_note.is_some()
+            || !canvas_response.hovered()
+        {
+            return false;
+        }
+        let Some(pointer) = pointer.filter(|pointer| view.contains(*pointer)) else {
+            return false;
+        };
+        let world = camera.screen_to_world(pointer, view);
+        let page_id = self.workspace.active_page;
+        // The dock resolver already knows what "near a rail" means at every
+        // zoom, and its node-before-segment tiers give the grab the right
+        // meaning: a dot moves one stop, the line moves the whole route.
+        let Some(target) = PathwayDockGeometry::prepare(&self.workspace, page_id).target(
+            PathwayPoint::new(f64::from(world[0]), f64::from(world[1])),
+            f64::from(camera.zoom),
+            None,
+        ) else {
+            return false;
+        };
+        let Some(pathway) = self
+            .workspace
+            .domain
+            .pathways
+            .pathways
+            .get(&target.pathway_id)
+        else {
+            return false;
+        };
+        let grabbed: BTreeMap<PathwayNodeId, PathwayPoint> = match target.anchor {
+            PathwayDockAnchor::Node(node_id) => pathway
+                .nodes
+                .get(&node_id)
+                .map(|node| (node_id, node.point))
+                .into_iter()
+                .collect(),
+            PathwayDockAnchor::Segment(_) => pathway
+                .nodes
+                .iter()
+                .map(|(node_id, node)| (*node_id, node.point))
+                .collect(),
+        };
+        if grabbed.is_empty() {
+            return false;
+        }
+        self.pathway_drag = Some(PathwayRailDrag {
+            pathway_id: target.pathway_id,
+            start_world: world,
+            start_pointer: pointer,
+            preview_nodes: grabbed.clone(),
+            original_nodes: grabbed,
+            page_size: self.workspace.active_page().size,
+            moved: false,
+        });
+        true
+    }
+
+    fn commit_pathway_rail_drag(&mut self, session: &PathwayRailDrag, context: &Context) {
+        match apply_pathway_rail_drag(
+            &mut self.workspace,
+            session.pathway_id,
+            &session.preview_nodes,
+            unix_now_micros(),
+            Uuid::new_v4(),
+        ) {
+            Ok(()) => {
+                // Checkpoint AFTER the move, deliberately. Pathway edits are
+                // exempt from undo, so a pre-move snapshot would make Cmd+Z
+                // restore riders' pre-pause tile rects while the rail stayed
+                // put — arming the external-movement check to detach them at
+                // stale, backwards positions. A post-move snapshot makes the
+                // natural "undo the rail move" press a harmless no-op instead.
+                self.checkpoint();
+                self.changed(true);
+            }
+            Err(error) => {
+                log::warn!("could not move the pathway: {error}");
+                self.toast("The pathway could not be moved", context);
+            }
+        }
+    }
+
     fn handle_background_interaction(
         &mut self,
         context: &Context,
@@ -6281,7 +6597,6 @@ impl AdamApp {
                 );
                 context.request_repaint();
             }
-
             self.text_note_drop_target = self
                 .drag
                 .as_ref()
@@ -6298,6 +6613,31 @@ impl AdamApp {
                         projected_rects,
                         current,
                         source_id,
+                    )
+                });
+
+            // The dock highlight follows the pointer, not the tiles: dropping
+            // means "join here". Only a moved drag docks, so a plain click on
+            // a tile that happens to sit near a rail never flashes a target.
+            // Runs after the drop targets above so the ring never promises a
+            // ride on a drop that a note merge or page move will actually win,
+            // and never competes with a review sheet already awaiting a choice.
+            self.pathway_dock_preview = self
+                .drag
+                .as_ref()
+                .filter(|drag| drag.moved && drag.page_id == self.workspace.active_page)
+                .filter(|_| {
+                    self.text_note_drop_target.is_none()
+                        && self.page_drop_target.is_none()
+                        && self.drag_destination_page.is_none()
+                        && self.pathway_enrollment_review.is_none()
+                })
+                .and_then(|drag| drag.dock.as_ref())
+                .and_then(|dock| {
+                    dock.target(
+                        PathwayPoint::new(f64::from(current[0]), f64::from(current[1])),
+                        f64::from(camera.zoom),
+                        self.pathway_dock_preview.as_ref(),
                     )
                 });
 
@@ -6415,6 +6755,7 @@ impl AdamApp {
                     self.page_hover = None;
                     self.drag_destination_page = None;
                     self.text_note_drop_target = None;
+                    self.pathway_dock_preview = None;
                     context.request_repaint();
                     return;
                 }
@@ -6508,6 +6849,36 @@ impl AdamApp {
                 }
                 self.ensure_page_contains(final_page);
                 self.changed(true);
+
+                // Dropping while docked offers the ride. This runs after every
+                // rect mutation of the release (snap, merges, page moves), so
+                // the review captures the frames enrollment will re-validate.
+                if let Some(target) = self
+                    .pathway_dock_preview
+                    .take()
+                    .filter(|_| !moved_to_page && !merged_into_note)
+                    .filter(|_| self.pathway_enrollment_review.is_none())
+                {
+                    let cargo = ids
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            self.workspace
+                                .page(final_page)
+                                .and_then(|page| page.tile(*id))
+                                .is_some_and(|tile| tile.kind() != TileKind::Pile)
+                        })
+                        .collect::<BTreeSet<_>>();
+                    if !cargo.is_empty() {
+                        match PathwayEnrollmentService::review(&self.workspace, target, cargo) {
+                            Ok(review) => self.pathway_enrollment_review = Some(review),
+                            Err(error) => {
+                                log::warn!("pathway drop review refused: {error}");
+                                self.toast("Those tiles cannot ride this pathway", context);
+                            }
+                        }
+                    }
+                }
             }
             if let Some(resize) = self.resize.take()
                 && resize.changed
@@ -6526,6 +6897,7 @@ impl AdamApp {
             self.page_hover = None;
             self.drag_destination_page = None;
             self.text_note_drop_target = None;
+            self.pathway_dock_preview = None;
         }
     }
 
@@ -6579,11 +6951,28 @@ impl AdamApp {
             .flatten()
             .filter(|tile| tile.canvas_style == CanvasTileStyle::FreeText)
             .map(|tile| tile.id);
+        // A drag that includes a pile is "moving a pile" (possibly with its
+        // contents along for the ride), not an offer of cargo — docking then
+        // would propose enrolling tiles the user never singled out.
+        let mut carries_cargo = false;
+        let mut carries_pile = false;
+        for tile in &self.workspace.active_page().tiles {
+            if self.selection.contains(&tile.id) {
+                if tile.kind() == TileKind::Pile {
+                    carries_pile = true;
+                } else {
+                    carries_cargo = true;
+                }
+            }
+        }
+        let dock = (carries_cargo && !carries_pile)
+            .then(|| PathwayDockGeometry::prepare(&self.workspace, self.workspace.active_page));
         self.drag = Some(DragSession {
             page_id: self.workspace.active_page,
             start_world,
             originals,
             durable_originals,
+            dock,
             text_source,
             moved: false,
         });
@@ -13402,7 +13791,9 @@ fn pathway_color(hex: &str, colors: Theme) -> Color32 {
 /// Rails are page geometry rather than decoration, so they are drawn whether
 /// or not the route is running; a paused or disabled route simply reads
 /// dimmer. Node and segment positions come straight from the durable graph —
-/// this function never consults projected cargo geometry.
+/// this function never consults projected cargo geometry. A live rail drag
+/// supplies preview positions for the grabbed stops, exactly the way a tile
+/// drag previews rects before its release commits them.
 fn draw_pathways(
     painter: &Painter,
     workspace: &Workspace,
@@ -13410,6 +13801,7 @@ fn draw_pathways(
     camera: Camera,
     view: Rect,
     colors: Theme,
+    rail_preview: Option<(PathwayId, &BTreeMap<PathwayNodeId, PathwayPoint>)>,
 ) {
     let world_point = |point: PathwayPoint| -> Option<Pos2> {
         (point.is_finite()).then(|| camera.world_to_screen([point.x as f32, point.y as f32], view))
@@ -13422,6 +13814,16 @@ fn draw_pathways(
         .values()
         .filter(|pathway| pathway.page_id == page_id)
     {
+        let previewed = rail_preview
+            .as_ref()
+            .filter(|(preview_id, _)| *preview_id == pathway.id)
+            .map(|(_, nodes)| *nodes);
+        let node_point = |node_id: PathwayNodeId, stored: PathwayPoint| -> PathwayPoint {
+            previewed
+                .and_then(|nodes| nodes.get(&node_id).copied())
+                .unwrap_or(stored)
+        };
+
         let base = pathway_color(&pathway.color_hex, colors);
         let color = if pathway.is_enabled {
             base
@@ -13437,7 +13839,10 @@ fn draw_pathways(
             ) else {
                 continue;
             };
-            let (Some(start), Some(end)) = (world_point(from.point), world_point(to.point)) else {
+            let (Some(start), Some(end)) = (
+                world_point(node_point(segment.from_node_id, from.point)),
+                world_point(node_point(segment.to_node_id, to.point)),
+            ) else {
                 continue;
             };
             painter.line_segment([start, end], Stroke::new(width, color));
@@ -13445,7 +13850,7 @@ fn draw_pathways(
 
         let radius = (5.0 * camera.zoom).clamp(3.0, 9.0);
         for node in pathway.nodes.values() {
-            let Some(center) = world_point(node.point) else {
+            let Some(center) = world_point(node_point(node.id, node.point)) else {
                 continue;
             };
             painter.circle_filled(center, radius, color);
@@ -21864,6 +22269,231 @@ mod tests {
         );
     }
 
+    /// The state the rail-drag release commits: an enabled route with a rider
+    /// mid-segment, exactly what a user has after drag-to-enroll.
+    fn rail_drag_fixture() -> (Workspace, crate::domain::PathwayId, Uuid, Uuid) {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let tile = Tile::note("Cargo", "", WorldRect::new(500.0, 500.0, 80.0, 60.0));
+        let tile_id = tile.id;
+        workspace.active_page_mut().add_tile(tile);
+        let pathway_id = PathwayEditingService::create_pathway(
+            &mut workspace,
+            page_id,
+            PathwayPoint::new(200.0, 300.0),
+            PathwayEditContext::new("test", crate::domain::UnixMicros(1_000)).unwrap(),
+        )
+        .unwrap();
+        let target = PathwayDockGeometry::prepare(&workspace, page_id)
+            .target(PathwayPoint::new(200.0, 300.0), 1.0, None)
+            .unwrap();
+        let review = PathwayEnrollmentService::review(
+            &workspace,
+            target,
+            std::collections::BTreeSet::from([tile_id]),
+        )
+        .unwrap();
+        let result = PathwayEnrollmentService::enroll(
+            &mut workspace,
+            &review,
+            PathwayEnrollmentChoice::AtBeginning,
+            PathwayEnrollmentContext::new("test", crate::domain::UnixMicros(2_000)).unwrap(),
+        )
+        .unwrap();
+        (workspace, pathway_id, tile_id, result.assignment_ids[0])
+    }
+
+    #[test]
+    fn rail_drag_moves_the_whole_route_and_running_cargo_keeps_running() {
+        let (mut workspace, pathway_id, _, assignment_id) = rail_drag_fixture();
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(
+            assignment.state,
+            crate::domain::PathwayAssignmentState::Moving,
+            "the fixture rider must be live so the commit exercises pause+resume"
+        );
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert!(pathway.is_enabled);
+        let originals: BTreeMap<_, _> = pathway
+            .nodes
+            .iter()
+            .map(|(id, node)| (*id, node.point))
+            .collect();
+        let page_size = workspace.active_page().size;
+        let targets: BTreeMap<_, _> = originals
+            .iter()
+            .map(|(id, point)| {
+                (
+                    *id,
+                    clamped_rail_point(
+                        PathwayPoint::new(point.x + 150.0, point.y + 90.0),
+                        page_size,
+                    ),
+                )
+            })
+            .collect();
+
+        let now = crate::domain::UnixMicros(5_000_000);
+        apply_pathway_rail_drag(
+            &mut workspace,
+            pathway_id,
+            &targets,
+            now,
+            Uuid::from_u128(77),
+        )
+        .unwrap();
+
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert!(
+            pathway.is_enabled,
+            "an enabled route must come back enabled after a reshape"
+        );
+        for (node_id, node) in &pathway.nodes {
+            assert_eq!(
+                node.point, targets[node_id],
+                "stop {node_id} must land at the preview"
+            );
+        }
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(
+            assignment.state,
+            crate::domain::PathwayAssignmentState::Moving,
+            "a live rider pauses for the edit and resumes with it"
+        );
+        assert_eq!(assignment.segment_started_at, Some(now));
+    }
+
+    #[test]
+    fn rail_drag_commit_is_all_or_nothing_when_a_rider_cannot_pause() {
+        let (mut workspace, pathway_id, tile_id, _) = rail_drag_fixture();
+        // A disabled route with a Moving rider whose tile is gone is the one
+        // state the editing pause refuses; pathway edits are exempt from undo,
+        // so a partial move here would be unrecoverable.
+        workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&pathway_id)
+            .unwrap()
+            .is_enabled = false;
+        workspace
+            .active_page_mut()
+            .tiles
+            .retain(|tile| tile.id != tile_id);
+        let originals: BTreeMap<_, _> = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|(id, node)| (*id, PathwayPoint::new(node.point.x + 40.0, node.point.y)))
+            .collect();
+        let before = workspace.clone();
+
+        let result = apply_pathway_rail_drag(
+            &mut workspace,
+            pathway_id,
+            &originals,
+            crate::domain::UnixMicros(6_000_000),
+            Uuid::from_u128(78),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(workspace, before, "a refused move must leave no trace");
+    }
+
+    #[test]
+    fn rail_preview_clamp_matches_what_the_editing_service_commits() {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let page_size = workspace.active_page().size;
+        let pathway_id = PathwayEditingService::create_pathway(
+            &mut workspace,
+            page_id,
+            PathwayPoint::new(200.0, 300.0),
+            PathwayEditContext::new("test", crate::domain::UnixMicros(1_000)).unwrap(),
+        )
+        .unwrap();
+        let node_id = *workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .nodes
+            .keys()
+            .next()
+            .unwrap();
+        // Far off the page in both axes: the preview must promise exactly the
+        // clamped point the service will store.
+        let wild = PathwayPoint::new(-9_000.0, 90_000.0);
+        let predicted = clamped_rail_point(wild, page_size);
+        PathwayEditingService::move_node(
+            &mut workspace,
+            pathway_id,
+            node_id,
+            wild,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(2_000)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            workspace.domain.pathways.pathway(pathway_id).unwrap().nodes[&node_id].point,
+            predicted
+        );
+    }
+
+    #[test]
+    fn dropping_dragged_cargo_on_a_rail_reviews_at_that_spot() {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let tile = Tile::note("Dropped", "", WorldRect::new(900.0, 900.0, 80.0, 60.0));
+        let tile_id = tile.id;
+        workspace.active_page_mut().add_tile(tile);
+        let pathway_id = PathwayEditingService::create_pathway(
+            &mut workspace,
+            page_id,
+            PathwayPoint::new(200.0, 300.0),
+            PathwayEditContext::new("test", crate::domain::UnixMicros(1_000)).unwrap(),
+        )
+        .unwrap();
+
+        // The dock geometry is frozen at pointer-down; mid-drag ticks feed the
+        // previous target back in, mirroring update_live_gestures.
+        let dock = PathwayDockGeometry::prepare(&workspace, page_id);
+        let first = dock
+            .target(PathwayPoint::new(330.0, 306.0), 1.0, None)
+            .unwrap();
+        let held = dock
+            .target(PathwayPoint::new(342.0, 310.0), 1.0, Some(&first))
+            .unwrap();
+        assert_eq!(held.pathway_id, pathway_id);
+
+        let review = PathwayEnrollmentService::review(
+            &workspace,
+            held,
+            std::collections::BTreeSet::from([tile_id]),
+        )
+        .unwrap();
+        assert_eq!(review.default_choice, PathwayEnrollmentChoice::AtThisSpot);
+        let result = PathwayEnrollmentService::enroll(
+            &mut workspace,
+            &review,
+            PathwayEnrollmentChoice::AtThisSpot,
+            PathwayEnrollmentContext::new("test", crate::domain::UnixMicros(2_000)).unwrap(),
+        )
+        .unwrap();
+        let assignment = workspace
+            .domain
+            .pathways
+            .assignment(result.assignment_ids[0])
+            .unwrap();
+        assert_eq!(assignment.tile_id, tile_id);
+        assert!(
+            assignment.current_segment_id.is_some(),
+            "an At-This-Spot drop joins mid-segment, not at a node"
+        );
+    }
+
     #[test]
     fn projected_drag_noop_and_cancel_preserve_durable_rect_bits() {
         fn bits(rect: WorldRect) -> [u32; 4] {
@@ -21910,6 +22540,7 @@ mod tests {
             start_world: [0.0, 0.0],
             originals: visual_origins,
             durable_originals: durable_originals.clone(),
+            dock: None,
             text_source: None,
             moved: true,
         };
