@@ -73,7 +73,10 @@ use crate::{
     spreadsheet,
     structured_preview::{StructuredPreview, StructuredPreviewCache},
 };
-use crate::{webview_host::LiveWebHost, webview_policy};
+use crate::{
+    webview_host::{LiveWebHost, LiveWebSource},
+    webview_policy,
+};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use egui::{
     Align, Align2, Button, Color32, Context, CornerRadius, CursorIcon, FontData, FontDefinitions,
@@ -1131,6 +1134,9 @@ pub struct AdamApp {
     live_web_pending: Option<Uuid>,
     live_web_last_zoom: f32,
     live_web_zoom_motion: Option<Instant>,
+    /// Captured each canvas frame: the live tile is riding a pathway, so
+    /// its painted rect and durable rect diverge and the page steps aside.
+    live_web_tile_riding: bool,
     snap_to_grid: bool,
     preferences: AppPreferences,
     dots_available: bool,
@@ -1477,6 +1483,7 @@ impl AdamApp {
             live_web_pending: None,
             live_web_last_zoom: 1.0,
             live_web_zoom_motion: None,
+            live_web_tile_riding: false,
             snap_to_grid: false,
             preferences,
             dots_available,
@@ -4063,6 +4070,10 @@ impl AdamApp {
                     .zip(projected_rects.iter().copied())
                     .map(|(tile, rect)| (tile.id, rect))
                     .collect::<HashMap<_, _>>();
+                self.live_web_tile_riding = self
+                    .live_web
+                    .as_ref()
+                    .is_some_and(|session| geometry.is_projected(session.tile_id));
                 if let Some(delay) = geometry.repaint_after(page_id, pathway_now) {
                     context.request_repaint_after(delay);
                 }
@@ -12769,7 +12780,15 @@ impl AdamApp {
                 // failures fall back to the system browser.
                 self.live_web_pending = Some(id);
             }
-            TileContent::File { .. } => self.open_tile(id),
+            TileContent::File { ref path, .. } => {
+                if path.extension().is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+                }) {
+                    self.live_web_pending = Some(id);
+                } else {
+                    self.open_tile(id);
+                }
+            }
         }
     }
 
@@ -12783,7 +12802,7 @@ impl AdamApp {
             return;
         }
         self.exit_live_web();
-        let Some(TileContent::Website { url }) = self
+        let Some(content) = self
             .workspace
             .active_page()
             .tile(tile_id)
@@ -12791,7 +12810,18 @@ impl AdamApp {
         else {
             return;
         };
-        match LiveWebHost::new(frame, &url) {
+        let source = match &content {
+            TileContent::Website { url } => LiveWebSource::Remote(url.clone()),
+            TileContent::File { path, .. } => LiveWebSource::LocalHtml(path.clone()),
+            _ => return,
+        };
+        // Grid view replaces the canvas entirely; activating there keeps the
+        // pre-live behavior instead of parking an invisible session.
+        if self.grid_view.is_some() {
+            self.open_live_web_source_externally(&source);
+            return;
+        }
+        match LiveWebHost::new(frame, &source) {
             Ok(host) => {
                 self.live_web = Some(LiveWebSession {
                     tile_id,
@@ -12800,12 +12830,24 @@ impl AdamApp {
                 });
                 self.live_web_last_zoom = self.active_camera().zoom;
                 self.live_web_zoom_motion = None;
+                self.live_web_tile_riding = false;
             }
             Err(error) => {
                 // The pre-live behavior remains the fallback wherever the
                 // live path is unavailable.
-                log::warn!("live page unavailable ({error}); opening in the browser");
-                platform::open_url(&url);
+                log::warn!("live page unavailable ({error}); opening externally");
+                self.open_live_web_source_externally(&source);
+            }
+        }
+    }
+
+    fn open_live_web_source_externally(&self, source: &LiveWebSource) {
+        match source {
+            LiveWebSource::Remote(url) => {
+                platform::open_url(url);
+            }
+            LiveWebSource::LocalHtml(path) => {
+                platform::open_path(path);
             }
         }
     }
@@ -12835,6 +12877,47 @@ impl AdamApp {
             || egui::Popup::is_any_open(context)
     }
 
+    /// True when the page rectangle would cover transient canvas chrome the
+    /// native view cannot be layered under: an active toast, the pathway
+    /// problem banner, or the minimap. The quick bar is deliberately NOT a
+    /// row — a viewport-filling live page is the point of live mode, and
+    /// Escape always brings the tools back.
+    fn transient_chrome_overlap(&self, page_rect: Rect, view: Rect, context: &Context) -> bool {
+        let screen = context.content_rect();
+        let mut chrome: [Option<Rect>; 3] = [None, None, None];
+        if self.toast.is_some() {
+            chrome[0] = Some(Rect::from_min_size(
+                pos2(screen.center().x - 280.0, screen.max.y - 96.0),
+                vec2(560.0, 72.0),
+            ));
+        }
+        if self.pathway_runtime_problem.is_some()
+            || self.pathway_persistence_problem.is_some()
+            || !self.pathway_reconcile_report.problems.is_empty()
+        {
+            chrome[1] = Some(Rect::from_min_size(
+                pos2(screen.center().x - 330.0, TOOLBAR_HEIGHT + 6.0),
+                vec2(660.0, 64.0),
+            ));
+        }
+        let page = self.workspace.active_page();
+        let camera = self.active_camera();
+        let page_screen = vec2(page.size[0], page.size[1]) * camera.zoom;
+        let minimap_shown = page_screen.x > view.width() * 1.45
+            || page_screen.y > view.height() * 1.45
+            || camera.zoom < 0.45;
+        if minimap_shown {
+            chrome[2] = Some(Rect::from_min_size(
+                pos2(view.max.x - 212.0, view.max.y - 152.0),
+                vec2(205.0, 145.0),
+            ));
+        }
+        chrome
+            .into_iter()
+            .flatten()
+            .any(|rect| rect.intersects(page_rect))
+    }
+
     /// Applies this frame's live-web decision: policy in, one native view
     /// placement out, escape drained. Destroys the session when its page or
     /// tile is gone.
@@ -12850,18 +12933,23 @@ impl AdamApp {
             self.exit_live_web();
             return;
         }
-        let Some((world_rect, is_website)) =
+        let Some((world_rect, is_live_capable)) =
             self.workspace.active_page().tile(tile_id).map(|tile| {
-                (
-                    tile.rect,
-                    matches!(tile.content, TileContent::Website { .. }),
-                )
+                let live_capable = match &tile.content {
+                    TileContent::Website { .. } => true,
+                    TileContent::File { path, .. } => path.extension().is_some_and(|extension| {
+                        extension.eq_ignore_ascii_case("html")
+                            || extension.eq_ignore_ascii_case("htm")
+                    }),
+                    _ => false,
+                };
+                (tile.rect, live_capable)
             })
         else {
             self.exit_live_web();
             return;
         };
-        if !is_website {
+        if !is_live_capable {
             self.exit_live_web();
             return;
         }
@@ -12897,6 +12985,15 @@ impl AdamApp {
             canvas_rect: to_point_rect(view),
             overlay_active: self.canvas_overlay_active(context),
             marquee_active: self.marquee.is_some(),
+            tile_riding: self.live_web_tile_riding,
+            tile_filtered_out: self.tag_filter.is_some_and(|tag_id| {
+                self.workspace
+                    .domain
+                    .tags
+                    .assignment(tile_id, tag_id)
+                    .is_none()
+            }),
+            chrome_overlap: self.transient_chrome_overlap(page_rect, view, context),
             editing_note: self.editing_note.is_some(),
             viewport_visible,
             viewport_focused,

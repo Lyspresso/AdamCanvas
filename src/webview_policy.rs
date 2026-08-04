@@ -79,6 +79,14 @@ pub struct LiveWebInputs {
     pub overlay_active: bool,
     /// A marquee selection is being dragged (it would draw under the page).
     pub marquee_active: bool,
+    /// The tile is riding a pathway this frame: it draws at a projected
+    /// rect the durable geometry cannot follow, so the page steps aside.
+    pub tile_riding: bool,
+    /// The active tag filter dims this tile; a live page cannot be dimmed.
+    pub tile_filtered_out: bool,
+    /// The page rect would cover active transient chrome (toast, problem
+    /// banner, minimap) that egui cannot draw over a native view.
+    pub chrome_overlap: bool,
     /// The inline note editor is open (it is an overlay in the same space).
     pub editing_note: bool,
     pub viewport_visible: bool,
@@ -121,6 +129,9 @@ pub fn desired_state(inputs: &LiveWebInputs) -> LiveWebState {
         || inputs.grid_view_open
         || inputs.overlay_active
         || inputs.marquee_active
+        || inputs.tile_riding
+        || inputs.tile_filtered_out
+        || inputs.chrome_overlap
         || inputs.editing_note
         || !inputs.viewport_visible
         || !inputs.viewport_focused
@@ -197,6 +208,9 @@ mod tests {
             canvas_rect: PointRect::new(240.0, 40.0, 1200.0, 800.0),
             overlay_active: false,
             marquee_active: false,
+            tile_riding: false,
+            tile_filtered_out: false,
+            chrome_overlap: false,
             editing_note: false,
             viewport_visible: true,
             viewport_focused: true,
@@ -236,6 +250,9 @@ mod tests {
         expect_hidden(|inputs| inputs.page_rect = None);
         expect_hidden(|inputs| inputs.overlay_active = true);
         expect_hidden(|inputs| inputs.marquee_active = true);
+        expect_hidden(|inputs| inputs.tile_riding = true);
+        expect_hidden(|inputs| inputs.tile_filtered_out = true);
+        expect_hidden(|inputs| inputs.chrome_overlap = true);
         expect_hidden(|inputs| inputs.editing_note = true);
         expect_hidden(|inputs| inputs.viewport_visible = false);
         expect_hidden(|inputs| inputs.viewport_focused = false);

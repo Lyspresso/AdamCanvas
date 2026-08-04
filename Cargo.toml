@@ -95,7 +95,7 @@ winit = { version = "0.30", default-features = false }
 # Live web tiles (macOS-first per the plan of record). `os-webview` is the
 # working-backend feature; default-features off drops the x11 pull-in the
 # Linux tree would otherwise add to the audit surface.
-wry = { version = "0.55", default-features = false, features = ["os-webview"] }
+wry = { version = "0.55", default-features = false, features = ["os-webview", "protocol"] }
 
 [dev-dependencies]
 rust_xlsxwriter = "0.97.0"
