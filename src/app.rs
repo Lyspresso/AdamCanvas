@@ -7763,9 +7763,9 @@ impl AdamApp {
             Ok(node_id) => {
                 self.history
                     .record_stop_add(pathway_id, after_node_id, node_id, draft, leg_speed);
-                // Splitting a leg parks the riders that were on it — engine
-                // law, and nothing lifts that state automatically. Say so, or
-                // the tile just sits there looking broken.
+                // Riders on a split leg silently re-join the new track;
+                // this toast fires only on the rare no-finite-rail fallback
+                // where the engine genuinely had nowhere to put the tile.
                 if self.parked_rider_count(pathway_id) > parked_before {
                     self.toast(
                         "Stop added — a tile riding that leg paused; drop it back on the rail to keep riding",
@@ -24240,7 +24240,7 @@ mod tests {
             Some(44.0),
             None,
             None,
-            crate::domain::UnixMicros(5_000_000),
+            crate::domain::UnixMicros(3_000_000),
             Uuid::from_u128(201),
         )
         .unwrap();
