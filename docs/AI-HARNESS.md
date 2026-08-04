@@ -742,6 +742,31 @@ Attachments are explicit. Adam extracts at most 64 KiB of text per attachment
 and 256 KiB per turn, rejects obvious binary text extraction, and still
 provides the file path for a capable workspace agent.
 
+### Complete canvas context foundation
+
+Adam has a provider-neutral inventory contract for a frozen page snapshot. It
+enumerates every authorized tile, semantic pile (including piles without a
+canvas tile), tag, conversation link, pathway record, and typed relationship;
+there is no entity-count sample in this contract. Projected pathway geometry is
+captured once so positions and pile membership agree. Pile access is applied
+recursively and fails closed for remote/on-device-only, hidden, ambiguous, and
+malformed links. `NamesAndTagsOnly` omits geometry, selection, provenance, and
+free-form pile text.
+
+The inventory is encoded once as deterministic JSONL and exposed internally in
+whole-row pages of at most 48 KiB. User-controlled metadata fields have an
+explicit byte bound and carry their original byte length plus a truncation
+flag; entity rows and relationship rows do not have a count cutoff.
+
+This is a foundation, not a claim about current provider visibility. Until the
+authenticated, run-owned read broker is connected, provider prompts retain the
+existing bounded compatibility summary. The broker must retain one immutable
+snapshot for the turn, advertise only a bounded handle, and make every page
+reachable through provider-native tools before that compatibility limit is
+removed. Complete capture and later source extraction must run off the UI
+thread, with one cached snapshot per run; responsiveness is never enforced by
+silently sampling or dropping canvas entities.
+
 ## Queue and lifecycle
 
 - Up to four provider runs may be active globally.

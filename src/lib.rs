@@ -1,5 +1,9 @@
 pub mod agents_panel;
 pub mod ai;
+// The immutable inventory lands before its authenticated provider read broker.
+// Keep the foundation crate-private and lint-clean until that next PR wires it.
+#[allow(dead_code)]
+pub(crate) mod ai_canvas_context;
 pub(crate) mod ai_canvas_tools;
 pub mod ai_prompt;
 pub mod ai_state;
