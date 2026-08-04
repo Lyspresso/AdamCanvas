@@ -70,9 +70,9 @@ impl StructuredPreviewKind {
 
 const TEXT_EXTENSIONS: &[&str] = &["log", "md", "text", "txt"];
 const CODE_EXTENSIONS: &[&str] = &[
-    "c", "cc", "cpp", "css", "go", "h", "hpp", "html", "java", "js", "json", "jsx", "kt", "kts",
-    "m", "mm", "php", "pl", "py", "rb", "rs", "sh", "sql", "swift", "toml", "ts", "tsx", "xml",
-    "yaml", "yml", "zsh",
+    "c", "cc", "cpp", "css", "go", "h", "hpp", "html", "htm", "java", "js", "json", "jsx", "kt",
+    "kts", "m", "mm", "php", "pl", "py", "rb", "rs", "sh", "sql", "swift", "toml", "ts", "tsx",
+    "xml", "yaml", "yml", "zsh",
 ];
 
 fn matches_extension(extension: &str, candidates: &[&str]) -> bool {

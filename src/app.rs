@@ -73,6 +73,10 @@ use crate::{
     spreadsheet,
     structured_preview::{StructuredPreview, StructuredPreviewCache},
 };
+use crate::{
+    webview_host::{LiveWebHost, LiveWebSource},
+    webview_policy,
+};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use egui::{
     Align, Align2, Button, Color32, Context, CornerRadius, CursorIcon, FontData, FontDefinitions,
@@ -1126,6 +1130,21 @@ pub struct AdamApp {
     /// Contact-sheet lens over the active page. `None` is the ordinary spatial
     /// canvas; the grid never writes tile geometry, so toggling is free.
     grid_view: Option<GridViewState>,
+    /// Auto-live web pages, one session per eligible tile on the active
+    /// page, capped at [`MAX_LIVE_WEB_PAGES`]. Runtime-only, reconciled
+    /// against the canvas every frame.
+    live_web: Vec<LiveWebSession>,
+    /// The page the sessions belong to; switching pages clears them.
+    live_web_page: Option<Uuid>,
+    /// Tiles whose host creation failed; not retried until a page switch so
+    /// a persistent failure cannot spam a create attempt per frame.
+    live_web_failed: HashSet<Uuid>,
+    live_web_last_zoom: f32,
+    live_web_zoom_motion: Option<Instant>,
+    /// Captured each canvas frame: web tiles currently riding a pathway
+    /// draw at projected rects the durable geometry cannot follow, so their
+    /// pages step aside.
+    live_web_riding: HashSet<Uuid>,
     snap_to_grid: bool,
     preferences: AppPreferences,
     dots_available: bool,
@@ -1468,6 +1487,12 @@ impl AdamApp {
             pathway_reconcile_report: PathwayReconcileReport::default(),
             show_grid: false,
             grid_view: None,
+            live_web: Vec::new(),
+            live_web_page: None,
+            live_web_failed: HashSet::new(),
+            live_web_last_zoom: 1.0,
+            live_web_zoom_motion: None,
+            live_web_riding: HashSet::new(),
             snap_to_grid: false,
             preferences,
             dots_available,
@@ -1687,6 +1712,7 @@ impl AdamApp {
     }
 
     fn switch_page(&mut self, page_id: Uuid) {
+        self.clear_live_webs();
         let changed_page = self.workspace.active_page != page_id;
         if self.workspace.set_active_page(page_id) {
             self.open_chat = None;
@@ -4052,6 +4078,16 @@ impl AdamApp {
                     .zip(projected_rects.iter().copied())
                     .map(|(tile, rect)| (tile.id, rect))
                     .collect::<HashMap<_, _>>();
+                self.live_web_riding = self
+                    .workspace
+                    .active_page()
+                    .tiles
+                    .iter()
+                    .filter(|tile| {
+                        live_web_source_for(tile).is_some() && geometry.is_projected(tile.id)
+                    })
+                    .map(|tile| tile.id)
+                    .collect();
                 if let Some(delay) = geometry.repaint_after(page_id, pathway_now) {
                     context.request_repaint_after(delay);
                 }
@@ -12751,7 +12787,267 @@ impl AdamApp {
             TileContent::AiChat { conversation_id } => {
                 self.open_conversation(conversation_id);
             }
-            TileContent::File { .. } | TileContent::Website { .. } => self.open_tile(id),
+            TileContent::Website { .. } => {
+                // Web tiles are live automatically on the canvas; grid view
+                // (and any platform without live pages) opens externally.
+                if self.grid_view.is_some() || !live_web_supported() {
+                    self.open_tile(id);
+                }
+            }
+            TileContent::File { ref path, .. } => {
+                let is_html = path.extension().is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+                });
+                if !is_html || self.grid_view.is_some() || !live_web_supported() {
+                    self.open_tile(id);
+                }
+            }
+        }
+    }
+
+    fn clear_live_webs(&mut self) {
+        for session in self.live_web.drain(..) {
+            session.host.release_focus();
+        }
+        self.live_web_page = None;
+        self.live_web_failed.clear();
+        self.live_web_riding.clear();
+    }
+
+    /// Any modal dialog, draft, or egui popup (context menus included) that
+    /// could draw inside the canvas rect. A native page cannot be clipped or
+    /// layered under them — it hides instead.
+    fn canvas_overlay_active(&self, context: &Context) -> bool {
+        self.renaming_page.is_some()
+            || self.renaming_tile.is_some()
+            || self.link_editor_open
+            || self.pending_page_delete.is_some()
+            || self.pending_chat_delete.is_some()
+            || self.tag_picker_tile.is_some()
+            || self.renaming_tag.is_some()
+            || self.pending_tag_delete.is_some()
+            || self.details_tile.is_some()
+            || self.pile_settings.is_some()
+            || self.trash_open
+            || self.note_draft.is_some()
+            || egui::Popup::is_any_open(context)
+    }
+
+    /// True when the page rectangle would cover transient canvas chrome the
+    /// native view cannot be layered under: an active toast, the pathway
+    /// problem banner, or the minimap. The quick bar is deliberately NOT a
+    /// row — a viewport-filling live page is the point of live mode, and
+    /// Escape always brings the tools back.
+    fn transient_chrome_overlap(&self, page_rect: Rect, view: Rect, context: &Context) -> bool {
+        let screen = context.content_rect();
+        let mut chrome: [Option<Rect>; 3] = [None, None, None];
+        if self.toast.is_some() {
+            chrome[0] = Some(Rect::from_min_size(
+                pos2(screen.center().x - 280.0, screen.max.y - 96.0),
+                vec2(560.0, 72.0),
+            ));
+        }
+        if self.pathway_runtime_problem.is_some()
+            || self.pathway_persistence_problem.is_some()
+            || !self.pathway_reconcile_report.problems.is_empty()
+        {
+            chrome[1] = Some(Rect::from_min_size(
+                pos2(screen.center().x - 330.0, TOOLBAR_HEIGHT + 6.0),
+                vec2(660.0, 64.0),
+            ));
+        }
+        let page = self.workspace.active_page();
+        let camera = self.active_camera();
+        let page_screen = vec2(page.size[0], page.size[1]) * camera.zoom;
+        let minimap_shown = page_screen.x > view.width() * 1.45
+            || page_screen.y > view.height() * 1.45
+            || camera.zoom < 0.45;
+        if minimap_shown {
+            chrome[2] = Some(Rect::from_min_size(
+                pos2(view.max.x - 212.0, view.max.y - 152.0),
+                vec2(205.0, 145.0),
+            ));
+        }
+        chrome
+            .into_iter()
+            .flatten()
+            .any(|rect| rect.intersects(page_rect))
+    }
+
+    /// Reconciles the auto-live pages against the canvas, once per frame:
+    /// every eligible web tile on the active page gets a live session, the
+    /// biggest on screen first, capped at [`MAX_LIVE_WEB_PAGES`]. Sessions
+    /// whose tiles are gone are destroyed; transient hides (modals, grid
+    /// view, chrome overlap) keep the session so page state survives.
+    fn sync_live_webs(&mut self, context: &Context, frame: &eframe::Frame) {
+        if !live_web_supported() {
+            return;
+        }
+        if self.live_web_page != Some(self.workspace.active_page) {
+            self.clear_live_webs();
+            self.live_web_page = Some(self.workspace.active_page);
+        }
+        let Some(view) = self.last_canvas_rect else {
+            return;
+        };
+        let camera = self.active_camera();
+        if (camera.zoom - self.live_web_last_zoom).abs() > 0.000_1 {
+            self.live_web_last_zoom = camera.zoom;
+            self.live_web_zoom_motion = Some(Instant::now());
+        }
+        let zoom_settled = self
+            .live_web_zoom_motion
+            .map_or(true, |at| at.elapsed() >= Duration::from_millis(120));
+
+        // The shared predicate rows, computed once.
+        let canvas_is_front =
+            !self.agents.open && !self.artifact_library.open && self.open_chat.is_none();
+        let overlay_active = self.canvas_overlay_active(context);
+        let marquee_active = self.marquee.is_some();
+        let editing_note = self.editing_note.is_some();
+        let (viewport_focused, viewport_visible) = context.input(|input| {
+            let viewport = input.viewport();
+            (
+                viewport.focused.unwrap_or(true),
+                !viewport.minimized.unwrap_or(false),
+            )
+        });
+        let to_point_rect = |rect: Rect| {
+            webview_policy::PointRect::new(rect.min.x, rect.min.y, rect.width(), rect.height())
+        };
+
+        // Desired set: every web tile on the page, with its per-tile state.
+        struct Desired {
+            tile_id: Uuid,
+            source: LiveWebSource,
+            state: webview_policy::LiveWebState,
+            area: f32,
+        }
+        let mut desired: Vec<Desired> = Vec::new();
+        for tile in &self.workspace.active_page().tiles {
+            let Some(source) = live_web_source_for(tile) else {
+                continue;
+            };
+            let page_rect = website_page_rect(camera.screen_rect(tile.rect, view), camera.zoom);
+            let native_applied = self
+                .live_web
+                .iter()
+                .find(|session| session.tile_id == tile.id)
+                .map(|session| session.host.native_zoom_applied())
+                .unwrap_or(1.0);
+            let inputs = webview_policy::LiveWebInputs {
+                tile_on_active_page: true,
+                canvas_is_front,
+                grid_view_open: self.grid_view.is_some(),
+                page_rect: Some(to_point_rect(page_rect)),
+                canvas_rect: to_point_rect(view),
+                overlay_active,
+                marquee_active,
+                tile_riding: self.live_web_riding.contains(&tile.id),
+                tile_filtered_out: self.tag_filter.is_some_and(|tag_id| {
+                    self.workspace
+                        .domain
+                        .tags
+                        .assignment(tile.id, tag_id)
+                        .is_none()
+                }),
+                chrome_overlap: self.transient_chrome_overlap(page_rect, view, context),
+                editing_note,
+                viewport_visible,
+                viewport_focused,
+                camera_zoom: camera.zoom,
+                zoom_settled,
+                native_zoom_applied: native_applied,
+            };
+            desired.push(Desired {
+                tile_id: tile.id,
+                source: live_web_source_for(tile).expect("checked above"),
+                state: webview_policy::desired_state(&inputs),
+                area: page_rect.area(),
+            });
+            let _ = source;
+        }
+
+        // Destroy sessions whose tile stopped being a web tile entirely.
+        let web_tile_ids: HashSet<Uuid> = desired.iter().map(|entry| entry.tile_id).collect();
+        self.live_web.retain(|session| {
+            let keep = web_tile_ids.contains(&session.tile_id);
+            if !keep {
+                session.host.release_focus();
+            }
+            keep
+        });
+
+        // The cap: biggest visible pages win a session; the rest are hidden
+        // and, if over cap, destroyed so processes cannot pile up.
+        let mut visible: Vec<&Desired> = desired
+            .iter()
+            .filter(|entry| matches!(entry.state, webview_policy::LiveWebState::Visible(_)))
+            .collect();
+        visible.sort_by(|left, right| right.area.total_cmp(&left.area));
+        let keep_ids: HashSet<Uuid> = visible
+            .iter()
+            .take(MAX_LIVE_WEB_PAGES)
+            .map(|entry| entry.tile_id)
+            .collect();
+        self.live_web.retain(|session| {
+            let keep = keep_ids.contains(&session.tile_id)
+                || desired.iter().any(|entry| {
+                    entry.tile_id == session.tile_id
+                        && matches!(entry.state, webview_policy::LiveWebState::Hidden)
+                });
+            if !keep {
+                session.host.release_focus();
+            }
+            keep
+        });
+
+        // Create at most one missing host per frame to avoid hitching.
+        if let Some(entry) = desired.iter().find(|entry| {
+            keep_ids.contains(&entry.tile_id)
+                && !self
+                    .live_web
+                    .iter()
+                    .any(|session| session.tile_id == entry.tile_id)
+                && !self.live_web_failed.contains(&entry.tile_id)
+        }) {
+            match LiveWebHost::new(frame, &entry.source) {
+                Ok(host) => {
+                    self.live_web.push(LiveWebSession {
+                        tile_id: entry.tile_id,
+                        host,
+                    });
+                }
+                Err(error) => {
+                    log::warn!("live page unavailable for tile {} ({error})", entry.tile_id);
+                    self.live_web_failed.insert(entry.tile_id);
+                }
+            }
+        }
+
+        // Apply each session's state; over-cap eligible pages hide.
+        for session in &mut self.live_web {
+            let state = desired
+                .iter()
+                .find(|entry| entry.tile_id == session.tile_id)
+                .map(|entry| {
+                    if keep_ids.contains(&entry.tile_id) {
+                        entry.state
+                    } else {
+                        webview_policy::LiveWebState::Hidden
+                    }
+                })
+                .unwrap_or(webview_policy::LiveWebState::Hidden);
+            session.host.apply(&state);
+            if session.host.escape_requested() {
+                // Escape inside a page hands the keyboard back to the canvas;
+                // the page itself stays live.
+                session.host.release_focus();
+            }
+        }
+        if !zoom_settled {
+            // Keep frames coming until the crisp settle re-raster lands.
+            context.request_repaint_after(Duration::from_millis(120));
         }
     }
 
@@ -12872,6 +13168,60 @@ impl AdamApp {
     }
 }
 
+/// Auto-live web pages are capped: each is a full browser content+GPU
+/// process pair, and a canvas full of them is a different application.
+const MAX_LIVE_WEB_PAGES: usize = 4;
+
+/// Whether this platform can host live pages at all (macOS today).
+fn live_web_supported() -> bool {
+    cfg!(target_os = "macos")
+}
+
+/// The live source a tile offers, if any: a website, or a local HTML file.
+fn live_web_source_for(tile: &Tile) -> Option<LiveWebSource> {
+    match &tile.content {
+        TileContent::Website { url } => Some(LiveWebSource::Remote(url.clone())),
+        TileContent::File { path, .. } => path
+            .extension()
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+            })
+            .then(|| LiveWebSource::LocalHtml(path.clone())),
+        _ => None,
+    }
+}
+
+/// One live web page layered over the canvas. Runtime-only, exactly like
+/// `editing_note`: never persisted, never in the model.
+struct LiveWebSession {
+    tile_id: Uuid,
+    host: LiveWebHost,
+}
+
+/// The screen rectangle the live page owns inside a website tile: the fake
+/// browser chrome's content area. Mirrors draw_tile's footer math and
+/// draw_website_preview's inset and bar exactly — the page must sit
+/// precisely inside the painted frame, with the painted bar left as the
+/// egui-owned drag handle.
+fn website_page_rect(screen_rect: Rect, zoom: f32) -> Rect {
+    let title_height = (TILE_FOOTER_HEIGHT * zoom)
+        .clamp(5.0, 38.0)
+        .min(screen_rect.height() * 0.34);
+    let content = Rect::from_min_max(
+        screen_rect.min,
+        pos2(screen_rect.right(), screen_rect.bottom() - title_height),
+    );
+    let browser = content.shrink((14.0 * zoom.sqrt()).clamp(8.0, 16.0));
+    let bar_height = 25.0 * zoom.sqrt();
+    Rect::from_min_max(
+        pos2(
+            browser.min.x,
+            (browser.min.y + bar_height).min(browser.max.y),
+        ),
+        browser.max,
+    )
+}
+
 impl eframe::App for AdamApp {
     fn logic(&mut self, context: &Context, _frame: &mut eframe::Frame) {
         self.refresh_reduce_motion();
@@ -12958,6 +13308,7 @@ impl eframe::App for AdamApp {
         } else {
             self.show_canvas(ui);
         }
+        self.sync_live_webs(&context, frame);
         self.show_link_editor(&context);
         self.show_page_delete_confirmation(&context);
         self.show_chat_delete_confirmation(&context);

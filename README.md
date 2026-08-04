@@ -77,7 +77,10 @@ Useful shortcuts:
 Adam uses one Metal-backed canvas instead of creating a native view for
 every tile. It requests the low-power GPU, uses event-driven repainting, culls
 offscreen tiles through a compact spatial index, and draws static previews
-until an item is opened.
+until an item is opened. The one exception is deliberate: web tiles are live
+on the canvas — each visible one hosts a native web view, capped at the four
+largest on screen, hidden the moment anything else needs their space, and
+destroyed when their tiles leave the page.
 
 Dots uses one GPU callback, pipeline, uniform, clock, and full-screen
 coordinate field. Two hardware scissors form the connected top-and-sidebar
