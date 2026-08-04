@@ -146,6 +146,7 @@ mod platform_host {
                 container.addSubview(&wk);
             }
 
+            log::debug!("live-web host created for {source:?}");
             Ok(Self {
                 webview,
                 container,
@@ -188,17 +189,19 @@ mod platform_host {
                             CATransaction::begin();
                             CATransaction::setDisableActions(true);
                             if let Some(parent) = self.container.superview() {
-                                // AppKit's origin is bottom-left; egui's is
-                                // top-left. Flip through the parent height.
-                                let parent_height = parent.frame().size.height;
+                                // Mirror wry exactly: a flipped parent (like
+                                // winit's) is already top-left; only an
+                                // unflipped one needs the bottom-left flip.
                                 let clip = placement.clip;
+                                let container_y = if parent.isFlipped() {
+                                    f64::from(clip.min_y)
+                                } else {
+                                    parent.frame().size.height
+                                        - f64::from(clip.min_y)
+                                        - f64::from(clip.height)
+                                };
                                 self.container.setFrame(NSRect::new(
-                                    NSPoint::new(
-                                        f64::from(clip.min_x),
-                                        parent_height
-                                            - f64::from(clip.min_y)
-                                            - f64::from(clip.height),
-                                    ),
+                                    NSPoint::new(f64::from(clip.min_x), container_y),
                                     NSSize::new(f64::from(clip.width), f64::from(clip.height)),
                                 ));
                                 // The page keeps its full content size inside
