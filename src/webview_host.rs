@@ -25,8 +25,15 @@ mod platform_host {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use objc2::MainThreadMarker;
+    use objc2::rc::Retained;
+    use objc2_app_kit::NSView;
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+    use objc2_quartz_core::CATransaction;
+    use wry::WebViewExtMacOS;
+
     use super::LiveWebSource;
-    use crate::webview_policy::{LiveWebPlacement, LiveWebState};
+    use crate::webview_policy::{LiveWebPlacement, LiveWebState, PointRect};
 
     /// Scripted page-side scale for the residual below WebKit's native zoom
     /// floor. Inverse width/height keep the layout viewport at the tile's
@@ -52,20 +59,27 @@ mod platform_host {
        if (e.key === 'Escape') { window.ipc.postMessage('escape'); }\n\
      });";
 
+    /// The page IS the tile: Adam owns its geometry outright. The WKWebView
+    /// is re-parented into a clipping container view; both are moved inside
+    /// animation-disabled transactions so they commit with the same frame as
+    /// the canvas, never trailing it, and the container's layer mask crops
+    /// the page at the canvas edge exactly like any painted tile.
     pub struct LiveWebHost {
         webview: wry::WebView,
+        container: Retained<NSView>,
         escape_rx: crossbeam_channel::Receiver<()>,
-        /// Set by the page-load handler: a navigation wiped the scripted
-        /// residual, so the diff cache must not believe it is still applied.
         residual_wiped: Arc<AtomicBool>,
         shown: bool,
         native_applied: f64,
         residual_applied: f64,
-        last_placement: Option<LiveWebPlacement>,
+        last_content: Option<PointRect>,
+        last_clip: Option<PointRect>,
     }
 
     impl LiveWebHost {
         pub fn new(frame: &eframe::Frame, source: &LiveWebSource) -> Result<Self, String> {
+            let mtm = MainThreadMarker::new()
+                .ok_or_else(|| "live pages must be created on the main thread".to_string())?;
             let (escape_tx, escape_rx) = crossbeam_channel::unbounded();
             let residual_wiped = Arc::new(AtomicBool::new(false));
             let load_flag = Arc::clone(&residual_wiped);
@@ -112,19 +126,43 @@ mod platform_host {
             let webview = builder
                 .build_as_child(frame)
                 .map_err(|error| error.to_string())?;
+
+            // Take the view tree over: WKWebView moves inside a clipping
+            // container that Adam positions; wry's own bounds API is never
+            // used again.
+            let wk = webview.webview();
+            let container = NSView::new(mtm);
+            unsafe {
+                let Some(parent) = wk.superview() else {
+                    return Err("the webview attached to no parent view".to_string());
+                };
+                container.setWantsLayer(true);
+                if let Some(layer) = container.layer() {
+                    layer.setMasksToBounds(true);
+                }
+                container.setHidden(true);
+                wk.removeFromSuperview();
+                parent.addSubview(&container);
+                container.addSubview(&wk);
+            }
+
             Ok(Self {
                 webview,
+                container,
                 escape_rx,
                 residual_wiped,
                 shown: false,
                 native_applied: 1.0,
                 residual_applied: 1.0,
-                last_placement: None,
+                last_content: None,
+                last_clip: None,
             })
         }
 
         /// Applies one frame's decision. Diffs against what is already
-        /// applied so a static frame costs nothing.
+        /// applied so a static frame costs nothing; every geometry write is
+        /// wrapped in an animation-disabled transaction so the page commits
+        /// with the canvas frame instead of easing after it.
         pub fn apply(&mut self, state: &LiveWebState) {
             if self.residual_wiped.swap(false, Ordering::Relaxed) {
                 // A navigation reset the document; forget the cached scale so
@@ -134,30 +172,62 @@ mod platform_host {
             match state {
                 LiveWebState::Hidden => {
                     if self.shown {
-                        let _ = self.webview.set_visible(false);
+                        CATransaction::begin();
+                        CATransaction::setDisableActions(true);
+                        self.container.setHidden(true);
+                        CATransaction::commit();
                         self.shown = false;
                     }
                 }
                 LiveWebState::Visible(placement) => {
-                    if self
-                        .last_placement
-                        .map(|last| (last.x_px, last.y_px, last.width_px, last.height_px))
-                        != Some((
-                            placement.x_px,
-                            placement.y_px,
-                            placement.width_px,
-                            placement.height_px,
-                        ))
-                    {
-                        let _ = self.webview.set_bounds(wry::Rect {
-                            position: wry::dpi::Position::Physical(
-                                wry::dpi::PhysicalPosition::new(placement.x_px, placement.y_px),
-                            ),
-                            size: wry::dpi::Size::Physical(wry::dpi::PhysicalSize::new(
-                                placement.width_px,
-                                placement.height_px,
-                            )),
-                        });
+                    let geometry_changed = self.last_content != Some(placement.content)
+                        || self.last_clip != Some(placement.clip);
+                    if geometry_changed || !self.shown {
+                        let wk = self.webview.webview();
+                        unsafe {
+                            CATransaction::begin();
+                            CATransaction::setDisableActions(true);
+                            if let Some(parent) = self.container.superview() {
+                                // AppKit's origin is bottom-left; egui's is
+                                // top-left. Flip through the parent height.
+                                let parent_height = parent.frame().size.height;
+                                let clip = placement.clip;
+                                self.container.setFrame(NSRect::new(
+                                    NSPoint::new(
+                                        f64::from(clip.min_x),
+                                        parent_height
+                                            - f64::from(clip.min_y)
+                                            - f64::from(clip.height),
+                                    ),
+                                    NSSize::new(f64::from(clip.width), f64::from(clip.height)),
+                                ));
+                                // The page keeps its full content size inside
+                                // the container; the offset shows the right
+                                // part through the clip.
+                                let content = placement.content;
+                                let offset_x = f64::from(content.min_x - clip.min_x);
+                                let offset_top = f64::from(content.min_y - clip.min_y);
+                                wk.setFrame(NSRect::new(
+                                    NSPoint::new(
+                                        offset_x,
+                                        f64::from(clip.height)
+                                            - offset_top
+                                            - f64::from(content.height),
+                                    ),
+                                    NSSize::new(
+                                        f64::from(content.width),
+                                        f64::from(content.height),
+                                    ),
+                                ));
+                            }
+                            if !self.shown {
+                                self.container.setHidden(false);
+                            }
+                            CATransaction::commit();
+                        }
+                        self.shown = true;
+                        self.last_content = Some(placement.content);
+                        self.last_clip = Some(placement.clip);
                     }
                     if placement.commit_native {
                         let _ = self.webview.zoom(placement.native_zoom);
@@ -169,11 +239,6 @@ mod platform_host {
                             .evaluate_script(&residual_script(placement.residual_scale));
                         self.residual_applied = placement.residual_scale;
                     }
-                    if !self.shown {
-                        let _ = self.webview.set_visible(true);
-                        self.shown = true;
-                    }
-                    self.last_placement = Some(*placement);
                 }
             }
         }
@@ -194,6 +259,14 @@ mod platform_host {
         /// Hands keyboard focus back to the window before teardown.
         pub fn release_focus(&self) {
             let _ = self.webview.focus_parent();
+        }
+    }
+
+    impl Drop for LiveWebHost {
+        fn drop(&mut self) {
+            // The container is Adam's own view; wry only knows about the
+            // WKWebView inside it. Remove the whole subtree.
+            self.container.removeFromSuperview();
         }
     }
 }

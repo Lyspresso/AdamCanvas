@@ -51,11 +51,26 @@ impl PointRect {
             && self.height.is_finite()
     }
 
-    fn contains_rect(&self, other: &PointRect) -> bool {
-        other.min_x >= self.min_x
-            && other.min_y >= self.min_y
-            && other.min_x + other.width <= self.min_x + self.width
-            && other.min_y + other.height <= self.min_y + self.height
+    fn intersection(&self, other: &PointRect) -> PointRect {
+        let min_x = self.min_x.max(other.min_x);
+        let min_y = self.min_y.max(other.min_y);
+        let max_x = (self.min_x + self.width).min(other.min_x + other.width);
+        let max_y = (self.min_y + self.height).min(other.min_y + other.height);
+        PointRect::new(
+            min_x,
+            min_y,
+            (max_x - min_x).max(0.0),
+            (max_y - min_y).max(0.0),
+        )
+    }
+
+    fn rounded(&self) -> PointRect {
+        PointRect::new(
+            self.min_x.round(),
+            self.min_y.round(),
+            self.width.round(),
+            self.height.round(),
+        )
     }
 }
 
@@ -91,7 +106,6 @@ pub struct LiveWebInputs {
     pub editing_note: bool,
     pub viewport_visible: bool,
     pub viewport_focused: bool,
-    pub pixels_per_point: f32,
     pub camera_zoom: f32,
     /// The camera has been still long enough for a crisp re-raster.
     pub zoom_settled: bool,
@@ -99,13 +113,16 @@ pub struct LiveWebInputs {
     pub native_zoom_applied: f64,
 }
 
-/// The exact placement the impure shell must apply, physical pixels.
+/// The exact placement the impure shell must apply, in logical points.
+///
+/// `content` is the full page rectangle — it may extend past the canvas.
+/// `clip` is the part the user may actually see: content ∩ canvas. The host
+/// clips natively, so a tile zoomed past the viewport edge crops exactly
+/// like every painted tile instead of vanishing.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LiveWebPlacement {
-    pub x_px: i32,
-    pub y_px: i32,
-    pub width_px: u32,
-    pub height_px: u32,
+    pub content: PointRect,
+    pub clip: PointRect,
     /// The native page zoom that should be applied (only changes when
     /// `commit_native`).
     pub native_zoom: f64,
@@ -143,31 +160,19 @@ pub fn desired_state(inputs: &LiveWebInputs) -> LiveWebState {
     };
     if !page_rect.is_finite()
         || !inputs.canvas_rect.is_finite()
-        || !inputs.pixels_per_point.is_finite()
-        || inputs.pixels_per_point <= 0.0
         || !inputs.camera_zoom.is_finite()
         || inputs.camera_zoom <= 0.0
     {
         return LiveWebState::Hidden;
     }
-    // No clipping exists for a native view: partial overlap with the canvas
-    // edge would spill the page over Adam's chrome. Fully inside or hidden.
-    if !inputs.canvas_rect.contains_rect(&page_rect) {
+    // Whole-point rounding first, so frames can never jitter by a fraction.
+    let content = page_rect.rounded();
+    let clip = content.intersection(&inputs.canvas_rect.rounded());
+    // The page crops at the canvas edge like any tile; it hides only when
+    // the visible sliver stops being meaningfully a page.
+    if clip.width < MIN_LIVE_SIDE_POINTS || clip.height < MIN_LIVE_SIDE_POINTS {
         return LiveWebState::Hidden;
     }
-    if page_rect.width < MIN_LIVE_SIDE_POINTS || page_rect.height < MIN_LIVE_SIDE_POINTS {
-        return LiveWebState::Hidden;
-    }
-
-    // Whole-point rounding before the physical conversion: wry truncates
-    // logical sizes, so fractional rects would jitter by a point.
-    let rounded = PointRect::new(
-        page_rect.min_x.round(),
-        page_rect.min_y.round(),
-        page_rect.width.round(),
-        page_rect.height.round(),
-    );
-    let ppp = inputs.pixels_per_point;
 
     let camera = f64::from(inputs.camera_zoom);
     let applied = if inputs.native_zoom_applied.is_finite() && inputs.native_zoom_applied > 0.0 {
@@ -185,10 +190,8 @@ pub fn desired_state(inputs: &LiveWebInputs) -> LiveWebState {
     let residual_scale = camera / native_zoom;
 
     LiveWebState::Visible(LiveWebPlacement {
-        x_px: (rounded.min_x * ppp) as i32,
-        y_px: (rounded.min_y * ppp) as i32,
-        width_px: (rounded.width * ppp).max(1.0) as u32,
-        height_px: (rounded.height * ppp).max(1.0) as u32,
+        content,
+        clip,
         native_zoom,
         residual_scale,
         commit_native,
@@ -214,7 +217,6 @@ mod tests {
             editing_note: false,
             viewport_visible: true,
             viewport_focused: true,
-            pixels_per_point: 2.0,
             camera_zoom: 1.0,
             zoom_settled: true,
             native_zoom_applied: 1.0,
@@ -228,18 +230,49 @@ mod tests {
     }
 
     #[test]
-    fn the_happy_path_is_visible_at_exact_physical_pixels() {
+    fn the_happy_path_is_visible_with_content_equal_to_clip() {
         let state = desired_state(&base_inputs());
         let LiveWebState::Visible(placement) = state else {
             panic!("expected visible");
         };
-        assert_eq!(placement.x_px, 600);
-        assert_eq!(placement.y_px, 400);
-        assert_eq!(placement.width_px, 800);
-        assert_eq!(placement.height_px, 600);
+        assert_eq!(
+            placement.content,
+            PointRect::new(300.0, 200.0, 400.0, 300.0)
+        );
+        assert_eq!(placement.clip, placement.content);
         assert_eq!(placement.native_zoom, 1.0);
         assert_eq!(placement.residual_scale, 1.0);
         assert!(!placement.commit_native);
+    }
+
+    #[test]
+    fn a_page_bigger_than_the_canvas_clips_to_it_instead_of_vanishing() {
+        // Zoom-to-fill: the tile's page rect exceeds the viewport on every
+        // side. It must stay visible, cropped at the canvas edge.
+        let mut inputs = base_inputs();
+        inputs.page_rect = Some(PointRect::new(100.0, -100.0, 2000.0, 1400.0));
+        let LiveWebState::Visible(placement) = desired_state(&inputs) else {
+            panic!("expected visible");
+        };
+        assert_eq!(
+            placement.content,
+            PointRect::new(100.0, -100.0, 2000.0, 1400.0)
+        );
+        assert_eq!(placement.clip, PointRect::new(240.0, 40.0, 1200.0, 800.0));
+    }
+
+    #[test]
+    fn a_page_partly_off_the_canvas_edge_clips_to_the_overlap() {
+        let mut inputs = base_inputs();
+        inputs.page_rect = Some(PointRect::new(100.0, 200.0, 400.0, 300.0));
+        let LiveWebState::Visible(placement) = desired_state(&inputs) else {
+            panic!("expected visible");
+        };
+        assert_eq!(placement.clip, PointRect::new(240.0, 200.0, 260.0, 300.0));
+        assert_eq!(
+            placement.content.min_x, 100.0,
+            "content keeps its true origin"
+        );
     }
 
     #[test]
@@ -259,14 +292,13 @@ mod tests {
     }
 
     #[test]
-    fn partial_overlap_with_the_canvas_edge_hides() {
-        // A native view cannot be clipped; spilling over the sidebar would
-        // cover Adam's chrome.
+    fn a_sliver_of_page_at_the_canvas_edge_hides() {
+        // Barely-overlapping intersections stop being meaningfully a page.
         expect_hidden(|inputs| {
-            inputs.page_rect = Some(PointRect::new(100.0, 200.0, 400.0, 300.0));
+            inputs.page_rect = Some(PointRect::new(230.0, 200.0, 20.0, 300.0));
         });
         expect_hidden(|inputs| {
-            inputs.page_rect = Some(PointRect::new(1200.0, 700.0, 400.0, 300.0));
+            inputs.page_rect = Some(PointRect::new(1430.0, 830.0, 400.0, 300.0));
         });
     }
 
@@ -279,21 +311,19 @@ mod tests {
             inputs.page_rect = Some(PointRect::new(300.0, 200.0, 400.0, f32::NAN));
         });
         expect_hidden(|inputs| inputs.camera_zoom = 0.0);
-        expect_hidden(|inputs| inputs.pixels_per_point = f32::NAN);
     }
 
     #[test]
-    fn fractional_rects_round_to_whole_points_before_conversion() {
+    fn fractional_rects_round_to_whole_points() {
         let mut inputs = base_inputs();
         inputs.page_rect = Some(PointRect::new(300.4, 199.6, 400.3, 299.5));
         let LiveWebState::Visible(placement) = desired_state(&inputs) else {
             panic!("expected visible");
         };
-        // 300 / 200 / 400 / 300 points at 2 px per point.
-        assert_eq!(placement.x_px, 600);
-        assert_eq!(placement.y_px, 400);
-        assert_eq!(placement.width_px, 800);
-        assert_eq!(placement.height_px, 600);
+        assert_eq!(
+            placement.content,
+            PointRect::new(300.0, 200.0, 400.0, 300.0)
+        );
     }
 
     #[test]
@@ -314,7 +344,6 @@ mod tests {
         let mut inputs = base_inputs();
         inputs.camera_zoom = 0.1;
         inputs.native_zoom_applied = 1.0;
-        // Keep the projected rect inside the canvas at this zoom.
         inputs.page_rect = Some(PointRect::new(300.0, 200.0, 56.0, 40.0));
         let LiveWebState::Visible(placement) = desired_state(&inputs) else {
             panic!("expected visible");

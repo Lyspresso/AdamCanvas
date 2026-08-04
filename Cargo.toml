@@ -54,6 +54,9 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSAccessibility",
     "NSPasteboard",
     "NSWorkspace",
+    "NSResponder",
+    "NSView",
+    "objc2-quartz-core",
 ] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
     "std",
@@ -94,7 +97,13 @@ objc2-vision = { version = "0.3", default-features = false, features = [
 winit = { version = "0.30", default-features = false }
 # Live web tiles (macOS-first per the plan of record). `os-webview` is the
 # working-backend feature; default-features off drops the x11 pull-in the
-# Linux tree would otherwise add to the audit surface.
+# Linux tree would otherwise add to the audit surface. quartz-core drives
+# the clipping container and animation-free frame transactions.
+objc2-quartz-core = { version = "0.3", default-features = false, features = [
+    "std",
+    "CALayer",
+    "CATransaction",
+] }
 wry = { version = "0.55", default-features = false, features = ["os-webview", "protocol"] }
 
 [dev-dependencies]

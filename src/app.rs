@@ -12955,7 +12955,6 @@ impl AdamApp {
                 editing_note,
                 viewport_visible,
                 viewport_focused,
-                pixels_per_point: context.pixels_per_point(),
                 camera_zoom: camera.zoom,
                 zoom_settled,
                 native_zoom_applied: native_applied,
