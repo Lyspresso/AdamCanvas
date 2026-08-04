@@ -73,6 +73,7 @@ use crate::{
     spreadsheet,
     structured_preview::{StructuredPreview, StructuredPreviewCache},
 };
+use crate::{webview_host::LiveWebHost, webview_policy};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use egui::{
     Align, Align2, Button, Color32, Context, CornerRadius, CursorIcon, FontData, FontDefinitions,
@@ -1126,6 +1127,10 @@ pub struct AdamApp {
     /// Contact-sheet lens over the active page. `None` is the ordinary spatial
     /// canvas; the grid never writes tile geometry, so toggling is free.
     grid_view: Option<GridViewState>,
+    live_web: Option<LiveWebSession>,
+    live_web_pending: Option<Uuid>,
+    live_web_last_zoom: f32,
+    live_web_zoom_motion: Option<Instant>,
     snap_to_grid: bool,
     preferences: AppPreferences,
     dots_available: bool,
@@ -1468,6 +1473,10 @@ impl AdamApp {
             pathway_reconcile_report: PathwayReconcileReport::default(),
             show_grid: false,
             grid_view: None,
+            live_web: None,
+            live_web_pending: None,
+            live_web_last_zoom: 1.0,
+            live_web_zoom_motion: None,
             snap_to_grid: false,
             preferences,
             dots_available,
@@ -1687,6 +1696,7 @@ impl AdamApp {
     }
 
     fn switch_page(&mut self, page_id: Uuid) {
+        self.exit_live_web();
         let changed_page = self.workspace.active_page != page_id;
         if self.workspace.set_active_page(page_id) {
             self.open_chat = None;
@@ -3002,6 +3012,7 @@ impl AdamApp {
             self.fit_page();
         }
         if context.input(|input| input.key_pressed(Key::Escape)) {
+            self.exit_live_web();
             if let Some(drag) = self.drag.take()
                 && let Some(page) = self.workspace.page_mut(drag.page_id)
             {
@@ -12751,7 +12762,169 @@ impl AdamApp {
             TileContent::AiChat { conversation_id } => {
                 self.open_conversation(conversation_id);
             }
-            TileContent::File { .. } | TileContent::Website { .. } => self.open_tile(id),
+            TileContent::Website { .. } => {
+                // Double-click goes live in place (created next frame, where
+                // the window handle is available); a second double-click on
+                // the live tile leaves live mode. Non-macOS and engine
+                // failures fall back to the system browser.
+                self.live_web_pending = Some(id);
+            }
+            TileContent::File { .. } => self.open_tile(id),
+        }
+    }
+
+    fn start_live_web(&mut self, tile_id: Uuid, frame: &eframe::Frame) {
+        if self
+            .live_web
+            .as_ref()
+            .is_some_and(|session| session.tile_id == tile_id)
+        {
+            self.exit_live_web();
+            return;
+        }
+        self.exit_live_web();
+        let Some(TileContent::Website { url }) = self
+            .workspace
+            .active_page()
+            .tile(tile_id)
+            .map(|tile| tile.content.clone())
+        else {
+            return;
+        };
+        match LiveWebHost::new(frame, &url) {
+            Ok(host) => {
+                self.live_web = Some(LiveWebSession {
+                    tile_id,
+                    page_id: self.workspace.active_page,
+                    host,
+                });
+                self.live_web_last_zoom = self.active_camera().zoom;
+                self.live_web_zoom_motion = None;
+            }
+            Err(error) => {
+                // The pre-live behavior remains the fallback wherever the
+                // live path is unavailable.
+                log::warn!("live page unavailable ({error}); opening in the browser");
+                platform::open_url(&url);
+            }
+        }
+    }
+
+    fn exit_live_web(&mut self) {
+        if let Some(session) = self.live_web.take() {
+            session.host.release_focus();
+        }
+    }
+
+    /// Any modal dialog, draft, or egui popup (context menus included) that
+    /// could draw inside the canvas rect. A native page cannot be clipped or
+    /// layered under them — it hides instead.
+    fn canvas_overlay_active(&self, context: &Context) -> bool {
+        self.renaming_page.is_some()
+            || self.renaming_tile.is_some()
+            || self.link_editor_open
+            || self.pending_page_delete.is_some()
+            || self.pending_chat_delete.is_some()
+            || self.tag_picker_tile.is_some()
+            || self.renaming_tag.is_some()
+            || self.pending_tag_delete.is_some()
+            || self.details_tile.is_some()
+            || self.pile_settings.is_some()
+            || self.trash_open
+            || self.note_draft.is_some()
+            || egui::Popup::is_any_open(context)
+    }
+
+    /// Applies this frame's live-web decision: policy in, one native view
+    /// placement out, escape drained. Destroys the session when its page or
+    /// tile is gone.
+    fn sync_live_web(&mut self, context: &Context) {
+        let Some((tile_id, page_id)) = self
+            .live_web
+            .as_ref()
+            .map(|session| (session.tile_id, session.page_id))
+        else {
+            return;
+        };
+        if page_id != self.workspace.active_page {
+            self.exit_live_web();
+            return;
+        }
+        let Some((world_rect, is_website)) =
+            self.workspace.active_page().tile(tile_id).map(|tile| {
+                (
+                    tile.rect,
+                    matches!(tile.content, TileContent::Website { .. }),
+                )
+            })
+        else {
+            self.exit_live_web();
+            return;
+        };
+        if !is_website {
+            self.exit_live_web();
+            return;
+        }
+        let camera = self.active_camera();
+        if (camera.zoom - self.live_web_last_zoom).abs() > 0.000_1 {
+            self.live_web_last_zoom = camera.zoom;
+            self.live_web_zoom_motion = Some(Instant::now());
+        }
+        let zoom_settled = self
+            .live_web_zoom_motion
+            .map_or(true, |at| at.elapsed() >= Duration::from_millis(120));
+        let to_point_rect = |rect: Rect| {
+            webview_policy::PointRect::new(rect.min.x, rect.min.y, rect.width(), rect.height())
+        };
+        let Some(view) = self.last_canvas_rect else {
+            return;
+        };
+        let page_rect = website_page_rect(camera.screen_rect(world_rect, view), camera.zoom);
+        let canvas_is_front =
+            !self.agents.open && !self.artifact_library.open && self.open_chat.is_none();
+        let (viewport_focused, viewport_visible) = context.input(|input| {
+            let viewport = input.viewport();
+            (
+                viewport.focused.unwrap_or(true),
+                !viewport.minimized.unwrap_or(false),
+            )
+        });
+        let inputs = webview_policy::LiveWebInputs {
+            tile_on_active_page: true,
+            canvas_is_front,
+            grid_view_open: self.grid_view.is_some(),
+            page_rect: Some(to_point_rect(page_rect)),
+            canvas_rect: to_point_rect(view),
+            overlay_active: self.canvas_overlay_active(context),
+            marquee_active: self.marquee.is_some(),
+            editing_note: self.editing_note.is_some(),
+            viewport_visible,
+            viewport_focused,
+            pixels_per_point: context.pixels_per_point(),
+            camera_zoom: camera.zoom,
+            zoom_settled,
+            native_zoom_applied: self
+                .live_web
+                .as_ref()
+                .map(|session| session.host.native_zoom_applied())
+                .unwrap_or(1.0),
+        };
+        let state = webview_policy::desired_state(&inputs);
+        let escape = {
+            let session = self
+                .live_web
+                .as_mut()
+                .expect("session checked at the top of sync_live_web");
+            session.host.apply(&state);
+            session.host.escape_requested()
+        };
+        if escape {
+            self.exit_live_web();
+            return;
+        }
+        if !zoom_settled {
+            // Keep frames coming until the crisp settle re-raster lands.
+            context.request_repaint_after(Duration::from_millis(120));
         }
     }
 
@@ -12872,6 +13045,38 @@ impl AdamApp {
     }
 }
 
+/// One live web page layered over the canvas. Runtime-only, exactly like
+/// `editing_note`: never persisted, never in the model.
+struct LiveWebSession {
+    tile_id: Uuid,
+    page_id: Uuid,
+    host: LiveWebHost,
+}
+
+/// The screen rectangle the live page owns inside a website tile: the fake
+/// browser chrome's content area. Mirrors draw_tile's footer math and
+/// draw_website_preview's inset and bar exactly — the page must sit
+/// precisely inside the painted frame, with the painted bar left as the
+/// egui-owned drag handle.
+fn website_page_rect(screen_rect: Rect, zoom: f32) -> Rect {
+    let title_height = (TILE_FOOTER_HEIGHT * zoom)
+        .clamp(5.0, 38.0)
+        .min(screen_rect.height() * 0.34);
+    let content = Rect::from_min_max(
+        screen_rect.min,
+        pos2(screen_rect.right(), screen_rect.bottom() - title_height),
+    );
+    let browser = content.shrink((14.0 * zoom.sqrt()).clamp(8.0, 16.0));
+    let bar_height = 25.0 * zoom.sqrt();
+    Rect::from_min_max(
+        pos2(
+            browser.min.x,
+            (browser.min.y + bar_height).min(browser.max.y),
+        ),
+        browser.max,
+    )
+}
+
 impl eframe::App for AdamApp {
     fn logic(&mut self, context: &Context, _frame: &mut eframe::Frame) {
         self.refresh_reduce_motion();
@@ -12958,6 +13163,10 @@ impl eframe::App for AdamApp {
         } else {
             self.show_canvas(ui);
         }
+        if let Some(tile_id) = self.live_web_pending.take() {
+            self.start_live_web(tile_id, frame);
+        }
+        self.sync_live_web(&context);
         self.show_link_editor(&context);
         self.show_page_delete_confirmation(&context);
         self.show_chat_delete_confirmation(&context);
