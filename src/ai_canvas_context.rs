@@ -1615,3 +1615,6 @@ fn parse_manifest_cursor(cursor: &str, snapshot_id: Uuid) -> Result<usize, Canva
     }
     Ok(page_index)
 }
+
+#[cfg(test)]
+mod tests;
