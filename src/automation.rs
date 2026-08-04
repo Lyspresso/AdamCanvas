@@ -14,7 +14,7 @@ use crate::{
         TagSource, TagStore, TileId, UnixMicros, UnixMillis, evaluate_membership_progress,
         observe_override, resolve_pile_memberships,
     },
-    model::{Tile, TileKind, Workspace, WorldRect},
+    model::{CanvasPage, Tile, TileKind, Workspace, WorldRect},
     pathway_projection,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -200,53 +200,104 @@ where
 
     let mut snapshot = CanvasGeometrySnapshot::default();
     for page in &workspace.pages {
-        for tile in &page.tiles {
-            let tile_type =
-                classify_semantic_tile(tile).unwrap_or_else(|| DomainTileType::from(tile.kind()));
-            let mut rect = tile.rect;
-            let is_pile = workspace.domain.piles.contains_key(&tile.id)
-                || tile.kind() == TileKind::Pile
-                || matches!(
-                    tile_type,
-                    DomainTileType::Pile | DomainTileType::Content(TileKind::Pile)
-                );
-            if !is_pile
-                && let Some(assignment) = assignment_by_tile.get(&tile.id).copied()
-                && assignment.page_id == page.id
-                && let Some(pathway) = workspace
-                    .domain
-                    .pathways
-                    .pathways
-                    .get(&assignment.pathway_id)
-                && pathway.page_id == page.id
-            {
-                let projected = pathway_projection::position(assignment, pathway, at);
-                if projected.is_animating
-                    && projected.tile_center.is_finite()
-                    && tile.rect.w.is_finite()
-                    && tile.rect.h.is_finite()
-                {
-                    let motion = snapshot.motion_by_page.entry(page.id).or_default();
-                    motion.next_state_at = match (motion.next_state_at, projected.next_state_at) {
-                        (Some(current), Some(candidate)) => Some(current.min(candidate)),
-                        (None, candidate) => candidate,
-                        (current, None) => current,
-                    };
-                }
-                if let Some(projected_rect) = rect_centered_at(tile.rect, projected.tile_center) {
-                    rect = projected_rect;
-                    snapshot.projected_tile_ids.insert(tile.id);
-                }
-            }
-            snapshot.objects.push(CanvasObject {
-                id: tile.id,
-                page_id: page.id,
-                rect,
-                tile_type,
-            });
-        }
+        append_page_objects(
+            &mut snapshot,
+            workspace,
+            page,
+            at,
+            &assignment_by_tile,
+            &classify_semantic_tile,
+        );
     }
     snapshot
+}
+
+/// Projects one page without walking every tile in the workspace.
+///
+/// Complete AI canvas snapshots use this entry point so projected-geometry
+/// work visits only the selected page. Global authorization checks may still
+/// inspect the workspace. Object order remains exactly the page's tile order.
+pub(crate) fn canvas_objects_from_page<F>(
+    workspace: &Workspace,
+    page_id: PageId,
+    at: UnixMicros,
+    classify_semantic_tile: F,
+) -> Option<CanvasGeometrySnapshot>
+where
+    F: Fn(&Tile) -> Option<DomainTileType>,
+{
+    let page = workspace.page(page_id)?;
+    let assignment_by_tile = workspace
+        .domain
+        .pathways
+        .authoritative_assignments_by_tile();
+    let mut snapshot = CanvasGeometrySnapshot::default();
+    append_page_objects(
+        &mut snapshot,
+        workspace,
+        page,
+        at,
+        &assignment_by_tile,
+        &classify_semantic_tile,
+    );
+    Some(snapshot)
+}
+
+fn append_page_objects<F>(
+    snapshot: &mut CanvasGeometrySnapshot,
+    workspace: &Workspace,
+    page: &CanvasPage,
+    at: UnixMicros,
+    assignment_by_tile: &BTreeMap<TileId, &crate::domain::PathwayAssignment>,
+    classify_semantic_tile: &F,
+) where
+    F: Fn(&Tile) -> Option<DomainTileType>,
+{
+    for tile in &page.tiles {
+        let tile_type =
+            classify_semantic_tile(tile).unwrap_or_else(|| DomainTileType::from(tile.kind()));
+        let mut rect = tile.rect;
+        let is_pile = workspace.domain.piles.contains_key(&tile.id)
+            || tile.kind() == TileKind::Pile
+            || matches!(
+                tile_type,
+                DomainTileType::Pile | DomainTileType::Content(TileKind::Pile)
+            );
+        if !is_pile
+            && let Some(assignment) = assignment_by_tile.get(&tile.id).copied()
+            && assignment.page_id == page.id
+            && let Some(pathway) = workspace
+                .domain
+                .pathways
+                .pathways
+                .get(&assignment.pathway_id)
+            && pathway.page_id == page.id
+        {
+            let projected = pathway_projection::position(assignment, pathway, at);
+            if projected.is_animating
+                && projected.tile_center.is_finite()
+                && tile.rect.w.is_finite()
+                && tile.rect.h.is_finite()
+            {
+                let motion = snapshot.motion_by_page.entry(page.id).or_default();
+                motion.next_state_at = match (motion.next_state_at, projected.next_state_at) {
+                    (Some(current), Some(candidate)) => Some(current.min(candidate)),
+                    (None, candidate) => candidate,
+                    (current, None) => current,
+                };
+            }
+            if let Some(projected_rect) = rect_centered_at(tile.rect, projected.tile_center) {
+                rect = projected_rect;
+                snapshot.projected_tile_ids.insert(tile.id);
+            }
+        }
+        snapshot.objects.push(CanvasObject {
+            id: tile.id,
+            page_id: page.id,
+            rect,
+            tile_type,
+        });
+    }
 }
 
 fn rect_centered_at(base: WorldRect, center: crate::domain::PathwayPoint) -> Option<WorldRect> {
@@ -1044,6 +1095,88 @@ mod tests {
         );
         assert!(!geometry.is_projected(fixture.tile_id));
         assert_eq!(geometry.repaint_after(fixture.page_id, at), None);
+    }
+
+    #[test]
+    fn page_projection_matches_the_same_page_slice_of_the_workspace_projection() {
+        let mut fixture = motion_fixture();
+        let static_id = id(10_032);
+        let mut static_tile = Tile::note("Static", "", WorldRect::new(-300.0, 400.0, 30.0, 40.0));
+        static_tile.id = static_id;
+        fixture.workspace.active_page_mut().add_tile(static_tile);
+
+        let unresolved_id = id(10_033);
+        let unresolved_rect = WorldRect::new(700.0, 800.0, 50.0, 60.0);
+        let mut unresolved_tile = Tile::note("Unresolved", "", unresolved_rect);
+        unresolved_tile.id = unresolved_id;
+        fixture
+            .workspace
+            .active_page_mut()
+            .add_tile(unresolved_tile);
+        let unresolved_assignment = PathwayAssignment::new(
+            id(10_034),
+            id(99_998),
+            unresolved_id,
+            fixture.page_id,
+            PathwayAssignmentState::Moving,
+            PathwayPoint::ZERO,
+            PathwayPoint::new(4_000.0, 5_000.0),
+            PathwayPoint::new(3_975.0, 4_970.0),
+            fixture.started_at.saturating_add_micros(10),
+        )
+        .unwrap();
+        fixture
+            .workspace
+            .domain
+            .pathways
+            .assignments
+            .insert(unresolved_assignment.id, unresolved_assignment);
+
+        let other_page = fixture.workspace.create_page("Other");
+        fixture
+            .workspace
+            .page_mut(other_page)
+            .unwrap()
+            .add_tile(Tile::note(
+                "Other-page static",
+                "",
+                WorldRect::new(9_000.0, 9_000.0, 20.0, 20.0),
+            ));
+
+        let at = fixture.started_at.saturating_add_micros(20_000_000);
+        let workspace_geometry = canvas_objects_from_workspace(&fixture.workspace, at, |_| None);
+        let page_geometry =
+            canvas_objects_from_page(&fixture.workspace, fixture.page_id, at, |_| None).unwrap();
+        let workspace_page_objects = workspace_geometry
+            .objects()
+            .iter()
+            .filter(|object| object.page_id == fixture.page_id)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        assert_eq!(page_geometry.objects(), workspace_page_objects);
+        assert_eq!(
+            page_geometry.motion_by_page.get(&fixture.page_id),
+            workspace_geometry.motion_by_page.get(&fixture.page_id)
+        );
+        assert_eq!(
+            page_geometry.repaint_after(fixture.page_id, at),
+            workspace_geometry.repaint_after(fixture.page_id, at)
+        );
+        assert_eq!(
+            page_geometry.rect_for(fixture.page_id, unresolved_id),
+            Some(unresolved_rect),
+            "an unresolved authoritative assignment must use durable geometry in both bridges"
+        );
+        assert!(page_geometry.is_projected(fixture.tile_id));
+        assert!(!page_geometry.is_projected(static_id));
+        assert!(!page_geometry.is_projected(unresolved_id));
+        assert!(
+            page_geometry
+                .objects()
+                .iter()
+                .all(|object| object.page_id == fixture.page_id)
+        );
     }
 
     #[test]
