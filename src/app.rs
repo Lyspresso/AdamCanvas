@@ -19,7 +19,7 @@ use crate::{
     assets::AssetStore,
     automation::{
         CanvasGeometrySnapshot, PileGeometryPolicy, ReconcileRequest,
-        canvas_objects_from_workspace, reconcile_workspace,
+        canvas_objects_from_workspace, overlay_pathway_rail_preview, reconcile_workspace,
     },
     chat_core::{
         ActivityAccumulator, ActivityEvent as HarnessActivityEvent, ActivityKind, AgentGroupKind,
@@ -39,10 +39,10 @@ use crate::{
         AiQueuedTurn, AiWorkspaceMode, ApplyMode, ApprovalEvidence, AuthorizationDecision,
         AutoTagRule, AutoTagSettings, ContainmentMode, DomainActor, EarnedTagRemovalPolicy,
         ExistingTilesPolicy, HostArtifactOrigin, InitialMembership, MessageRole, PaletteColor,
-        PermissionMode, Pile, PileHistoryKind, RuleEditProgressPolicy, RuleState, TagClaim,
-        TagName, TagSource, TimeUnit, TimingMode, TrashActor, TrashItem, UnixMicros, UnixMillis,
-        ai_permission_verdict, apply_rule_edit, authorize_ai_action, auto_tag_rule_sentence,
-        resolve_pile_memberships,
+        PathwayId, PathwayNodeId, PathwayNodeKind, PathwayPoint, PermissionMode, Pile,
+        PileHistoryKind, RuleEditProgressPolicy, RuleState, TagClaim, TagName, TagSource, TimeUnit,
+        TimingMode, TrashActor, TrashItem, UnixMicros, UnixMillis, ai_permission_verdict,
+        apply_rule_edit, authorize_ai_action, auto_tag_rule_sentence, resolve_pile_memberships,
     },
     dots::{self, ChromeRects},
     file_watch::{self, FileWatch},
@@ -53,7 +53,12 @@ use crate::{
         TileKind, Workspace, WorldRect,
     },
     ocr::{OcrQueueError, PhotoOcrRequest, PhotoOcrWorker, source_fingerprint},
-    pathway_enrollment::{PathwayEnrollmentContext, PathwayEnrollmentService},
+    pathway_editing::{PathwayEditContext, PathwayEditingService, PathwayNodeDraft},
+    pathway_enrollment::{
+        PathwayDockAnchor, PathwayDockGeometry, PathwayDockTarget, PathwayEnrollmentChoice,
+        PathwayEnrollmentContext, PathwayEnrollmentReview, PathwayEnrollmentService,
+        PathwayFinishBehavior,
+    },
     pathway_reconciliation::{
         PathwayProblem, PathwayProblemKind, PathwayReconcileCause, PathwayReconcileContext,
         PathwayReconcileReport, PathwayReconcileService, materialize_absorbed_assignments,
@@ -77,7 +82,7 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use egui::{
     Align, Align2, Button, Color32, Context, CornerRadius, CursorIcon, FontData, FontDefinitions,
     FontFamily, FontId, Frame, Id, Key, Layout, Margin, Painter, PointerButton, Pos2, Rect,
-    Response, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
+    Response, RichText, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui, Vec2,
     epaint::text::{FontInsert, FontPriority, InsertFontFamily},
     pos2, vec2,
 };
@@ -246,45 +251,178 @@ impl Camera {
     }
 }
 
+/// One undoable step. Canvas layout undoes by snapshot restore; a rail move
+/// undoes by applying the INVERSE move through the editing service. The
+/// pathway ledger is append-only audit state and is never rewound as data —
+/// "undo" of a rail move is a brand-new, fully audited edit that happens to
+/// land the stops back where they were.
+enum HistoryEntry {
+    Canvas(Workspace),
+    RailMove {
+        pathway_id: PathwayId,
+        from: BTreeMap<PathwayNodeId, PathwayPoint>,
+        to: BTreeMap<PathwayNodeId, PathwayPoint>,
+    },
+    /// Undo removes the stop; redo re-creates it from the kept draft. The
+    /// re-created stop gets a fresh id, so redo rewrites `node_id` in the
+    /// entry it pushes back — and in every other entry that captured it.
+    StopAdd {
+        pathway_id: PathwayId,
+        after_node_id: PathwayNodeId,
+        node_id: PathwayNodeId,
+        draft: PathwayNodeDraft,
+        /// Speed pinned onto the (after → new) leg; see
+        /// [`apply_pathway_stop_add`].
+        leg_speed: Option<f64>,
+    },
+    /// Undo re-inserts the removed stop (fresh id, rewritten across the
+    /// stacks) with both adjacent leg speeds restored; redo removes it again.
+    StopRemove {
+        pathway_id: PathwayId,
+        /// The stop it followed in travel order; `None` when it was first.
+        after_node_id: Option<PathwayNodeId>,
+        node_id: PathwayNodeId,
+        draft: PathwayNodeDraft,
+        incoming_speed: Option<f64>,
+        outgoing_speed: Option<f64>,
+        /// The loop-back leg's speed, captured when removing an endpoint of a
+        /// repeating route: the rebuild resets the new closure to the default
+        /// speed, and undo must give the loop back its real pace.
+        closure_speed: Option<f64>,
+    },
+}
+
 #[derive(Default)]
 struct History {
-    undo: Vec<Workspace>,
-    redo: Vec<Workspace>,
+    undo: Vec<HistoryEntry>,
+    redo: Vec<HistoryEntry>,
 }
 
 impl History {
     fn checkpoint(&mut self, workspace: &Workspace) {
-        if self.undo.last().is_some_and(|last| last == workspace) {
+        if self
+            .undo
+            .last()
+            .is_some_and(|last| matches!(last, HistoryEntry::Canvas(prev) if prev == workspace))
+        {
             return;
         }
-        self.undo.push(workspace.clone());
-        if self.undo.len() > HISTORY_LIMIT {
-            self.undo.remove(0);
-        }
+        self.push_undo(HistoryEntry::Canvas(workspace.clone()));
         self.redo.clear();
     }
 
-    fn undo(&mut self, current: &Workspace) -> Option<Workspace> {
-        let previous = self.undo.pop()?;
-        self.redo.push(current.clone());
-        Some(previous)
+    fn record_rail_move(
+        &mut self,
+        pathway_id: PathwayId,
+        from: BTreeMap<PathwayNodeId, PathwayPoint>,
+        to: BTreeMap<PathwayNodeId, PathwayPoint>,
+    ) {
+        self.push_undo(HistoryEntry::RailMove {
+            pathway_id,
+            from,
+            to,
+        });
+        self.redo.clear();
     }
 
-    fn redo(&mut self, current: &Workspace) -> Option<Workspace> {
-        let next = self.redo.pop()?;
-        self.undo.push(current.clone());
-        Some(next)
+    fn record_stop_add(
+        &mut self,
+        pathway_id: PathwayId,
+        after_node_id: PathwayNodeId,
+        node_id: PathwayNodeId,
+        draft: PathwayNodeDraft,
+        leg_speed: Option<f64>,
+    ) {
+        self.push_undo(HistoryEntry::StopAdd {
+            pathway_id,
+            after_node_id,
+            node_id,
+            draft,
+            leg_speed,
+        });
+        self.redo.clear();
+    }
+
+    /// After a replay re-creates a stop under a fresh id, every entry still
+    /// on either stack that captured the old id must follow it, or later
+    /// replays would target a stop that no longer exists.
+    fn rewrite_node_id(&mut self, old: PathwayNodeId, new: PathwayNodeId) {
+        for entry in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            match entry {
+                HistoryEntry::Canvas(_) => {}
+                HistoryEntry::RailMove { from, to, .. } => {
+                    for map in [&mut *from, to] {
+                        if let Some(point) = map.remove(&old) {
+                            map.insert(new, point);
+                        }
+                    }
+                }
+                HistoryEntry::StopAdd {
+                    after_node_id,
+                    node_id,
+                    ..
+                } => {
+                    if *after_node_id == old {
+                        *after_node_id = new;
+                    }
+                    if *node_id == old {
+                        *node_id = new;
+                    }
+                }
+                HistoryEntry::StopRemove {
+                    after_node_id,
+                    node_id,
+                    ..
+                } => {
+                    if *after_node_id == Some(old) {
+                        *after_node_id = Some(new);
+                    }
+                    if *node_id == old {
+                        *node_id = new;
+                    }
+                }
+            }
+        }
+    }
+
+    fn record_stop_remove(&mut self, entry: HistoryEntry) {
+        debug_assert!(matches!(entry, HistoryEntry::StopRemove { .. }));
+        self.push_undo(entry);
+        self.redo.clear();
+    }
+
+    fn push_undo(&mut self, entry: HistoryEntry) {
+        self.undo.push(entry);
+        if self.undo.len() > HISTORY_LIMIT {
+            self.undo.remove(0);
+        }
+    }
+
+    fn pop_undo(&mut self) -> Option<HistoryEntry> {
+        self.undo.pop()
+    }
+
+    fn push_redo(&mut self, entry: HistoryEntry) {
+        self.redo.push(entry);
+    }
+
+    fn pop_redo(&mut self) -> Option<HistoryEntry> {
+        self.redo.pop()
     }
 
     fn forget_conversation(&mut self, conversation_id: Uuid) {
-        for workspace in self.undo.iter_mut().chain(self.redo.iter_mut()) {
-            purge_ai_conversation_from_workspace(workspace, conversation_id);
+        for entry in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            if let HistoryEntry::Canvas(workspace) = entry {
+                purge_ai_conversation_from_workspace(workspace, conversation_id);
+            }
         }
     }
 
     fn replace_file_path(&mut self, source: &PathBuf, managed_path: &PathBuf) {
-        for workspace in self.undo.iter_mut().chain(self.redo.iter_mut()) {
-            replace_workspace_file_path(workspace, source, managed_path);
+        for entry in self.undo.iter_mut().chain(self.redo.iter_mut()) {
+            if let HistoryEntry::Canvas(workspace) = entry {
+                replace_workspace_file_path(workspace, source, managed_path);
+            }
         }
     }
 }
@@ -305,8 +443,458 @@ struct DragSession {
     /// Store-backed rects used only to cancel the gesture. Merely pressing a
     /// moving rider must never materialize its projected position.
     durable_originals: HashMap<Uuid, WorldRect>,
+    /// Route geometry flattened once at pointer-down, per the plan's dock
+    /// contract: every later pointer tick is pure arithmetic against these
+    /// values, and the hysteresis needs them to hold still. `None` when the
+    /// drag carries nothing that could ride (piles only).
+    dock: Option<PathwayDockGeometry>,
     text_source: Option<Uuid>,
     moved: bool,
+}
+
+/// One in-flight rail gesture: a grabbed stop, or the whole route grabbed by
+/// its line. `original_nodes` holds only the stops this gesture may move.
+/// Nothing durable changes until release; Escape simply drops the session.
+struct PathwayRailDrag {
+    pathway_id: PathwayId,
+    start_world: [f32; 2],
+    /// Screen-space anchor for click-vs-drag discrimination. Rail edits are
+    /// durable and undo-exempt, so a plain click's pixel jitter must never
+    /// count as movement — a world-unit threshold would at low zoom.
+    start_pointer: Pos2,
+    original_nodes: BTreeMap<PathwayNodeId, PathwayPoint>,
+    preview_nodes: BTreeMap<PathwayNodeId, PathwayPoint>,
+    page_size: [f32; 2],
+    moved: bool,
+}
+
+/// Screen pixels of travel before a rail grab counts as a move rather than a
+/// click, matching the note tool's gesture threshold territory.
+const RAIL_DRAG_THRESHOLD_POINTS: f32 = 6.0;
+
+/// One completed settings-field edit, committed through the services.
+enum PathwaySettingsCommit {
+    Rename(String),
+    ToggleRun,
+    SetRepeats(bool),
+    NodeTitle(PathwayNodeId, String),
+    NodeKind(PathwayNodeId, PathwayNodeKind),
+    NodeWait(PathwayNodeId, f64),
+    SegmentSpeed(crate::domain::PathwaySegmentId, f64),
+    /// Appends a stop at the end of the route; the wait comes from the
+    /// panel's default-wait buffer.
+    AddStop(f64),
+    RemoveStop(PathwayNodeId),
+    /// Sets every stop's wait to one value (waypoints stay at zero).
+    SetAllWaits(f64),
+    Delete,
+}
+
+/// Edit buffers for the pathway settings window.
+///
+/// Every field commits through the editing/engine services on its completion
+/// event (blur, drag end, selection) — never per keystroke or per drag tick,
+/// which would flood the append-only history with one event per frame. The
+/// buffers re-sync from the store after each commit so a service that
+/// normalizes a value (trimmed title, clamped speed) is reflected honestly.
+struct PathwaySettingsPanel {
+    pathway_id: PathwayId,
+    name: String,
+    stop_titles: BTreeMap<PathwayNodeId, String>,
+    stop_waits: BTreeMap<PathwayNodeId, f64>,
+    speeds: BTreeMap<crate::domain::PathwaySegmentId, f64>,
+    /// UI-only buffer for the "set every stop" control; survives resyncs so
+    /// a typed value is not wiped by the commit it powers.
+    default_wait: f64,
+    confirm_delete: bool,
+}
+
+impl PathwaySettingsPanel {
+    fn synced_from(workspace: &Workspace, pathway_id: PathwayId) -> Option<Self> {
+        let pathway = workspace.domain.pathways.pathway(pathway_id)?;
+        Some(Self {
+            pathway_id,
+            name: pathway.title.clone(),
+            stop_titles: pathway
+                .nodes
+                .iter()
+                .map(|(id, node)| (*id, node.title.clone()))
+                .collect(),
+            stop_waits: pathway
+                .nodes
+                .iter()
+                .map(|(id, node)| (*id, node.wait_duration_seconds))
+                .collect(),
+            speeds: pathway
+                .segments
+                .iter()
+                .map(|(id, segment)| (*id, segment.speed_points_per_second))
+                .collect(),
+            default_wait: 5.0,
+            confirm_delete: false,
+        })
+    }
+}
+
+/// Runs one settings edit and restores the route's running state when the
+/// edit's safety pause was the only reason it stopped.
+///
+/// Graph-touching edits pause live cargo first — the plan's law — but a
+/// settings tweak should feel like adjusting the track, not pulling its
+/// power. Only an edit that actually flipped the route from enabled to
+/// disabled triggers the resume, so editing an already-paused route leaves
+/// it paused, exactly as the user left it.
+fn commit_pathway_edit_with_resume<T>(
+    workspace: &mut Workspace,
+    pathway_id: PathwayId,
+    now: UnixMicros,
+    operation_id: Uuid,
+    edit: impl FnOnce(&mut Workspace) -> Result<T, String>,
+) -> Result<T, String> {
+    let was_enabled = workspace
+        .domain
+        .pathways
+        .pathway(pathway_id)
+        .is_some_and(|pathway| pathway.is_enabled);
+    let value = edit(workspace)?;
+    let now_disabled = workspace
+        .domain
+        .pathways
+        .pathway(pathway_id)
+        .is_some_and(|pathway| !pathway.is_enabled);
+    if was_enabled && now_disabled {
+        // A resume failure must NOT fail the commit: the edit has already
+        // durably applied, and reporting failure would both lie and skip the
+        // dirty-marking that schedules the save. The route stays honestly
+        // paused (visible in the settings panel) and can be run manually.
+        match PathwayReconcileContext::with_operation_id(
+            "Adam pathway settings",
+            now,
+            PathwayReconcileCause::Live,
+            operation_id,
+        ) {
+            Ok(resume) => {
+                if let Err(error) =
+                    PathwayReconcileService::set_enabled(workspace, pathway_id, true, resume)
+                {
+                    log::warn!("pathway {pathway_id} stayed paused after a settings edit: {error}");
+                }
+            }
+            Err(error) => {
+                log::warn!("pathway {pathway_id} stayed paused after a settings edit: {error}");
+            }
+        }
+    }
+    Ok(value)
+}
+
+/// Mirrors the editing service's placement clamp (32-point canvas margin) so
+/// the drag preview lands exactly where the commit will.
+fn clamped_rail_point(point: PathwayPoint, page_size: [f32; 2]) -> PathwayPoint {
+    const RAIL_CANVAS_MARGIN: f64 = 32.0;
+    if !point.is_finite() {
+        return point;
+    }
+    let width = f64::from(page_size[0]);
+    let height = f64::from(page_size[1]);
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return point;
+    }
+    PathwayPoint::new(
+        point.x.clamp(
+            RAIL_CANVAS_MARGIN,
+            (width - RAIL_CANVAS_MARGIN).max(RAIL_CANVAS_MARGIN),
+        ),
+        point.y.clamp(
+            RAIL_CANVAS_MARGIN,
+            (height - RAIL_CANVAS_MARGIN).max(RAIL_CANVAS_MARGIN),
+        ),
+    )
+}
+
+/// Applies a finished rail gesture as one all-or-nothing step, then restores
+/// the route's running state.
+///
+/// The editing service pauses live cargo before any graph change — that is
+/// the plan's law, not a choice — so a route that was enabled is re-enabled
+/// afterwards: reshaping the track should feel like bending it, not like
+/// pulling its power. The whole move runs on a clone first because pathway
+/// edits are exempt from undo by design (P1); a half-moved route would be
+/// unrecoverable.
+fn apply_pathway_rail_drag(
+    workspace: &mut Workspace,
+    pathway_id: PathwayId,
+    target_nodes: &BTreeMap<PathwayNodeId, PathwayPoint>,
+    now: UnixMicros,
+    operation_id: Uuid,
+) -> Result<(), String> {
+    let was_enabled = workspace
+        .domain
+        .pathways
+        .pathways
+        .get(&pathway_id)
+        .is_some_and(|pathway| pathway.is_enabled);
+    let mut draft = workspace.clone();
+    for (node_id, point) in target_nodes {
+        let edit = PathwayEditContext::with_operation_id("Adam rail drag", now, operation_id)
+            .map_err(|error| error.to_string())?;
+        PathwayEditingService::move_node(&mut draft, pathway_id, *node_id, *point, edit)
+            .map_err(|error| error.to_string())?;
+    }
+    if was_enabled {
+        let resume = PathwayReconcileContext::with_operation_id(
+            "Adam rail drag",
+            now,
+            PathwayReconcileCause::Live,
+            operation_id,
+        )
+        .map_err(|error| error.to_string())?;
+        PathwayReconcileService::set_enabled(&mut draft, pathway_id, true, resume)
+            .map_err(|error| error.to_string())?;
+    }
+    *workspace = draft;
+    Ok(())
+}
+
+/// Adds one stop after `after_node_id` through the editing service, resuming
+/// the route if the edit's own safety pause disabled it. Returns the new
+/// stop's id so history can target it.
+///
+/// `leg_speed` pins the new (after → new) leg to that speed. The engine
+/// preserves the split leg's speed for interior splits on its own, but a
+/// split of a repeating route's closing leg is classified as an append and
+/// would inherit the fastest forward speed instead — the caller that knows
+/// which leg was actually split passes its speed through. All-or-nothing on
+/// a draft clone.
+fn apply_pathway_stop_add(
+    workspace: &mut Workspace,
+    pathway_id: PathwayId,
+    after_node_id: Option<PathwayNodeId>,
+    draft: PathwayNodeDraft,
+    leg_speed: Option<f64>,
+    outgoing_speed: Option<f64>,
+    closure_speed: Option<f64>,
+    now: UnixMicros,
+    operation_id: Uuid,
+) -> Result<PathwayNodeId, String> {
+    commit_pathway_edit_with_resume(workspace, pathway_id, now, operation_id, |workspace| {
+        let mut draft_workspace = workspace.clone();
+        let edit = PathwayEditContext::with_operation_id("Adam pathway stops", now, operation_id)
+            .map_err(|error| error.to_string())?;
+        let node_id = PathwayEditingService::create_node(
+            &mut draft_workspace,
+            pathway_id,
+            after_node_id,
+            draft,
+            edit,
+        )
+        .map_err(|error| error.to_string())?;
+        // Pin the incoming leg (after → new) and outgoing leg (new → next)
+        // speeds when the caller knows them: a fresh insert keeps the split
+        // leg's own pace, and a re-inserted stop must hand both its legs
+        // back their exact old speeds.
+        let outgoing_to = outgoing_speed.and_then(|_| {
+            draft_workspace
+                .domain
+                .pathways
+                .pathway(pathway_id)?
+                .segments
+                .values()
+                .find(|segment| segment.from_node_id == node_id)
+                .map(|segment| segment.to_node_id)
+        });
+        let closure_pair = closure_speed.and_then(|_| {
+            let pathway = draft_workspace.domain.pathways.pathway(pathway_id)?;
+            let closure = closure_segment_id(pathway)?;
+            let segment = pathway.segments.get(&closure)?;
+            Some((segment.from_node_id, segment.to_node_id))
+        });
+        let pins = [
+            leg_speed.and_then(|speed| after_node_id.map(|after| ((after, node_id), speed))),
+            outgoing_speed.and_then(|speed| outgoing_to.map(|to| ((node_id, to), speed))),
+            closure_speed.and_then(|speed| closure_pair.map(|pair| (pair, speed))),
+        ];
+        for ((from, to), speed) in pins.into_iter().flatten() {
+            let segment_id = draft_workspace
+                .domain
+                .pathways
+                .pathway(pathway_id)
+                .and_then(|pathway| {
+                    pathway
+                        .segments
+                        .values()
+                        .find(|segment| segment.from_node_id == from && segment.to_node_id == to)
+                        .map(|segment| segment.id)
+                });
+            if let Some(segment_id) = segment_id {
+                let edit =
+                    PathwayEditContext::with_operation_id("Adam pathway stops", now, operation_id)
+                        .map_err(|error| error.to_string())?;
+                PathwayEditingService::set_segment_speed(
+                    &mut draft_workspace,
+                    pathway_id,
+                    segment_id,
+                    speed,
+                    edit,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        *workspace = draft_workspace;
+        Ok(node_id)
+    })
+}
+
+fn apply_pathway_stop_remove(
+    workspace: &mut Workspace,
+    pathway_id: PathwayId,
+    node_id: PathwayNodeId,
+    now: UnixMicros,
+    operation_id: Uuid,
+) -> Result<(), String> {
+    commit_pathway_edit_with_resume(workspace, pathway_id, now, operation_id, |workspace| {
+        let edit = PathwayEditContext::with_operation_id("Adam pathway stops", now, operation_id)
+            .map_err(|error| error.to_string())?;
+        PathwayEditingService::remove_node(workspace, pathway_id, node_id, edit)
+            .map_err(|error| error.to_string())
+    })
+}
+
+/// Sets every stop's wait to one value, all-or-nothing on a draft clone.
+/// Waypoints pass through the service's own coercion (their wait stays 0).
+fn apply_pathway_wait_for_all_stops(
+    workspace: &mut Workspace,
+    pathway_id: PathwayId,
+    wait_duration_seconds: f64,
+    now: UnixMicros,
+    operation_id: Uuid,
+) -> Result<bool, String> {
+    commit_pathway_edit_with_resume(workspace, pathway_id, now, operation_id, |workspace| {
+        let nodes: Vec<(PathwayNodeId, String, PathwayNodeKind)> = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .ok_or_else(|| "that pathway no longer exists".to_owned())?
+            .nodes
+            .values()
+            .map(|node| (node.id, node.title.clone(), node.kind))
+            .collect();
+        let mut draft_workspace = workspace.clone();
+        let mut changed = false;
+        for (node_id, title, kind) in nodes {
+            let edit =
+                PathwayEditContext::with_operation_id("Adam pathway stops", now, operation_id)
+                    .map_err(|error| error.to_string())?;
+            changed |= PathwayEditingService::set_node_properties(
+                &mut draft_workspace,
+                pathway_id,
+                node_id,
+                title,
+                kind,
+                wait_duration_seconds,
+                edit,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        *workspace = draft_workspace;
+        Ok(changed)
+    })
+}
+
+/// Travel-order comparator matching the engine's own `indexed_cmp`: equal
+/// sort indices — including -0.0 vs +0.0 — fall through to the UUID
+/// tie-break. Bare `total_cmp` would order -0.0 before +0.0 and bypass it.
+fn travel_order(
+    left: &crate::domain::PathwayNode,
+    right: &crate::domain::PathwayNode,
+) -> std::cmp::Ordering {
+    let order = if left.sort_index == right.sort_index {
+        std::cmp::Ordering::Equal
+    } else {
+        left.sort_index.total_cmp(&right.sort_index)
+    };
+    order.then_with(|| left.id.as_bytes().cmp(right.id.as_bytes()))
+}
+
+/// The loop-back leg of a repeating route: last stop in travel order back to
+/// the first. `None` when the route does not repeat.
+fn closure_segment_id(pathway: &crate::domain::Pathway) -> Option<crate::domain::PathwaySegmentId> {
+    if !pathway.repeats || pathway.nodes.len() < 2 {
+        return None;
+    }
+    let mut ordered: Vec<_> = pathway.nodes.values().collect();
+    ordered.sort_by(|left, right| travel_order(left, right));
+    let first = ordered.first()?.id;
+    let last = ordered.last()?.id;
+    pathway
+        .segments
+        .values()
+        .find(|segment| segment.from_node_id == last && segment.to_node_id == first)
+        .map(|segment| segment.id)
+}
+
+/// Resolves where a rail double-click should insert its stop.
+///
+/// On an out-and-back route the trip out and the loop-back leg sit on the
+/// same line, and the dock can return either. Splitting the loop-back leg
+/// turns the return trip into a visible detour while the authored track keeps
+/// running straight — which reads as "the old line was never deleted". When
+/// the click hit the loop-back leg but the point also lies on an authored
+/// leg, insert into that leg instead; a true circuit (return leg with its own
+/// geometry) keeps the closure insert.
+fn corrected_stop_insert(
+    pathway: &crate::domain::Pathway,
+    hit_segment_id: crate::domain::PathwaySegmentId,
+    route_point: PathwayPoint,
+) -> Option<(PathwayNodeId, f64)> {
+    let hit = pathway.segments.get(&hit_segment_id)?;
+    if closure_segment_id(pathway) != Some(hit_segment_id) {
+        return Some((hit.from_node_id, hit.speed_points_per_second));
+    }
+    for segment in pathway.segments.values() {
+        if segment.id == hit_segment_id {
+            continue;
+        }
+        let (Some(from), Some(to)) = (
+            pathway.nodes.get(&segment.from_node_id),
+            pathway.nodes.get(&segment.to_node_id),
+        ) else {
+            continue;
+        };
+        let leg = (to.point.x - from.point.x, to.point.y - from.point.y);
+        let length_squared = leg.0 * leg.0 + leg.1 * leg.1;
+        if length_squared < f64::EPSILON {
+            continue;
+        }
+        let offset = (route_point.x - from.point.x, route_point.y - from.point.y);
+        let t = (offset.0 * leg.0 + offset.1 * leg.1) / length_squared;
+        if !(0.0..=1.0).contains(&t) {
+            continue;
+        }
+        let nearest = (from.point.x + t * leg.0, from.point.y + t * leg.1);
+        let distance =
+            ((route_point.x - nearest.0).powi(2) + (route_point.y - nearest.1).powi(2)).sqrt();
+        if distance <= 0.5 {
+            return Some((segment.from_node_id, segment.speed_points_per_second));
+        }
+    }
+    Some((hit.from_node_id, hit.speed_points_per_second))
+}
+
+/// A conventional name for a stop added by the app, matching the editing
+/// service's own append naming: one-based ordinal within the same kind.
+fn conventional_stop_name(pathway: &crate::domain::Pathway, kind: PathwayNodeKind) -> String {
+    let ordinal = pathway
+        .nodes
+        .values()
+        .filter(|node| node.kind == kind)
+        .count()
+        .saturating_add(1);
+    match kind {
+        PathwayNodeKind::Waypoint => format!("Waypoint {ordinal}"),
+        PathwayNodeKind::Destination => format!("Destination {ordinal}"),
+        PathwayNodeKind::ApprovalGate => format!("Approval Gate {ordinal}"),
+    }
 }
 
 struct ResizeSession {
@@ -737,6 +1325,9 @@ enum CanvasMenuAction {
     ToggleGrid,
     ToggleGridView,
     ToggleSnap,
+    PathwaySettings(Uuid),
+    PathwayToggleRun(Uuid),
+    PathwayRemoveStop(Uuid, Uuid),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -746,6 +1337,7 @@ enum CanvasQuickTool {
     Website,
     Import,
     Text,
+    Pathway,
 }
 
 impl CanvasQuickTool {
@@ -756,6 +1348,7 @@ impl CanvasQuickTool {
             Self::Website => "Website",
             Self::Import => "Import",
             Self::Text => "Text",
+            Self::Pathway => "Pathway",
         }
     }
 
@@ -766,6 +1359,9 @@ impl CanvasQuickTool {
             Self::Website => "W",
             Self::Import => "I",
             Self::Text => "T",
+            // "P" already reads as Pile, so the rail tool uses a direction
+            // arrow. Source Sans 3 ships U+2192, so it never falls back.
+            Self::Pathway => "→",
         }
     }
 }
@@ -1064,6 +1660,19 @@ pub struct AdamApp {
     link_input: String,
     pending_website_anchor: Option<[f32; 2]>,
     armed_canvas_tool: Option<ArmedCanvasQuickTool>,
+    /// A reviewed but unconfirmed enrollment. Holding the review here is what
+    /// makes docking review-first: the service re-validates the route revision
+    /// and the cargo frames when the user picks, so a stale sheet cannot apply.
+    pathway_enrollment_review: Option<PathwayEnrollmentReview>,
+    /// The rail the dragged tiles would join if dropped right now. Threaded
+    /// back into the resolver each tick so its hysteresis can hold and release
+    /// the highlight instead of flickering between overlapping rails.
+    pathway_dock_preview: Option<PathwayDockTarget>,
+    pathway_drag: Option<PathwayRailDrag>,
+    pathway_settings: Option<PathwaySettingsPanel>,
+    /// The rail under the pointer when the canvas context menu opened, frozen
+    /// at that click so the menu's pathway section cannot retarget mid-hover.
+    pathway_menu_target: Option<(PathwayId, Option<PathwayNodeId>)>,
     note_draft: Option<NoteDraft>,
     text_note_drop_target: Option<Uuid>,
     page_size_edit_active: bool,
@@ -1423,6 +2032,11 @@ impl AdamApp {
             link_input: String::new(),
             pending_website_anchor: None,
             armed_canvas_tool: None,
+            pathway_enrollment_review: None,
+            pathway_dock_preview: None,
+            pathway_drag: None,
+            pathway_settings: None,
+            pathway_menu_target: None,
             note_draft: None,
             text_note_drop_target: None,
             page_size_edit_active: false,
@@ -1680,6 +2294,8 @@ impl AdamApp {
         self.drag = None;
         self.resize = None;
         self.marquee = None;
+        self.pathway_drag = None;
+        self.pathway_dock_preview = None;
         self.note_draft = None;
         self.text_note_drop_target = None;
         self.spatial_dirty = true;
@@ -1700,6 +2316,8 @@ impl AdamApp {
             self.drag_destination_page = None;
             self.note_draft = None;
             self.text_note_drop_target = None;
+            self.pathway_drag = None;
+            self.pathway_dock_preview = None;
             self.spatial_dirty = true;
             self.spatial_page = None;
             if changed_page {
@@ -2294,7 +2912,10 @@ impl AdamApp {
 
     fn poll_pathway_reconciliation(&mut self, context: &Context) {
         let now = unix_now_micros();
-        let settled = self.drag.is_none() && self.resize.is_none();
+        // A grabbed rail also defers the engine: its commit will pause and
+        // resume cargo itself, and an engine pass mid-gesture could disable
+        // the very route whose preview the user is holding.
+        let settled = self.drag.is_none() && self.resize.is_none() && self.pathway_drag.is_none();
         match pathway_poll_decision(
             self.pathway_reconcile_requested,
             self.pathway_startup_reconcile_pending,
@@ -2366,6 +2987,14 @@ impl AdamApp {
                     report.problems.push(problem.clone());
                     report.problems.sort();
                     report.problems.dedup();
+                }
+                // Detachment is durable and has no other surface yet; without
+                // this the tile just silently stops riding.
+                if report.detached_count > 0 {
+                    self.toast(
+                        "A tile came off its pathway — drop it back on the rail to re-hook it",
+                        context,
+                    );
                 }
                 self.pathway_reconcile_report = report;
                 if let Some(wake) = self.pathway_next_wake {
@@ -2908,6 +3537,7 @@ impl AdamApp {
             || self.pending_tag_delete.is_some()
             || self.details_tile.is_some()
             || self.pile_settings.is_some()
+            || self.pathway_settings.is_some()
             || self.open_chat.is_some()
             || self.trash_open
             || self.agents.open
@@ -2920,14 +3550,9 @@ impl AdamApp {
             input.modifiers.command && input.modifiers.shift && input.key_pressed(Key::Z)
         });
         if undo && !text_is_active {
-            if let Some(workspace) = self.history.undo(&self.workspace) {
-                self.restore_workspace(workspace);
-            }
-        } else if redo
-            && !text_is_active
-            && let Some(workspace) = self.history.redo(&self.workspace)
-        {
-            self.restore_workspace(workspace);
+            self.perform_undo(context);
+        } else if redo && !text_is_active {
+            self.perform_redo(context);
         }
 
         if text_is_active {
@@ -3017,6 +3642,10 @@ impl AdamApp {
             self.text_note_drop_target = None;
             self.selection.clear();
             self.marquee = None;
+            // A rail gesture is preview-only, so cancelling is just dropping
+            // the session; nothing durable was written to restore.
+            self.pathway_drag = None;
+            self.pathway_dock_preview = None;
         }
     }
 
@@ -4025,6 +4654,21 @@ impl AdamApp {
                 let page_id = self.workspace.active_page;
                 let page_size = self.workspace.active_page().size;
                 draw_canvas_background(&painter, view, page_size, camera, self.show_grid, colors);
+                // Rails sit between the page and its cargo: a tile riding one
+                // must read as being on top of the rail, never under it.
+                let rail_preview = self
+                    .pathway_drag
+                    .as_ref()
+                    .map(|session| (session.pathway_id, &session.preview_nodes));
+                draw_pathways(
+                    &painter,
+                    &self.workspace,
+                    page_id,
+                    camera,
+                    view,
+                    colors,
+                    rail_preview,
+                );
 
                 // One wall-clock sample and one immutable geometry snapshot
                 // drive every canvas read in this frame. Projection remains
@@ -4039,6 +4683,18 @@ impl AdamApp {
                     self.drag.as_ref(),
                     self.resize.as_ref(),
                 );
+                // A rail being dragged is drawn at its preview nodes; its
+                // riders must be projected along that same preview or cargo
+                // visibly stays behind until the commit snaps it over.
+                if let Some(session) = self.pathway_drag.as_ref() {
+                    overlay_pathway_rail_preview(
+                        &mut geometry,
+                        &self.workspace,
+                        session.pathway_id,
+                        &session.preview_nodes,
+                        pathway_now,
+                    );
+                }
                 let projected_rects = geometry.page_rects(page_id).collect::<Vec<_>>();
                 debug_assert_eq!(
                     projected_rects.len(),
@@ -4275,13 +4931,24 @@ impl AdamApp {
                         &geometry,
                         &projected_rect_by_tile,
                     );
-                    self.handle_background_interaction(
+                    // Rails claim the pointer before the background can start
+                    // a marquee underneath a grabbed stop or line.
+                    let rail_consumed = self.handle_pathway_rail_interaction(
                         &context,
                         &canvas_response,
                         camera,
                         view,
                         any_tile_pressed,
                     );
+                    if !rail_consumed {
+                        self.handle_background_interaction(
+                            &context,
+                            &canvas_response,
+                            camera,
+                            view,
+                            any_tile_pressed,
+                        );
+                    }
                 }
                 self.update_live_gestures(&context, camera, view, &projected_rect_by_tile);
                 self.draw_text_note_drop_target(
@@ -4292,13 +4959,93 @@ impl AdamApp {
                     &projected_rect_by_tile,
                 );
                 self.draw_marquee(&painter, camera, view, colors);
+                self.draw_pathway_dock_preview(&painter, camera, view, colors);
                 self.show_note_editor(ui, &context, camera, view, colors, &projected_rect_by_tile);
                 self.draw_minimap(&painter, view, camera, colors, &projected_rects);
                 self.show_canvas_status(ui, view, colors);
                 self.show_drop_overlay(&context, &painter, view, colors);
+                self.show_pathway_enrollment_sheet(&context, colors);
 
+                if canvas_response.secondary_clicked() {
+                    self.pathway_menu_target = context
+                        .input(|input| input.pointer.interact_pos())
+                        .filter(|pointer| view.contains(*pointer))
+                        .and_then(|pointer| {
+                            let world = camera.screen_to_world(pointer, view);
+                            PathwayDockGeometry::prepare(&self.workspace, page_id)
+                                .target(
+                                    PathwayPoint::new(f64::from(world[0]), f64::from(world[1])),
+                                    f64::from(camera.zoom),
+                                    None,
+                                )
+                                .map(|target| {
+                                    let node = match target.anchor {
+                                        PathwayDockAnchor::Node(node_id) => Some(node_id),
+                                        PathwayDockAnchor::Segment(_) => None,
+                                    };
+                                    (target.pathway_id, node)
+                                })
+                        });
+                }
+                let menu_pathway = self.pathway_menu_target.and_then(|(pathway_id, node_id)| {
+                    self.workspace
+                        .domain
+                        .pathways
+                        .pathway(pathway_id)
+                        .map(|pathway| {
+                            (
+                                pathway_id,
+                                pathway.title.clone(),
+                                pathway.is_enabled,
+                                // Only offer removal for a dot that still exists
+                                // on a route that can spare it.
+                                node_id
+                                    .filter(|node_id| pathway.nodes.contains_key(node_id))
+                                    .map(|node_id| (node_id, pathway.nodes.len() > 2)),
+                            )
+                        })
+                });
                 let mut canvas_action = None;
                 canvas_response.context_menu(|ui| {
+                    if let Some((pathway_id, title, is_enabled, node)) = &menu_pathway {
+                        ui.label(
+                            RichText::new(title.as_str())
+                                .small()
+                                .color(colors.secondary_text),
+                        );
+                        if ui.button("Pathway Settings…").clicked() {
+                            canvas_action = Some(CanvasMenuAction::PathwaySettings(*pathway_id));
+                            ui.close();
+                        }
+                        if ui
+                            .button(if *is_enabled {
+                                "Pause Pathway"
+                            } else {
+                                "Run Pathway"
+                            })
+                            .clicked()
+                        {
+                            canvas_action = Some(CanvasMenuAction::PathwayToggleRun(*pathway_id));
+                            ui.close();
+                        }
+                        if let Some((node_id, can_remove)) = node {
+                            let button =
+                                ui.add_enabled(*can_remove, Button::new("Remove This Stop"));
+                            let button = if *can_remove {
+                                button
+                            } else {
+                                button.on_disabled_hover_text("A pathway needs at least two stops")
+                            };
+                            if button.clicked() {
+                                canvas_action = Some(CanvasMenuAction::PathwayRemoveStop(
+                                    *pathway_id,
+                                    *node_id,
+                                ));
+                                ui.close();
+                            }
+                        }
+                        ui.separator();
+                    }
                     if ui.button("Import…").clicked() {
                         canvas_action = Some(CanvasMenuAction::Import);
                         ui.close();
@@ -4389,6 +5136,16 @@ impl AdamApp {
                     Some(CanvasMenuAction::ToggleGrid) => self.show_grid = !self.show_grid,
                     Some(CanvasMenuAction::ToggleGridView) => self.toggle_grid_view(),
                     Some(CanvasMenuAction::ToggleSnap) => self.snap_to_grid = !self.snap_to_grid,
+                    Some(CanvasMenuAction::PathwaySettings(pathway_id)) => {
+                        self.pathway_settings =
+                            PathwaySettingsPanel::synced_from(&self.workspace, pathway_id);
+                    }
+                    Some(CanvasMenuAction::PathwayToggleRun(pathway_id)) => {
+                        self.toggle_pathway_running(pathway_id, &context);
+                    }
+                    Some(CanvasMenuAction::PathwayRemoveStop(pathway_id, node_id)) => {
+                        self.remove_pathway_stop(pathway_id, node_id, &context);
+                    }
                     None => {}
                 }
             });
@@ -5042,6 +5799,12 @@ impl AdamApp {
             Some(_) => None,
             None => Some(GridViewState::default()),
         };
+        // The canvas stops running while the grid is open, so a rail gesture
+        // could never observe its release; a stranded session would freeze the
+        // engine and commit on the next unrelated click. Drop it instead —
+        // it is preview-only, so this cancels cleanly.
+        self.pathway_drag = None;
+        self.pathway_dock_preview = None;
     }
 
     /// Switches cell shape, keeping the wall anchored on whatever row is at
@@ -5215,6 +5978,7 @@ impl AdamApp {
                                 CanvasQuickTool::Website,
                                 CanvasQuickTool::Import,
                                 CanvasQuickTool::Text,
+                                CanvasQuickTool::Pathway,
                             ] {
                                 let state = armed.filter(|state| state.tool == tool);
                                 let active = state.is_some();
@@ -5256,6 +6020,9 @@ impl AdamApp {
                                             .to_owned()
                                     } else if tool == CanvasQuickTool::Text {
                                         "Text\nClick and type directly · drag finished text onto a sticky note · double-click the tool to lock"
+                                            .to_owned()
+                                    } else if tool == CanvasQuickTool::Pathway {
+                                        "Pathway\nClick empty canvas to lay a new rail · drag tiles onto a rail to put them on it\nDrag a stop to move it · drag the line to move the whole route"
                                             .to_owned()
                                     } else {
                                         format!(
@@ -5313,7 +6080,7 @@ impl AdamApp {
                                 .on_hover_text("Clear the active canvas tool")
                                 .clicked();
 
-                            for _ in 0..3 {
+                            for _ in 0..2 {
                                 ui.add_enabled(
                                     false,
                                     Button::new(RichText::new("").color(colors.tertiary_text))
@@ -5455,11 +6222,840 @@ impl AdamApp {
             CanvasQuickTool::Text => {
                 self.add_free_text_at(context, world, true);
             }
+            CanvasQuickTool::Pathway => {
+                self.place_or_join_pathway_at(context, world, camera.zoom);
+            }
         }
         if !armed.locked {
             self.armed_canvas_tool = None;
         }
         true
+    }
+
+    /// Lays a new rail, or offers the current selection a ride on the rail
+    /// under the pointer.
+    ///
+    /// Docking wins whenever the pointer is on an existing rail, so a
+    /// deliberate join can never silently stack a second route on top of the
+    /// first. Joining is review-first: this only prepares the choice.
+    fn place_or_join_pathway_at(&mut self, context: &Context, world: [f32; 2], magnification: f32) {
+        // A review sheet is already asking for a decision; a second offer
+        // would silently discard it, cargo list and all.
+        if self.pathway_enrollment_review.is_some() {
+            return;
+        }
+        let page_id = self.workspace.active_page;
+        let pointer = PathwayPoint::new(f64::from(world[0]), f64::from(world[1]));
+        let dock = PathwayDockGeometry::prepare(&self.workspace, page_id).target(
+            pointer,
+            f64::from(magnification),
+            None,
+        );
+
+        if let Some(target) = dock {
+            let cargo = self
+                .selection
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.workspace
+                        .active_page()
+                        .tile(*id)
+                        .is_some_and(|tile| tile.kind() != TileKind::Pile)
+                })
+                .collect::<BTreeSet<_>>();
+            if cargo.is_empty() {
+                self.toast("Drag tiles onto the rail to put them on it", context);
+                return;
+            }
+            match PathwayEnrollmentService::review(&self.workspace, target, cargo) {
+                Ok(review) => self.pathway_enrollment_review = Some(review),
+                Err(error) => {
+                    log::warn!("pathway enrollment review refused: {error}");
+                    self.toast("Those tiles cannot ride this pathway", context);
+                }
+            }
+            return;
+        }
+
+        let Ok(edit_context) = PathwayEditContext::new("Adam canvas", unix_now_micros()) else {
+            return;
+        };
+        self.checkpoint();
+        match PathwayEditingService::create_pathway(
+            &mut self.workspace,
+            page_id,
+            pointer,
+            edit_context,
+        ) {
+            Ok(_) => {
+                self.changed(true);
+                self.toast("Pathway added — select tiles, then click the rail", context);
+            }
+            Err(error) => {
+                log::warn!("could not create a pathway: {error}");
+                self.toast("Could not add a pathway here", context);
+            }
+        }
+    }
+
+    /// Shows where dragged tiles would join a rail: a ring at the entry point,
+    /// drawn above the cargo so the drop target stays visible underneath the
+    /// tile being dragged.
+    fn draw_pathway_dock_preview(
+        &self,
+        painter: &Painter,
+        camera: Camera,
+        view: Rect,
+        colors: Theme,
+    ) {
+        let Some(target) = &self.pathway_dock_preview else {
+            return;
+        };
+        if !target.route_point.is_finite() {
+            return;
+        }
+        let center = camera.world_to_screen(
+            [target.route_point.x as f32, target.route_point.y as f32],
+            view,
+        );
+        let radius = (7.0 * camera.zoom).clamp(5.0, 12.0);
+        painter.circle_stroke(center, radius + 3.0, Stroke::new(2.0, colors.accent));
+        painter.circle_filled(center, radius * 0.45, colors.accent);
+    }
+
+    /// Runs a paused route, or pauses a running one, from the context menu.
+    fn toggle_pathway_running(&mut self, pathway_id: PathwayId, context: &Context) {
+        let Some(enabled) = self
+            .workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .map(|pathway| pathway.is_enabled)
+        else {
+            return;
+        };
+        let Ok(engine_context) = PathwayReconcileContext::new(
+            "Adam pathway settings",
+            unix_now_micros(),
+            PathwayReconcileCause::Live,
+        ) else {
+            return;
+        };
+        match PathwayReconcileService::set_enabled(
+            &mut self.workspace,
+            pathway_id,
+            !enabled,
+            engine_context,
+        ) {
+            Ok(_) => {
+                self.changed(true);
+                self.toast(
+                    if enabled {
+                        "Pathway paused — its tiles hold their positions"
+                    } else {
+                        "Pathway running"
+                    },
+                    context,
+                );
+            }
+            Err(error) => {
+                log::warn!("could not toggle pathway {pathway_id}: {error}");
+                self.toast("The pathway could not be switched", context);
+            }
+        }
+    }
+
+    /// The pathway settings window: rename, run/pause, loop, per-stop and
+    /// per-segment editing, and deletion.
+    ///
+    /// Every commit goes through the editing or engine service on a field's
+    /// completion event; the window then re-syncs its buffers so normalized
+    /// values (trimmed names, clamped speeds) are shown honestly. Edits that
+    /// pause live cargo are resumed by `commit_pathway_edit_with_resume`
+    /// unless the route was already paused before the edit.
+    fn show_pathway_settings(&mut self, context: &Context) {
+        let Some(mut panel) = self.pathway_settings.take() else {
+            return;
+        };
+        let Some(pathway) = self
+            .workspace
+            .domain
+            .pathways
+            .pathway(panel.pathway_id)
+            .cloned()
+        else {
+            return;
+        };
+        let colors = self.theme(context);
+        let mut open = true;
+        let mut commit: Option<PathwaySettingsCommit> = None;
+
+        let mut ordered_nodes: Vec<_> = pathway.nodes.values().collect();
+        ordered_nodes.sort_by(|left, right| travel_order(left, right));
+        let node_title = |node_id: PathwayNodeId| -> &str {
+            pathway
+                .nodes
+                .get(&node_id)
+                .map(|node| node.title.as_str())
+                .unwrap_or("?")
+        };
+
+        egui::Window::new("Pathway Settings")
+            .id(Id::new(("adam-pathway-settings", panel.pathway_id)))
+            .open(&mut open)
+            .default_width(430.0)
+            .resizable(true)
+            .show(context, |ui| {
+                ui.label(RichText::new("Identity").strong());
+                let name_response =
+                    ui.add(egui::TextEdit::singleline(&mut panel.name).hint_text("Pathway name"));
+                if name_response.lost_focus() && panel.name.trim() != pathway.title {
+                    commit = Some(PathwaySettingsCommit::Rename(panel.name.clone()));
+                }
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("Running").strong());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(if pathway.is_enabled {
+                            "Running — tiles ride on the clock".to_owned()
+                        } else {
+                            pathway
+                                .disabled_reason
+                                .clone()
+                                .unwrap_or_else(|| "Paused".to_owned())
+                        })
+                        .color(colors.secondary_text),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(if pathway.is_enabled { "Pause" } else { "Run" })
+                        .clicked()
+                    {
+                        commit = Some(PathwaySettingsCommit::ToggleRun);
+                    }
+                    let mut repeats = pathway.repeats;
+                    if ui
+                        .checkbox(&mut repeats, "Loops back to the start")
+                        .on_hover_text(
+                            "The last stop connects to the first with a real travelled leg",
+                        )
+                        .changed()
+                    {
+                        commit = Some(PathwaySettingsCommit::SetRepeats(repeats));
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("Stops").strong());
+                for node in &ordered_nodes {
+                    ui.horizontal(|ui| {
+                        // Seed from the live node: a stop can arrive outside
+                        // any panel commit (rail double-click, redo), and an
+                        // empty/zero default here both misrenders and arms a
+                        // stale blur-commit.
+                        let title = panel
+                            .stop_titles
+                            .entry(node.id)
+                            .or_insert_with(|| node.title.clone());
+                        let title_response =
+                            ui.add(egui::TextEdit::singleline(title).desired_width(140.0));
+                        if title_response.lost_focus() && title.trim() != node.title {
+                            commit = Some(PathwaySettingsCommit::NodeTitle(node.id, title.clone()));
+                        }
+
+                        let mut kind = node.kind;
+                        egui::ComboBox::from_id_salt(("adam-pathway-node-kind", node.id))
+                            .selected_text(match kind {
+                                PathwayNodeKind::Waypoint => "Waypoint",
+                                PathwayNodeKind::Destination => "Destination",
+                                PathwayNodeKind::ApprovalGate => "Approval gate",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut kind,
+                                    PathwayNodeKind::Waypoint,
+                                    "Waypoint",
+                                );
+                                ui.selectable_value(
+                                    &mut kind,
+                                    PathwayNodeKind::Destination,
+                                    "Destination",
+                                );
+                                ui.selectable_value(
+                                    &mut kind,
+                                    PathwayNodeKind::ApprovalGate,
+                                    "Approval gate",
+                                );
+                            });
+                        if kind != node.kind {
+                            commit = Some(PathwaySettingsCommit::NodeKind(node.id, kind));
+                        }
+
+                        if node.kind != PathwayNodeKind::Waypoint {
+                            let wait = panel
+                                .stop_waits
+                                .entry(node.id)
+                                .or_insert(node.wait_duration_seconds);
+                            // clamp_existing_to_range(false) is load-bearing:
+                            // the shared library can hold values outside the
+                            // widget's range (another writer, EarlIt), and the
+                            // default would silently rewrite them on display —
+                            // then a look-only click would commit the rewrite.
+                            let wait_response = ui.add(
+                                egui::DragValue::new(wait)
+                                    .range(0.0..=86_400.0)
+                                    .clamp_existing_to_range(false)
+                                    .speed(0.5)
+                                    .suffix(" s wait"),
+                            );
+                            if (wait_response.drag_stopped() || wait_response.lost_focus())
+                                && (*wait - node.wait_duration_seconds).abs() > f64::EPSILON
+                            {
+                                commit = Some(PathwaySettingsCommit::NodeWait(node.id, *wait));
+                            }
+                        }
+
+                        let can_remove = ordered_nodes.len() > 2;
+                        let remove = ui.add_enabled(
+                            can_remove,
+                            Button::new(RichText::new("✕").color(if can_remove {
+                                colors.danger
+                            } else {
+                                colors.tertiary_text
+                            })),
+                        );
+                        let remove = if can_remove {
+                            remove.on_hover_text("Remove this stop")
+                        } else {
+                            remove.on_disabled_hover_text("A pathway needs at least two stops")
+                        };
+                        if remove.clicked() {
+                            commit = Some(PathwaySettingsCommit::RemoveStop(node.id));
+                        }
+                    });
+                }
+
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("Add a stop")
+                        .on_hover_text("Extends the route with a new stop past the last one")
+                        .clicked()
+                    {
+                        commit = Some(PathwaySettingsCommit::AddStop(panel.default_wait));
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Default wait").color(colors.secondary_text));
+                    ui.add(
+                        egui::DragValue::new(&mut panel.default_wait)
+                            .range(0.0..=86_400.0)
+                            .speed(0.5)
+                            .suffix(" s"),
+                    );
+                    if ui
+                        .button("Set every stop")
+                        .on_hover_text(
+                            "Gives every stop this wait; pass-through waypoints stay at zero",
+                        )
+                        .clicked()
+                    {
+                        commit = Some(PathwaySettingsCommit::SetAllWaits(panel.default_wait));
+                    }
+                });
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("Speeds").strong());
+                // Present legs in route order, matching the Stops list, not
+                // the map's id order.
+                let node_order: HashMap<PathwayNodeId, usize> = ordered_nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, node)| (node.id, index))
+                    .collect();
+                let mut ordered_segments: Vec<_> = pathway.segments.values().collect();
+                ordered_segments.sort_by_key(|segment| {
+                    (node_order.get(&segment.from_node_id).copied(), segment.id)
+                });
+                for segment in ordered_segments {
+                    let segment_id = segment.id;
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{} → {}",
+                                node_title(segment.from_node_id),
+                                node_title(segment.to_node_id),
+                            ))
+                            .color(colors.secondary_text),
+                        );
+                        let speed = panel
+                            .speeds
+                            .entry(segment_id)
+                            .or_insert(segment.speed_points_per_second);
+                        let speed_response = ui.add(
+                            egui::DragValue::new(speed)
+                                .range(1.0..=1_000.0)
+                                .clamp_existing_to_range(false)
+                                .speed(1.0)
+                                .suffix(" pts/s"),
+                        );
+                        if (speed_response.drag_stopped() || speed_response.lost_focus())
+                            && (*speed - segment.speed_points_per_second).abs() > f64::EPSILON
+                        {
+                            commit = Some(PathwaySettingsCommit::SegmentSpeed(segment_id, *speed));
+                        }
+                    });
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if panel.confirm_delete {
+                        ui.label(
+                            RichText::new("Tiles stay where they are; history is kept.")
+                                .color(colors.secondary_text),
+                        );
+                        if ui
+                            .add(Button::new(
+                                RichText::new("Delete Pathway").color(colors.danger),
+                            ))
+                            .clicked()
+                        {
+                            commit = Some(PathwaySettingsCommit::Delete);
+                        }
+                        if ui.button("Keep it").clicked() {
+                            panel.confirm_delete = false;
+                        }
+                    } else if ui
+                        .add(Button::new(
+                            RichText::new("Delete Pathway…").color(colors.danger),
+                        ))
+                        .clicked()
+                    {
+                        panel.confirm_delete = true;
+                    }
+                });
+            });
+
+        if let Some(commit) = commit {
+            self.apply_pathway_settings_commit(panel.pathway_id, commit, context);
+            // Re-sync so normalized values replace whatever was typed. The
+            // decision to close is made from what actually happened: a REFUSED
+            // delete leaves the route in place and the window open — closing
+            // would read as agreeing to a delete the service just rejected.
+            // synced_from returns None once the route is truly gone. Closing
+            // the window still commits a pending blur-edit, but must not
+            // resurrect the window it just closed.
+            if open {
+                self.pathway_settings =
+                    PathwaySettingsPanel::synced_from(&self.workspace, panel.pathway_id).map(
+                        |mut fresh| {
+                            fresh.default_wait = panel.default_wait;
+                            fresh
+                        },
+                    );
+            }
+        } else if open {
+            self.pathway_settings = Some(panel);
+        }
+    }
+
+    fn apply_pathway_settings_commit(
+        &mut self,
+        pathway_id: PathwayId,
+        commit: PathwaySettingsCommit,
+        context: &Context,
+    ) {
+        let now = unix_now_micros();
+        let operation_id = Uuid::new_v4();
+        // Stop add/remove go through the shared entry points so they land in
+        // history exactly like the canvas gestures do.
+        if let PathwaySettingsCommit::RemoveStop(node_id) = commit {
+            self.remove_pathway_stop(pathway_id, node_id, context);
+            return;
+        }
+        if let PathwaySettingsCommit::AddStop(wait) = commit {
+            let Some(pathway) = self.workspace.domain.pathways.pathway(pathway_id) else {
+                return;
+            };
+            let mut ordered: Vec<_> = pathway.nodes.values().collect();
+            ordered.sort_by(|left, right| travel_order(left, right));
+            let Some(last) = ordered.last() else {
+                return;
+            };
+            // Extend past the last stop along the final leg's direction, one
+            // conventional spacing out; the service clamps to the page.
+            let direction = ordered
+                .len()
+                .checked_sub(2)
+                .and_then(|index| ordered.get(index))
+                .map(|previous| {
+                    let dx = last.point.x - previous.point.x;
+                    let dy = last.point.y - previous.point.y;
+                    let length = (dx * dx + dy * dy).sqrt();
+                    if length > 1.0 {
+                        (dx / length, dy / length)
+                    } else {
+                        (1.0, 0.0)
+                    }
+                })
+                .unwrap_or((1.0, 0.0));
+            let point = PathwayPoint::new(
+                last.point.x + direction.0 * 160.0,
+                last.point.y + direction.1 * 160.0,
+            );
+            let draft = PathwayNodeDraft::new(
+                point,
+                conventional_stop_name(pathway, PathwayNodeKind::Destination),
+                PathwayNodeKind::Destination,
+                wait,
+            );
+            let after_node_id = last.id;
+            self.add_pathway_stop(pathway_id, after_node_id, draft, None, context);
+            return;
+        }
+        let edit_context =
+            |now| PathwayEditContext::with_operation_id("Adam pathway settings", now, operation_id);
+        let outcome: Result<bool, String> = match commit {
+            PathwaySettingsCommit::Rename(name) => edit_context(now)
+                .map_err(|error| error.to_string())
+                .and_then(|edit| {
+                    PathwayEditingService::rename_pathway(
+                        &mut self.workspace,
+                        pathway_id,
+                        name,
+                        edit,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .map(|_| false),
+            PathwaySettingsCommit::ToggleRun => {
+                self.toggle_pathway_running(pathway_id, context);
+                return;
+            }
+            PathwaySettingsCommit::SetRepeats(repeats) => commit_pathway_edit_with_resume(
+                &mut self.workspace,
+                pathway_id,
+                now,
+                operation_id,
+                |workspace| {
+                    edit_context(now)
+                        .map_err(|error| error.to_string())
+                        .and_then(|edit| {
+                            PathwayEditingService::set_repeats(workspace, pathway_id, repeats, edit)
+                                .map_err(|error| error.to_string())
+                        })
+                },
+            )
+            .map(|_| true),
+            // Intercepted above; kept for match completeness.
+            PathwaySettingsCommit::AddStop(_) | PathwaySettingsCommit::RemoveStop(_) => return,
+            PathwaySettingsCommit::SetAllWaits(wait) => apply_pathway_wait_for_all_stops(
+                &mut self.workspace,
+                pathway_id,
+                wait,
+                now,
+                operation_id,
+            ),
+            PathwaySettingsCommit::NodeTitle(node_id, _)
+            | PathwaySettingsCommit::NodeKind(node_id, _)
+            | PathwaySettingsCommit::NodeWait(node_id, _)
+                if !self
+                    .workspace
+                    .domain
+                    .pathways
+                    .pathway(pathway_id)
+                    .is_some_and(|pathway| pathway.nodes.contains_key(&node_id)) =>
+            {
+                Err(format!("stop {node_id} no longer exists"))
+            }
+            PathwaySettingsCommit::NodeTitle(node_id, title) => {
+                let (kind, wait) = self
+                    .workspace
+                    .domain
+                    .pathways
+                    .pathway(pathway_id)
+                    .and_then(|pathway| pathway.nodes.get(&node_id))
+                    .map(|node| (node.kind, node.wait_duration_seconds))
+                    .expect("checked above");
+                commit_pathway_edit_with_resume(
+                    &mut self.workspace,
+                    pathway_id,
+                    now,
+                    operation_id,
+                    |workspace| {
+                        edit_context(now)
+                            .map_err(|error| error.to_string())
+                            .and_then(|edit| {
+                                PathwayEditingService::set_node_properties(
+                                    workspace, pathway_id, node_id, title, kind, wait, edit,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                    },
+                )
+                .map(|_| false)
+            }
+            PathwaySettingsCommit::NodeKind(node_id, kind) => {
+                let (title, wait) = self
+                    .workspace
+                    .domain
+                    .pathways
+                    .pathway(pathway_id)
+                    .and_then(|pathway| pathway.nodes.get(&node_id))
+                    .map(|node| (node.title.clone(), node.wait_duration_seconds))
+                    .expect("checked above");
+                commit_pathway_edit_with_resume(
+                    &mut self.workspace,
+                    pathway_id,
+                    now,
+                    operation_id,
+                    |workspace| {
+                        edit_context(now)
+                            .map_err(|error| error.to_string())
+                            .and_then(|edit| {
+                                PathwayEditingService::set_node_properties(
+                                    workspace, pathway_id, node_id, title, kind, wait, edit,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                    },
+                )
+                .map(|_| true)
+            }
+            PathwaySettingsCommit::NodeWait(node_id, wait) => {
+                let (title, kind) = self
+                    .workspace
+                    .domain
+                    .pathways
+                    .pathway(pathway_id)
+                    .and_then(|pathway| pathway.nodes.get(&node_id))
+                    .map(|node| (node.title.clone(), node.kind))
+                    .expect("checked above");
+                commit_pathway_edit_with_resume(
+                    &mut self.workspace,
+                    pathway_id,
+                    now,
+                    operation_id,
+                    |workspace| {
+                        edit_context(now)
+                            .map_err(|error| error.to_string())
+                            .and_then(|edit| {
+                                PathwayEditingService::set_node_properties(
+                                    workspace, pathway_id, node_id, title, kind, wait, edit,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                    },
+                )
+                .map(|_| true)
+            }
+            PathwaySettingsCommit::SegmentSpeed(segment_id, speed) => {
+                commit_pathway_edit_with_resume(
+                    &mut self.workspace,
+                    pathway_id,
+                    now,
+                    operation_id,
+                    |workspace| {
+                        edit_context(now)
+                            .map_err(|error| error.to_string())
+                            .and_then(|edit| {
+                                PathwayEditingService::set_segment_speed(
+                                    workspace, pathway_id, segment_id, speed, edit,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                    },
+                )
+                .map(|_| true)
+            }
+            PathwaySettingsCommit::Delete => edit_context(now)
+                .map_err(|error| error.to_string())
+                .and_then(|edit| {
+                    PathwayEditingService::delete_pathway(&mut self.workspace, pathway_id, edit)
+                        .map_err(|error| error.to_string())
+                })
+                .map(|_| {
+                    self.toast("Pathway deleted — its tiles stay put", context);
+                    true
+                }),
+        };
+        match outcome {
+            Ok(layout_changed) => self.changed(layout_changed),
+            Err(error) => {
+                log::warn!("pathway settings change refused: {error}");
+                self.toast("That change could not be applied", context);
+            }
+        }
+    }
+
+    /// Confirms a reviewed enrollment.
+    ///
+    /// The two choices are the product contract: join the route where the
+    /// pointer landed, or start it from the first stop. Confirming re-checks
+    /// the route revision and the cargo frames inside the service, so a sheet
+    /// left open while the canvas changed underneath refuses rather than
+    /// applying to stale geometry.
+    fn show_pathway_enrollment_sheet(&mut self, context: &Context, colors: Theme) {
+        let Some(review) = self.pathway_enrollment_review.clone() else {
+            return;
+        };
+        let mut chosen = None;
+        let mut cancelled = context.input(|input| input.key_pressed(Key::Escape));
+
+        egui::Window::new("Put tiles on this pathway")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
+            .show(context, |ui| {
+                ui.set_max_width(360.0);
+                let tiles = review.tile_ids.len();
+                ui.label(
+                    RichText::new(format!(
+                        "{tiles} {} will ride “{}”",
+                        if tiles == 1 { "tile" } else { "tiles" },
+                        review.target.pathway_title,
+                    ))
+                    .size(15.0)
+                    .color(colors.text),
+                );
+                ui.add_space(6.0);
+
+                let behavior = &review.behavior;
+                let line = |ui: &mut Ui, text: String| {
+                    ui.label(RichText::new(text).size(13.0).color(colors.secondary_text));
+                };
+                if let Some((slowest, fastest)) = behavior.speed_range {
+                    line(
+                        ui,
+                        if (fastest - slowest).abs() < 0.5 {
+                            format!("Travels at {slowest:.0} points per second")
+                        } else {
+                            format!("Travels at {slowest:.0}–{fastest:.0} points per second")
+                        },
+                    );
+                }
+                if behavior.timed_stop_count > 0 {
+                    line(
+                        ui,
+                        format!(
+                            "Waits at {} {} for {:.0}s in total",
+                            behavior.timed_stop_count,
+                            if behavior.timed_stop_count == 1 {
+                                "stop"
+                            } else {
+                                "stops"
+                            },
+                            behavior.total_wait_seconds,
+                        ),
+                    );
+                }
+                if behavior.approval_gate_count > 0 {
+                    line(
+                        ui,
+                        format!(
+                            "Holds at {} approval {} until you say go",
+                            behavior.approval_gate_count,
+                            if behavior.approval_gate_count == 1 {
+                                "gate"
+                            } else {
+                                "gates"
+                            },
+                        ),
+                    );
+                }
+                line(
+                    ui,
+                    match &behavior.finish {
+                        PathwayFinishBehavior::Repeats => "Loops around and keeps going".to_owned(),
+                        PathwayFinishBehavior::StopsAt { title, .. } => {
+                            format!("Comes to rest at {title}")
+                        }
+                        PathwayFinishBehavior::Unconfigured => {
+                            "Has no finish configured yet".to_owned()
+                        }
+                    },
+                );
+                if !behavior.starts_immediately {
+                    ui.add_space(4.0);
+                    line(
+                        ui,
+                        "This pathway is paused — the tiles will wait on it until you resume."
+                            .to_owned(),
+                    );
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let spot_is_default =
+                        review.default_choice == PathwayEnrollmentChoice::AtThisSpot;
+                    if ui
+                        .add(
+                            Button::new(RichText::new("At This Spot").color(colors.text))
+                                .min_size(vec2(120.0, 30.0))
+                                .fill(if spot_is_default {
+                                    colors.selection_fill
+                                } else {
+                                    colors.tile
+                                }),
+                        )
+                        .on_hover_text("Join the pathway where you clicked")
+                        .clicked()
+                    {
+                        chosen = Some(PathwayEnrollmentChoice::AtThisSpot);
+                    }
+                    if ui
+                        .add(
+                            Button::new(RichText::new("At the Beginning").color(colors.text))
+                                .min_size(vec2(140.0, 30.0))
+                                .fill(if spot_is_default {
+                                    colors.tile
+                                } else {
+                                    colors.selection_fill
+                                }),
+                        )
+                        .on_hover_text("Start from the pathway's first stop")
+                        .clicked()
+                    {
+                        chosen = Some(PathwayEnrollmentChoice::AtBeginning);
+                    }
+                    cancelled |= ui
+                        .add(
+                            Button::new(RichText::new("Cancel").color(colors.secondary_text))
+                                .min_size(vec2(80.0, 30.0))
+                                .fill(colors.tile),
+                        )
+                        .clicked();
+                });
+            });
+
+        if let Some(choice) = chosen {
+            self.pathway_enrollment_review = None;
+            let Ok(enroll_context) =
+                PathwayEnrollmentContext::new("Adam canvas", unix_now_micros())
+            else {
+                return;
+            };
+            self.checkpoint();
+            match PathwayEnrollmentService::enroll(
+                &mut self.workspace,
+                &review,
+                choice,
+                enroll_context,
+            ) {
+                Ok(_) => {
+                    self.changed(true);
+                    self.toast("On the pathway — drag a tile off to take it back", context);
+                }
+                Err(error) => {
+                    log::warn!("pathway enrollment refused: {error}");
+                    self.toast("The pathway or tiles changed — try again", context);
+                }
+            }
+        } else if cancelled {
+            self.pathway_enrollment_review = None;
+        }
     }
 
     fn draw_note_draft(&self, painter: &Painter, camera: Camera, view: Rect, colors: Theme) {
@@ -5942,6 +7538,588 @@ impl AdamApp {
         self.editing_note = None;
     }
 
+    /// Lets rails be reshaped directly: grab a stop to move it, grab the line
+    /// to move the whole route. Returns true while the pointer belongs to a
+    /// rail gesture so the background marquee cannot start underneath it.
+    fn handle_pathway_rail_interaction(
+        &mut self,
+        context: &Context,
+        canvas_response: &Response,
+        camera: Camera,
+        view: Rect,
+        any_tile_pressed: bool,
+    ) -> bool {
+        let pointer = context.input(|input| input.pointer.interact_pos());
+        let primary_pressed =
+            context.input(|input| input.pointer.button_pressed(PointerButton::Primary));
+        let primary_released =
+            context.input(|input| input.pointer.button_released(PointerButton::Primary));
+        let primary_down = context.input(|input| input.pointer.primary_down());
+        let space_down = context.input(|input| input.key_down(Key::Space));
+
+        // Double-clicking a rail's line plants a new stop right there. This
+        // must be read before the live-session branch: the second click's
+        // press has already opened a session that would otherwise swallow the
+        // release this gesture arrives on.
+        if canvas_response.double_clicked_by(PointerButton::Primary)
+            && !space_down
+            && !any_tile_pressed
+            && let Some(pointer) = pointer.filter(|pointer| view.contains(*pointer))
+        {
+            let world = camera.screen_to_world(pointer, view);
+            let page_id = self.workspace.active_page;
+            let planted = PathwayDockGeometry::prepare(&self.workspace, page_id)
+                .target(
+                    PathwayPoint::new(f64::from(world[0]), f64::from(world[1])),
+                    f64::from(camera.zoom),
+                    None,
+                )
+                .and_then(|target| {
+                    let PathwayDockAnchor::Segment(segment_id) = target.anchor else {
+                        return None;
+                    };
+                    let pathway = self.workspace.domain.pathways.pathway(target.pathway_id)?;
+                    // On an out-and-back track the dock may hand us the
+                    // loop-back leg; the stop belongs on the authored track.
+                    // The split leg's own speed rides along so a loop-back
+                    // split can't inherit the forward speed.
+                    let (after_node_id, leg_speed) =
+                        corrected_stop_insert(pathway, segment_id, target.route_point)?;
+                    Some((
+                        target.pathway_id,
+                        after_node_id,
+                        PathwayNodeDraft::new(
+                            target.route_point,
+                            conventional_stop_name(pathway, PathwayNodeKind::Destination),
+                            PathwayNodeKind::Destination,
+                            0.0,
+                        ),
+                        leg_speed,
+                    ))
+                });
+            if let Some((pathway_id, after_node_id, draft, leg_speed)) = planted {
+                self.pathway_drag = None;
+                self.pathway_dock_preview = None;
+                self.add_pathway_stop(pathway_id, after_node_id, draft, Some(leg_speed), context);
+                context.request_repaint();
+                return true;
+            }
+        }
+
+        if let Some(mut session) = self.pathway_drag.take() {
+            // A pan taking over mid-gesture (Space pressed after the grab), or
+            // a release this handler never observed (grid view, lost focus),
+            // must cancel rather than commit: an unwitnessed gesture cannot be
+            // the basis for a durable, undo-exempt route edit.
+            if self.pan.is_some() || space_down || (!primary_down && !primary_released) {
+                context.request_repaint();
+                return false;
+            }
+            if let Some(pointer) = pointer {
+                let world = camera.screen_to_world(pointer, view);
+                let delta = [
+                    world[0] - session.start_world[0],
+                    world[1] - session.start_world[1],
+                ];
+                session.moved |=
+                    pointer.distance(session.start_pointer) >= RAIL_DRAG_THRESHOLD_POINTS;
+                session.preview_nodes = session
+                    .original_nodes
+                    .iter()
+                    .map(|(node_id, point)| {
+                        let shifted = PathwayPoint::new(
+                            point.x + f64::from(delta[0]),
+                            point.y + f64::from(delta[1]),
+                        );
+                        (*node_id, clamped_rail_point(shifted, session.page_size))
+                    })
+                    .collect();
+                context.request_repaint();
+            }
+            if primary_released {
+                if session.moved {
+                    self.commit_pathway_rail_drag(&session, context);
+                }
+                context.request_repaint();
+                return true;
+            }
+            self.pathway_drag = Some(session);
+            return true;
+        }
+
+        if !primary_pressed
+            || space_down
+            || any_tile_pressed
+            || self.marquee.is_some()
+            || self.drag.is_some()
+            || self.resize.is_some()
+            || self.pan.is_some()
+            || self.editing_note.is_some()
+            || !canvas_response.hovered()
+        {
+            return false;
+        }
+        let Some(pointer) = pointer.filter(|pointer| view.contains(*pointer)) else {
+            return false;
+        };
+        let world = camera.screen_to_world(pointer, view);
+        let page_id = self.workspace.active_page;
+        // The dock resolver already knows what "near a rail" means at every
+        // zoom, and its node-before-segment tiers give the grab the right
+        // meaning: a dot moves one stop, the line moves the whole route.
+        let Some(target) = PathwayDockGeometry::prepare(&self.workspace, page_id).target(
+            PathwayPoint::new(f64::from(world[0]), f64::from(world[1])),
+            f64::from(camera.zoom),
+            None,
+        ) else {
+            return false;
+        };
+        let Some(pathway) = self
+            .workspace
+            .domain
+            .pathways
+            .pathways
+            .get(&target.pathway_id)
+        else {
+            return false;
+        };
+        let grabbed: BTreeMap<PathwayNodeId, PathwayPoint> = match target.anchor {
+            PathwayDockAnchor::Node(node_id) => pathway
+                .nodes
+                .get(&node_id)
+                .map(|node| (node_id, node.point))
+                .into_iter()
+                .collect(),
+            PathwayDockAnchor::Segment(_) => pathway
+                .nodes
+                .iter()
+                .map(|(node_id, node)| (*node_id, node.point))
+                .collect(),
+        };
+        if grabbed.is_empty() {
+            return false;
+        }
+        self.pathway_drag = Some(PathwayRailDrag {
+            pathway_id: target.pathway_id,
+            start_world: world,
+            start_pointer: pointer,
+            preview_nodes: grabbed.clone(),
+            original_nodes: grabbed,
+            page_size: self.workspace.active_page().size,
+            moved: false,
+        });
+        true
+    }
+
+    fn commit_pathway_rail_drag(&mut self, session: &PathwayRailDrag, context: &Context) {
+        match apply_pathway_rail_drag(
+            &mut self.workspace,
+            session.pathway_id,
+            &session.preview_nodes,
+            unix_now_micros(),
+            Uuid::new_v4(),
+        ) {
+            Ok(()) => {
+                // Not a canvas checkpoint: restoring a tile snapshot around a
+                // moved rail would put riders' rects at odds with the route
+                // and arm the external-movement detach. Undo of a rail move
+                // instead applies the inverse move through the same
+                // all-or-nothing service commit, which re-seats riders itself.
+                self.history.record_rail_move(
+                    session.pathway_id,
+                    session.original_nodes.clone(),
+                    session.preview_nodes.clone(),
+                );
+                self.changed(true);
+            }
+            Err(error) => {
+                log::warn!("could not move the pathway: {error}");
+                self.toast("The pathway could not be moved", context);
+            }
+        }
+    }
+
+    /// Adds one stop through the service and records it so Cmd+Z removes it.
+    fn add_pathway_stop(
+        &mut self,
+        pathway_id: PathwayId,
+        after_node_id: PathwayNodeId,
+        draft: PathwayNodeDraft,
+        leg_speed: Option<f64>,
+        context: &Context,
+    ) {
+        let parked_before = self.parked_rider_count(pathway_id);
+        match apply_pathway_stop_add(
+            &mut self.workspace,
+            pathway_id,
+            Some(after_node_id),
+            draft.clone(),
+            leg_speed,
+            None,
+            None,
+            unix_now_micros(),
+            Uuid::new_v4(),
+        ) {
+            Ok(node_id) => {
+                self.history
+                    .record_stop_add(pathway_id, after_node_id, node_id, draft, leg_speed);
+                // Riders on a split leg silently re-join the new track;
+                // this toast fires only on the rare no-finite-rail fallback
+                // where the engine genuinely had nowhere to put the tile.
+                if self.parked_rider_count(pathway_id) > parked_before {
+                    self.toast(
+                        "Stop added — a tile riding that leg paused; drop it back on the rail to keep riding",
+                        context,
+                    );
+                }
+                self.changed(true);
+            }
+            Err(error) => {
+                log::warn!("could not add a pathway stop: {error}");
+                self.toast("A stop could not be added there", context);
+            }
+        }
+    }
+
+    /// Removes one stop through the service and records it so Cmd+Z puts it
+    /// back — position, name, kind, wait, and both adjacent leg speeds.
+    fn remove_pathway_stop(
+        &mut self,
+        pathway_id: PathwayId,
+        node_id: PathwayNodeId,
+        context: &Context,
+    ) {
+        // Capture what undo needs BEFORE the removal rebuilds the graph.
+        let Some(pathway) = self.workspace.domain.pathways.pathway(pathway_id) else {
+            return;
+        };
+        let Some(node) = pathway.nodes.get(&node_id) else {
+            return;
+        };
+        let draft = PathwayNodeDraft::new(
+            node.point,
+            node.title.clone(),
+            node.kind,
+            node.wait_duration_seconds,
+        );
+        let mut ordered: Vec<_> = pathway.nodes.values().collect();
+        ordered.sort_by(|left, right| travel_order(left, right));
+        let index = ordered.iter().position(|candidate| candidate.id == node_id);
+        let after_node_id = index
+            .and_then(|index| index.checked_sub(1))
+            .and_then(|index| ordered.get(index))
+            .map(|previous| previous.id);
+        let closure_id = closure_segment_id(pathway);
+        let leg_speed_between = |from: PathwayNodeId, to: PathwayNodeId| {
+            pathway
+                .segments
+                .values()
+                .find(|segment| {
+                    segment.from_node_id == from
+                        && segment.to_node_id == to
+                        && Some(segment.id) != closure_id
+                })
+                .map(|segment| segment.speed_points_per_second)
+        };
+        let incoming_speed = after_node_id.and_then(|after| leg_speed_between(after, node_id));
+        let outgoing_speed = index
+            .and_then(|index| ordered.get(index + 1))
+            .and_then(|next| leg_speed_between(node_id, next.id));
+        // Removing an endpoint of a repeating route rebuilds the loop-back
+        // leg at the default speed; capture its real pace while it exists so
+        // undo can hand it back.
+        let is_endpoint = index == Some(0) || index == Some(ordered.len().saturating_sub(1));
+        let closure_speed = closure_id
+            .filter(|_| is_endpoint)
+            .and_then(|id| pathway.segments.get(&id))
+            .map(|segment| segment.speed_points_per_second);
+
+        let parked_before = self.parked_rider_count(pathway_id);
+        match apply_pathway_stop_remove(
+            &mut self.workspace,
+            pathway_id,
+            node_id,
+            unix_now_micros(),
+            Uuid::new_v4(),
+        ) {
+            Ok(()) => {
+                self.history.record_stop_remove(HistoryEntry::StopRemove {
+                    pathway_id,
+                    after_node_id,
+                    node_id,
+                    draft,
+                    incoming_speed,
+                    outgoing_speed,
+                    closure_speed,
+                });
+                if self.parked_rider_count(pathway_id) > parked_before {
+                    self.toast(
+                        "Stop removed — a tile using it paused; drop it back on the rail to keep riding",
+                        context,
+                    );
+                }
+                self.changed(true);
+            }
+            Err(error) => {
+                log::warn!("could not remove the pathway stop: {error}");
+                self.toast("A pathway needs at least two stops", context);
+            }
+        }
+    }
+
+    fn parked_rider_count(&self, pathway_id: PathwayId) -> usize {
+        self.workspace
+            .domain
+            .pathways
+            .assignments
+            .values()
+            .filter(|assignment| {
+                assignment.pathway_id == pathway_id
+                    && assignment.state == crate::domain::PathwayAssignmentState::NeedsAttention
+            })
+            .count()
+    }
+
+    /// Applies one popped history entry in the given direction. Canvas
+    /// snapshots restore; rail moves re-run through the editing service. A
+    /// rail entry that can no longer apply (route or stop since deleted) is
+    /// consumed with a toast rather than left to block the stack.
+    fn apply_history_entry(&mut self, entry: HistoryEntry, is_undo: bool, context: &Context) {
+        match entry {
+            HistoryEntry::Canvas(snapshot) => {
+                let current = HistoryEntry::Canvas(self.workspace.clone());
+                if is_undo {
+                    self.history.push_redo(current);
+                } else {
+                    self.history.push_undo(current);
+                }
+                self.restore_workspace(snapshot);
+            }
+            HistoryEntry::RailMove {
+                pathway_id,
+                from,
+                to,
+            } => {
+                let target = if is_undo { &from } else { &to };
+                match apply_pathway_rail_drag(
+                    &mut self.workspace,
+                    pathway_id,
+                    target,
+                    unix_now_micros(),
+                    Uuid::new_v4(),
+                ) {
+                    Ok(()) => {
+                        let entry = HistoryEntry::RailMove {
+                            pathway_id,
+                            from,
+                            to,
+                        };
+                        if is_undo {
+                            self.history.push_redo(entry);
+                        } else {
+                            self.history.push_undo(entry);
+                        }
+                        self.changed(true);
+                    }
+                    Err(error) => {
+                        log::warn!("could not replay the pathway move: {error}");
+                        self.toast(
+                            if is_undo {
+                                "That pathway move can no longer be undone"
+                            } else {
+                                "That pathway move can no longer be redone"
+                            },
+                            context,
+                        );
+                    }
+                }
+            }
+            HistoryEntry::StopAdd {
+                pathway_id,
+                after_node_id,
+                node_id,
+                draft,
+                leg_speed,
+            } => {
+                let now = unix_now_micros();
+                let parked_before = self.parked_rider_count(pathway_id);
+                if is_undo {
+                    match apply_pathway_stop_remove(
+                        &mut self.workspace,
+                        pathway_id,
+                        node_id,
+                        now,
+                        Uuid::new_v4(),
+                    ) {
+                        Ok(()) => {
+                            self.history.push_redo(HistoryEntry::StopAdd {
+                                pathway_id,
+                                after_node_id,
+                                node_id,
+                                draft,
+                                leg_speed,
+                            });
+                            if self.parked_rider_count(pathway_id) > parked_before {
+                                self.toast(
+                                    "Stop removed — a tile using it paused; drop it back on the rail to keep riding",
+                                    context,
+                                );
+                            }
+                            self.changed(true);
+                        }
+                        Err(error) => {
+                            log::warn!("could not undo the added stop: {error}");
+                            self.toast("That added stop can no longer be undone", context);
+                        }
+                    }
+                } else {
+                    match apply_pathway_stop_add(
+                        &mut self.workspace,
+                        pathway_id,
+                        Some(after_node_id),
+                        draft.clone(),
+                        leg_speed,
+                        None,
+                        None,
+                        now,
+                        Uuid::new_v4(),
+                    ) {
+                        Ok(new_node_id) => {
+                            // The re-created stop has a fresh id: the entry
+                            // pushed back must target it, and so must every
+                            // other stacked entry that captured the old id —
+                            // otherwise the rest of the redo chain replays
+                            // against a stop that no longer exists.
+                            self.history.rewrite_node_id(node_id, new_node_id);
+                            self.history.push_undo(HistoryEntry::StopAdd {
+                                pathway_id,
+                                after_node_id,
+                                node_id: new_node_id,
+                                draft,
+                                leg_speed,
+                            });
+                            if self.parked_rider_count(pathway_id) > parked_before {
+                                self.toast(
+                                    "Stop added — a tile riding that leg paused; drop it back on the rail to keep riding",
+                                    context,
+                                );
+                            }
+                            self.changed(true);
+                        }
+                        Err(error) => {
+                            log::warn!("could not redo the added stop: {error}");
+                            self.toast("That added stop can no longer be redone", context);
+                        }
+                    }
+                }
+            }
+            HistoryEntry::StopRemove {
+                pathway_id,
+                after_node_id,
+                node_id,
+                draft,
+                incoming_speed,
+                outgoing_speed,
+                closure_speed,
+            } => {
+                let now = unix_now_micros();
+                let parked_before = self.parked_rider_count(pathway_id);
+                if is_undo {
+                    match apply_pathway_stop_add(
+                        &mut self.workspace,
+                        pathway_id,
+                        after_node_id,
+                        draft.clone(),
+                        incoming_speed,
+                        outgoing_speed,
+                        closure_speed,
+                        now,
+                        Uuid::new_v4(),
+                    ) {
+                        Ok(new_node_id) => {
+                            self.history.rewrite_node_id(node_id, new_node_id);
+                            self.history.push_redo(HistoryEntry::StopRemove {
+                                pathway_id,
+                                after_node_id,
+                                node_id: new_node_id,
+                                draft,
+                                incoming_speed,
+                                outgoing_speed,
+                                closure_speed,
+                            });
+                            if self.parked_rider_count(pathway_id) > parked_before {
+                                self.toast(
+                                    "Stop added — a tile riding that leg paused; drop it back on the rail to keep riding",
+                                    context,
+                                );
+                            }
+                            self.changed(true);
+                        }
+                        Err(error) => {
+                            log::warn!("could not undo the removed stop: {error}");
+                            self.toast("That removed stop can no longer be undone", context);
+                        }
+                    }
+                } else {
+                    match apply_pathway_stop_remove(
+                        &mut self.workspace,
+                        pathway_id,
+                        node_id,
+                        now,
+                        Uuid::new_v4(),
+                    ) {
+                        Ok(()) => {
+                            self.history.push_undo(HistoryEntry::StopRemove {
+                                pathway_id,
+                                after_node_id,
+                                node_id,
+                                draft,
+                                incoming_speed,
+                                outgoing_speed,
+                                closure_speed,
+                            });
+                            if self.parked_rider_count(pathway_id) > parked_before {
+                                self.toast(
+                                    "Stop removed — a tile using it paused; drop it back on the rail to keep riding",
+                                    context,
+                                );
+                            }
+                            self.changed(true);
+                        }
+                        Err(error) => {
+                            log::warn!("could not redo the removed stop: {error}");
+                            self.toast("That removed stop can no longer be redone", context);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn perform_undo(&mut self, context: &Context) {
+        if let Some(entry) = self.history.pop_undo() {
+            self.cancel_rail_gesture_for_history();
+            self.apply_history_entry(entry, true, context);
+        }
+    }
+
+    fn perform_redo(&mut self, context: &Context) {
+        if let Some(entry) = self.history.pop_redo() {
+            self.cancel_rail_gesture_for_history();
+            self.apply_history_entry(entry, false, context);
+        }
+    }
+
+    /// History must never apply underneath a held rail: the session's frozen
+    /// `original_nodes` would go stale, its release commit would re-apply the
+    /// undone positions, and `record_rail_move`'s redo-clear would destroy the
+    /// entry that undo had just parked. The session is preview-only, so
+    /// dropping it is a clean cancel — the same rationale as Escape.
+    fn cancel_rail_gesture_for_history(&mut self) {
+        self.pathway_drag = None;
+        self.pathway_dock_preview = None;
+    }
+
     fn handle_background_interaction(
         &mut self,
         context: &Context,
@@ -6023,7 +8201,6 @@ impl AdamApp {
                 );
                 context.request_repaint();
             }
-
             self.text_note_drop_target = self
                 .drag
                 .as_ref()
@@ -6040,6 +8217,31 @@ impl AdamApp {
                         projected_rects,
                         current,
                         source_id,
+                    )
+                });
+
+            // The dock highlight follows the pointer, not the tiles: dropping
+            // means "join here". Only a moved drag docks, so a plain click on
+            // a tile that happens to sit near a rail never flashes a target.
+            // Runs after the drop targets above so the ring never promises a
+            // ride on a drop that a note merge or page move will actually win,
+            // and never competes with a review sheet already awaiting a choice.
+            self.pathway_dock_preview = self
+                .drag
+                .as_ref()
+                .filter(|drag| drag.moved && drag.page_id == self.workspace.active_page)
+                .filter(|_| {
+                    self.text_note_drop_target.is_none()
+                        && self.page_drop_target.is_none()
+                        && self.drag_destination_page.is_none()
+                        && self.pathway_enrollment_review.is_none()
+                })
+                .and_then(|drag| drag.dock.as_ref())
+                .and_then(|dock| {
+                    dock.target(
+                        PathwayPoint::new(f64::from(current[0]), f64::from(current[1])),
+                        f64::from(camera.zoom),
+                        self.pathway_dock_preview.as_ref(),
                     )
                 });
 
@@ -6157,6 +8359,7 @@ impl AdamApp {
                     self.page_hover = None;
                     self.drag_destination_page = None;
                     self.text_note_drop_target = None;
+                    self.pathway_dock_preview = None;
                     context.request_repaint();
                     return;
                 }
@@ -6250,6 +8453,36 @@ impl AdamApp {
                 }
                 self.ensure_page_contains(final_page);
                 self.changed(true);
+
+                // Dropping while docked offers the ride. This runs after every
+                // rect mutation of the release (snap, merges, page moves), so
+                // the review captures the frames enrollment will re-validate.
+                if let Some(target) = self
+                    .pathway_dock_preview
+                    .take()
+                    .filter(|_| !moved_to_page && !merged_into_note)
+                    .filter(|_| self.pathway_enrollment_review.is_none())
+                {
+                    let cargo = ids
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            self.workspace
+                                .page(final_page)
+                                .and_then(|page| page.tile(*id))
+                                .is_some_and(|tile| tile.kind() != TileKind::Pile)
+                        })
+                        .collect::<BTreeSet<_>>();
+                    if !cargo.is_empty() {
+                        match PathwayEnrollmentService::review(&self.workspace, target, cargo) {
+                            Ok(review) => self.pathway_enrollment_review = Some(review),
+                            Err(error) => {
+                                log::warn!("pathway drop review refused: {error}");
+                                self.toast("Those tiles cannot ride this pathway", context);
+                            }
+                        }
+                    }
+                }
             }
             if let Some(resize) = self.resize.take()
                 && resize.changed
@@ -6268,6 +8501,7 @@ impl AdamApp {
             self.page_hover = None;
             self.drag_destination_page = None;
             self.text_note_drop_target = None;
+            self.pathway_dock_preview = None;
         }
     }
 
@@ -6321,11 +8555,28 @@ impl AdamApp {
             .flatten()
             .filter(|tile| tile.canvas_style == CanvasTileStyle::FreeText)
             .map(|tile| tile.id);
+        // A drag that includes a pile is "moving a pile" (possibly with its
+        // contents along for the ride), not an offer of cargo — docking then
+        // would propose enrolling tiles the user never singled out.
+        let mut carries_cargo = false;
+        let mut carries_pile = false;
+        for tile in &self.workspace.active_page().tiles {
+            if self.selection.contains(&tile.id) {
+                if tile.kind() == TileKind::Pile {
+                    carries_pile = true;
+                } else {
+                    carries_cargo = true;
+                }
+            }
+        }
+        let dock = (carries_cargo && !carries_pile)
+            .then(|| PathwayDockGeometry::prepare(&self.workspace, self.workspace.active_page));
         self.drag = Some(DragSession {
             page_id: self.workspace.active_page,
             start_world,
             originals,
             durable_originals,
+            dock,
             text_source,
             moved: false,
         });
@@ -12966,6 +15217,7 @@ impl eframe::App for AdamApp {
         self.show_tag_picker(&context);
         self.show_tag_management(&context);
         self.show_pile_settings(&context);
+        self.show_pathway_settings(&context);
         self.show_trash(&context);
         self.show_pathway_problem_row(&context);
         self.show_toast(&context);
@@ -13130,6 +15382,115 @@ fn tile_outline_stroke(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Parses a stored `#RRGGBB` route colour, falling back to the accent so a
+/// hand-edited library can never make a rail invisible.
+fn pathway_color(_hex: &str, colors: Theme) -> Color32 {
+    // Rails draw in the theme's ink — black in light mode, light in dark —
+    // matching the canvas's monochrome language. The stored hex stays in the
+    // data model (and this signature) for the day settings grow a per-route
+    // color picker.
+    colors.text
+}
+
+/// Draws every rail on the page underneath the tiles that ride it.
+///
+/// Rails are page geometry rather than decoration, so they are drawn whether
+/// or not the route is running; a paused or disabled route simply reads
+/// dimmer. Node and segment positions come straight from the durable graph —
+/// this function never consults projected cargo geometry. A live rail drag
+/// supplies preview positions for the grabbed stops, exactly the way a tile
+/// drag previews rects before its release commits them.
+fn draw_pathways(
+    painter: &Painter,
+    workspace: &Workspace,
+    page_id: Uuid,
+    camera: Camera,
+    view: Rect,
+    colors: Theme,
+    rail_preview: Option<(PathwayId, &BTreeMap<PathwayNodeId, PathwayPoint>)>,
+) {
+    let world_point = |point: PathwayPoint| -> Option<Pos2> {
+        (point.is_finite()).then(|| camera.world_to_screen([point.x as f32, point.y as f32], view))
+    };
+
+    for pathway in workspace
+        .domain
+        .pathways
+        .pathways
+        .values()
+        .filter(|pathway| pathway.page_id == page_id)
+    {
+        let previewed = rail_preview
+            .as_ref()
+            .filter(|(preview_id, _)| *preview_id == pathway.id)
+            .map(|(_, nodes)| *nodes);
+        let node_point = |node_id: PathwayNodeId, stored: PathwayPoint| -> PathwayPoint {
+            previewed
+                .and_then(|nodes| nodes.get(&node_id).copied())
+                .unwrap_or(stored)
+        };
+
+        let base = pathway_color(&pathway.color_hex, colors);
+        let color = if pathway.is_enabled {
+            base
+        } else {
+            mix_color(base, colors.canvas, 0.55)
+        };
+        let width = (2.0 * camera.zoom).clamp(1.0, 4.0);
+
+        // The loop-back leg draws first, dashed and quieter: it is the way
+        // back, not an authored track, and must never read as a duplicate
+        // line. Where it coincides with the track, the solid legs paint over
+        // it entirely.
+        let closure_id = closure_segment_id(pathway);
+        let segment_endpoints = |segment: &crate::domain::PathwaySegment| {
+            let from = pathway.nodes.get(&segment.from_node_id)?;
+            let to = pathway.nodes.get(&segment.to_node_id)?;
+            Some((
+                world_point(node_point(segment.from_node_id, from.point))?,
+                world_point(node_point(segment.to_node_id, to.point))?,
+            ))
+        };
+        if let Some(closure) = closure_id.and_then(|id| pathway.segments.get(&id))
+            && let Some((start, end)) = segment_endpoints(closure)
+        {
+            painter.extend(Shape::dashed_line(
+                &[start, end],
+                Stroke::new(width, mix_color(color, colors.canvas, 0.45)),
+                8.0,
+                6.0,
+            ));
+        }
+        for segment in pathway.segments.values() {
+            if Some(segment.id) == closure_id {
+                continue;
+            }
+            let Some((start, end)) = segment_endpoints(segment) else {
+                continue;
+            };
+            // A canvas-colored halo under the ink keeps the rail readable
+            // when it crosses ink-colored content — note text most of all.
+            painter.line_segment([start, end], Stroke::new(width + 2.0, colors.canvas));
+            painter.line_segment([start, end], Stroke::new(width, color));
+        }
+
+        let radius = (5.0 * camera.zoom).clamp(3.0, 9.0);
+        for node in pathway.nodes.values() {
+            let Some(center) = world_point(node_point(node.id, node.point)) else {
+                continue;
+            };
+            painter.circle_filled(center, radius + 1.5, colors.canvas);
+            painter.circle_filled(center, radius, color);
+            // An approval gate stops cargo until a person says go, so it is
+            // the one stop that has to be recognisable at a glance.
+            if node.kind == PathwayNodeKind::ApprovalGate {
+                painter.circle_stroke(center, radius + 4.0, Stroke::new(1.5, colors.canvas));
+                painter.circle_stroke(center, radius + 3.0, Stroke::new(1.5, color));
+            }
+        }
+    }
+}
+
 fn draw_tile(
     ui: &mut Ui,
     painter: &Painter,
@@ -21281,13 +23642,16 @@ mod tests {
             .link_tile(tile_id, conversation_id)
             .unwrap();
         history.checkpoint(&workspace);
-        history.redo.push(workspace.clone());
+        history.redo.push(HistoryEntry::Canvas(workspace.clone()));
 
         history.forget_conversation(conversation_id);
 
         assert_eq!(history.undo.len(), 1);
         assert_eq!(history.redo.len(), 1);
-        for snapshot in history.undo.iter().chain(&history.redo) {
+        for entry in history.undo.iter().chain(&history.redo) {
+            let HistoryEntry::Canvas(snapshot) = entry else {
+                panic!("this test records only canvas snapshots");
+            };
             assert!(
                 !snapshot
                     .domain
@@ -21358,7 +23722,9 @@ mod tests {
             .title = "Current route".into();
         let current_pathways = workspace.domain.pathways.clone();
 
-        let mut restored = history.undo(&workspace).unwrap();
+        let Some(HistoryEntry::Canvas(mut restored)) = history.pop_undo() else {
+            panic!("expected a canvas snapshot on the undo stack");
+        };
         carry_forward_pathways(&workspace, &mut restored);
 
         assert!(restored.active_page().tile(added_tile_id).is_none());
@@ -21422,13 +23788,19 @@ mod tests {
             .unwrap();
         let expected_pathways = current.domain.pathways.clone();
 
-        let mut undone = history.undo(&current).unwrap();
+        let Some(HistoryEntry::Canvas(mut undone)) = history.pop_undo() else {
+            panic!("expected a canvas snapshot on the undo stack");
+        };
+        history.push_redo(HistoryEntry::Canvas(current.clone()));
         carry_forward_pathways(&current, &mut undone);
         let undone = undone.normalized();
         assert!(undone.page(pathway_page_id).is_none());
         assert_eq!(undone.domain.pathways, expected_pathways);
 
-        let mut redone = history.redo(&undone).unwrap();
+        let Some(HistoryEntry::Canvas(mut redone)) = history.pop_redo() else {
+            panic!("expected a canvas snapshot on the redo stack");
+        };
+        history.push_undo(HistoryEntry::Canvas(undone.clone()));
         carry_forward_pathways(&undone, &mut redone);
         let redone = redone.normalized();
         assert!(redone.page(pathway_page_id).is_some());
@@ -21449,6 +23821,1061 @@ mod tests {
         assert_eq!(
             assignment.paused_at,
             Some(crate::domain::UnixMicros(2_000_006))
+        );
+    }
+
+    #[test]
+    fn pathway_rail_colour_is_the_theme_ink_in_both_modes() {
+        // Rails draw in ink — black on the light canvas, light on the dark
+        // one — and no stored value, valid or broken, may produce an
+        // invisible rail on either background.
+        for dark in [false, true] {
+            let colors = Theme::new(dark);
+            for stored in [
+                "#0A84FF",
+                "0A84FF",
+                "",
+                "#",
+                "#12345",
+                "#GGGGGG",
+                "#0A84FF00",
+            ] {
+                assert_eq!(pathway_color(stored, colors), colors.text, "{stored:?}");
+            }
+            assert_ne!(
+                pathway_color("#0A84FF", colors),
+                colors.canvas,
+                "ink must contrast with the canvas it draws on"
+            );
+        }
+    }
+
+    #[test]
+    fn pathway_quick_tool_is_offered_with_a_renderable_glyph() {
+        assert_eq!(CanvasQuickTool::Pathway.label(), "Pathway");
+        // Source Sans 3 ships U+2192; a tool glyph must never render as tofu,
+        // and it must not be mistaken for the Pile tool.
+        assert_eq!(CanvasQuickTool::Pathway.glyph(), "→");
+        assert_ne!(
+            CanvasQuickTool::Pathway.glyph(),
+            CanvasQuickTool::Pile.glyph()
+        );
+    }
+
+    /// Walks exactly what the canvas click does: lay a rail, dock a pointer
+    /// onto it, review, and confirm. Guards the wiring the toolbar depends on.
+    #[test]
+    fn pathway_tool_lays_a_rail_that_a_click_can_dock_and_enroll_onto() {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let tile = Tile::note("Cargo", "", WorldRect::new(600.0, 600.0, 80.0, 60.0));
+        let tile_id = tile.id;
+        workspace.active_page_mut().add_tile(tile);
+
+        let start = PathwayPoint::new(200.0, 300.0);
+        let pathway_id = PathwayEditingService::create_pathway(
+            &mut workspace,
+            page_id,
+            start,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(1_000)).unwrap(),
+        )
+        .unwrap();
+
+        // Clicking the start node must dock rather than lay a second rail.
+        let target = PathwayDockGeometry::prepare(&workspace, page_id)
+            .target(start, 1.0, None)
+            .expect("the freshly drawn rail must be dockable where it was drawn");
+        assert_eq!(target.pathway_id, pathway_id);
+        assert!(target.is_start_node);
+
+        let review = PathwayEnrollmentService::review(
+            &workspace,
+            target,
+            std::collections::BTreeSet::from([tile_id]),
+        )
+        .unwrap();
+        assert_eq!(review.default_choice, PathwayEnrollmentChoice::AtBeginning);
+
+        let result = PathwayEnrollmentService::enroll(
+            &mut workspace,
+            &review,
+            PathwayEnrollmentChoice::AtBeginning,
+            PathwayEnrollmentContext::new("test", crate::domain::UnixMicros(2_000)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result.assignment_ids.len(), 1);
+        let assignment = workspace
+            .domain
+            .pathways
+            .assignment(result.assignment_ids[0])
+            .unwrap();
+        assert_eq!(assignment.pathway_id, pathway_id);
+        assert_eq!(assignment.tile_id, tile_id);
+        assert_ne!(
+            assignment.state,
+            crate::domain::PathwayAssignmentState::Detached
+        );
+    }
+
+    /// The state the rail-drag release commits: an enabled route with a rider
+    /// mid-segment, exactly what a user has after drag-to-enroll.
+    fn rail_drag_fixture() -> (Workspace, crate::domain::PathwayId, Uuid, Uuid) {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let tile = Tile::note("Cargo", "", WorldRect::new(500.0, 500.0, 80.0, 60.0));
+        let tile_id = tile.id;
+        workspace.active_page_mut().add_tile(tile);
+        let pathway_id = PathwayEditingService::create_pathway(
+            &mut workspace,
+            page_id,
+            PathwayPoint::new(200.0, 300.0),
+            PathwayEditContext::new("test", crate::domain::UnixMicros(1_000)).unwrap(),
+        )
+        .unwrap();
+        let target = PathwayDockGeometry::prepare(&workspace, page_id)
+            .target(PathwayPoint::new(200.0, 300.0), 1.0, None)
+            .unwrap();
+        let review = PathwayEnrollmentService::review(
+            &workspace,
+            target,
+            std::collections::BTreeSet::from([tile_id]),
+        )
+        .unwrap();
+        let result = PathwayEnrollmentService::enroll(
+            &mut workspace,
+            &review,
+            PathwayEnrollmentChoice::AtBeginning,
+            PathwayEnrollmentContext::new("test", crate::domain::UnixMicros(2_000)).unwrap(),
+        )
+        .unwrap();
+        (workspace, pathway_id, tile_id, result.assignment_ids[0])
+    }
+
+    #[test]
+    fn rail_drag_moves_the_whole_route_and_running_cargo_keeps_running() {
+        let (mut workspace, pathway_id, _, assignment_id) = rail_drag_fixture();
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(
+            assignment.state,
+            crate::domain::PathwayAssignmentState::Moving,
+            "the fixture rider must be live so the commit exercises pause+resume"
+        );
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert!(pathway.is_enabled);
+        let originals: BTreeMap<_, _> = pathway
+            .nodes
+            .iter()
+            .map(|(id, node)| (*id, node.point))
+            .collect();
+        let page_size = workspace.active_page().size;
+        let targets: BTreeMap<_, _> = originals
+            .iter()
+            .map(|(id, point)| {
+                (
+                    *id,
+                    clamped_rail_point(
+                        PathwayPoint::new(point.x + 150.0, point.y + 90.0),
+                        page_size,
+                    ),
+                )
+            })
+            .collect();
+
+        let now = crate::domain::UnixMicros(5_000_000);
+        apply_pathway_rail_drag(
+            &mut workspace,
+            pathway_id,
+            &targets,
+            now,
+            Uuid::from_u128(77),
+        )
+        .unwrap();
+
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert!(
+            pathway.is_enabled,
+            "an enabled route must come back enabled after a reshape"
+        );
+        for (node_id, node) in &pathway.nodes {
+            assert_eq!(
+                node.point, targets[node_id],
+                "stop {node_id} must land at the preview"
+            );
+        }
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(
+            assignment.state,
+            crate::domain::PathwayAssignmentState::Moving,
+            "a live rider pauses for the edit and resumes with it"
+        );
+        assert_eq!(assignment.segment_started_at, Some(now));
+    }
+
+    #[test]
+    fn rail_drag_commit_is_all_or_nothing_when_a_rider_cannot_pause() {
+        let (mut workspace, pathway_id, tile_id, _) = rail_drag_fixture();
+        // A disabled route with a Moving rider whose tile is gone is the one
+        // state the editing pause refuses; pathway edits are exempt from undo,
+        // so a partial move here would be unrecoverable.
+        workspace
+            .domain
+            .pathways
+            .pathways
+            .get_mut(&pathway_id)
+            .unwrap()
+            .is_enabled = false;
+        workspace
+            .active_page_mut()
+            .tiles
+            .retain(|tile| tile.id != tile_id);
+        let originals: BTreeMap<_, _> = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|(id, node)| (*id, PathwayPoint::new(node.point.x + 40.0, node.point.y)))
+            .collect();
+        let before = workspace.clone();
+
+        let result = apply_pathway_rail_drag(
+            &mut workspace,
+            pathway_id,
+            &originals,
+            crate::domain::UnixMicros(6_000_000),
+            Uuid::from_u128(78),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(workspace, before, "a refused move must leave no trace");
+    }
+
+    #[test]
+    fn rail_preview_clamp_matches_what_the_editing_service_commits() {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let page_size = workspace.active_page().size;
+        let pathway_id = PathwayEditingService::create_pathway(
+            &mut workspace,
+            page_id,
+            PathwayPoint::new(200.0, 300.0),
+            PathwayEditContext::new("test", crate::domain::UnixMicros(1_000)).unwrap(),
+        )
+        .unwrap();
+        let node_id = *workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .nodes
+            .keys()
+            .next()
+            .unwrap();
+        // Far off the page in both axes: the preview must promise exactly the
+        // clamped point the service will store.
+        let wild = PathwayPoint::new(-9_000.0, 90_000.0);
+        let predicted = clamped_rail_point(wild, page_size);
+        PathwayEditingService::move_node(
+            &mut workspace,
+            pathway_id,
+            node_id,
+            wild,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(2_000)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            workspace.domain.pathways.pathway(pathway_id).unwrap().nodes[&node_id].point,
+            predicted
+        );
+    }
+
+    #[test]
+    fn rail_drag_preview_carries_riders_with_the_moving_rail() {
+        let (workspace, pathway_id, tile_id, _) = rail_drag_fixture();
+        let page_id = workspace.active_page;
+        let at = crate::domain::UnixMicros(2_500_000);
+        let mut geometry = canvas_objects_from_workspace(&workspace, at, |_| None);
+        let before = geometry.rect_for(page_id, tile_id).unwrap();
+
+        // A preview naming a route this page does not have must change nothing.
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let shifted: BTreeMap<_, _> = pathway
+            .nodes
+            .iter()
+            .map(|(id, node)| {
+                (
+                    *id,
+                    PathwayPoint::new(node.point.x + 150.0, node.point.y + 90.0),
+                )
+            })
+            .collect();
+        overlay_pathway_rail_preview(
+            &mut geometry,
+            &workspace,
+            Uuid::from_u128(999),
+            &shifted,
+            at,
+        );
+        assert_eq!(geometry.rect_for(page_id, tile_id).unwrap(), before);
+
+        // A uniform rail translation must carry the rider by exactly the same
+        // delta, whatever leg of the route it is on.
+        overlay_pathway_rail_preview(&mut geometry, &workspace, pathway_id, &shifted, at);
+        let after = geometry.rect_for(page_id, tile_id).unwrap();
+        assert!((after.x - (before.x + 150.0)).abs() < 1e-3);
+        assert!((after.y - (before.y + 90.0)).abs() < 1e-3);
+        assert_eq!(after.w, before.w);
+        assert_eq!(after.h, before.h);
+    }
+
+    #[test]
+    fn rail_drag_preview_of_one_stop_reprojects_riders_along_the_reshaped_leg() {
+        // A single grabbed stop is the partial-preview path: the session map
+        // holds one node and the overlay must merge it over the durable route,
+        // then re-project by travelled distance — not offset the rider by the
+        // node's delta.
+        let (workspace, pathway_id, tile_id, assignment_id) = rail_drag_fixture();
+        let page_id = workspace.active_page;
+        let at = crate::domain::UnixMicros(2_500_000);
+        let mut geometry = canvas_objects_from_workspace(&workspace, at, |_| None);
+        let before = geometry.rect_for(page_id, tile_id).unwrap();
+
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let start = crate::pathway_projection::first_node(pathway).unwrap();
+        let segment = crate::pathway_projection::outgoing_segment(pathway, start.id).unwrap();
+        let end = &pathway.nodes[&segment.to_node_id];
+        // Swing the destination stop perpendicular to the leg so direction,
+        // length, and the rider's projected point all genuinely change.
+        let moved_end = PathwayPoint::new(end.point.x, end.point.y + 240.0);
+        let preview = BTreeMap::from([(segment.to_node_id, moved_end)]);
+        overlay_pathway_rail_preview(&mut geometry, &workspace, pathway_id, &preview, at);
+        let after = geometry.rect_for(page_id, tile_id).unwrap();
+
+        // Independent expectation: same distance travelled, new leg geometry.
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(assignment.segment_start_progress, 0.0);
+        let elapsed = (at.0 - assignment.segment_started_at.unwrap().0) as f64 / 1_000_000.0;
+        let travelled = elapsed * segment.speed_points_per_second;
+        let leg_x = moved_end.x - start.point.x;
+        let leg_y = moved_end.y - start.point.y;
+        let progress = (travelled / (leg_x * leg_x + leg_y * leg_y).sqrt()).min(1.0);
+        let expected_x = start.point.x + progress * leg_x;
+        let expected_y = start.point.y + progress * leg_y;
+        assert!((f64::from(after.x + after.w * 0.5) - expected_x).abs() < 1e-2);
+        assert!((f64::from(after.y + after.h * 0.5) - expected_y).abs() < 1e-2);
+        assert!(
+            (after.y - before.y).abs() > 10.0,
+            "the reshaped leg must actually move the rider off its old projection"
+        );
+    }
+
+    #[test]
+    fn undoing_a_rail_move_returns_the_route_and_its_rider_to_the_old_rail() {
+        let (mut workspace, pathway_id, _, assignment_id) = rail_drag_fixture();
+        let originals: BTreeMap<_, _> = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|(id, node)| (*id, node.point))
+            .collect();
+        let moved: BTreeMap<_, _> = originals
+            .iter()
+            .map(|(id, point)| (*id, PathwayPoint::new(point.x + 150.0, point.y + 90.0)))
+            .collect();
+        apply_pathway_rail_drag(
+            &mut workspace,
+            pathway_id,
+            &moved,
+            crate::domain::UnixMicros(5_000_000),
+            Uuid::from_u128(101),
+        )
+        .unwrap();
+
+        // Undo = the inverse move through the same service commit.
+        apply_pathway_rail_drag(
+            &mut workspace,
+            pathway_id,
+            &originals,
+            crate::domain::UnixMicros(6_000_000),
+            Uuid::from_u128(102),
+        )
+        .unwrap();
+
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        for (node_id, node) in &pathway.nodes {
+            assert_eq!(node.point, originals[node_id], "stop {node_id} must return");
+        }
+        assert!(pathway.is_enabled, "the route must come back running");
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(
+            assignment.state,
+            crate::domain::PathwayAssignmentState::Moving,
+            "the rider must still be riding after undo"
+        );
+    }
+
+    #[test]
+    fn adding_a_stop_mid_leg_keeps_the_rider_riding_and_survives_undo_redo() {
+        let (mut workspace, pathway_id, _, assignment_id) = rail_drag_fixture();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let first = crate::pathway_projection::first_node(pathway).unwrap();
+        let first_id = first.id;
+        let mid = PathwayPoint::new(first.point.x + 160.0, first.point.y + 40.0);
+        let draft = PathwayNodeDraft::new(
+            mid,
+            conventional_stop_name(pathway, PathwayNodeKind::Destination),
+            PathwayNodeKind::Destination,
+            12.0,
+        );
+
+        let node_id = apply_pathway_stop_add(
+            &mut workspace,
+            pathway_id,
+            Some(first_id),
+            draft.clone(),
+            Some(44.0),
+            None,
+            None,
+            crate::domain::UnixMicros(3_000_000),
+            Uuid::from_u128(201),
+        )
+        .unwrap();
+
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert_eq!(pathway.nodes.len(), 3);
+        assert!(
+            pathway.is_enabled,
+            "the add must hand the route back running"
+        );
+        let added = &pathway.nodes[&node_id];
+        assert_eq!(added.point, mid);
+        assert_eq!(added.kind, PathwayNodeKind::Destination);
+        assert_eq!(added.wait_duration_seconds, 12.0);
+        // Route order: the new stop sits directly after the first.
+        let mut ordered: Vec<_> = pathway.nodes.values().collect();
+        ordered.sort_by(|left, right| travel_order(left, right));
+        assert_eq!(ordered[0].id, first_id);
+        assert_eq!(ordered[1].id, node_id);
+        // The split leg's pinned speed lands on the (first → new) leg — the
+        // guard against a loop-back split inheriting the forward speed.
+        let pinned = pathway
+            .segments
+            .values()
+            .find(|segment| segment.from_node_id == first_id && segment.to_node_id == node_id)
+            .expect("the split must create a first → new leg");
+        assert_eq!(pinned.speed_points_per_second, 44.0);
+        // Split-continuity: the rider whose leg was split silently re-joins
+        // the new geometry and comes back riding — the edit's pause and the
+        // resume both happen inside the add, and no needs-attention parking
+        // is ever visible to the user.
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_eq!(
+            assignment.state,
+            crate::domain::PathwayAssignmentState::Moving,
+            "a split leg must not strand the rider that was on it"
+        );
+        let rejoined = assignment
+            .current_segment_id
+            .expect("the rider must be re-aimed at a surviving rail");
+        assert!(
+            workspace
+                .domain
+                .pathways
+                .pathway(pathway_id)
+                .unwrap()
+                .segments
+                .contains_key(&rejoined)
+        );
+        crate::pathway_reconciliation::PathwayReconcileService::reconcile(
+            &mut workspace,
+            crate::pathway_reconciliation::PathwayReconcileContext::new(
+                "test",
+                crate::domain::UnixMicros(5_100_000),
+                crate::pathway_reconciliation::PathwayReconcileCause::Live,
+            )
+            .unwrap()
+            .with_settled(true),
+        )
+        .unwrap();
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_ne!(
+            assignment.state,
+            crate::domain::PathwayAssignmentState::NeedsAttention,
+            "reconcile must keep the adapted rider in service"
+        );
+
+        // Undo removes exactly that stop; redo re-creates it from the draft.
+        apply_pathway_stop_remove(
+            &mut workspace,
+            pathway_id,
+            node_id,
+            crate::domain::UnixMicros(6_000_000),
+            Uuid::from_u128(202),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert_eq!(pathway.nodes.len(), 2);
+        assert!(!pathway.nodes.contains_key(&node_id));
+        assert!(pathway.is_enabled);
+
+        let redone_id = apply_pathway_stop_add(
+            &mut workspace,
+            pathway_id,
+            Some(first_id),
+            draft,
+            Some(44.0),
+            None,
+            None,
+            crate::domain::UnixMicros(7_000_000),
+            Uuid::from_u128(203),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert_eq!(pathway.nodes.len(), 3);
+        assert_eq!(pathway.nodes[&redone_id].point, mid);
+        assert_eq!(pathway.nodes[&redone_id].wait_duration_seconds, 12.0);
+    }
+
+    #[test]
+    fn double_click_on_an_out_and_back_track_splits_the_track_not_the_return() {
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        PathwayEditingService::set_repeats(
+            &mut workspace,
+            pathway_id,
+            true,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(3_000_000)).unwrap(),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let closure = closure_segment_id(pathway).expect("a repeating route has a loop-back leg");
+        let forward = pathway
+            .segments
+            .values()
+            .find(|segment| segment.id != closure)
+            .expect("the authored track leg");
+        let from = pathway.nodes[&forward.from_node_id].point;
+        let to = pathway.nodes[&forward.to_node_id].point;
+        let mid = PathwayPoint::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5);
+
+        // The dock may hand back the loop-back leg on a coincident track; the
+        // stop must land on the authored track either way, at its speed.
+        let via_closure = corrected_stop_insert(pathway, closure, mid).unwrap();
+        let via_track = corrected_stop_insert(pathway, forward.id, mid).unwrap();
+        assert_eq!(
+            via_closure,
+            (forward.from_node_id, forward.speed_points_per_second)
+        );
+        assert_eq!(via_closure, via_track);
+    }
+
+    #[test]
+    fn a_true_circuit_keeps_a_deliberate_return_leg_split() {
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        PathwayEditingService::set_repeats(
+            &mut workspace,
+            pathway_id,
+            true,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(3_000_000)).unwrap(),
+        )
+        .unwrap();
+        // Bend the route into a triangle: the loop-back leg gets its own
+        // visible geometry, so a click on it is a deliberate return split.
+        PathwayEditingService::append_node(
+            &mut workspace,
+            pathway_id,
+            PathwayNodeKind::Destination,
+            PathwayPoint::new(400.0, 600.0),
+            PathwayEditContext::new("test", crate::domain::UnixMicros(3_100_000)).unwrap(),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let closure = closure_segment_id(pathway).expect("still a repeating route");
+        let closure_segment = &pathway.segments[&closure];
+        let from = pathway.nodes[&closure_segment.from_node_id].point;
+        let to = pathway.nodes[&closure_segment.to_node_id].point;
+        let mid = PathwayPoint::new((from.x + to.x) * 0.5, (from.y + to.y) * 0.5);
+
+        let (after, speed) = corrected_stop_insert(pathway, closure, mid).unwrap();
+        assert_eq!(after, closure_segment.from_node_id);
+        assert_eq!(speed, closure_segment.speed_points_per_second);
+    }
+
+    #[test]
+    fn removing_a_stop_and_undoing_restores_position_properties_and_both_leg_speeds() {
+        // Build Start → Middle → End with distinct leg speeds, then remove
+        // Middle and re-insert it the way undo would.
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let first_id = crate::pathway_projection::first_node(pathway).unwrap().id;
+        let middle_point = PathwayPoint::new(360.0, 420.0);
+        let middle_id = apply_pathway_stop_add(
+            &mut workspace,
+            pathway_id,
+            Some(first_id),
+            PathwayNodeDraft::new(middle_point, "Middle", PathwayNodeKind::Destination, 7.0),
+            Some(21.0),
+            None,
+            None,
+            crate::domain::UnixMicros(5_000_000),
+            Uuid::from_u128(401),
+        )
+        .unwrap();
+        // Give the outgoing leg its own speed so the round-trip must restore
+        // two distinct values.
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let outgoing = pathway
+            .segments
+            .values()
+            .find(|segment| segment.from_node_id == middle_id)
+            .unwrap()
+            .id;
+        PathwayEditingService::set_segment_speed(
+            &mut workspace,
+            pathway_id,
+            outgoing,
+            63.0,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(5_100_000)).unwrap(),
+        )
+        .unwrap();
+
+        apply_pathway_stop_remove(
+            &mut workspace,
+            pathway_id,
+            middle_id,
+            crate::domain::UnixMicros(6_000_000),
+            Uuid::from_u128(402),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert_eq!(pathway.nodes.len(), 2);
+        assert!(!pathway.nodes.contains_key(&middle_id));
+
+        // Undo = re-insert with both adjacent speeds pinned.
+        let restored_id = apply_pathway_stop_add(
+            &mut workspace,
+            pathway_id,
+            Some(first_id),
+            PathwayNodeDraft::new(middle_point, "Middle", PathwayNodeKind::Destination, 7.0),
+            Some(21.0),
+            Some(63.0),
+            None,
+            crate::domain::UnixMicros(7_000_000),
+            Uuid::from_u128(403),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert_eq!(pathway.nodes.len(), 3);
+        let restored = &pathway.nodes[&restored_id];
+        assert_eq!(restored.point, middle_point);
+        assert_eq!(restored.title, "Middle");
+        assert_eq!(restored.wait_duration_seconds, 7.0);
+        let incoming = pathway
+            .segments
+            .values()
+            .find(|segment| segment.from_node_id == first_id && segment.to_node_id == restored_id)
+            .unwrap();
+        assert_eq!(incoming.speed_points_per_second, 21.0);
+        let outgoing = pathway
+            .segments
+            .values()
+            .find(|segment| segment.from_node_id == restored_id)
+            .unwrap();
+        assert_eq!(outgoing.speed_points_per_second, 63.0);
+    }
+
+    #[test]
+    fn undoing_an_endpoint_removal_gives_the_loop_back_leg_its_speed_back() {
+        // Looping A → B → C with the loop-back leg at 275. Removing C
+        // rebuilds the closure at the default speed (engine law); undo must
+        // hand the loop back its real pace via the captured closure pin.
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        PathwayEditingService::set_repeats(
+            &mut workspace,
+            pathway_id,
+            true,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(3_000_000)).unwrap(),
+        )
+        .unwrap();
+        let last_id = PathwayEditingService::append_node(
+            &mut workspace,
+            pathway_id,
+            PathwayNodeKind::Destination,
+            PathwayPoint::new(400.0, 600.0),
+            PathwayEditContext::new("test", crate::domain::UnixMicros(3_100_000)).unwrap(),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let closure = closure_segment_id(pathway).unwrap();
+        PathwayEditingService::set_segment_speed(
+            &mut workspace,
+            pathway_id,
+            closure,
+            275.0,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(3_200_000)).unwrap(),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let last = &pathway.nodes[&last_id];
+        let draft = PathwayNodeDraft::new(
+            last.point,
+            last.title.clone(),
+            last.kind,
+            last.wait_duration_seconds,
+        );
+        let mut ordered: Vec<_> = pathway.nodes.values().collect();
+        ordered.sort_by(|left, right| travel_order(left, right));
+        let predecessor = ordered[ordered.len() - 2].id;
+        let incoming = pathway
+            .segments
+            .values()
+            .find(|segment| segment.from_node_id == predecessor && segment.to_node_id == last_id)
+            .unwrap()
+            .speed_points_per_second;
+
+        apply_pathway_stop_remove(
+            &mut workspace,
+            pathway_id,
+            last_id,
+            crate::domain::UnixMicros(4_000_000),
+            Uuid::from_u128(501),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let rebuilt_closure = closure_segment_id(pathway).unwrap();
+        assert_ne!(
+            pathway.segments[&rebuilt_closure].speed_points_per_second, 275.0,
+            "engine law: an endpoint removal rebuilds the loop-back at default speed"
+        );
+
+        // Undo: re-insert with the captured closure pin.
+        apply_pathway_stop_add(
+            &mut workspace,
+            pathway_id,
+            Some(predecessor),
+            draft,
+            Some(incoming),
+            None,
+            Some(275.0),
+            crate::domain::UnixMicros(5_000_000),
+            Uuid::from_u128(502),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let restored_closure = closure_segment_id(pathway).unwrap();
+        assert_eq!(
+            pathway.segments[&restored_closure].speed_points_per_second, 275.0,
+            "undo must restore the loop-back leg's captured pace"
+        );
+    }
+
+    #[test]
+    fn a_two_stop_route_refuses_to_lose_another_stop() {
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let first_id = crate::pathway_projection::first_node(pathway).unwrap().id;
+        let error = apply_pathway_stop_remove(
+            &mut workspace,
+            pathway_id,
+            first_id,
+            crate::domain::UnixMicros(5_000_000),
+            Uuid::from_u128(410),
+        )
+        .unwrap_err();
+        assert!(!error.is_empty());
+        assert_eq!(
+            workspace
+                .domain
+                .pathways
+                .pathway(pathway_id)
+                .unwrap()
+                .nodes
+                .len(),
+            2,
+            "the refusal must leave the route untouched"
+        );
+    }
+
+    #[test]
+    fn conventional_stop_names_match_the_engine_convention() {
+        // The app predicts a name before inserting; the engine names appends
+        // itself. If the two formats ever drift, mixed routes get confusing
+        // sequences — pin them equal via a real engine append.
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let predicted = conventional_stop_name(pathway, PathwayNodeKind::Destination);
+        let end = pathway
+            .nodes
+            .values()
+            .map(|node| node.point)
+            .fold(PathwayPoint::new(0.0, 0.0), |_, point| point);
+        let appended = PathwayEditingService::append_node(
+            &mut workspace,
+            pathway_id,
+            PathwayNodeKind::Destination,
+            PathwayPoint::new(end.x + 120.0, end.y),
+            PathwayEditContext::new("test", crate::domain::UnixMicros(9_000_000)).unwrap(),
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert_eq!(pathway.nodes[&appended].title, predicted);
+    }
+
+    #[test]
+    fn set_every_stop_wait_skips_waypoints_and_survives_a_running_route() {
+        let (mut workspace, pathway_id, _, assignment_id) = rail_drag_fixture();
+        // Turn the first stop into a pass-through waypoint so the sweep has
+        // both kinds to treat differently.
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        let first_id = crate::pathway_projection::first_node(pathway).unwrap().id;
+        let first_title = pathway.nodes[&first_id].title.clone();
+        PathwayEditingService::set_node_properties(
+            &mut workspace,
+            pathway_id,
+            first_id,
+            first_title,
+            PathwayNodeKind::Waypoint,
+            0.0,
+            PathwayEditContext::new("test", crate::domain::UnixMicros(4_000_000)).unwrap(),
+        )
+        .unwrap();
+        crate::pathway_reconciliation::PathwayReconcileService::set_enabled(
+            &mut workspace,
+            pathway_id,
+            true,
+            crate::pathway_reconciliation::PathwayReconcileContext::new(
+                "test",
+                crate::domain::UnixMicros(4_500_000),
+                crate::pathway_reconciliation::PathwayReconcileCause::Live,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let changed = apply_pathway_wait_for_all_stops(
+            &mut workspace,
+            pathway_id,
+            30.0,
+            crate::domain::UnixMicros(5_000_000),
+            Uuid::from_u128(301),
+        )
+        .unwrap();
+        assert!(changed);
+
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert!(
+            pathway.is_enabled,
+            "the sweep must hand the route back running"
+        );
+        for node in pathway.nodes.values() {
+            let expected = if node.kind == PathwayNodeKind::Waypoint {
+                0.0
+            } else {
+                30.0
+            };
+            assert_eq!(node.wait_duration_seconds, expected, "stop {}", node.id);
+        }
+        let assignment = workspace.domain.pathways.assignment(assignment_id).unwrap();
+        assert_ne!(
+            assignment.state,
+            crate::domain::PathwayAssignmentState::Detached,
+            "a wait sweep must never knock cargo off the route"
+        );
+    }
+
+    #[test]
+    fn history_keeps_rail_moves_and_canvas_snapshots_in_one_ordered_stack() {
+        let mut history = History::default();
+        let workspace = Workspace::new();
+        history.checkpoint(&workspace);
+        let node_id = Uuid::from_u128(7);
+        history.record_rail_move(
+            Uuid::from_u128(1),
+            BTreeMap::from([(node_id, PathwayPoint::new(10.0, 10.0))]),
+            BTreeMap::from([(node_id, PathwayPoint::new(90.0, 40.0))]),
+        );
+        // The rail move must not be deduplicated against the snapshot, and a
+        // fresh checkpoint after it must still dedupe against nothing but a
+        // matching snapshot.
+        history.checkpoint(&workspace);
+        assert_eq!(history.undo.len(), 3);
+        assert!(matches!(
+            history.undo[1],
+            HistoryEntry::RailMove { pathway_id, .. } if pathway_id == Uuid::from_u128(1)
+        ));
+        // Pop order comes back newest-first, rail move in the middle.
+        assert!(matches!(history.pop_undo(), Some(HistoryEntry::Canvas(_))));
+        let Some(HistoryEntry::RailMove { from, to, .. }) = history.pop_undo() else {
+            panic!("the rail move must come back intact");
+        };
+        assert_eq!(from[&node_id], PathwayPoint::new(10.0, 10.0));
+        assert_eq!(to[&node_id], PathwayPoint::new(90.0, 40.0));
+    }
+
+    #[test]
+    fn dropping_dragged_cargo_on_a_rail_reviews_at_that_spot() {
+        let mut workspace = Workspace::new();
+        let page_id = workspace.active_page;
+        let tile = Tile::note("Dropped", "", WorldRect::new(900.0, 900.0, 80.0, 60.0));
+        let tile_id = tile.id;
+        workspace.active_page_mut().add_tile(tile);
+        let pathway_id = PathwayEditingService::create_pathway(
+            &mut workspace,
+            page_id,
+            PathwayPoint::new(200.0, 300.0),
+            PathwayEditContext::new("test", crate::domain::UnixMicros(1_000)).unwrap(),
+        )
+        .unwrap();
+
+        // The dock geometry is frozen at pointer-down; mid-drag ticks feed the
+        // previous target back in, mirroring update_live_gestures.
+        let dock = PathwayDockGeometry::prepare(&workspace, page_id);
+        let first = dock
+            .target(PathwayPoint::new(330.0, 306.0), 1.0, None)
+            .unwrap();
+        let held = dock
+            .target(PathwayPoint::new(342.0, 310.0), 1.0, Some(&first))
+            .unwrap();
+        assert_eq!(held.pathway_id, pathway_id);
+
+        let review = PathwayEnrollmentService::review(
+            &workspace,
+            held,
+            std::collections::BTreeSet::from([tile_id]),
+        )
+        .unwrap();
+        assert_eq!(review.default_choice, PathwayEnrollmentChoice::AtThisSpot);
+        let result = PathwayEnrollmentService::enroll(
+            &mut workspace,
+            &review,
+            PathwayEnrollmentChoice::AtThisSpot,
+            PathwayEnrollmentContext::new("test", crate::domain::UnixMicros(2_000)).unwrap(),
+        )
+        .unwrap();
+        let assignment = workspace
+            .domain
+            .pathways
+            .assignment(result.assignment_ids[0])
+            .unwrap();
+        assert_eq!(assignment.tile_id, tile_id);
+        assert!(
+            assignment.current_segment_id.is_some(),
+            "an At-This-Spot drop joins mid-segment, not at a node"
+        );
+    }
+
+    #[test]
+    fn settings_edits_resume_a_running_route_but_respect_a_paused_one() {
+        // Running route: a loop toggle pauses cargo for the graph edit and the
+        // wrapper brings the route back, exactly like the rail drag does.
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        assert!(
+            workspace
+                .domain
+                .pathways
+                .pathway(pathway_id)
+                .unwrap()
+                .is_enabled
+        );
+        commit_pathway_edit_with_resume(
+            &mut workspace,
+            pathway_id,
+            crate::domain::UnixMicros(5_000_000),
+            Uuid::from_u128(80),
+            |workspace| {
+                PathwayEditingService::set_repeats(
+                    workspace,
+                    pathway_id,
+                    true,
+                    PathwayEditContext::with_operation_id(
+                        "test",
+                        crate::domain::UnixMicros(5_000_000),
+                        Uuid::from_u128(80),
+                    )
+                    .unwrap(),
+                )
+                .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+        let pathway = workspace.domain.pathways.pathway(pathway_id).unwrap();
+        assert!(pathway.repeats);
+        assert!(
+            pathway.is_enabled,
+            "a settings edit on a running route must hand it back running"
+        );
+
+        // Paused route: the same edit leaves it paused — the wrapper resumes
+        // only when its own edit was what stopped the route.
+        let (mut paused, paused_id, _, _) = rail_drag_fixture();
+        let pause = PathwayReconcileContext::with_operation_id(
+            "test",
+            crate::domain::UnixMicros(6_000_000),
+            PathwayReconcileCause::Live,
+            Uuid::from_u128(81),
+        )
+        .unwrap();
+        PathwayReconcileService::set_enabled(&mut paused, paused_id, false, pause).unwrap();
+        commit_pathway_edit_with_resume(
+            &mut paused,
+            paused_id,
+            crate::domain::UnixMicros(7_000_000),
+            Uuid::from_u128(82),
+            |workspace| {
+                PathwayEditingService::set_repeats(
+                    workspace,
+                    paused_id,
+                    true,
+                    PathwayEditContext::with_operation_id(
+                        "test",
+                        crate::domain::UnixMicros(7_000_000),
+                        Uuid::from_u128(82),
+                    )
+                    .unwrap(),
+                )
+                .map_err(|error| error.to_string())
+            },
+        )
+        .unwrap();
+        assert!(
+            !paused
+                .domain
+                .pathways
+                .pathway(paused_id)
+                .unwrap()
+                .is_enabled,
+            "a route the user paused stays paused through a settings edit"
+        );
+    }
+
+    #[test]
+    fn settings_resume_wrapper_propagates_edit_failures_untouched() {
+        let (mut workspace, pathway_id, _, _) = rail_drag_fixture();
+        let before_enabled = workspace
+            .domain
+            .pathways
+            .pathway(pathway_id)
+            .unwrap()
+            .is_enabled;
+        let result: Result<(), String> = commit_pathway_edit_with_resume(
+            &mut workspace,
+            pathway_id,
+            crate::domain::UnixMicros(8_000_000),
+            Uuid::from_u128(83),
+            |_| Err("refused".to_owned()),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            workspace
+                .domain
+                .pathways
+                .pathway(pathway_id)
+                .unwrap()
+                .is_enabled,
+            before_enabled
         );
     }
 
@@ -21498,6 +24925,7 @@ mod tests {
             start_world: [0.0, 0.0],
             originals: visual_origins,
             durable_originals: durable_originals.clone(),
+            dock: None,
             text_source: None,
             moved: true,
         };
