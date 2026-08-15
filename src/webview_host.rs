@@ -6,6 +6,22 @@
 //! platforms get a stub whose constructor declines, so callers fall back to
 //! opening the page in the system browser and no `#[cfg]` leaks anywhere
 //! else in the app.
+//!
+//! ## Architecture: two real layers
+//!
+//! The WKWebView is composited **below** the egui Metal layer rather than on
+//! top of it. Both the Metal layer (added by `raw-window-metal` as a sublayer
+//! of the winit content view's backing layer) and the page's container view
+//! are siblings under that backing layer; giving the container a negative
+//! `zPosition` sorts it behind the Metal sublayer. egui therefore paints over
+//! the whole window, Adam punches a transparent hole (see [`crate::web_hole`])
+//! exactly at the page's rect, and the web view shows through only there.
+//!
+//! Input still has to reach the page even though it is visually "underneath".
+//! A native subview participates in hit-testing regardless of its compositing
+//! order, so the container is a custom `NSView` subclass whose `hitTest:`
+//! returns the web view for points over the page and declines (nil) for points
+//! over chrome that overlaps the page — letting those fall through to egui.
 
 use std::path::PathBuf;
 
@@ -21,13 +37,13 @@ pub enum LiveWebSource {
 #[cfg(target_os = "macos")]
 mod platform_host {
     use std::borrow::Cow;
+    use std::cell::RefCell;
 
-    use objc2::MainThreadMarker;
     use objc2::rc::Retained;
+    use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
     use objc2_app_kit::NSView;
-    use objc2_core_graphics::CGMutablePath;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
-    use objc2_quartz_core::{CAShapeLayer, CATransaction, CATransform3D, kCAFillRuleEvenOdd};
+    use objc2_quartz_core::{CATransaction, CATransform3D};
     use wry::WebViewExtMacOS;
 
     use super::LiveWebSource;
@@ -37,6 +53,73 @@ mod platform_host {
        if (e.key === 'Escape') { window.ipc.postMessage('escape'); }\n\
      });";
 
+    /// Sorts the page container's layer behind the egui Metal sublayer. Both
+    /// live under the same backing layer, so any value below the Metal layer's
+    /// default `zPosition` (0.0) works; -1 leaves head-room for nothing else.
+    const CONTAINER_Z: f64 = -1.0;
+
+    /// Ivars for [`WebContainer`]: the chrome rectangles — in the container's
+    /// SUPERVIEW (content view) coordinate space — that must be handed to egui
+    /// even when they sit over the live page, so persistent controls like the
+    /// quick bar and minimap stay clickable through the page.
+    struct ContainerIvars {
+        chrome: RefCell<Vec<NSRect>>,
+    }
+
+    define_class!(
+        // SAFETY:
+        // - The superclass NSView imposes no subclassing requirements we break.
+        // - This type's `Drop` (via `LiveWebHost`) only removes the view from
+        //   its superview; it calls no overridden methods.
+        #[unsafe(super(NSView))]
+        #[thread_kind = MainThreadOnly]
+        #[name = "AdamWebContainer"]
+        #[ivars = ContainerIvars]
+        struct WebContainer;
+
+        impl WebContainer {
+            /// Route input by geometry. `point` arrives in this view's superview
+            /// (the content view) coordinate space — the same space the stored
+            /// chrome rects were converted into. A point over passthrough chrome
+            /// declines (nil) so the content view, and thus egui, handles it;
+            /// everything else defers to the WKWebView subview underneath.
+            #[unsafe(method(hitTest:))]
+            fn hit_test(&self, point: NSPoint) -> *mut NSView {
+                let over_chrome = self
+                    .ivars()
+                    .chrome
+                    .borrow()
+                    .iter()
+                    .any(|rect| point_in_rect(point, *rect));
+                if over_chrome {
+                    std::ptr::null_mut()
+                } else {
+                    unsafe { msg_send![super(self), hitTest: point] }
+                }
+            }
+        }
+    );
+
+    impl WebContainer {
+        fn new(mtm: MainThreadMarker) -> Retained<Self> {
+            let this = Self::alloc(mtm).set_ivars(ContainerIvars {
+                chrome: RefCell::new(Vec::new()),
+            });
+            unsafe { msg_send![super(this), init] }
+        }
+
+        fn set_chrome(&self, rects: Vec<NSRect>) {
+            *self.ivars().chrome.borrow_mut() = rects;
+        }
+    }
+
+    fn point_in_rect(point: NSPoint, rect: NSRect) -> bool {
+        point.x >= rect.origin.x
+            && point.x < rect.origin.x + rect.size.width
+            && point.y >= rect.origin.y
+            && point.y < rect.origin.y + rect.size.height
+    }
+
     /// The page IS the tile: Adam owns its geometry outright. The WKWebView
     /// is re-parented into a clipping container view; both are moved inside
     /// animation-disabled transactions so they commit with the same frame as
@@ -44,7 +127,7 @@ mod platform_host {
     /// the page at the canvas edge exactly like any painted tile.
     pub struct LiveWebHost {
         webview: wry::WebView,
-        container: Retained<NSView>,
+        container: Retained<WebContainer>,
         escape_rx: crossbeam_channel::Receiver<()>,
         /// The container backing layer's anchor point, read once at creation.
         /// This is the pivot Core Animation scales sublayers about, so reading
@@ -54,7 +137,6 @@ mod platform_host {
         shown: bool,
         last_content: Option<PointRect>,
         last_clip: Option<PointRect>,
-        last_exclude: Option<PointRect>,
     }
 
     impl LiveWebHost {
@@ -102,10 +184,11 @@ mod platform_host {
                 .map_err(|error| error.to_string())?;
 
             // Take the view tree over: WKWebView moves inside a clipping
-            // container that Adam positions; wry's own bounds API is never
-            // used again.
+            // container that Adam positions, sorted BELOW the egui Metal layer
+            // so chrome composites over it. wry's own bounds API is never used
+            // again.
             let wk = webview.webview();
-            let container = NSView::new(mtm);
+            let container = WebContainer::new(mtm);
             let mut container_anchor = (0.0_f64, 0.0_f64);
             unsafe {
                 let Some(parent) = wk.superview() else {
@@ -116,9 +199,15 @@ mod platform_host {
                     layer.setMasksToBounds(true);
                     let anchor = layer.anchorPoint();
                     container_anchor = (anchor.x, anchor.y);
+                    // The whole point of the two-layer design: this container
+                    // and the Metal layer are sibling sublayers of `parent`'s
+                    // backing layer; a negative zPosition composites the page
+                    // behind egui's drawing.
+                    layer.setZPosition(CONTAINER_Z);
                 }
                 container.setHidden(true);
                 wk.removeFromSuperview();
+                // Still a subview (so it hit-tests), just composited behind.
                 parent.addSubview(&container);
                 container.addSubview(&wk);
             }
@@ -132,7 +221,6 @@ mod platform_host {
                 shown: false,
                 last_content: None,
                 last_clip: None,
-                last_exclude: None,
             })
         }
 
@@ -153,8 +241,7 @@ mod platform_host {
                 }
                 LiveWebState::Visible(placement) => {
                     let geometry_changed = self.last_content != Some(placement.content)
-                        || self.last_clip != Some(placement.clip)
-                        || self.last_exclude != placement.exclude;
+                        || self.last_clip != Some(placement.clip);
                     if !(geometry_changed || !self.shown) {
                         // A static frame costs nothing: the compositor holds
                         // the last sublayerTransform on its own.
@@ -223,53 +310,14 @@ mod platform_host {
                             // Adam's own container layer. AppKit and WebKit
                             // never reset a sublayerTransform we set, so it
                             // survives navigation and needs no per-frame
-                            // re-assert or settle re-raster.
+                            // re-assert or settle re-raster. Re-assert the
+                            // behind-egui zPosition here too, cheaply, in case a
+                            // layout pass reset it.
                             if let Some(layer) = self.container.layer() {
                                 layer.setSublayerTransform(CATransform3D::new_scale(
                                     scale, scale, 1.0,
                                 ));
-                                // Punch out the quick-bar notch (screen-space,
-                                // so independent of the page scale). Even-odd
-                                // fill of the full bounds plus the hole leaves
-                                // everything visible except the hole, where the
-                                // egui bar underneath shows through. Container
-                                // coords are bottom-left; flip the hole's y.
-                                match placement.exclude {
-                                    Some(hole) => {
-                                        let hx = f64::from(hole.min_x - clip.min_x);
-                                        let hy = f64::from(clip.height)
-                                            - f64::from(hole.min_y - clip.min_y)
-                                            - f64::from(hole.height);
-                                        let path = CGMutablePath::new();
-                                        CGMutablePath::add_rect(
-                                            Some(&path),
-                                            std::ptr::null(),
-                                            NSRect::new(
-                                                NSPoint::new(0.0, 0.0),
-                                                NSSize::new(
-                                                    f64::from(clip.width),
-                                                    f64::from(clip.height),
-                                                ),
-                                            ),
-                                        );
-                                        CGMutablePath::add_rect(
-                                            Some(&path),
-                                            std::ptr::null(),
-                                            NSRect::new(
-                                                NSPoint::new(hx, hy),
-                                                NSSize::new(
-                                                    f64::from(hole.width),
-                                                    f64::from(hole.height),
-                                                ),
-                                            ),
-                                        );
-                                        let mask = CAShapeLayer::new();
-                                        mask.setPath(Some(&path));
-                                        mask.setFillRule(kCAFillRuleEvenOdd);
-                                        layer.setMask(Some(&mask));
-                                    }
-                                    None => layer.setMask(None),
-                                }
+                                layer.setZPosition(CONTAINER_Z);
                             }
                         }
                         if !self.shown {
@@ -285,9 +333,35 @@ mod platform_host {
                     self.shown = true;
                     self.last_content = Some(placement.content);
                     self.last_clip = Some(placement.clip);
-                    self.last_exclude = placement.exclude;
                 }
             }
+        }
+
+        /// Records the chrome rectangles (egui logical points, top-left origin)
+        /// that must pass through to egui when they overlap this page. They are
+        /// converted into the container's superview coordinate space so the
+        /// custom `hitTest:` can compare them against incoming points directly.
+        pub fn set_passthrough_chrome(&self, rects: &[PointRect]) {
+            let Some(parent) = (unsafe { self.container.superview() }) else {
+                return;
+            };
+            let flipped = parent.isFlipped();
+            let parent_height = parent.frame().size.height;
+            let converted = rects
+                .iter()
+                .map(|rect| {
+                    let y = if flipped {
+                        f64::from(rect.min_y)
+                    } else {
+                        parent_height - f64::from(rect.min_y) - f64::from(rect.height)
+                    };
+                    NSRect::new(
+                        NSPoint::new(f64::from(rect.min_x), y),
+                        NSSize::new(f64::from(rect.width), f64::from(rect.height)),
+                    )
+                })
+                .collect();
+            self.container.set_chrome(converted);
         }
 
         /// True when the page asked to leave live mode (Escape inside it).
@@ -317,7 +391,7 @@ mod platform_host {
 #[cfg(not(target_os = "macos"))]
 mod platform_host {
     use super::LiveWebSource;
-    use crate::webview_policy::LiveWebState;
+    use crate::webview_policy::{LiveWebState, PointRect};
 
     /// Live pages are macOS-only until the Windows P3 lands; the constructor
     /// declines and callers fall back to the system browser.
@@ -329,6 +403,8 @@ mod platform_host {
         }
 
         pub fn apply(&mut self, _state: &LiveWebState) {}
+
+        pub fn set_passthrough_chrome(&self, _rects: &[PointRect]) {}
 
         pub fn escape_requested(&mut self) -> bool {
             false

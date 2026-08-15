@@ -74,6 +74,7 @@ use crate::{
     structured_preview::{StructuredPreview, StructuredPreviewCache},
 };
 use crate::{
+    web_hole,
     webview_host::{LiveWebHost, LiveWebSource},
     webview_policy,
 };
@@ -1143,9 +1144,15 @@ pub struct AdamApp {
     /// frame later by the tile painter so the page body shows a normal
     /// cursor instead of the tile drag-grab (the title bar still drags).
     live_web_shown: HashSet<Uuid>,
-    /// The canvas quick-tool bar's screen rect, captured each frame so a live
-    /// page that would reach it crops to its top and leaves it visible.
-    last_quick_bar_rect: Option<Rect>,
+    /// Persistent chrome rects (quick bar, minimap) captured each canvas frame.
+    /// A live page composites BELOW egui, so these draw over it visually; this
+    /// list is handed to each web host so its native `hitTest:` lets clicks on
+    /// those controls fall through to egui instead of the page.
+    chrome_passthrough_rects: Vec<Rect>,
+    /// A reserved paint slot (canvas Background layer, after the tiles, before
+    /// the chrome) that `sync_live_webs` fills with the transparent hole punch
+    /// once the live set is known. The web view shows through only there.
+    web_hole_slot: Option<(Painter, egui::layers::ShapeIdx)>,
     /// Captured each canvas frame: web tiles currently riding a pathway
     /// draw at projected rects the durable geometry cannot follow, so their
     /// pages step aside.
@@ -1262,6 +1269,10 @@ impl AdamApp {
             creation.egui_ctx.set_theme(preference);
         }
         let dots_available = dots::install(creation);
+        // The transparent hole punch shares the wgpu render state; installing it
+        // here (like the dots pipeline) makes the callback resource available
+        // for the whole session. Harmless when there is no wgpu backend.
+        web_hole::install(creation);
         let reduce_motion = platform::reduce_motion_enabled();
         let paths = AppPaths::discover();
         let resume_store_path = paths.root.join("ai-native-sessions.json");
@@ -1496,7 +1507,8 @@ impl AdamApp {
             live_web_page: None,
             live_web_failed: HashSet::new(),
             live_web_shown: HashSet::new(),
-            last_quick_bar_rect: None,
+            chrome_passthrough_rects: Vec::new(),
+            web_hole_slot: None,
             live_web_riding: HashSet::new(),
             snap_to_grid: false,
             preferences,
@@ -4290,6 +4302,12 @@ impl AdamApp {
                         tile_events.push(event);
                     }
                 }
+                // Reserve the transparent hole-punch slot here: after the desk
+                // and every tile (so it cuts through them) but before the
+                // carried preview, note draft, minimap, quick bar and all
+                // overlay Areas (so those composite on top of a live page).
+                // `sync_live_webs` fills it once the live set is known.
+                self.web_hole_slot = Some((painter.clone(), painter.add(egui::Shape::Noop)));
                 self.draw_carried_preview(&context, &painter, camera, view, colors);
                 self.draw_note_draft(&painter, camera, view, colors);
 
@@ -4300,10 +4318,12 @@ impl AdamApp {
                         || event.resize_started.is_some()
                 });
                 let quick_bar_rect = self.show_canvas_quick_bar(&context, view, colors);
-                // Remembered for the live-web pass: a page that reaches the
-                // bottom-center crops to the bar's top instead of painting the
-                // native view over these creation tools.
-                self.last_quick_bar_rect = Some(quick_bar_rect);
+                // The persistent chrome that composites over a live page. Reset
+                // for this frame and record the quick bar; the minimap appends
+                // itself below when it draws. Handed to the web hosts so clicks
+                // on these controls pass through to egui instead of the page.
+                self.chrome_passthrough_rects.clear();
+                self.chrome_passthrough_rects.push(quick_bar_rect);
                 let quick_tool_consumed = self.handle_canvas_quick_tool_click(
                     &context,
                     &canvas_response,
@@ -4339,7 +4359,11 @@ impl AdamApp {
                 );
                 self.draw_marquee(&painter, camera, view, colors);
                 self.show_note_editor(ui, &context, camera, view, colors, &projected_rect_by_tile);
-                self.draw_minimap(&painter, view, camera, colors, &projected_rects);
+                if let Some(minimap_rect) =
+                    self.draw_minimap(&painter, view, camera, colors, &projected_rects)
+                {
+                    self.chrome_passthrough_rects.push(minimap_rect);
+                }
                 self.show_canvas_status(ui, view, colors);
                 self.show_drop_overlay(&context, &painter, view, colors);
 
@@ -11715,6 +11739,9 @@ impl AdamApp {
         );
     }
 
+    /// Draws the minimap when the page is much larger than the viewport, and
+    /// returns its footprint (background plate included) so the live-web pass
+    /// can let clicks on it fall through the page. `None` when not drawn.
     fn draw_minimap(
         &self,
         painter: &Painter,
@@ -11722,13 +11749,13 @@ impl AdamApp {
         camera: Camera,
         colors: Theme,
         projected_rects: &[WorldRect],
-    ) {
+    ) -> Option<Rect> {
         let page = self.workspace.active_page();
         let page_screen_size = vec2(page.size[0], page.size[1]) * camera.zoom;
         let substantially_larger =
             page_screen_size.x > view.width() * 1.45 || page_screen_size.y > view.height() * 1.45;
         if !substantially_larger && camera.zoom >= 0.45 {
-            return;
+            return None;
         }
 
         let maximum = vec2(176.0, 116.0);
@@ -11786,6 +11813,7 @@ impl AdamApp {
                 StrokeKind::Inside,
             );
         }
+        Some(map.expand(7.0))
     }
 
     fn show_page_delete_confirmation(&mut self, context: &Context) {
@@ -12843,46 +12871,18 @@ impl AdamApp {
             || egui::Popup::is_any_open(context)
     }
 
-    /// True when the page rectangle would cover transient canvas chrome the
-    /// native view cannot be layered under: an active toast or the pathway
-    /// problem banner. Both are brief and important, so a page that would
-    /// cover one steps aside until it clears.
-    ///
-    /// The minimap is deliberately NOT a row. It is persistent, not transient,
-    /// so hiding the whole page whenever it drifted into the bottom-right
-    /// corner blanked the page exactly when zoomed in — the page just draws
-    /// over it instead, and the minimap returns the moment the page shrinks
-    /// off the corner. The quick bar is out for the same "the page is the
-    /// point" reason; Escape always brings the tools back.
-    fn transient_chrome_overlap(&self, page_rect: Rect, _view: Rect, context: &Context) -> bool {
-        let screen = context.content_rect();
-        let mut chrome: [Option<Rect>; 2] = [None, None];
-        if self.toast.is_some() {
-            chrome[0] = Some(Rect::from_min_size(
-                pos2(screen.center().x - 280.0, screen.max.y - 96.0),
-                vec2(560.0, 72.0),
-            ));
-        }
-        if self.pathway_runtime_problem.is_some()
-            || self.pathway_persistence_problem.is_some()
-            || !self.pathway_reconcile_report.problems.is_empty()
-        {
-            chrome[1] = Some(Rect::from_min_size(
-                pos2(screen.center().x - 330.0, TOOLBAR_HEIGHT + 6.0),
-                vec2(660.0, 64.0),
-            ));
-        }
-        chrome
-            .into_iter()
-            .flatten()
-            .any(|rect| rect.intersects(page_rect))
-    }
-
     /// Reconciles the auto-live pages against the canvas, once per frame:
     /// every eligible web tile on the active page gets a live session, the
     /// biggest on screen first, capped at [`MAX_LIVE_WEB_PAGES`]. Sessions
-    /// whose tiles are gone are destroyed; transient hides (modals, grid
-    /// view, chrome overlap) keep the session so page state survives.
+    /// whose tiles are gone are destroyed; transient hides (modals, grid view)
+    /// keep the session so page state survives.
+    ///
+    /// Under the two-layer design chrome no longer forces a hide: the page
+    /// composites below egui, so toasts, banners, the quick bar and the minimap
+    /// simply draw over it. This pass also (a) collects the visible page clip
+    /// rects and fills the reserved [`Self::web_hole_slot`] with the transparent
+    /// hole punch, and (b) hands each host the persistent chrome rects so those
+    /// controls stay clickable through the page.
     fn sync_live_webs(&mut self, context: &Context, frame: &eframe::Frame) {
         if !live_web_supported() {
             return;
@@ -12943,13 +12943,11 @@ impl AdamApp {
                         .assignment(tile.id, tag_id)
                         .is_none()
                 }),
-                chrome_overlap: self.transient_chrome_overlap(page_rect, view, context),
                 editing_note,
                 viewport_visible,
                 viewport_focused,
                 camera_zoom: camera.zoom,
                 natural_size: (natural.x, natural.y),
-                quick_bar_rect: self.last_quick_bar_rect.map(to_point_rect),
             };
             desired.push(Desired {
                 tile_id: tile.id,
@@ -13017,8 +13015,19 @@ impl AdamApp {
             }
         }
 
-        // Apply each session's state; over-cap eligible pages hide.
+        // The persistent chrome that draws over the page, in policy space, so
+        // each host can pass clicks on it through to egui.
+        let passthrough: Vec<webview_policy::PointRect> = self
+            .chrome_passthrough_rects
+            .iter()
+            .copied()
+            .map(to_point_rect)
+            .collect();
+
+        // Apply each session's state; over-cap eligible pages hide. Collect the
+        // visible clip rects to punch out of the opaque surface.
         self.live_web_shown.clear();
+        let mut holes: Vec<Rect> = Vec::new();
         for session in &mut self.live_web {
             let state = desired
                 .iter()
@@ -13031,14 +13040,30 @@ impl AdamApp {
                     }
                 })
                 .unwrap_or(webview_policy::LiveWebState::Hidden);
-            if matches!(state, webview_policy::LiveWebState::Visible(_)) {
+            if let webview_policy::LiveWebState::Visible(placement) = state {
                 self.live_web_shown.insert(session.tile_id);
+                holes.push(Rect::from_min_size(
+                    pos2(placement.clip.min_x, placement.clip.min_y),
+                    vec2(placement.clip.width, placement.clip.height),
+                ));
             }
+            session.host.set_passthrough_chrome(&passthrough);
             session.host.apply(&state);
             if session.host.escape_requested() {
                 // Escape inside a page hands the keyboard back to the canvas;
                 // the page itself stays live.
                 session.host.release_focus();
+            }
+        }
+
+        // Fill the reserved canvas slot: cut the surface transparent at each
+        // live page so the web view composited beneath shows through, or leave
+        // it opaque (Noop) when nothing is live.
+        if let Some((painter, slot)) = self.web_hole_slot.take() {
+            if holes.is_empty() {
+                painter.set(slot, egui::Shape::Noop);
+            } else {
+                painter.set(slot, web_hole::paint_callback(view, holes));
             }
         }
     }
@@ -13358,6 +13383,15 @@ impl eframe::App for AdamApp {
 
     fn auto_save_interval(&self) -> Duration {
         Duration::from_secs(3_600)
+    }
+
+    /// Fully transparent so the two-layer live web tile works: the surface
+    /// starts see-through each frame, Adam repaints an opaque desk + chrome over
+    /// all of it, and the [`web_hole`] callback re-clears alpha to zero only at
+    /// each live page's rect, where the WKWebView composited beneath shows
+    /// through. With no live page the whole window is opaque as before.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0, 0.0, 0.0, 0.0]
     }
 }
 

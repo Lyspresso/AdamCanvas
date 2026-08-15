@@ -41,6 +41,7 @@ pub mod sheet_view;
 pub mod spatial;
 pub mod spreadsheet;
 pub mod structured_preview;
+pub mod web_hole;
 pub mod webview_host;
 pub mod webview_policy;
 pub(crate) mod xai_responses;

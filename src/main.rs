@@ -24,7 +24,13 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Adam")
             .with_inner_size([1380.0, 860.0])
-            .with_min_inner_size([900.0, 600.0]),
+            .with_min_inner_size([900.0, 600.0])
+            // Two-layer live web tiles: the window surface must be able to go
+            // transparent so Adam can punch a hole exactly at each live page's
+            // rect and let the WKWebView (composited below the egui Metal layer)
+            // show through. Everywhere else Adam paints an opaque desk, so the
+            // desktop is never visible. See `webview_host` / `web_hole`.
+            .with_transparent(true),
         ..Default::default()
     };
 
