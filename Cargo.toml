@@ -71,6 +71,7 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "CGColorSpace",
     "CGContext",
     "CGImage",
+    "CGPath",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
@@ -102,7 +103,11 @@ winit = { version = "0.30", default-features = false }
 objc2-quartz-core = { version = "0.3", default-features = false, features = [
     "std",
     "CALayer",
+    "CAShapeLayer",
     "CATransaction",
+    "CATransform3D",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
 ] }
 wry = { version = "0.55", default-features = false, features = ["os-webview", "protocol"] }
 

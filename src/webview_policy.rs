@@ -7,19 +7,16 @@
 //! testably: may the page be visible at all, and if so, exactly which
 //! physical pixels does it own and at what scale.
 //!
-//! The rules encode what the P0 spike measured (2026-08-03, Lydia driving):
+//! The rules encode what the P0 spike measured (2026-08-03, Lydia driving),
+//! amended after the zoom rework (2026-08-14):
 //! - The page tracks the camera continuously; there is NO hide-on-motion.
-//! - One camera: the page's zoom is chained to the canvas zoom. Native page
-//!   zoom adjusts the layout viewport (media queries keep seeing the tile's
-//!   world size — no phone-layout flips) but WebKit floors it near 0.5, so
-//!   below the floor a raster transform carries the residual.
-//! - During a zoom gesture the native zoom holds still and the cheap raster
-//!   residual tracks every frame; the crisp native re-raster lands once the
-//!   camera settles.
-
-/// WebKit silently refuses page zooms much below one half; measured in the
-/// P0 spike (both the native API and CSS `zoom` pin there).
-pub const NATIVE_ZOOM_FLOOR: f64 = 0.5;
+//! - Stable like a picture: the document lays out exactly ONCE at the tile's
+//!   camera-independent world size (`natural`) with WebKit page zoom pinned at
+//!   1.0. @media therefore keys off a constant width and can never re-fire on
+//!   zoom — no phone-layout flips, no reflow. The whole canvas zoom is carried
+//!   as a single uniform compositor scale the host applies to its OWN
+//!   container layer, so it is pure GPU magnification, floor-free, and immune
+//!   to WebKit's ~0.5 page-zoom floor.
 
 /// Below this on-screen size the page rectangle is degenerate; the painted
 /// preview reads better than a sliver of live browser.
@@ -107,10 +104,15 @@ pub struct LiveWebInputs {
     pub viewport_visible: bool,
     pub viewport_focused: bool,
     pub camera_zoom: f32,
-    /// The camera has been still long enough for a crisp re-raster.
-    pub zoom_settled: bool,
-    /// The native page zoom currently applied to the webview.
-    pub native_zoom_applied: f64,
+    /// The tile's page-content size in WORLD points (camera-independent),
+    /// evaluated at zoom 1. This becomes the WKWebView's fixed frame, so the
+    /// document lays out exactly once and @media keys off a constant width no
+    /// matter how the canvas is zoomed.
+    pub natural_size: (f32, f32),
+    /// The canvas quick-tool bar's screen rect, if shown. A page that would
+    /// reach it crops its visible area to the bar's top edge instead of
+    /// painting the native view over these persistent controls.
+    pub quick_bar_rect: Option<PointRect>,
 }
 
 /// The exact placement the impure shell must apply, in logical points.
@@ -123,15 +125,17 @@ pub struct LiveWebInputs {
 pub struct LiveWebPlacement {
     pub content: PointRect,
     pub clip: PointRect,
-    /// The native page zoom that should be applied (only changes when
-    /// `commit_native`).
-    pub native_zoom: f64,
-    /// The raster residual so frame × content always equals the camera:
-    /// `native_zoom * residual_scale == camera_zoom` (up to the floor).
-    pub residual_scale: f64,
-    /// True when the camera has settled on a value the native zoom has not
-    /// caught up with: apply `native_zoom` now (one crisp re-raster).
-    pub commit_native: bool,
+    /// The camera-invariant world layout size = the WKWebView's frame size.
+    /// The page lays out once at this size; zoom never touches it.
+    pub natural: (f64, f64),
+    /// The uniform "cover" scale the container applies as a compositor
+    /// transform — pure GPU magnification, invisible to layout and @media.
+    /// Exactly 1.0 when the canvas is at 100%.
+    pub scale: f64,
+    /// A screen-space rectangle punched OUT of the page so a persistent
+    /// control underneath (the quick-tool bar) stays visible without hiding
+    /// or cropping the whole page. `None` when nothing overlaps it.
+    pub exclude: Option<PointRect>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -174,27 +178,35 @@ pub fn desired_state(inputs: &LiveWebInputs) -> LiveWebState {
         return LiveWebState::Hidden;
     }
 
-    let camera = f64::from(inputs.camera_zoom);
-    let applied = if inputs.native_zoom_applied.is_finite() && inputs.native_zoom_applied > 0.0 {
-        inputs.native_zoom_applied
-    } else {
-        1.0
-    };
-    let (native_zoom, commit_native) = if inputs.zoom_settled {
-        let target = camera.max(NATIVE_ZOOM_FLOOR);
-        (target, (target - applied).abs() > 0.000_5)
-    } else {
-        // Mid-gesture the native zoom holds still; the residual tracks.
-        (applied, false)
-    };
-    let residual_scale = camera / native_zoom;
+    // Keep the persistent quick-tool bar on top by punching its footprint out
+    // of the page — a small notch exactly where the bar sits, not a full-width
+    // crop and never a whole-page hide. Only the part of the bar that actually
+    // overlaps the visible page is excluded.
+    let exclude = inputs.quick_bar_rect.and_then(|bar| {
+        let hole = bar.rounded().intersection(&clip);
+        (hole.width >= 1.0 && hole.height >= 1.0).then_some(hole)
+    });
+
+    let nat_w = f64::from(inputs.natural_size.0).round();
+    let nat_h = f64::from(inputs.natural_size.1).round();
+    if !nat_w.is_finite() || !nat_h.is_finite() || nat_w < 1.0 || nat_h < 1.0 {
+        return LiveWebState::Hidden;
+    }
+    // Uniform aspect-fill ("cover"): the larger of the two axis ratios, so the
+    // page always fully covers the painted content rect. The small overshoot
+    // on the other axis is cropped by the container mask — never a per-axis
+    // scale, so the page can never stretch, only crop a hair at extreme zoom.
+    let scale = (f64::from(content.width) / nat_w).max(f64::from(content.height) / nat_h);
+    if !scale.is_finite() || scale <= 0.0 {
+        return LiveWebState::Hidden;
+    }
 
     LiveWebState::Visible(LiveWebPlacement {
         content,
         clip,
-        native_zoom,
-        residual_scale,
-        commit_native,
+        natural: (nat_w, nat_h),
+        scale,
+        exclude,
     })
 }
 
@@ -218,8 +230,10 @@ mod tests {
             viewport_visible: true,
             viewport_focused: true,
             camera_zoom: 1.0,
-            zoom_settled: true,
-            native_zoom_applied: 1.0,
+            // Matches the 400×300 page_rect above, so the base case sits at
+            // 100% and scale == 1.
+            natural_size: (400.0, 300.0),
+            quick_bar_rect: None,
         }
     }
 
@@ -240,9 +254,8 @@ mod tests {
             PointRect::new(300.0, 200.0, 400.0, 300.0)
         );
         assert_eq!(placement.clip, placement.content);
-        assert_eq!(placement.native_zoom, 1.0);
-        assert_eq!(placement.residual_scale, 1.0);
-        assert!(!placement.commit_native);
+        assert_eq!(placement.natural, (400.0, 300.0));
+        assert_eq!(placement.scale, 1.0);
     }
 
     #[test]
@@ -327,55 +340,94 @@ mod tests {
     }
 
     #[test]
-    fn settled_zoom_above_the_floor_is_all_native_no_residual() {
+    fn scale_is_a_cover_fit_of_content_over_the_natural_size() {
+        // A 400×300 natural page shown in an 800×600 content rect covers at 2×.
         let mut inputs = base_inputs();
-        inputs.camera_zoom = 1.8;
-        inputs.native_zoom_applied = 1.0;
+        inputs.page_rect = Some(PointRect::new(300.0, 200.0, 800.0, 600.0));
+        inputs.canvas_rect = PointRect::new(0.0, 0.0, 4000.0, 4000.0);
         let LiveWebState::Visible(placement) = desired_state(&inputs) else {
             panic!("expected visible");
         };
-        assert!((placement.native_zoom - 1.8).abs() < 1e-6);
-        assert!((placement.residual_scale - 1.0).abs() < 1e-9);
-        assert!(placement.commit_native);
+        assert_eq!(placement.natural, (400.0, 300.0));
+        assert!((placement.scale - 2.0).abs() < 1e-9);
     }
 
     #[test]
-    fn settled_zoom_below_the_floor_splits_native_and_residual() {
+    fn mismatched_aspect_covers_on_the_larger_ratio() {
+        // Natural 400×300 (4:3) into a 400×600 content rect: cover takes the
+        // taller ratio (2.0), never the wider one, so the page can only crop.
         let mut inputs = base_inputs();
-        inputs.camera_zoom = 0.1;
-        inputs.native_zoom_applied = 1.0;
-        inputs.page_rect = Some(PointRect::new(300.0, 200.0, 56.0, 40.0));
+        inputs.page_rect = Some(PointRect::new(300.0, 200.0, 400.0, 600.0));
+        inputs.canvas_rect = PointRect::new(0.0, 0.0, 4000.0, 4000.0);
         let LiveWebState::Visible(placement) = desired_state(&inputs) else {
             panic!("expected visible");
         };
-        assert_eq!(placement.native_zoom, NATIVE_ZOOM_FLOOR);
-        let camera = placement.native_zoom * placement.residual_scale;
-        assert!((camera - 0.1).abs() < 1e-6, "frame x content == camera");
-        assert!(placement.commit_native);
+        assert!((placement.scale - 2.0).abs() < 1e-9);
     }
 
     #[test]
-    fn mid_gesture_the_native_zoom_holds_and_the_residual_tracks() {
+    fn a_page_over_the_quick_bar_punches_a_notch_not_a_crop() {
+        // Page fills the canvas; the quick bar sits near the bottom-center.
         let mut inputs = base_inputs();
-        inputs.camera_zoom = 1.3;
-        inputs.native_zoom_applied = 1.0;
-        inputs.zoom_settled = false;
+        inputs.page_rect = Some(PointRect::new(240.0, 40.0, 1200.0, 800.0));
+        inputs.quick_bar_rect = Some(PointRect::new(700.0, 760.0, 300.0, 60.0));
         let LiveWebState::Visible(placement) = desired_state(&inputs) else {
-            panic!("expected visible");
+            panic!("expected visible, not hidden");
         };
-        assert_eq!(placement.native_zoom, 1.0, "no re-raster mid-gesture");
-        assert!((placement.residual_scale - 1.3).abs() < 1e-6);
-        assert!(!placement.commit_native);
+        // The page keeps its FULL visible area — nothing cropped.
+        assert_eq!(placement.clip, PointRect::new(240.0, 40.0, 1200.0, 800.0));
+        // Only the bar's footprint is punched out.
+        assert_eq!(placement.exclude, Some(PointRect::new(700.0, 760.0, 300.0, 60.0)));
     }
 
     #[test]
-    fn a_settled_camera_already_matching_the_native_zoom_commits_nothing() {
+    fn the_notch_is_only_the_part_of_the_bar_over_the_page() {
+        // The bar pokes past the page's right edge; only the overlap is cut.
         let mut inputs = base_inputs();
-        inputs.camera_zoom = 1.8;
-        inputs.native_zoom_applied = 1.8;
+        inputs.page_rect = Some(PointRect::new(240.0, 40.0, 800.0, 800.0));
+        inputs.quick_bar_rect = Some(PointRect::new(900.0, 760.0, 300.0, 60.0));
         let LiveWebState::Visible(placement) = desired_state(&inputs) else {
             panic!("expected visible");
         };
-        assert!(!placement.commit_native, "no redundant re-raster at rest");
+        // Page right edge = 1040; bar spans 900..1200 → hole is 900..1040.
+        assert_eq!(placement.exclude, Some(PointRect::new(900.0, 760.0, 140.0, 60.0)));
+    }
+
+    #[test]
+    fn a_page_that_misses_the_quick_bar_has_no_notch() {
+        // The page sits on the left; the centered bar never overlaps it.
+        let mut inputs = base_inputs();
+        inputs.page_rect = Some(PointRect::new(240.0, 40.0, 300.0, 800.0));
+        inputs.quick_bar_rect = Some(PointRect::new(900.0, 760.0, 300.0, 60.0));
+        let LiveWebState::Visible(placement) = desired_state(&inputs) else {
+            panic!("expected visible");
+        };
+        assert_eq!(placement.clip.height, 800.0, "page keeps its full height");
+        assert_eq!(placement.exclude, None, "no notch when the bar is elsewhere");
+    }
+
+    #[test]
+    fn the_natural_size_is_camera_invariant_across_zoom() {
+        // The whole point of the rework: whatever the on-screen page size, the
+        // layout size the WKWebView is framed at never moves — only scale does.
+        let sizes = [
+            PointRect::new(300.0, 200.0, 40.0, 30.0),
+            PointRect::new(300.0, 200.0, 400.0, 300.0),
+            PointRect::new(0.0, 0.0, 3200.0, 2400.0),
+        ];
+        let mut naturals = Vec::new();
+        for rect in sizes {
+            let mut inputs = base_inputs();
+            inputs.page_rect = Some(rect);
+            inputs.canvas_rect = PointRect::new(0.0, 0.0, 4000.0, 4000.0);
+            let LiveWebState::Visible(placement) = desired_state(&inputs) else {
+                panic!("expected visible");
+            };
+            naturals.push(placement.natural);
+        }
+        assert!(
+            naturals.iter().all(|n| *n == (400.0, 300.0)),
+            "natural layout size must not move with zoom: {naturals:?}"
+        );
     }
 }

@@ -1139,8 +1139,13 @@ pub struct AdamApp {
     /// Tiles whose host creation failed; not retried until a page switch so
     /// a persistent failure cannot spam a create attempt per frame.
     live_web_failed: HashSet<Uuid>,
-    live_web_last_zoom: f32,
-    live_web_zoom_motion: Option<Instant>,
+    /// Tiles whose native page is live and on-screen right now. Read one
+    /// frame later by the tile painter so the page body shows a normal
+    /// cursor instead of the tile drag-grab (the title bar still drags).
+    live_web_shown: HashSet<Uuid>,
+    /// The canvas quick-tool bar's screen rect, captured each frame so a live
+    /// page that would reach it crops to its top and leaves it visible.
+    last_quick_bar_rect: Option<Rect>,
     /// Captured each canvas frame: web tiles currently riding a pathway
     /// draw at projected rects the durable geometry cannot follow, so their
     /// pages step aside.
@@ -1490,8 +1495,8 @@ impl AdamApp {
             live_web: Vec::new(),
             live_web_page: None,
             live_web_failed: HashSet::new(),
-            live_web_last_zoom: 1.0,
-            live_web_zoom_motion: None,
+            live_web_shown: HashSet::new(),
+            last_quick_bar_rect: None,
             live_web_riding: HashSet::new(),
             snap_to_grid: false,
             preferences,
@@ -4275,6 +4280,7 @@ impl AdamApp {
                             ai_preview,
                             pile_member_count,
                             pile_controls_enabled,
+                            self.live_web_shown.contains(&tile.id),
                             previews,
                             structured_previews,
                             sheet_snapshots.get(&tile.id),
@@ -4294,6 +4300,10 @@ impl AdamApp {
                         || event.resize_started.is_some()
                 });
                 let quick_bar_rect = self.show_canvas_quick_bar(&context, view, colors);
+                // Remembered for the live-web pass: a page that reaches the
+                // bottom-center crops to the bar's top instead of painting the
+                // native view over these creation tools.
+                self.last_quick_bar_rect = Some(quick_bar_rect);
                 let quick_tool_consumed = self.handle_canvas_quick_tool_click(
                     &context,
                     &canvas_response,
@@ -12834,13 +12844,19 @@ impl AdamApp {
     }
 
     /// True when the page rectangle would cover transient canvas chrome the
-    /// native view cannot be layered under: an active toast, the pathway
-    /// problem banner, or the minimap. The quick bar is deliberately NOT a
-    /// row — a viewport-filling live page is the point of live mode, and
-    /// Escape always brings the tools back.
-    fn transient_chrome_overlap(&self, page_rect: Rect, view: Rect, context: &Context) -> bool {
+    /// native view cannot be layered under: an active toast or the pathway
+    /// problem banner. Both are brief and important, so a page that would
+    /// cover one steps aside until it clears.
+    ///
+    /// The minimap is deliberately NOT a row. It is persistent, not transient,
+    /// so hiding the whole page whenever it drifted into the bottom-right
+    /// corner blanked the page exactly when zoomed in — the page just draws
+    /// over it instead, and the minimap returns the moment the page shrinks
+    /// off the corner. The quick bar is out for the same "the page is the
+    /// point" reason; Escape always brings the tools back.
+    fn transient_chrome_overlap(&self, page_rect: Rect, _view: Rect, context: &Context) -> bool {
         let screen = context.content_rect();
-        let mut chrome: [Option<Rect>; 3] = [None, None, None];
+        let mut chrome: [Option<Rect>; 2] = [None, None];
         if self.toast.is_some() {
             chrome[0] = Some(Rect::from_min_size(
                 pos2(screen.center().x - 280.0, screen.max.y - 96.0),
@@ -12854,18 +12870,6 @@ impl AdamApp {
             chrome[1] = Some(Rect::from_min_size(
                 pos2(screen.center().x - 330.0, TOOLBAR_HEIGHT + 6.0),
                 vec2(660.0, 64.0),
-            ));
-        }
-        let page = self.workspace.active_page();
-        let camera = self.active_camera();
-        let page_screen = vec2(page.size[0], page.size[1]) * camera.zoom;
-        let minimap_shown = page_screen.x > view.width() * 1.45
-            || page_screen.y > view.height() * 1.45
-            || camera.zoom < 0.45;
-        if minimap_shown {
-            chrome[2] = Some(Rect::from_min_size(
-                pos2(view.max.x - 212.0, view.max.y - 152.0),
-                vec2(205.0, 145.0),
             ));
         }
         chrome
@@ -12891,13 +12895,6 @@ impl AdamApp {
             return;
         };
         let camera = self.active_camera();
-        if (camera.zoom - self.live_web_last_zoom).abs() > 0.000_1 {
-            self.live_web_last_zoom = camera.zoom;
-            self.live_web_zoom_motion = Some(Instant::now());
-        }
-        let zoom_settled = self
-            .live_web_zoom_motion
-            .map_or(true, |at| at.elapsed() >= Duration::from_millis(120));
 
         // The shared predicate rows, computed once.
         let canvas_is_front =
@@ -12929,12 +12926,7 @@ impl AdamApp {
                 continue;
             };
             let page_rect = website_page_rect(camera.screen_rect(tile.rect, view), camera.zoom);
-            let native_applied = self
-                .live_web
-                .iter()
-                .find(|session| session.tile_id == tile.id)
-                .map(|session| session.host.native_zoom_applied())
-                .unwrap_or(1.0);
+            let natural = website_page_world_size(tile.rect);
             let inputs = webview_policy::LiveWebInputs {
                 tile_on_active_page: true,
                 canvas_is_front,
@@ -12956,8 +12948,8 @@ impl AdamApp {
                 viewport_visible,
                 viewport_focused,
                 camera_zoom: camera.zoom,
-                zoom_settled,
-                native_zoom_applied: native_applied,
+                natural_size: (natural.x, natural.y),
+                quick_bar_rect: self.last_quick_bar_rect.map(to_point_rect),
             };
             desired.push(Desired {
                 tile_id: tile.id,
@@ -13026,6 +13018,7 @@ impl AdamApp {
         }
 
         // Apply each session's state; over-cap eligible pages hide.
+        self.live_web_shown.clear();
         for session in &mut self.live_web {
             let state = desired
                 .iter()
@@ -13038,16 +13031,15 @@ impl AdamApp {
                     }
                 })
                 .unwrap_or(webview_policy::LiveWebState::Hidden);
+            if matches!(state, webview_policy::LiveWebState::Visible(_)) {
+                self.live_web_shown.insert(session.tile_id);
+            }
             session.host.apply(&state);
             if session.host.escape_requested() {
                 // Escape inside a page hands the keyboard back to the canvas;
                 // the page itself stays live.
                 session.host.release_focus();
             }
-        }
-        if !zoom_settled {
-            // Keep frames coming until the crisp settle re-raster lands.
-            context.request_repaint_after(Duration::from_millis(120));
         }
     }
 
@@ -13220,6 +13212,15 @@ fn website_page_rect(screen_rect: Rect, zoom: f32) -> Rect {
         ),
         browser.max,
     )
+}
+
+/// The page-content size in WORLD points: `website_page_rect` evaluated at
+/// zoom 1 on the tile's own size. Camera-independent (world units equal
+/// screen points at zoom 1), so it is the fixed CSS width the live WKWebView
+/// lays out at — the whole reason @media never re-fires when the canvas zooms.
+fn website_page_world_size(tile_rect: WorldRect) -> Vec2 {
+    let [w, h] = tile_rect.size();
+    website_page_rect(Rect::from_min_size(pos2(0.0, 0.0), vec2(w, h)), 1.0).size()
 }
 
 impl eframe::App for AdamApp {
@@ -13499,6 +13500,7 @@ fn draw_tile(
     ai_preview: Option<&AiTilePreview>,
     pile_member_count: usize,
     pile_controls_enabled: bool,
+    live_web_active: bool,
     previews: &mut PreviewCache,
     structured_previews: &mut StructuredPreviewCache,
     live_sheet: Option<&(spreadsheet::Sheet, SheetFonts)>,
@@ -13529,7 +13531,12 @@ fn draw_tile(
         interaction_sense,
     );
     if !is_pile || pile_controls_enabled {
-        if !(is_free_text && editing) {
+        // Over a live web tile's page area the native view owns the pointer,
+        // so the tile drag-grab cursor is wrong there — only the chrome (the
+        // title bar strip above the page) should read as draggable.
+        let over_live_page = live_web_active
+            && ui.rect_contains_pointer(website_page_rect(screen_rect, camera.zoom));
+        if !(is_free_text && editing) && !over_live_page {
             response = response.on_hover_cursor(CursorIcon::Grab);
         }
         event.clicked = response.clicked();
