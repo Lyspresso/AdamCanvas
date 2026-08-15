@@ -96,9 +96,6 @@ pub struct LiveWebInputs {
     pub tile_riding: bool,
     /// The active tag filter dims this tile; a live page cannot be dimmed.
     pub tile_filtered_out: bool,
-    /// The page rect would cover active transient chrome (toast, problem
-    /// banner, minimap) that egui cannot draw over a native view.
-    pub chrome_overlap: bool,
     /// The inline note editor is open (it is an overlay in the same space).
     pub editing_note: bool,
     pub viewport_visible: bool,
@@ -109,10 +106,6 @@ pub struct LiveWebInputs {
     /// document lays out exactly once and @media keys off a constant width no
     /// matter how the canvas is zoomed.
     pub natural_size: (f32, f32),
-    /// The canvas quick-tool bar's screen rect, if shown. A page that would
-    /// reach it crops its visible area to the bar's top edge instead of
-    /// painting the native view over these persistent controls.
-    pub quick_bar_rect: Option<PointRect>,
 }
 
 /// The exact placement the impure shell must apply, in logical points.
@@ -132,10 +125,6 @@ pub struct LiveWebPlacement {
     /// transform — pure GPU magnification, invisible to layout and @media.
     /// Exactly 1.0 when the canvas is at 100%.
     pub scale: f64,
-    /// A screen-space rectangle punched OUT of the page so a persistent
-    /// control underneath (the quick-tool bar) stays visible without hiding
-    /// or cropping the whole page. `None` when nothing overlaps it.
-    pub exclude: Option<PointRect>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -152,7 +141,6 @@ pub fn desired_state(inputs: &LiveWebInputs) -> LiveWebState {
         || inputs.marquee_active
         || inputs.tile_riding
         || inputs.tile_filtered_out
-        || inputs.chrome_overlap
         || inputs.editing_note
         || !inputs.viewport_visible
         || !inputs.viewport_focused
@@ -178,15 +166,6 @@ pub fn desired_state(inputs: &LiveWebInputs) -> LiveWebState {
         return LiveWebState::Hidden;
     }
 
-    // Keep the persistent quick-tool bar on top by punching its footprint out
-    // of the page — a small notch exactly where the bar sits, not a full-width
-    // crop and never a whole-page hide. Only the part of the bar that actually
-    // overlaps the visible page is excluded.
-    let exclude = inputs.quick_bar_rect.and_then(|bar| {
-        let hole = bar.rounded().intersection(&clip);
-        (hole.width >= 1.0 && hole.height >= 1.0).then_some(hole)
-    });
-
     let nat_w = f64::from(inputs.natural_size.0).round();
     let nat_h = f64::from(inputs.natural_size.1).round();
     if !nat_w.is_finite() || !nat_h.is_finite() || nat_w < 1.0 || nat_h < 1.0 {
@@ -206,7 +185,6 @@ pub fn desired_state(inputs: &LiveWebInputs) -> LiveWebState {
         clip,
         natural: (nat_w, nat_h),
         scale,
-        exclude,
     })
 }
 
@@ -225,7 +203,6 @@ mod tests {
             marquee_active: false,
             tile_riding: false,
             tile_filtered_out: false,
-            chrome_overlap: false,
             editing_note: false,
             viewport_visible: true,
             viewport_focused: true,
@@ -233,7 +210,6 @@ mod tests {
             // Matches the 400×300 page_rect above, so the base case sits at
             // 100% and scale == 1.
             natural_size: (400.0, 300.0),
-            quick_bar_rect: None,
         }
     }
 
@@ -298,7 +274,6 @@ mod tests {
         expect_hidden(|inputs| inputs.marquee_active = true);
         expect_hidden(|inputs| inputs.tile_riding = true);
         expect_hidden(|inputs| inputs.tile_filtered_out = true);
-        expect_hidden(|inputs| inputs.chrome_overlap = true);
         expect_hidden(|inputs| inputs.editing_note = true);
         expect_hidden(|inputs| inputs.viewport_visible = false);
         expect_hidden(|inputs| inputs.viewport_focused = false);
@@ -365,46 +340,11 @@ mod tests {
         assert!((placement.scale - 2.0).abs() < 1e-9);
     }
 
-    #[test]
-    fn a_page_over_the_quick_bar_punches_a_notch_not_a_crop() {
-        // Page fills the canvas; the quick bar sits near the bottom-center.
-        let mut inputs = base_inputs();
-        inputs.page_rect = Some(PointRect::new(240.0, 40.0, 1200.0, 800.0));
-        inputs.quick_bar_rect = Some(PointRect::new(700.0, 760.0, 300.0, 60.0));
-        let LiveWebState::Visible(placement) = desired_state(&inputs) else {
-            panic!("expected visible, not hidden");
-        };
-        // The page keeps its FULL visible area — nothing cropped.
-        assert_eq!(placement.clip, PointRect::new(240.0, 40.0, 1200.0, 800.0));
-        // Only the bar's footprint is punched out.
-        assert_eq!(placement.exclude, Some(PointRect::new(700.0, 760.0, 300.0, 60.0)));
-    }
-
-    #[test]
-    fn the_notch_is_only_the_part_of_the_bar_over_the_page() {
-        // The bar pokes past the page's right edge; only the overlap is cut.
-        let mut inputs = base_inputs();
-        inputs.page_rect = Some(PointRect::new(240.0, 40.0, 800.0, 800.0));
-        inputs.quick_bar_rect = Some(PointRect::new(900.0, 760.0, 300.0, 60.0));
-        let LiveWebState::Visible(placement) = desired_state(&inputs) else {
-            panic!("expected visible");
-        };
-        // Page right edge = 1040; bar spans 900..1200 → hole is 900..1040.
-        assert_eq!(placement.exclude, Some(PointRect::new(900.0, 760.0, 140.0, 60.0)));
-    }
-
-    #[test]
-    fn a_page_that_misses_the_quick_bar_has_no_notch() {
-        // The page sits on the left; the centered bar never overlaps it.
-        let mut inputs = base_inputs();
-        inputs.page_rect = Some(PointRect::new(240.0, 40.0, 300.0, 800.0));
-        inputs.quick_bar_rect = Some(PointRect::new(900.0, 760.0, 300.0, 60.0));
-        let LiveWebState::Visible(placement) = desired_state(&inputs) else {
-            panic!("expected visible");
-        };
-        assert_eq!(placement.clip.height, 800.0, "page keeps its full height");
-        assert_eq!(placement.exclude, None, "no notch when the bar is elsewhere");
-    }
+    // NOTE: the old "quick-bar notch" tests were deleted with the notch: under
+    // the native-chrome-on-top architecture the page keeps its full rect and the
+    // quick bar / minimap are rebuilt as native AppKit overlays ABOVE the web
+    // view rather than punched out of it. The placement therefore no longer
+    // carries an `exclude` region, and the policy no longer sees the bar rect.
 
     #[test]
     fn the_natural_size_is_camera_invariant_across_zoom() {

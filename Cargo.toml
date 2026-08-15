@@ -56,6 +56,12 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSWorkspace",
     "NSResponder",
     "NSView",
+    # Native chrome overlays that sit ABOVE the live WKWebView: NSEvent for
+    # the quick-bar view's mouseDown hit-testing, NSGraphics for
+    # `addSubview:positioned:relativeTo:` (NSWindowOrderingMode) so the
+    # overlays can be raised front-most over the web containers.
+    "NSEvent",
+    "NSGraphics",
     "objc2-quartz-core",
 ] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
@@ -68,6 +74,8 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "std",
     "CGBitmapContext",
+    # CGColor drives the native chrome overlays' layer fills/borders/text.
+    "CGColor",
     "CGColorSpace",
     "CGContext",
     "CGImage",
@@ -104,6 +112,8 @@ objc2-quartz-core = { version = "0.3", default-features = false, features = [
     "std",
     "CALayer",
     "CAShapeLayer",
+    # CATextLayer renders the native quick-bar glyphs above the web view.
+    "CATextLayer",
     "CATransaction",
     "CATransform3D",
     "objc2-core-foundation",

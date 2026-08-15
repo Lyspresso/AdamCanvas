@@ -74,7 +74,10 @@ use crate::{
     structured_preview::{StructuredPreview, StructuredPreviewCache},
 };
 use crate::{
-    webview_host::{LiveWebHost, LiveWebSource},
+    webview_host::{
+        LiveWebHost, LiveWebSource, MinimapLayout, OverlayPalette, OverlayRect, QuickBarClick,
+        QuickBarLayout, WebChromeInputs, WebChromeOverlays,
+    },
     webview_policy,
 };
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -1143,9 +1146,17 @@ pub struct AdamApp {
     /// frame later by the tile painter so the page body shows a normal
     /// cursor instead of the tile drag-grab (the title bar still drags).
     live_web_shown: HashSet<Uuid>,
-    /// The canvas quick-tool bar's screen rect, captured each frame so a live
-    /// page that would reach it crops to its top and leaves it visible.
+    /// The canvas quick-tool bar's screen rect, captured each egui frame so the
+    /// NATIVE quick-bar overlay (raised above a live page) can be positioned to
+    /// match it exactly. See [`AdamApp::sync_live_webs`].
     last_quick_bar_rect: Option<Rect>,
+    /// The minimap's (map rect, viewport-indicator rect) when it was drawn this
+    /// frame, else `None`. Feeds the native minimap overlay's placement.
+    last_minimap: Option<(Rect, Rect)>,
+    /// The native AppKit chrome (quick bar + minimap) rebuilt ABOVE the live
+    /// web view so it stays visible and clickable over a full-screen website.
+    /// A no-op off macOS.
+    web_chrome: WebChromeOverlays,
     /// Captured each canvas frame: web tiles currently riding a pathway
     /// draw at projected rects the durable geometry cannot follow, so their
     /// pages step aside.
@@ -1497,6 +1508,8 @@ impl AdamApp {
             live_web_failed: HashSet::new(),
             live_web_shown: HashSet::new(),
             last_quick_bar_rect: None,
+            last_minimap: None,
+            web_chrome: WebChromeOverlays::new(),
             live_web_riding: HashSet::new(),
             snap_to_grid: false,
             preferences,
@@ -4300,9 +4313,9 @@ impl AdamApp {
                         || event.resize_started.is_some()
                 });
                 let quick_bar_rect = self.show_canvas_quick_bar(&context, view, colors);
-                // Remembered for the live-web pass: a page that reaches the
-                // bottom-center crops to the bar's top instead of painting the
-                // native view over these creation tools.
+                // Remembered for the live-web pass: the native quick-bar overlay
+                // is positioned to match this rect and raised above any page
+                // covering the bottom-center.
                 self.last_quick_bar_rect = Some(quick_bar_rect);
                 let quick_tool_consumed = self.handle_canvas_quick_tool_click(
                     &context,
@@ -4339,7 +4352,10 @@ impl AdamApp {
                 );
                 self.draw_marquee(&painter, camera, view, colors);
                 self.show_note_editor(ui, &context, camera, view, colors, &projected_rect_by_tile);
-                self.draw_minimap(&painter, view, camera, colors, &projected_rects);
+                // Remembered for the live-web pass: a native minimap overlay is
+                // raised over any page covering this corner.
+                self.last_minimap =
+                    self.draw_minimap(&painter, view, camera, colors, &projected_rects);
                 self.show_canvas_status(ui, view, colors);
                 self.show_drop_overlay(&context, &painter, view, colors);
 
@@ -5220,11 +5236,8 @@ impl AdamApp {
         let outer_padding = 8.0;
         let maximum_slots_width = CANVAS_QUICK_SLOT_SIZE * CANVAS_QUICK_SLOT_COUNT as f32
             + CANVAS_QUICK_SLOT_GAP * (CANVAS_QUICK_SLOT_COUNT.saturating_sub(1)) as f32;
-        let available_slots_width = (view.width() - 40.0 - outer_padding * 2.0).max(300.0);
-        let slot_size = ((available_slots_width
-            - CANVAS_QUICK_SLOT_GAP * (CANVAS_QUICK_SLOT_COUNT.saturating_sub(1)) as f32)
-            / CANVAS_QUICK_SLOT_COUNT as f32)
-            .clamp(28.0, CANVAS_QUICK_SLOT_SIZE);
+        // Shared with the native overlay so the two lay out identically.
+        let slot_size = quick_bar_slot_size(view.width());
         let slots_width = (slot_size * CANVAS_QUICK_SLOT_COUNT as f32
             + CANVAS_QUICK_SLOT_GAP * (CANVAS_QUICK_SLOT_COUNT.saturating_sub(1)) as f32)
             .min(maximum_slots_width);
@@ -11715,6 +11728,11 @@ impl AdamApp {
         );
     }
 
+    /// Draws the minimap and returns its (map rect, viewport-indicator rect)
+    /// when shown, so [`AdamApp::sync_web_chrome`] can raise a native copy over
+    /// any live page that covers this corner. `None` when the minimap is not
+    /// drawn this frame. The viewport rect is [`Rect::ZERO`] when the visible
+    /// region is degenerate.
     fn draw_minimap(
         &self,
         painter: &Painter,
@@ -11722,13 +11740,13 @@ impl AdamApp {
         camera: Camera,
         colors: Theme,
         projected_rects: &[WorldRect],
-    ) {
+    ) -> Option<(Rect, Rect)> {
         let page = self.workspace.active_page();
         let page_screen_size = vec2(page.size[0], page.size[1]) * camera.zoom;
         let substantially_larger =
             page_screen_size.x > view.width() * 1.45 || page_screen_size.y > view.height() * 1.45;
         if !substantially_larger && camera.zoom >= 0.45 {
-            return;
+            return None;
         }
 
         let maximum = vec2(176.0, 116.0);
@@ -11774,6 +11792,7 @@ impl AdamApp {
         let y0 = visible.min_y().clamp(0.0, page.size[1]);
         let x1 = visible.max_x().clamp(0.0, page.size[0]);
         let y1 = visible.max_y().clamp(0.0, page.size[1]);
+        let mut viewport_rect = Rect::ZERO;
         if x1 > x0 && y1 > y0 {
             let viewport_map = Rect::from_min_max(
                 map.min + vec2(x0 * scale, y0 * scale),
@@ -11785,7 +11804,9 @@ impl AdamApp {
                 Stroke::new(1.5, colors.text),
                 StrokeKind::Inside,
             );
+            viewport_rect = viewport_map;
         }
+        Some((map, viewport_rect))
     }
 
     fn show_page_delete_confirmation(&mut self, context: &Context) {
@@ -12843,41 +12864,6 @@ impl AdamApp {
             || egui::Popup::is_any_open(context)
     }
 
-    /// True when the page rectangle would cover transient canvas chrome the
-    /// native view cannot be layered under: an active toast or the pathway
-    /// problem banner. Both are brief and important, so a page that would
-    /// cover one steps aside until it clears.
-    ///
-    /// The minimap is deliberately NOT a row. It is persistent, not transient,
-    /// so hiding the whole page whenever it drifted into the bottom-right
-    /// corner blanked the page exactly when zoomed in — the page just draws
-    /// over it instead, and the minimap returns the moment the page shrinks
-    /// off the corner. The quick bar is out for the same "the page is the
-    /// point" reason; Escape always brings the tools back.
-    fn transient_chrome_overlap(&self, page_rect: Rect, _view: Rect, context: &Context) -> bool {
-        let screen = context.content_rect();
-        let mut chrome: [Option<Rect>; 2] = [None, None];
-        if self.toast.is_some() {
-            chrome[0] = Some(Rect::from_min_size(
-                pos2(screen.center().x - 280.0, screen.max.y - 96.0),
-                vec2(560.0, 72.0),
-            ));
-        }
-        if self.pathway_runtime_problem.is_some()
-            || self.pathway_persistence_problem.is_some()
-            || !self.pathway_reconcile_report.problems.is_empty()
-        {
-            chrome[1] = Some(Rect::from_min_size(
-                pos2(screen.center().x - 330.0, TOOLBAR_HEIGHT + 6.0),
-                vec2(660.0, 64.0),
-            ));
-        }
-        chrome
-            .into_iter()
-            .flatten()
-            .any(|rect| rect.intersects(page_rect))
-    }
-
     /// Reconciles the auto-live pages against the canvas, once per frame:
     /// every eligible web tile on the active page gets a live session, the
     /// biggest on screen first, capped at [`MAX_LIVE_WEB_PAGES`]. Sessions
@@ -12943,13 +12929,11 @@ impl AdamApp {
                         .assignment(tile.id, tag_id)
                         .is_none()
                 }),
-                chrome_overlap: self.transient_chrome_overlap(page_rect, view, context),
                 editing_note,
                 viewport_visible,
                 viewport_focused,
                 camera_zoom: camera.zoom,
                 natural_size: (natural.x, natural.y),
-                quick_bar_rect: self.last_quick_bar_rect.map(to_point_rect),
             };
             desired.push(Desired {
                 tile_id: tile.id,
@@ -13017,8 +13001,11 @@ impl AdamApp {
             }
         }
 
-        // Apply each session's state; over-cap eligible pages hide.
+        // Apply each session's state; over-cap eligible pages hide. Collect
+        // the visible clip rects so the native chrome only appears when a page
+        // is actually covering it (otherwise the egui chrome shows on its own).
         self.live_web_shown.clear();
+        let mut shown_clips: Vec<Rect> = Vec::new();
         for session in &mut self.live_web {
             let state = desired
                 .iter()
@@ -13031,8 +13018,13 @@ impl AdamApp {
                     }
                 })
                 .unwrap_or(webview_policy::LiveWebState::Hidden);
-            if matches!(state, webview_policy::LiveWebState::Visible(_)) {
+            if let webview_policy::LiveWebState::Visible(placement) = state {
                 self.live_web_shown.insert(session.tile_id);
+                let clip = placement.clip;
+                shown_clips.push(Rect::from_min_size(
+                    pos2(clip.min_x, clip.min_y),
+                    vec2(clip.width, clip.height),
+                ));
             }
             session.host.apply(&state);
             if session.host.escape_requested() {
@@ -13040,6 +13032,89 @@ impl AdamApp {
                 // the page itself stays live.
                 session.host.release_focus();
             }
+        }
+
+        self.sync_web_chrome(context, view, &shown_clips);
+    }
+
+    /// Places and raises the native quick bar + minimap above the live web
+    /// view(s) — but only where a page is actually covering the egui version —
+    /// and runs whatever the native quick bar was clicked to do this frame.
+    fn sync_web_chrome(&mut self, context: &Context, view: Rect, shown_clips: &[Rect]) {
+        if !live_web_supported() {
+            return;
+        }
+        let colors = self.theme(context);
+        // Only show a native overlay where a page actually covers the egui one;
+        // elsewhere the egui bar / minimap are unoccluded and drawing a native
+        // copy on top of the Metal layer would double them.
+        let quick_bar = self.last_quick_bar_rect.and_then(|bar| {
+            shown_clips
+                .iter()
+                .any(|clip| clip.intersects(bar))
+                .then(|| quick_bar_layout(bar, view.width(), self.armed_canvas_tool))
+        });
+        let minimap = self.last_minimap.and_then(|(map, viewport)| {
+            shown_clips
+                .iter()
+                .any(|clip| clip.intersects(map))
+                .then_some(MinimapLayout {
+                    rect: to_overlay_rect(map),
+                    viewport: to_overlay_rect(viewport),
+                })
+        });
+        let inputs = WebChromeInputs {
+            quick_bar,
+            minimap,
+            palette: web_chrome_palette(colors),
+        };
+        let anchor = self.live_web.first().map(|session| &session.host);
+        self.web_chrome.sync(anchor, &inputs);
+
+        let mut acted = false;
+        for click in self.web_chrome.take_clicks() {
+            self.apply_quick_bar_click(context, click);
+            acted = true;
+        }
+        if acted {
+            // Reflect the new armed state / paste result immediately.
+            context.request_repaint();
+        }
+    }
+
+    /// Runs the same action the egui quick bar runs, for a click the NATIVE
+    /// quick bar captured over a live page. Kept in lockstep with
+    /// [`AdamApp::show_canvas_quick_bar`].
+    fn apply_quick_bar_click(&mut self, context: &Context, click: QuickBarClick) {
+        let tool = match click.slot {
+            0 => Some(CanvasQuickTool::StickyNote),
+            1 => Some(CanvasQuickTool::Pile),
+            2 => Some(CanvasQuickTool::Website),
+            3 => Some(CanvasQuickTool::Import),
+            4 => Some(CanvasQuickTool::Text),
+            _ => None,
+        };
+        if let Some(tool) = tool {
+            self.armed_canvas_tool = Some(ArmedCanvasQuickTool {
+                tool,
+                locked: click.double,
+            });
+            self.note_draft = None;
+            self.marquee = None;
+            self.drag = None;
+            self.resize = None;
+            self.editing_note = None;
+            return;
+        }
+        match click.slot {
+            5 => self.copy_selection(context),
+            6 => self.paste(context),
+            7 => self.duplicate_selection(context),
+            8 => {
+                self.armed_canvas_tool = None;
+                self.note_draft = None;
+            }
+            _ => {}
         }
     }
 
@@ -13188,6 +13263,68 @@ fn live_web_source_for(tile: &Tile) -> Option<LiveWebSource> {
 struct LiveWebSession {
     tile_id: Uuid,
     host: LiveWebHost,
+}
+
+/// The quick-bar slot side length for the given canvas width — the single
+/// source of truth shared by the egui bar ([`AdamApp::show_canvas_quick_bar`])
+/// and the native overlay so the two lay out identically.
+fn quick_bar_slot_size(view_width: f32) -> f32 {
+    let outer_padding = 8.0;
+    let available_slots_width = (view_width - 40.0 - outer_padding * 2.0).max(300.0);
+    ((available_slots_width
+        - CANVAS_QUICK_SLOT_GAP * (CANVAS_QUICK_SLOT_COUNT.saturating_sub(1)) as f32)
+        / CANVAS_QUICK_SLOT_COUNT as f32)
+        .clamp(28.0, CANVAS_QUICK_SLOT_SIZE)
+}
+
+fn to_overlay_rect(rect: Rect) -> OverlayRect {
+    OverlayRect {
+        x: rect.min.x,
+        y: rect.min.y,
+        w: rect.width(),
+        h: rect.height(),
+    }
+}
+
+/// Builds the native quick-bar placement from the egui bar's captured rect and
+/// the currently armed tool.
+fn quick_bar_layout(bar: Rect, view_width: f32, armed: Option<ArmedCanvasQuickTool>) -> QuickBarLayout {
+    let armed_slot = armed.map(|state| match state.tool {
+        CanvasQuickTool::StickyNote => 0,
+        CanvasQuickTool::Pile => 1,
+        CanvasQuickTool::Website => 2,
+        CanvasQuickTool::Import => 3,
+        CanvasQuickTool::Text => 4,
+    });
+    QuickBarLayout {
+        rect: to_overlay_rect(bar),
+        slot_size: quick_bar_slot_size(view_width),
+        gap: CANVAS_QUICK_SLOT_GAP,
+        pad: 8.0,
+        slot_count: CANVAS_QUICK_SLOT_COUNT,
+        glyph_count: 9,
+        armed: armed_slot,
+        clear_is_danger: armed.is_some(),
+    }
+}
+
+/// Lifts the native-overlay palette from the active egui theme so the native
+/// chrome matches the canvas colors.
+fn web_chrome_palette(colors: Theme) -> OverlayPalette {
+    OverlayPalette {
+        bar_fill: colors.floating.to_array(),
+        bar_border: colors.separator.to_array(),
+        slot_fill: colors.tile.to_array(),
+        slot_border: colors.tile_border.to_array(),
+        slot_empty_fill: colors.panel_inset.to_array(),
+        glyph: colors.text.to_array(),
+        armed_fill: colors.selection_fill.to_array(),
+        armed_border: colors.accent.to_array(),
+        danger: colors.danger.to_array(),
+        map_fill: colors.canvas.to_array(),
+        map_border: colors.canvas_border.to_array(),
+        map_viewport: colors.text.to_array(),
+    }
 }
 
 /// The screen rectangle the live page owns inside a website tile: the fake
