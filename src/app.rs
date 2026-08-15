@@ -1152,7 +1152,7 @@ pub struct AdamApp {
     last_quick_bar_rect: Option<Rect>,
     /// The minimap's (map rect, viewport-indicator rect) when it was drawn this
     /// frame, else `None`. Feeds the native minimap overlay's placement.
-    last_minimap: Option<(Rect, Rect)>,
+    last_minimap: Option<MinimapSnapshot>,
     /// The native AppKit chrome (quick bar + minimap) rebuilt ABOVE the live
     /// web view so it stays visible and clickable over a full-screen website.
     /// A no-op off macOS.
@@ -11740,7 +11740,7 @@ impl AdamApp {
         camera: Camera,
         colors: Theme,
         projected_rects: &[WorldRect],
-    ) -> Option<(Rect, Rect)> {
+    ) -> Option<MinimapSnapshot> {
         let page = self.workspace.active_page();
         let page_screen_size = vec2(page.size[0], page.size[1]) * camera.zoom;
         let substantially_larger =
@@ -11771,6 +11771,7 @@ impl AdamApp {
             StrokeKind::Inside,
         );
 
+        let mut tile_dots: Vec<Rect> = Vec::new();
         for (index, tile) in page.tiles.iter().take(400).enumerate() {
             let rect = projected_rects.get(index).copied().unwrap_or(tile.rect);
             let x0 = rect.min_x().clamp(0.0, page.size[0]);
@@ -11785,6 +11786,7 @@ impl AdamApp {
                 map.min + vec2(x1 * scale, y1 * scale),
             );
             painter.rect_filled(tile_map, CornerRadius::ZERO, colors.tile_border);
+            tile_dots.push(tile_map);
         }
 
         let visible = camera.visible_world(view);
@@ -11806,7 +11808,12 @@ impl AdamApp {
             );
             viewport_rect = viewport_map;
         }
-        Some((map, viewport_rect))
+        Some(MinimapSnapshot {
+            outer: map.expand(7.0),
+            map,
+            viewport: viewport_rect,
+            tiles: tile_dots,
+        })
     }
 
     fn show_page_delete_confirmation(&mut self, context: &Context) {
@@ -13054,13 +13061,15 @@ impl AdamApp {
                 .any(|clip| clip.intersects(bar))
                 .then(|| quick_bar_layout(bar, view.width(), self.armed_canvas_tool))
         });
-        let minimap = self.last_minimap.and_then(|(map, viewport)| {
+        let minimap = self.last_minimap.as_ref().and_then(|snap| {
             shown_clips
                 .iter()
-                .any(|clip| clip.intersects(map))
-                .then_some(MinimapLayout {
-                    rect: to_overlay_rect(map),
-                    viewport: to_overlay_rect(viewport),
+                .any(|clip| clip.intersects(snap.map))
+                .then(|| MinimapLayout {
+                    outer: to_overlay_rect(snap.outer),
+                    rect: to_overlay_rect(snap.map),
+                    viewport: to_overlay_rect(snap.viewport),
+                    tiles: snap.tiles.iter().map(|t| to_overlay_rect(*t)).collect(),
                 })
         });
         let inputs = WebChromeInputs {
@@ -13304,12 +13313,23 @@ fn quick_bar_layout(bar: Rect, view_width: f32, armed: Option<ArmedCanvasQuickTo
         slot_count: CANVAS_QUICK_SLOT_COUNT,
         glyph_count: 9,
         armed: armed_slot,
+        locked: armed.is_some_and(|state| state.locked),
         clear_is_danger: armed.is_some(),
     }
 }
 
 /// Lifts the native-overlay palette from the active egui theme so the native
 /// chrome matches the canvas colors.
+/// The minimap geometry captured each frame (screen points) so the native
+/// overlay can redraw the map — panel, dots, and viewport — over a live page.
+#[derive(Clone)]
+struct MinimapSnapshot {
+    outer: Rect,
+    map: Rect,
+    viewport: Rect,
+    tiles: Vec<Rect>,
+}
+
 fn web_chrome_palette(colors: Theme) -> OverlayPalette {
     OverlayPalette {
         bar_fill: colors.floating.to_array(),
@@ -13324,6 +13344,8 @@ fn web_chrome_palette(colors: Theme) -> OverlayPalette {
         map_fill: colors.canvas.to_array(),
         map_border: colors.canvas_border.to_array(),
         map_viewport: colors.text.to_array(),
+        map_outer: colors.floating.to_array(),
+        map_tile: colors.tile_border.to_array(),
     }
 }
 

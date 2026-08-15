@@ -60,6 +60,10 @@ pub struct OverlayPalette {
     pub map_fill: [u8; 4],
     pub map_border: [u8; 4],
     pub map_viewport: [u8; 4],
+    /// The floating panel behind the map (egui draws `map.expand(7)` in this).
+    pub map_outer: [u8; 4],
+    /// One dot per tile, the same color egui uses (`tile_border`).
+    pub map_tile: [u8; 4],
 }
 
 /// Where and how to draw the native quick bar this frame. `None` on
@@ -78,21 +82,30 @@ pub struct QuickBarLayout {
     pub glyph_count: usize,
     /// Which tool slot (0..=4) is armed, highlighted like the egui bar.
     pub armed: Option<usize>,
+    /// The armed tool is locked for repeated placement — the glyph gets the
+    /// "∞" marker, exactly like the egui bar.
+    pub locked: bool,
     /// The clear "×" reads danger-colored while a tool is armed.
     pub clear_is_danger: bool,
 }
 
-/// Where to draw the native minimap this frame.
-#[derive(Clone, Copy, Debug)]
+/// Where to draw the native minimap this frame. All rects are screen points;
+/// `configure_minimap` converts them into the panel's local space.
+#[derive(Clone, Debug)]
 pub struct MinimapLayout {
+    /// The floating panel behind the map — the NSView is placed here so the
+    /// outer square is drawn, not clipped at the window edge.
+    pub outer: OverlayRect,
     /// The map's screen rect (the canvas-colored inner panel).
     pub rect: OverlayRect,
     /// The viewport indicator, in screen points (converted to map-local).
     pub viewport: OverlayRect,
+    /// One screen rect per tile — drawn as the minimap dots.
+    pub tiles: Vec<OverlayRect>,
 }
 
 /// One frame's worth of native-chrome placement, computed by the app.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct WebChromeInputs {
     pub quick_bar: Option<QuickBarLayout>,
     pub minimap: Option<MinimapLayout>,
@@ -124,7 +137,7 @@ mod platform_host {
     use objc2::{DefinedClass, MainThreadMarker, define_class, msg_send};
     use objc2_app_kit::{NSEvent, NSView, NSWindowOrderingMode};
     use objc2_core_foundation::CFRetained;
-    use objc2_core_graphics::CGColor;
+    use objc2_core_graphics::{CGColor, CGDataProvider, CGFont};
     use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
     use objc2_quartz_core::{CALayer, CATextLayer, CATransaction, CATransform3D, kCAAlignmentCenter};
     use wry::WebViewExtMacOS;
@@ -583,6 +596,33 @@ mod platform_host {
         view
     }
 
+    /// The same UI font egui renders with (`adam_font_definitions`), loaded as
+    /// a CGFont so the native quick-bar glyphs match instead of falling back to
+    /// the system font. Built once per thread and cached.
+    const UI_FONT_TTF: &[u8] = include_bytes!("../Resources/Fonts/SourceSans3-Regular.ttf");
+
+    fn ui_font() -> Option<CFRetained<CGFont>> {
+        thread_local! {
+            static FONT: std::cell::OnceCell<Option<CFRetained<CGFont>>> =
+                const { std::cell::OnceCell::new() };
+        }
+        FONT.with(|cell| {
+            cell.get_or_init(|| {
+                // Static bytes live for the process, so no release callback.
+                let provider = unsafe {
+                    CGDataProvider::with_data(
+                        std::ptr::null_mut(),
+                        UI_FONT_TTF.as_ptr().cast(),
+                        UI_FONT_TTF.len(),
+                        None,
+                    )
+                }?;
+                CGFont::with_data_provider(&provider)
+            })
+            .clone()
+        })
+    }
+
     /// A straight-alpha sRGB color from egui bytes.
     fn cg(rgba: [u8; 4]) -> CFRetained<CGColor> {
         CGColor::new_srgb(
@@ -637,12 +677,15 @@ mod platform_host {
         let step = slot + gap;
         let font_size = if layout.slot_size < 36.0 { 15.0 } else { 19.0 };
         let text_h = font_size + 6.0;
+        let font = ui_font();
 
         for index in 0..layout.slot_count {
             let x = pad + (index as f64) * step;
             let slot_layer = CALayer::new();
             slot_layer.setFrame(NSRect::new(NSPoint::new(x, pad), NSSize::new(slot, slot)));
-            slot_layer.setCornerRadius(6.0);
+            // Match egui's widget corner radius (style sets it to 8) so the
+            // armed highlight outline is the same rounded rect.
+            slot_layer.setCornerRadius(8.0);
             let armed = layout.armed == Some(index);
             let empty = index >= layout.glyph_count;
             let (fill, border, border_width) = if armed {
@@ -668,8 +711,17 @@ mod platform_host {
                     NSPoint::new(x, pad + (slot - text_h) / 2.0),
                     NSSize::new(slot, text_h),
                 ));
-                let glyph = NSString::from_str(QUICK_GLYPHS[index]);
+                // A locked tool gets the "∞" marker, exactly like the egui bar.
+                let label = if Some(index) == layout.armed && layout.locked {
+                    format!("{}  \u{221e}", QUICK_GLYPHS[index])
+                } else {
+                    QUICK_GLYPHS[index].to_owned()
+                };
+                let glyph = NSString::from_str(&label);
                 unsafe { text.setString(Some(&glyph)) };
+                if let Some(font) = &font {
+                    unsafe { text.setFont(Some(&**font)) };
+                }
                 text.setFontSize(font_size);
                 text.setForegroundColor(Some(&cg(color)));
                 text.setAlignmentMode(unsafe { kCAAlignmentCenter });
@@ -686,28 +738,56 @@ mod platform_host {
         layout: &MinimapLayout,
         palette: &OverlayPalette,
     ) {
-        place(view, parent, layout.rect);
+        // The NSView spans the OUTER floating rect so the whole square is
+        // drawn (placing it at the inner map would clip the border at the
+        // window edge). Everything else is a sublayer in outer-local space.
+        place(view, parent, layout.outer);
         let Some(layer) = view.layer() else {
             return;
         };
-        layer.setBackgroundColor(Some(&cg(palette.map_fill)));
+        layer.setBackgroundColor(Some(&cg(palette.map_outer)));
         layer.setCornerRadius(0.0);
-        layer.setBorderColor(Some(&cg(palette.map_border)));
-        layer.setBorderWidth(1.0);
+        layer.setBorderWidth(0.0);
         layer.setMasksToBounds(true);
         unsafe { layer.setSublayers(None) };
 
-        let map = layout.rect;
+        let outer = layout.outer;
+        // Screen (top-left) -> outer-local (bottom-left, the layer's space).
+        let to_local = |r: OverlayRect| {
+            NSRect::new(
+                NSPoint::new(
+                    f64::from(r.x - outer.x),
+                    f64::from(outer.h - (r.y - outer.y) - r.h),
+                ),
+                NSSize::new(f64::from(r.w.max(0.0)), f64::from(r.h.max(0.0))),
+            )
+        };
+
+        // The inner canvas-colored panel.
+        let inner = CALayer::new();
+        inner.setFrame(to_local(layout.rect));
+        inner.setBackgroundColor(Some(&cg(palette.map_fill)));
+        inner.setBorderColor(Some(&cg(palette.map_border)));
+        inner.setBorderWidth(1.0);
+        layer.addSublayer(&inner);
+
+        // One dot per tile, same color egui fills them with.
+        let dot_color = cg(palette.map_tile);
+        for tile in &layout.tiles {
+            if tile.w < 0.5 || tile.h < 0.5 {
+                continue;
+            }
+            let dot = CALayer::new();
+            dot.setFrame(to_local(*tile));
+            dot.setBackgroundColor(Some(&dot_color));
+            layer.addSublayer(&dot);
+        }
+
+        // The viewport indicator on top.
         let viewport = layout.viewport;
         if viewport.w > 0.5 && viewport.h > 0.5 {
-            // Screen (top-left) -> map-local (bottom-left) for the indicator.
-            let local_x = f64::from(viewport.x - map.x);
-            let local_y = f64::from(map.h - (viewport.y - map.y) - viewport.h);
             let indicator = CALayer::new();
-            indicator.setFrame(NSRect::new(
-                NSPoint::new(local_x, local_y),
-                NSSize::new(f64::from(viewport.w), f64::from(viewport.h)),
-            ));
+            indicator.setFrame(to_local(viewport));
             indicator.setBorderColor(Some(&cg(palette.map_viewport)));
             indicator.setBorderWidth(1.5);
             layer.addSublayer(&indicator);

@@ -78,6 +78,10 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "CGColor",
     "CGColorSpace",
     "CGContext",
+    # CGFont + CGDataProvider load SourceSans3 into the quick-bar glyphs so the
+    # native bar matches the egui bar's font instead of falling back to system.
+    "CGDataProvider",
+    "CGFont",
     "CGImage",
     "CGPath",
 ] }
