@@ -60,15 +60,6 @@ impl PointRect {
             (max_y - min_y).max(0.0),
         )
     }
-
-    fn rounded(&self) -> PointRect {
-        PointRect::new(
-            self.min_x.round(),
-            self.min_y.round(),
-            self.width.round(),
-            self.height.round(),
-        )
-    }
 }
 
 /// Everything the decision needs, as plain data. No egui context, no wry —
@@ -157,9 +148,13 @@ pub fn desired_state(inputs: &LiveWebInputs) -> LiveWebState {
     {
         return LiveWebState::Hidden;
     }
-    // Whole-point rounding first, so frames can never jitter by a fraction.
-    let content = page_rect.rounded();
-    let clip = content.intersection(&inputs.canvas_rect.rounded());
+    // Preserve egui's exact logical-point geometry. Quantizing here makes the
+    // native page hold still across fractional pan/zoom frames and then jump a
+    // whole point while the painted tile continues moving smoothly. AppKit
+    // frames use logical points too, so the host can consume this geometry
+    // directly and let the compositor perform physical-pixel sampling.
+    let content = page_rect;
+    let clip = content.intersection(&inputs.canvas_rect);
     // The page crops at the canvas edge like any tile; it hides only when
     // the visible sliver stops being meaningfully a page.
     if clip.width < MIN_LIVE_SIDE_POINTS || clip.height < MIN_LIVE_SIDE_POINTS {
@@ -302,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn fractional_rects_round_to_whole_points() {
+    fn fractional_rects_are_preserved_for_smooth_native_motion() {
         let mut inputs = base_inputs();
         inputs.page_rect = Some(PointRect::new(300.4, 199.6, 400.3, 299.5));
         let LiveWebState::Visible(placement) = desired_state(&inputs) else {
@@ -310,8 +305,39 @@ mod tests {
         };
         assert_eq!(
             placement.content,
-            PointRect::new(300.0, 200.0, 400.0, 300.0)
+            PointRect::new(300.4, 199.6, 400.3, 299.5)
         );
+    }
+
+    #[test]
+    fn subpoint_pan_and_zoom_never_hold_then_jump() {
+        let mut previous_x = None;
+        let mut previous_scale = None;
+        for step in 0..8 {
+            let delta = step as f32 * 0.125;
+            let mut inputs = base_inputs();
+            inputs.page_rect = Some(PointRect::new(
+                300.0 + delta,
+                200.0 + delta,
+                400.0 + delta,
+                300.0 + delta,
+            ));
+            let LiveWebState::Visible(placement) = desired_state(&inputs) else {
+                panic!("expected visible");
+            };
+            assert_eq!(placement.content.min_x, 300.0 + delta);
+            if let Some(previous_x) = previous_x {
+                assert_eq!(placement.content.min_x - previous_x, 0.125);
+            }
+            if let Some(previous_scale) = previous_scale {
+                assert!(
+                    placement.scale > previous_scale,
+                    "every fractional zoom frame must reach the host"
+                );
+            }
+            previous_x = Some(placement.content.min_x);
+            previous_scale = Some(placement.scale);
+        }
     }
 
     #[test]

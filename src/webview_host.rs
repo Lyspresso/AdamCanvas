@@ -148,7 +148,7 @@ mod platform_host {
         LiveWebSource, MinimapLayout, OverlayPalette, OverlayRect, QUICK_GLYPHS, QuickBarClick,
         QuickBarLayout, WebChromeInputs,
     };
-    use crate::webview_policy::{LiveWebState, PointRect};
+    use crate::webview_policy::LiveWebState;
 
     const ESCAPE_SCRIPT: &str = "document.addEventListener('keydown', (e) => {\n\
        if (e.key === 'Escape') { window.ipc.postMessage('escape'); }\n\
@@ -169,8 +169,10 @@ mod platform_host {
         /// correct whatever AppKit chose for a layer-backed view.
         container_anchor: (f64, f64),
         shown: bool,
-        last_content: Option<PointRect>,
-        last_clip: Option<PointRect>,
+        /// The complete placement last committed to AppKit. Comparing the
+        /// whole value is important: scale and natural size are geometry too,
+        /// even if a clipped screen rectangle happens to be unchanged.
+        last_placement: Option<crate::webview_policy::LiveWebPlacement>,
     }
 
     impl LiveWebHost {
@@ -246,8 +248,7 @@ mod platform_host {
                 escape_rx,
                 container_anchor,
                 shown: false,
-                last_content: None,
-                last_clip: None,
+                last_placement: None,
             })
         }
 
@@ -274,8 +275,7 @@ mod platform_host {
                     }
                 }
                 LiveWebState::Visible(placement) => {
-                    let geometry_changed = self.last_content != Some(placement.content)
-                        || self.last_clip != Some(placement.clip);
+                    let geometry_changed = self.last_placement != Some(*placement);
                     if !(geometry_changed || !self.shown) {
                         // A static frame costs nothing: the compositor holds
                         // the last sublayerTransform on its own.
@@ -361,8 +361,7 @@ mod platform_host {
                         CATransaction::commit();
                     }
                     self.shown = true;
-                    self.last_content = Some(placement.content);
-                    self.last_clip = Some(placement.clip);
+                    self.last_placement = Some(*placement);
                 }
             }
         }
