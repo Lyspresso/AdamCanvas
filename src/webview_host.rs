@@ -139,7 +139,9 @@ mod platform_host {
     use objc2_core_foundation::CFRetained;
     use objc2_core_graphics::{CGColor, CGDataProvider, CGFont};
     use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
-    use objc2_quartz_core::{CALayer, CATextLayer, CATransaction, CATransform3D, kCAAlignmentCenter};
+    use objc2_quartz_core::{
+        CALayer, CATextLayer, CATransaction, CATransform3D, kCAAlignmentCenter,
+    };
     use wry::WebViewExtMacOS;
 
     use super::{
@@ -322,8 +324,7 @@ mod platform_host {
                             // the page share an origin and the cover overshoot
                             // spills off the bottom/right into the mask.
                             let visual_x = content_bl_x;
-                            let visual_y =
-                                content_bl_y + f64::from(content.height) - scale * nat_h;
+                            let visual_y = content_bl_y + f64::from(content.height) - scale * nat_h;
 
                             // Core Animation scales sublayers about the pivot
                             // q = anchor * container-bounds. Invert it so the

@@ -13297,7 +13297,11 @@ fn to_overlay_rect(rect: Rect) -> OverlayRect {
 
 /// Builds the native quick-bar placement from the egui bar's captured rect and
 /// the currently armed tool.
-fn quick_bar_layout(bar: Rect, view_width: f32, armed: Option<ArmedCanvasQuickTool>) -> QuickBarLayout {
+fn quick_bar_layout(
+    bar: Rect,
+    view_width: f32,
+    armed: Option<ArmedCanvasQuickTool>,
+) -> QuickBarLayout {
     let armed_slot = armed.map(|state| match state.tool {
         CanvasQuickTool::StickyNote => 0,
         CanvasQuickTool::Pile => 1,
