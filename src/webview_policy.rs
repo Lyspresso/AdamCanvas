@@ -377,7 +377,10 @@ mod tests {
         // The page keeps its FULL visible area — nothing cropped.
         assert_eq!(placement.clip, PointRect::new(240.0, 40.0, 1200.0, 800.0));
         // Only the bar's footprint is punched out.
-        assert_eq!(placement.exclude, Some(PointRect::new(700.0, 760.0, 300.0, 60.0)));
+        assert_eq!(
+            placement.exclude,
+            Some(PointRect::new(700.0, 760.0, 300.0, 60.0))
+        );
     }
 
     #[test]
@@ -390,7 +393,10 @@ mod tests {
             panic!("expected visible");
         };
         // Page right edge = 1040; bar spans 900..1200 → hole is 900..1040.
-        assert_eq!(placement.exclude, Some(PointRect::new(900.0, 760.0, 140.0, 60.0)));
+        assert_eq!(
+            placement.exclude,
+            Some(PointRect::new(900.0, 760.0, 140.0, 60.0))
+        );
     }
 
     #[test]
@@ -403,7 +409,10 @@ mod tests {
             panic!("expected visible");
         };
         assert_eq!(placement.clip.height, 800.0, "page keeps its full height");
-        assert_eq!(placement.exclude, None, "no notch when the bar is elsewhere");
+        assert_eq!(
+            placement.exclude, None,
+            "no notch when the bar is elsewhere"
+        );
     }
 
     #[test]
