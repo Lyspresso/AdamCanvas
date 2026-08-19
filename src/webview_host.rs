@@ -139,9 +139,7 @@ mod platform_host {
     use objc2_core_foundation::CFRetained;
     use objc2_core_graphics::{CGColor, CGDataProvider, CGFont};
     use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
-    use objc2_quartz_core::{
-        CALayer, CATextLayer, CATransaction, CATransform3D, kCAAlignmentCenter,
-    };
+    use objc2_quartz_core::{CALayer, CATextLayer, CATransaction, kCAAlignmentCenter};
     use wry::WebViewExtMacOS;
 
     use super::{
@@ -163,11 +161,6 @@ mod platform_host {
         webview: wry::WebView,
         container: Retained<NSView>,
         escape_rx: crossbeam_channel::Receiver<()>,
-        /// The container backing layer's anchor point, read once at creation.
-        /// This is the pivot Core Animation scales sublayers about, so reading
-        /// it (rather than assuming 0,0 or 0.5,0.5) keeps the frame math
-        /// correct whatever AppKit chose for a layer-backed view.
-        container_anchor: (f64, f64),
         shown: bool,
         /// The complete placement last committed to AppKit. Comparing the
         /// whole value is important: scale and natural size are geometry too,
@@ -224,7 +217,6 @@ mod platform_host {
             // used again.
             let wk = webview.webview();
             let container = NSView::new(mtm);
-            let mut container_anchor = (0.0_f64, 0.0_f64);
             unsafe {
                 let Some(parent) = wk.superview() else {
                     return Err("the webview attached to no parent view".to_string());
@@ -232,8 +224,6 @@ mod platform_host {
                 container.setWantsLayer(true);
                 if let Some(layer) = container.layer() {
                     layer.setMasksToBounds(true);
-                    let anchor = layer.anchorPoint();
-                    container_anchor = (anchor.x, anchor.y);
                 }
                 container.setHidden(true);
                 wk.removeFromSuperview();
@@ -246,7 +236,6 @@ mod platform_host {
                 webview,
                 container,
                 escape_rx,
-                container_anchor,
                 shown: false,
                 last_placement: None,
             })
@@ -302,11 +291,16 @@ mod platform_host {
                                 NSSize::new(f64::from(clip.width), f64::from(clip.height)),
                             ));
 
-                            // (2) The page lays out at its fixed natural size
-                            //     and the camera is a pure compositor scale, so
-                            //     the WKWebView frame never changes size with
-                            //     zoom — only where it sits. Container is a
-                            //     plain unflipped NSView (bottom-left origin).
+                            // (2) Keep WebKit's layout coordinate space fixed
+                            //     at the page's natural size, while AppKit maps
+                            //     that one view into the camera-scaled frame.
+                            //     This is deliberately expressed as frame +
+                            //     bounds on the WKWebView itself. The previous
+                            //     implementation moved the view frame and also
+                            //     changed its parent's sublayerTransform; those
+                            //     two compositor properties could present on
+                            //     adjacent frames and make the page visibly
+                            //     jiggle relative to egui's Metal tile.
                             let content = placement.content;
                             let offset_x = f64::from(content.min_x - clip.min_x);
                             let offset_top = f64::from(content.min_y - clip.min_y);
@@ -326,29 +320,14 @@ mod platform_host {
                             let visual_x = content_bl_x;
                             let visual_y = content_bl_y + f64::from(content.height) - scale * nat_h;
 
-                            // Core Animation scales sublayers about the pivot
-                            // q = anchor * container-bounds. Invert it so the
-                            // unscaled frame f satisfies scale*f + (1-scale)*q
-                            // == visual-origin.
-                            let pivot_x = self.container_anchor.0 * f64::from(clip.width);
-                            let pivot_y = self.container_anchor.1 * f64::from(clip.height);
-                            let frame_x = (visual_x - (1.0 - scale) * pivot_x) / scale;
-                            let frame_y = (visual_y - (1.0 - scale) * pivot_y) / scale;
                             wk.setFrame(NSRect::new(
-                                NSPoint::new(frame_x, frame_y),
+                                NSPoint::new(visual_x, visual_y),
+                                NSSize::new(scale * nat_w, scale * nat_h),
+                            ));
+                            wk.setBounds(NSRect::new(
+                                NSPoint::new(0.0, 0.0),
                                 NSSize::new(nat_w, nat_h),
                             ));
-
-                            // The camera lives ONLY here: one uniform scale on
-                            // Adam's own container layer. AppKit and WebKit
-                            // never reset a sublayerTransform we set, so it
-                            // survives navigation and needs no per-frame
-                            // re-assert or settle re-raster.
-                            if let Some(layer) = self.container.layer() {
-                                layer.setSublayerTransform(CATransform3D::new_scale(
-                                    scale, scale, 1.0,
-                                ));
-                            }
                         }
                         if !self.shown {
                             self.container.setHidden(false);
