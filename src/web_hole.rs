@@ -84,7 +84,12 @@ impl WebHoleResources {
         Self { pipeline }
     }
 
-    fn paint(&self, info: PaintCallbackInfo, render_pass: &mut wgpu::RenderPass<'_>, holes: &[Rect]) {
+    fn paint(
+        &self,
+        info: PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'_>,
+        holes: &[Rect],
+    ) {
         let [screen_width, screen_height] = info.screen_size_px;
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_viewport(
@@ -209,7 +214,15 @@ mod tests {
             [2000, 1600],
         )
         .expect("positive rect yields a scissor");
-        assert_eq!(scissor, ScissorRect { x: 200, y: 100, width: 400, height: 240 });
+        assert_eq!(
+            scissor,
+            ScissorRect {
+                x: 200,
+                y: 100,
+                width: 400,
+                height: 240
+            }
+        );
     }
 
     #[test]
