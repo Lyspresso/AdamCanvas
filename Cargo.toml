@@ -94,7 +94,7 @@ objc2-vision = { version = "0.3", default-features = false, features = [
 winit = { version = "0.30", default-features = false }
 
 [dev-dependencies]
-rust_xlsxwriter = "0.97.0"
+rust_xlsxwriter = "0.98.1"
 tempfile = "3.20"
 
 [profile.dev]
