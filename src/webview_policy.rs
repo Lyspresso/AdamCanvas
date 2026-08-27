@@ -60,15 +60,6 @@ impl PointRect {
             (max_y - min_y).max(0.0),
         )
     }
-
-    fn rounded(&self) -> PointRect {
-        PointRect::new(
-            self.min_x.round(),
-            self.min_y.round(),
-            self.width.round(),
-            self.height.round(),
-        )
-    }
 }
 
 /// Everything the decision needs, as plain data. No egui context, no wry —
@@ -138,6 +129,83 @@ pub struct LiveWebPlacement {
     pub exclude: Option<PointRect>,
 }
 
+/// One camera projection shared by browser painting and browser input.
+///
+/// The browser always lays out at [`Self::natural`]. Adam then scales that
+/// surface uniformly from its top-left corner until it covers [`Self::content`].
+/// If the page and tile chrome have slightly different aspect ratios, only
+/// the excess right or bottom edge is cropped through [`Self::uv`]; the page
+/// is never stretched independently on each axis.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LiveWebSurfaceTransform {
+    /// The exact screen rectangle occupied by the live page.
+    ///
+    /// This must retain the camera's fractional coordinates. Snapping only
+    /// the browser surface while the tile frame moves continuously makes the
+    /// page visibly stick and jump relative to its own tile.
+    pub content: PointRect,
+    /// The normalized top-left texture region sampled into `content`.
+    pub uv: PointRect,
+    /// The camera-independent browser layout size in logical points.
+    pub natural: (f64, f64),
+    /// Uniform screen-points-per-browser-point cover scale.
+    pub scale: f64,
+}
+
+impl LiveWebSurfaceTransform {
+    /// Builds the canonical top-left cover transform.
+    ///
+    /// The destination is the camera's exact projected rectangle. The natural
+    /// browser layout size remains integral and camera-independent, but the
+    /// compositor destination must never be rounded independently of the tile.
+    pub fn new(content: PointRect, natural: (f64, f64)) -> Option<Self> {
+        let natural = (natural.0.round(), natural.1.round());
+        if !content.is_finite()
+            || content.width <= 0.0
+            || content.height <= 0.0
+            || !natural.0.is_finite()
+            || !natural.1.is_finite()
+            || natural.0 < 1.0
+            || natural.1 < 1.0
+        {
+            return None;
+        }
+
+        let scale =
+            (f64::from(content.width) / natural.0).max(f64::from(content.height) / natural.1);
+        if !scale.is_finite() || scale <= 0.0 {
+            return None;
+        }
+
+        let uv_width = (f64::from(content.width) / (natural.0 * scale)).clamp(0.0, 1.0);
+        let uv_height = (f64::from(content.height) / (natural.1 * scale)).clamp(0.0, 1.0);
+        Some(Self {
+            content,
+            uv: PointRect::new(0.0, 0.0, uv_width as f32, uv_height as f32),
+            natural,
+            scale,
+        })
+    }
+
+    /// Maps a screen point back into the browser's logical coordinate space.
+    ///
+    /// This intentionally does not clamp: a captured pointer may be released
+    /// just outside the tile and CEF still needs that matching release event.
+    pub fn local_position(self, screen_x: f32, screen_y: f32) -> (f32, f32) {
+        (
+            (f64::from(screen_x - self.content.min_x) / self.scale) as f32,
+            (f64::from(screen_y - self.content.min_y) / self.scale) as f32,
+        )
+    }
+}
+
+impl LiveWebPlacement {
+    /// Returns the exact texture/input transform represented by this state.
+    pub fn surface_transform(self) -> Option<LiveWebSurfaceTransform> {
+        LiveWebSurfaceTransform::new(self.content, self.natural)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum LiveWebState {
     Hidden,
@@ -169,9 +237,11 @@ pub fn desired_state(inputs: &LiveWebInputs) -> LiveWebState {
     {
         return LiveWebState::Hidden;
     }
-    // Whole-point rounding first, so frames can never jitter by a fraction.
-    let content = page_rect.rounded();
-    let clip = content.intersection(&inputs.canvas_rect.rounded());
+    // Keep the exact camera projection. The tile frame and browser image are
+    // painted by the same egui compositor; snapping only this inner surface
+    // creates visible stick-then-jump motion during fractional pan and zoom.
+    let content = page_rect;
+    let clip = content.intersection(&inputs.canvas_rect);
     // The page crops at the canvas edge like any tile; it hides only when
     // the visible sliver stops being meaningfully a page.
     if clip.width < MIN_LIVE_SIDE_POINTS || clip.height < MIN_LIVE_SIDE_POINTS {
@@ -183,29 +253,29 @@ pub fn desired_state(inputs: &LiveWebInputs) -> LiveWebState {
     // crop and never a whole-page hide. Only the part of the bar that actually
     // overlaps the visible page is excluded.
     let exclude = inputs.quick_bar_rect.and_then(|bar| {
-        let hole = bar.rounded().intersection(&clip);
+        let hole = bar.intersection(&clip);
         (hole.width >= 1.0 && hole.height >= 1.0).then_some(hole)
     });
 
-    let nat_w = f64::from(inputs.natural_size.0).round();
-    let nat_h = f64::from(inputs.natural_size.1).round();
-    if !nat_w.is_finite() || !nat_h.is_finite() || nat_w < 1.0 || nat_h < 1.0 {
-        return LiveWebState::Hidden;
-    }
     // Uniform aspect-fill ("cover"): the larger of the two axis ratios, so the
-    // page always fully covers the painted content rect. The small overshoot
-    // on the other axis is cropped by the container mask — never a per-axis
-    // scale, so the page can never stretch, only crop a hair at extreme zoom.
-    let scale = (f64::from(content.width) / nat_w).max(f64::from(content.height) / nat_h);
-    if !scale.is_finite() || scale <= 0.0 {
+    // page always fully covers the painted content rect. Painting and pointer
+    // input consume this same transform; neither may recreate an independent
+    // per-axis scale that would stretch the browser surface.
+    let Some(surface) = LiveWebSurfaceTransform::new(
+        content,
+        (
+            f64::from(inputs.natural_size.0),
+            f64::from(inputs.natural_size.1),
+        ),
+    ) else {
         return LiveWebState::Hidden;
-    }
+    };
 
     LiveWebState::Visible(LiveWebPlacement {
-        content,
+        content: surface.content,
         clip,
-        natural: (nat_w, nat_h),
-        scale,
+        natural: surface.natural,
+        scale: surface.scale,
         exclude,
     })
 }
@@ -327,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn fractional_rects_round_to_whole_points() {
+    fn fractional_rects_remain_locked_to_the_camera_projection() {
         let mut inputs = base_inputs();
         inputs.page_rect = Some(PointRect::new(300.4, 199.6, 400.3, 299.5));
         let LiveWebState::Visible(placement) = desired_state(&inputs) else {
@@ -335,7 +405,11 @@ mod tests {
         };
         assert_eq!(
             placement.content,
-            PointRect::new(300.0, 200.0, 400.0, 300.0)
+            PointRect::new(300.4, 199.6, 400.3, 299.5)
+        );
+        assert_eq!(
+            placement.surface_transform().unwrap().content,
+            placement.content
         );
     }
 
@@ -363,6 +437,11 @@ mod tests {
             panic!("expected visible");
         };
         assert!((placement.scale - 2.0).abs() < 1e-9);
+        let surface = placement.surface_transform().expect("surface transform");
+        assert_eq!(surface.uv.width, 0.5);
+        assert_eq!(surface.uv.height, 1.0);
+        let local = surface.local_position(500.0, 500.0);
+        assert_eq!(local, (100.0, 150.0));
     }
 
     #[test]

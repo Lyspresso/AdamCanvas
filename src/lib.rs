@@ -10,6 +10,7 @@ pub mod app;
 pub mod artifact_library;
 pub mod assets;
 pub mod automation;
+pub mod cef_runtime;
 pub mod chat_core;
 pub mod clipboard;
 pub mod domain;

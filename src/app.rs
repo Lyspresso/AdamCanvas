@@ -74,14 +74,17 @@ use crate::{
     structured_preview::{StructuredPreview, StructuredPreviewCache},
 };
 use crate::{
-    webview_host::{LiveWebHost, LiveWebSource},
+    webview_host::{
+        LiveWebHost, LiveWebSource, PointerButton as LiveWebPointerButton, PointerInput,
+        PointerInputKind,
+    },
     webview_policy,
 };
 use crossbeam_channel::{Receiver, Sender, bounded};
 use egui::{
     Align, Align2, Button, Color32, Context, CornerRadius, CursorIcon, FontData, FontDefinitions,
     FontFamily, FontId, Frame, Id, Key, Layout, Margin, Painter, PointerButton, Pos2, Rect,
-    Response, RichText, Sense, Stroke, StrokeKind, TextEdit, Ui, Vec2,
+    Response, RichText, Sense, Stroke, StrokeKind, TextEdit, TextureId, Ui, Vec2,
     epaint::text::{FontInsert, FontPriority, InsertFontFamily},
     pos2, vec2,
 };
@@ -354,6 +357,86 @@ impl ResizeHandle {
     fn moves_bottom(self) -> bool {
         matches!(self, Self::SouthWest | Self::SouthEast | Self::South)
     }
+}
+
+/// The exact eight Adam-owned resize hit areas around a tile. Live browser
+/// routing uses these same rectangles as exclusions, so a resize press can
+/// never also become a captured CEF press.
+fn tile_resize_hit_rects(screen_rect: Rect) -> [(ResizeHandle, Rect); 8] {
+    let corner = RESIZE_CORNER_HIT_SIZE;
+    let edge_inset_x = (corner * 0.55).min(screen_rect.width() * 0.28);
+    let edge_inset_y = (corner * 0.55).min(screen_rect.height() * 0.28);
+    let edge = RESIZE_EDGE_HIT_THICKNESS;
+    [
+        (
+            ResizeHandle::NorthWest,
+            Rect::from_center_size(screen_rect.left_top(), Vec2::splat(corner)),
+        ),
+        (
+            ResizeHandle::NorthEast,
+            Rect::from_center_size(screen_rect.right_top(), Vec2::splat(corner)),
+        ),
+        (
+            ResizeHandle::SouthWest,
+            Rect::from_center_size(screen_rect.left_bottom(), Vec2::splat(corner)),
+        ),
+        (
+            ResizeHandle::SouthEast,
+            Rect::from_center_size(screen_rect.right_bottom(), Vec2::splat(corner)),
+        ),
+        (
+            ResizeHandle::North,
+            Rect::from_min_max(
+                pos2(
+                    screen_rect.left() + edge_inset_x,
+                    screen_rect.top() - edge * 0.5,
+                ),
+                pos2(
+                    screen_rect.right() - edge_inset_x,
+                    screen_rect.top() + edge * 0.5,
+                ),
+            ),
+        ),
+        (
+            ResizeHandle::East,
+            Rect::from_min_max(
+                pos2(
+                    screen_rect.right() - edge * 0.5,
+                    screen_rect.top() + edge_inset_y,
+                ),
+                pos2(
+                    screen_rect.right() + edge * 0.5,
+                    screen_rect.bottom() - edge_inset_y,
+                ),
+            ),
+        ),
+        (
+            ResizeHandle::South,
+            Rect::from_min_max(
+                pos2(
+                    screen_rect.left() + edge_inset_x,
+                    screen_rect.bottom() - edge * 0.5,
+                ),
+                pos2(
+                    screen_rect.right() - edge_inset_x,
+                    screen_rect.bottom() + edge * 0.5,
+                ),
+            ),
+        ),
+        (
+            ResizeHandle::West,
+            Rect::from_min_max(
+                pos2(
+                    screen_rect.left() - edge * 0.5,
+                    screen_rect.top() + edge_inset_y,
+                ),
+                pos2(
+                    screen_rect.left() + edge * 0.5,
+                    screen_rect.bottom() - edge_inset_y,
+                ),
+            ),
+        ),
+    ]
 }
 
 struct Marquee {
@@ -794,6 +877,12 @@ struct TileUiEvent {
     clicked: bool,
     toggle: bool,
     double_clicked: bool,
+    /// The pointer is over a live browser texture. Browser input must not also
+    /// start a canvas tool, marquee, selection change, or tile drag.
+    pointer_consumed: bool,
+    /// This press belongs to Adam even though it began over browser pixels.
+    /// It latches browser suppression through the matching mouse-up.
+    live_web_drag_override: bool,
     drag_started: Option<Pos2>,
     resize_started: Option<(Pos2, ResizeHandle)>,
     action: Option<TileAction>,
@@ -1139,10 +1228,6 @@ pub struct AdamApp {
     /// Tiles whose host creation failed; not retried until a page switch so
     /// a persistent failure cannot spam a create attempt per frame.
     live_web_failed: HashSet<Uuid>,
-    /// Tiles whose native page is live and on-screen right now. Read one
-    /// frame later by the tile painter so the page body shows a normal
-    /// cursor instead of the tile drag-grab (the title bar still drags).
-    live_web_shown: HashSet<Uuid>,
     /// The canvas quick-tool bar's screen rect, captured each frame so a live
     /// page that would reach it crops to its top and leaves it visible.
     last_quick_bar_rect: Option<Rect>,
@@ -1150,6 +1235,18 @@ pub struct AdamApp {
     /// draw at projected rects the durable geometry cannot follow, so their
     /// pages step aside.
     live_web_riding: HashSet<Uuid>,
+    /// True only for the frame in which Adam changed the canvas camera.
+    /// Browser input is suppressed for that frame so a stationary pointer
+    /// cannot become a synthetic page move or receive the same wheel event
+    /// that Adam already consumed for pan/zoom.
+    live_web_camera_changed: bool,
+    /// Adam and CEF must never both own one press. Once an Adam canvas
+    /// gesture starts, suppress browser events until the matching release,
+    /// even if modifiers change or the page moves under the pointer.
+    live_web_canvas_pointer_latched: Option<PointerButton>,
+    /// Declared after the live browser sessions so they close before CEF's
+    /// process-wide shutdown runs during field destruction.
+    cef_runtime: Option<crate::cef_runtime::CefRuntime>,
     snap_to_grid: bool,
     preferences: AppPreferences,
     dots_available: bool,
@@ -1495,9 +1592,11 @@ impl AdamApp {
             live_web: Vec::new(),
             live_web_page: None,
             live_web_failed: HashSet::new(),
-            live_web_shown: HashSet::new(),
             last_quick_bar_rect: None,
             live_web_riding: HashSet::new(),
+            live_web_camera_changed: false,
+            live_web_canvas_pointer_latched: None,
+            cef_runtime: None,
             snap_to_grid: false,
             preferences,
             dots_available,
@@ -1513,6 +1612,12 @@ impl AdamApp {
         }
         app.resume_external_asset_imports();
         app
+    }
+
+    /// Installs the process-wide CEF lifetime after construction. The main
+    /// binary initializes Chromium before winit creates Adam's window.
+    pub fn install_cef_runtime(&mut self, runtime: crate::cef_runtime::CefRuntime) {
+        self.cef_runtime = Some(runtime);
     }
 
     fn theme(&self, context: &Context) -> Theme {
@@ -4026,6 +4131,7 @@ impl AdamApp {
     }
 
     fn show_canvas(&mut self, root: &mut Ui) {
+        self.live_web_camera_changed = false;
         if self.grid_view.is_some() {
             self.show_grid_view(root);
             return;
@@ -4043,7 +4149,56 @@ impl AdamApp {
                 self.last_canvas_rect = Some(view);
 
                 let mut camera = self.active_camera();
-                self.handle_pan_and_zoom(ui, &canvas_response, view, &mut camera);
+                // Browser pixels are ordinary egui textures, but their page
+                // body still owns pointer input. Resolve that ownership before
+                // camera gestures so one wheel/click can never affect both the
+                // page and the canvas.
+                let live_web_textures = self
+                    .live_web
+                    .iter()
+                    .filter_map(|session| session.texture.map(|texture| (session.tile_id, texture)))
+                    .collect::<HashMap<_, _>>();
+                let live_web_pointer_captures = self
+                    .live_web
+                    .iter()
+                    .filter(|session| !session.captured_buttons.is_empty())
+                    .map(|session| session.tile_id)
+                    .collect::<HashSet<_>>();
+                let pointer_over_live_web = context
+                    .input(|input| input.pointer.hover_pos())
+                    .filter(|pointer| view.contains(*pointer))
+                    .is_some_and(|pointer| {
+                        self.workspace.active_page().tiles.iter().rev().any(|tile| {
+                            live_web_textures.contains_key(&tile.id)
+                                && live_web_page_rect(
+                                    tile,
+                                    camera.screen_rect(tile.rect, view),
+                                    camera.zoom,
+                                )
+                                .is_some_and(|rect| rect.contains(pointer))
+                                && !self
+                                    .last_quick_bar_rect
+                                    .is_some_and(|rect| rect.contains(pointer))
+                        })
+                    });
+                let browser_has_capture = !live_web_pointer_captures.is_empty();
+                let command_drag_override = context.input(|input| input.modifiers.command);
+                let browser_owns_pointer = live_web_page_owns_pointer(
+                    pointer_over_live_web,
+                    browser_has_capture,
+                    self.live_web_canvas_pointer_latched.is_some(),
+                    command_drag_override,
+                );
+                let camera_before_input = camera;
+                self.handle_pan_and_zoom(
+                    ui,
+                    &canvas_response,
+                    view,
+                    &mut camera,
+                    browser_owns_pointer,
+                );
+                self.live_web_camera_changed = camera.origin != camera_before_input.origin
+                    || camera.zoom != camera_before_input.zoom;
                 self.set_active_camera(camera);
 
                 if let Some(pointer) = context.input(|input| input.pointer.hover_pos())
@@ -4280,7 +4435,9 @@ impl AdamApp {
                             ai_preview,
                             pile_member_count,
                             pile_controls_enabled,
-                            self.live_web_shown.contains(&tile.id),
+                            live_web_textures.get(&tile.id).copied(),
+                            live_web_pointer_captures.contains(&tile.id),
+                            self.live_web_canvas_pointer_latched.is_some(),
                             previews,
                             structured_previews,
                             sheet_snapshots.get(&tile.id),
@@ -4294,7 +4451,8 @@ impl AdamApp {
                 self.draw_note_draft(&painter, camera, view, colors);
 
                 let any_tile_pressed = tile_events.iter().any(|event| {
-                    event.clicked
+                    event.pointer_consumed
+                        || event.clicked
                         || event.double_clicked
                         || event.drag_started.is_some()
                         || event.resize_started.is_some()
@@ -5410,6 +5568,9 @@ impl AdamApp {
         let Some(armed) = self.armed_canvas_tool else {
             return false;
         };
+        if tile_events.iter().any(|event| event.pointer_consumed) {
+            return false;
+        }
         if self.editing_note.is_some() {
             return false;
         }
@@ -5579,9 +5740,10 @@ impl AdamApp {
         response: &Response,
         view: Rect,
         camera: &mut Camera,
+        browser_owns_pointer: bool,
     ) {
         let pointer = ui.input(|input| input.pointer.hover_pos());
-        if response.contains_pointer() {
+        if response.contains_pointer() && !browser_owns_pointer {
             let zoom_delta = ui.input(|input| input.zoom_delta());
             if zoom_delta != 1.0
                 && let Some(pointer) = pointer
@@ -5596,14 +5758,26 @@ impl AdamApp {
         }
 
         let space_down = ui.input(|input| input.key_down(Key::Space));
-        let pan_started = response.drag_started_by(PointerButton::Middle)
-            || (space_down && response.drag_started_by(PointerButton::Primary));
-        if pan_started && let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) {
+        let pan_button = (!browser_owns_pointer)
+            .then(|| {
+                if response.drag_started_by(PointerButton::Middle) {
+                    Some(PointerButton::Middle)
+                } else if space_down && response.drag_started_by(PointerButton::Primary) {
+                    Some(PointerButton::Primary)
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        if let (Some(pan_button), Some(pointer)) =
+            (pan_button, ui.input(|input| input.pointer.interact_pos()))
+        {
             self.pan = Some(PanSession {
                 start_pointer: pointer,
                 start_origin: camera.origin,
             });
             self.marquee = None;
+            self.live_web_canvas_pointer_latched = Some(pan_button);
         }
 
         if let Some(pan) = &self.pan {
@@ -5664,6 +5838,9 @@ impl AdamApp {
                         geometry,
                         projected_rects,
                     );
+                    if self.drag.is_some() || event.live_web_drag_override {
+                        self.live_web_canvas_pointer_latched = Some(PointerButton::Primary);
+                    }
                 }
             }
 
@@ -5675,6 +5852,9 @@ impl AdamApp {
                     context.input(|input| input.modifiers.shift),
                     projected_rects,
                 );
+                if self.resize.is_some() {
+                    self.live_web_canvas_pointer_latched = Some(PointerButton::Primary);
+                }
             }
 
             if let Some(action) = event.action {
@@ -6015,6 +6195,7 @@ impl AdamApp {
                     HashSet::new()
                 },
             });
+            self.live_web_canvas_pointer_latched = Some(PointerButton::Primary);
             if !command {
                 self.selection.clear();
             }
@@ -12805,9 +12986,7 @@ impl AdamApp {
                 }
             }
             TileContent::File { ref path, .. } => {
-                let is_html = path.extension().is_some_and(|extension| {
-                    extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
-                });
+                let is_html = is_live_html_path(path);
                 if !is_html || self.grid_view.is_some() || !live_web_supported() {
                     self.open_tile(id);
                 }
@@ -12822,6 +13001,288 @@ impl AdamApp {
         self.live_web_page = None;
         self.live_web_failed.clear();
         self.live_web_riding.clear();
+    }
+
+    fn refresh_live_web_textures(&mut self, context: &Context) {
+        for session in &mut self.live_web {
+            // `None` only means the browser has not produced its first frame.
+            // Once published, retain the stable ID so a temporarily hidden or
+            // idle host never flashes back to Adam's static placeholder.
+            if let Some(texture) = session.host.refresh_texture(context) {
+                session.texture = Some(texture);
+            }
+        }
+    }
+
+    fn live_web_target_at(&self, regions: &[LiveWebInputRegion], position: Pos2) -> Option<Uuid> {
+        regions
+            .iter()
+            .rev()
+            .find(|region| {
+                region.contains(position)
+                    && self.live_web.iter().any(|session| {
+                        session.tile_id == region.tile_id && session.texture.is_some()
+                    })
+            })
+            .map(|region| region.tile_id)
+    }
+
+    fn send_live_web_pointer_input(&mut self, context: &Context, regions: &[LiveWebInputRegion]) {
+        let (events, hover_position, modifiers, scroll_delta) = context.input(|input| {
+            (
+                input.events.clone(),
+                input.pointer.hover_pos(),
+                input.modifiers,
+                input.smooth_scroll_delta(),
+            )
+        });
+
+        let region_for = |tile_id| {
+            regions
+                .iter()
+                .find(|region| region.tile_id == tile_id)
+                .copied()
+        };
+        let pointer_gone = events
+            .iter()
+            .any(|event| matches!(event, egui::Event::PointerGone));
+        let pointer_moved = events
+            .iter()
+            .any(|event| matches!(event, egui::Event::PointerMoved(_)));
+
+        // Normal input belongs to the page. Command-drag is Adam's direct
+        // manipulation escape hatch when the surrounding tile chrome is too
+        // small to grab: suppress browser input for the whole gesture so the
+        // exact same press can start a tile drag. Never steal a gesture CEF
+        // already captured; changing modifiers midway must still deliver its
+        // matching release to the page.
+        let browser_has_capture = self
+            .live_web
+            .iter()
+            .any(|session| !session.captured_buttons.is_empty());
+        let command_canvas_press = !browser_has_capture
+            && events.iter().any(|event| match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers,
+                } => modifiers.command && self.live_web_target_at(regions, *pos).is_some(),
+                _ => false,
+            });
+        if command_canvas_press {
+            self.live_web_canvas_pointer_latched = Some(PointerButton::Primary);
+        }
+        let canvas_owner_released = self.live_web_canvas_pointer_latched.is_some_and(|owner| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::PointerButton {
+                        button,
+                        pressed: false,
+                        ..
+                    } if *button == owner
+                )
+            })
+        });
+        if self.live_web_canvas_pointer_latched.is_some()
+            || (modifiers.command && !browser_has_capture)
+        {
+            for session in &mut self.live_web {
+                if session.pointer_inside {
+                    session.host.send_pointer(PointerInput {
+                        x: 0.0,
+                        y: 0.0,
+                        modifiers,
+                        kind: PointerInputKind::Leave,
+                    });
+                    session.pointer_inside = false;
+                }
+            }
+            if pointer_gone || canvas_owner_released {
+                self.live_web_canvas_pointer_latched = None;
+            }
+            return;
+        }
+
+        for event in events {
+            let egui::Event::PointerButton {
+                pos,
+                button,
+                pressed,
+                modifiers,
+            } = event
+            else {
+                continue;
+            };
+            let Some(browser_button) = live_web_pointer_button(button) else {
+                continue;
+            };
+            let captured_tile = self
+                .live_web
+                .iter()
+                .find(|session| !session.captured_buttons.is_empty())
+                .map(|session| session.tile_id);
+            // A press may begin over a page (or join an existing captured
+            // chord). A release is only valid for the exact tile/button that
+            // received its down; never synthesize an unmatched up merely
+            // because the pointer happens to end over browser pixels.
+            let matching_button_tile = self
+                .live_web
+                .iter()
+                .find(|session| session.captured_buttons.contains(&button))
+                .map(|session| session.tile_id);
+            let hovered_tile = pressed
+                .then(|| self.live_web_target_at(regions, pos))
+                .flatten();
+            let target =
+                live_web_button_target(pressed, captured_tile, matching_button_tile, hovered_tile);
+            let Some((tile_id, region)) =
+                target.and_then(|tile_id| region_for(tile_id).map(|region| (tile_id, region)))
+            else {
+                continue;
+            };
+            let local = region.local_position(pos);
+            let Some(session) = self
+                .live_web
+                .iter_mut()
+                .find(|session| session.tile_id == tile_id)
+            else {
+                continue;
+            };
+
+            let click_count = if pressed {
+                let now = Instant::now();
+                let click_count = session.last_pointer_press.as_ref().map_or(1, |last| {
+                    if last.button == button
+                        && now.duration_since(last.at) <= Duration::from_millis(500)
+                        && last.position.distance(pos) <= 6.0
+                    {
+                        if last.click_count >= 3 {
+                            1
+                        } else {
+                            last.click_count + 1
+                        }
+                    } else {
+                        1
+                    }
+                });
+                session.last_pointer_press = Some(LiveWebPointerPress {
+                    at: now,
+                    position: pos,
+                    button,
+                    click_count,
+                });
+                capture_live_web_button(&mut session.captured_buttons, button);
+                click_count
+            } else {
+                release_live_web_button(&mut session.captured_buttons, button);
+                session
+                    .last_pointer_press
+                    .as_ref()
+                    .filter(|last| last.button == button)
+                    .map_or(1, |last| last.click_count)
+            };
+            session.host.send_pointer(PointerInput {
+                x: local.x,
+                y: local.y,
+                modifiers,
+                kind: PointerInputKind::Button {
+                    button: browser_button,
+                    pressed,
+                    click_count,
+                },
+            });
+        }
+
+        if pointer_gone {
+            for session in &mut self.live_web {
+                if session.pointer_inside || !session.captured_buttons.is_empty() {
+                    session.host.send_pointer(PointerInput {
+                        x: 0.0,
+                        y: 0.0,
+                        modifiers,
+                        kind: PointerInputKind::Leave,
+                    });
+                }
+                session.pointer_inside = false;
+                session.captured_buttons.clear();
+            }
+            return;
+        }
+
+        if self.live_web_camera_changed {
+            // The page moved under a stationary pointer; the pointer did not
+            // move inside the page. Sending post-transform coordinates here
+            // creates unsolicited hover changes, and forwarding the same
+            // wheel delta would make one gesture affect both canvas and page.
+            for session in &mut self.live_web {
+                if session.pointer_inside && session.captured_buttons.is_empty() {
+                    session.host.send_pointer(PointerInput {
+                        x: 0.0,
+                        y: 0.0,
+                        modifiers,
+                        kind: PointerInputKind::Leave,
+                    });
+                    session.pointer_inside = false;
+                }
+            }
+            return;
+        }
+
+        let captured = self
+            .live_web
+            .iter()
+            .find(|session| !session.captured_buttons.is_empty())
+            .map(|session| session.tile_id);
+        let hovered =
+            hover_position.and_then(|position| self.live_web_target_at(regions, position));
+        let move_target = captured.or(hovered);
+        for session in &mut self.live_web {
+            if session.pointer_inside && Some(session.tile_id) != move_target {
+                session.host.send_pointer(PointerInput {
+                    x: 0.0,
+                    y: 0.0,
+                    modifiers,
+                    kind: PointerInputKind::Leave,
+                });
+                session.pointer_inside = false;
+            }
+        }
+
+        let Some((tile_id, region, position)) =
+            move_target.and_then(|tile_id| Some((tile_id, region_for(tile_id)?, hover_position?)))
+        else {
+            return;
+        };
+        let local = region.local_position(position);
+        let Some(session) = self
+            .live_web
+            .iter_mut()
+            .find(|session| session.tile_id == tile_id)
+        else {
+            return;
+        };
+        if pointer_moved || !session.captured_buttons.is_empty() {
+            session.host.send_pointer(PointerInput {
+                x: local.x,
+                y: local.y,
+                modifiers,
+                kind: PointerInputKind::Move,
+            });
+            session.pointer_inside = true;
+        }
+        if scroll_delta != Vec2::ZERO {
+            session.host.send_pointer(PointerInput {
+                x: local.x,
+                y: local.y,
+                modifiers,
+                kind: PointerInputKind::Wheel {
+                    delta_x: scroll_delta.x,
+                    delta_y: scroll_delta.y,
+                },
+            });
+        }
     }
 
     /// Any modal dialog, draft, or egui popup (context menus included) that
@@ -12883,7 +13344,7 @@ impl AdamApp {
     /// biggest on screen first, capped at [`MAX_LIVE_WEB_PAGES`]. Sessions
     /// whose tiles are gone are destroyed; transient hides (modals, grid
     /// view, chrome overlap) keep the session so page state survives.
-    fn sync_live_webs(&mut self, context: &Context, frame: &eframe::Frame) {
+    fn sync_live_webs(&mut self, context: &Context) {
         if !live_web_supported() {
             return;
         }
@@ -12918,6 +13379,8 @@ impl AdamApp {
             tile_id: Uuid,
             source: LiveWebSource,
             state: webview_policy::LiveWebState,
+            natural: (f64, f64),
+            outer: Rect,
             area: f32,
         }
         let mut desired: Vec<Desired> = Vec::new();
@@ -12925,8 +13388,13 @@ impl AdamApp {
             let Some(source) = live_web_source_for(tile) else {
                 continue;
             };
-            let page_rect = website_page_rect(camera.screen_rect(tile.rect, view), camera.zoom);
-            let natural = website_page_world_size(tile.rect);
+            let outer = camera.screen_rect(tile.rect, view);
+            let Some(page_rect) = live_web_page_rect(tile, outer, camera.zoom) else {
+                continue;
+            };
+            let Some(natural) = live_web_page_world_size(tile) else {
+                continue;
+            };
             let inputs = webview_policy::LiveWebInputs {
                 tile_on_active_page: true,
                 canvas_is_front,
@@ -12953,11 +13421,12 @@ impl AdamApp {
             };
             desired.push(Desired {
                 tile_id: tile.id,
-                source: live_web_source_for(tile).expect("checked above"),
+                source,
                 state: webview_policy::desired_state(&inputs),
+                natural: (f64::from(natural.x), f64::from(natural.y)),
+                outer,
                 area: page_rect.area(),
             });
-            let _ = source;
         }
 
         // Destroy sessions whose tile stopped being a web tile entirely.
@@ -13003,11 +13472,15 @@ impl AdamApp {
                     .any(|session| session.tile_id == entry.tile_id)
                 && !self.live_web_failed.contains(&entry.tile_id)
         }) {
-            match LiveWebHost::new(frame, &entry.source) {
+            match LiveWebHost::new(context, &entry.source, entry.natural) {
                 Ok(host) => {
                     self.live_web.push(LiveWebSession {
                         tile_id: entry.tile_id,
                         host,
+                        texture: None,
+                        pointer_inside: false,
+                        captured_buttons: Vec::new(),
+                        last_pointer_press: None,
                     });
                 }
                 Err(error) => {
@@ -13017,8 +13490,26 @@ impl AdamApp {
             }
         }
 
+        let input_regions = desired
+            .iter()
+            .filter(|entry| keep_ids.contains(&entry.tile_id))
+            .filter_map(|entry| {
+                let webview_policy::LiveWebState::Visible(placement) = entry.state else {
+                    return None;
+                };
+                let surface = placement.surface_transform()?;
+                Some(LiveWebInputRegion {
+                    tile_id: entry.tile_id,
+                    content: point_rect(surface.content),
+                    clip: point_rect(placement.clip),
+                    exclude: placement.exclude.map(point_rect),
+                    adam_controls: tile_resize_hit_rects(entry.outer).map(|(_, rect)| rect),
+                    scale: surface.scale as f32,
+                })
+            })
+            .collect::<Vec<_>>();
+
         // Apply each session's state; over-cap eligible pages hide.
-        self.live_web_shown.clear();
         for session in &mut self.live_web {
             let state = desired
                 .iter()
@@ -13031,16 +13522,14 @@ impl AdamApp {
                     }
                 })
                 .unwrap_or(webview_policy::LiveWebState::Hidden);
-            if matches!(state, webview_policy::LiveWebState::Visible(_)) {
-                self.live_web_shown.insert(session.tile_id);
-            }
-            session.host.apply(&state);
+            session.host.apply(&state, context.pixels_per_point());
             if session.host.escape_requested() {
                 // Escape inside a page hands the keyboard back to the canvas;
                 // the page itself stays live.
                 session.host.release_focus();
             }
         }
+        self.send_live_web_pointer_input(context, &input_regions);
     }
 
     fn quick_look_tile(&self, id: Uuid) {
@@ -13173,14 +13662,17 @@ fn live_web_supported() -> bool {
 fn live_web_source_for(tile: &Tile) -> Option<LiveWebSource> {
     match &tile.content {
         TileContent::Website { url } => Some(LiveWebSource::Remote(url.clone())),
-        TileContent::File { path, .. } => path
-            .extension()
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
-            })
-            .then(|| LiveWebSource::LocalHtml(path.clone())),
+        TileContent::File { path, .. } => {
+            is_live_html_path(path).then(|| LiveWebSource::LocalHtml(path.clone()))
+        }
         _ => None,
     }
+}
+
+fn is_live_html_path(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm")
+    })
 }
 
 /// One live web page layered over the canvas. Runtime-only, exactly like
@@ -13188,6 +13680,141 @@ fn live_web_source_for(tile: &Tile) -> Option<LiveWebSource> {
 struct LiveWebSession {
     tile_id: Uuid,
     host: LiveWebHost,
+    /// The host owns the TextureHandle; Adam keeps the stable renderer ID so
+    /// the last complete browser frame remains paintable between callbacks.
+    texture: Option<TextureId>,
+    pointer_inside: bool,
+    /// Every button whose down was delivered to this page. Capture remains
+    /// active until each matching up, so releasing a different mouse button
+    /// cannot steal or terminate the original gesture.
+    captured_buttons: Vec<PointerButton>,
+    last_pointer_press: Option<LiveWebPointerPress>,
+}
+
+struct LiveWebPointerPress {
+    at: Instant,
+    position: Pos2,
+    button: PointerButton,
+    click_count: i32,
+}
+
+/// Resolves one pointer gesture to exactly one owner. A browser capture wins
+/// until its matching release; otherwise Adam keeps any gesture it already
+/// latched, even if Command is released before the drag threshold is crossed.
+fn live_web_page_owns_pointer(
+    over_live_page: bool,
+    browser_pointer_captured: bool,
+    canvas_pointer_latched: bool,
+    command_down: bool,
+) -> bool {
+    browser_pointer_captured || (over_live_page && !canvas_pointer_latched && !command_down)
+}
+
+fn live_web_button_target(
+    pressed: bool,
+    any_captured_tile: Option<Uuid>,
+    matching_button_tile: Option<Uuid>,
+    hovered_tile: Option<Uuid>,
+) -> Option<Uuid> {
+    if pressed {
+        any_captured_tile.or(hovered_tile)
+    } else {
+        matching_button_tile
+    }
+}
+
+fn capture_live_web_button(buttons: &mut Vec<PointerButton>, button: PointerButton) {
+    if !buttons.contains(&button) {
+        buttons.push(button);
+    }
+}
+
+fn release_live_web_button(buttons: &mut Vec<PointerButton>, button: PointerButton) {
+    buttons.retain(|captured| *captured != button);
+}
+
+#[derive(Clone, Copy)]
+struct LiveWebInputRegion {
+    tile_id: Uuid,
+    content: Rect,
+    clip: Rect,
+    exclude: Option<Rect>,
+    adam_controls: [Rect; 8],
+    /// Uniform screen-points-per-browser-point scale shared with painting.
+    scale: f32,
+}
+
+impl LiveWebInputRegion {
+    fn contains(self, position: Pos2) -> bool {
+        self.clip.contains(position)
+            && !self
+                .adam_controls
+                .iter()
+                .any(|control| control.contains(position))
+            && !self
+                .exclude
+                .is_some_and(|exclude| exclude.contains(position))
+    }
+
+    fn local_position(self, position: Pos2) -> Pos2 {
+        let relative = position - self.content.min;
+        pos2(relative.x / self.scale, relative.y / self.scale)
+    }
+}
+
+fn point_rect(rect: webview_policy::PointRect) -> Rect {
+    Rect::from_min_size(pos2(rect.min_x, rect.min_y), vec2(rect.width, rect.height))
+}
+
+fn live_web_pointer_button(button: PointerButton) -> Option<LiveWebPointerButton> {
+    match button {
+        PointerButton::Primary => Some(LiveWebPointerButton::Left),
+        PointerButton::Middle => Some(LiveWebPointerButton::Middle),
+        PointerButton::Secondary => Some(LiveWebPointerButton::Right),
+        PointerButton::Extra1 | PointerButton::Extra2 => None,
+    }
+}
+
+/// The standard File/Website content area above Adam's footer.
+fn standard_tile_content_rect(screen_rect: Rect, zoom: f32) -> Rect {
+    let title_height = (TILE_FOOTER_HEIGHT * zoom)
+        .clamp(5.0, 38.0)
+        .min(screen_rect.height() * 0.34);
+    Rect::from_min_max(
+        screen_rect.min,
+        pos2(screen_rect.right(), screen_rect.bottom() - title_height),
+    )
+}
+
+fn live_web_page_rect(tile: &Tile, screen_rect: Rect, zoom: f32) -> Option<Rect> {
+    match &tile.content {
+        TileContent::Website { .. } => Some(website_page_rect(screen_rect, zoom)),
+        TileContent::File { path, .. } if is_live_html_path(path) => {
+            Some(standard_tile_content_rect(screen_rect, zoom))
+        }
+        _ => None,
+    }
+}
+
+/// The one projection used by live-page texture sampling and pointer input.
+/// Keeping this in the canvas layer means both paths use the current camera
+/// frame; neither waits for the browser reconciliation pass later in `ui`.
+fn live_web_surface_transform(
+    tile: &Tile,
+    screen_rect: Rect,
+    zoom: f32,
+) -> Option<webview_policy::LiveWebSurfaceTransform> {
+    let content = live_web_page_rect(tile, screen_rect, zoom)?;
+    let natural = live_web_page_world_size(tile)?;
+    webview_policy::LiveWebSurfaceTransform::new(
+        webview_policy::PointRect::new(
+            content.min.x,
+            content.min.y,
+            content.width(),
+            content.height(),
+        ),
+        (f64::from(natural.x), f64::from(natural.y)),
+    )
 }
 
 /// The screen rectangle the live page owns inside a website tile: the fake
@@ -13196,13 +13823,7 @@ struct LiveWebSession {
 /// precisely inside the painted frame, with the painted bar left as the
 /// egui-owned drag handle.
 fn website_page_rect(screen_rect: Rect, zoom: f32) -> Rect {
-    let title_height = (TILE_FOOTER_HEIGHT * zoom)
-        .clamp(5.0, 38.0)
-        .min(screen_rect.height() * 0.34);
-    let content = Rect::from_min_max(
-        screen_rect.min,
-        pos2(screen_rect.right(), screen_rect.bottom() - title_height),
-    );
+    let content = standard_tile_content_rect(screen_rect, zoom);
     let browser = content.shrink((14.0 * zoom.sqrt()).clamp(8.0, 16.0));
     let bar_height = 25.0 * zoom.sqrt();
     Rect::from_min_max(
@@ -13214,17 +13835,20 @@ fn website_page_rect(screen_rect: Rect, zoom: f32) -> Rect {
     )
 }
 
-/// The page-content size in WORLD points: `website_page_rect` evaluated at
-/// zoom 1 on the tile's own size. Camera-independent (world units equal
-/// screen points at zoom 1), so it is the fixed CSS width the live WKWebView
-/// lays out at — the whole reason @media never re-fires when the canvas zooms.
-fn website_page_world_size(tile_rect: WorldRect) -> Vec2 {
-    let [w, h] = tile_rect.size();
-    website_page_rect(Rect::from_min_size(pos2(0.0, 0.0), vec2(w, h)), 1.0).size()
+/// Camera-independent CSS layout size for either kind of live page.
+fn live_web_page_world_size(tile: &Tile) -> Option<Vec2> {
+    let [width, height] = tile.rect.size();
+    live_web_page_rect(
+        tile,
+        Rect::from_min_size(Pos2::ZERO, vec2(width, height)),
+        1.0,
+    )
+    .map(|rect| rect.size())
 }
 
 impl eframe::App for AdamApp {
     fn logic(&mut self, context: &Context, _frame: &mut eframe::Frame) {
+        self.refresh_live_web_textures(context);
         self.refresh_reduce_motion();
         let (viewport_visible, viewport_focused) = context.input(|input| {
             let viewport = input.viewport();
@@ -13309,7 +13933,7 @@ impl eframe::App for AdamApp {
         } else {
             self.show_canvas(ui);
         }
-        self.sync_live_webs(&context, frame);
+        self.sync_live_webs(&context);
         self.show_link_editor(&context);
         self.show_page_delete_confirmation(&context);
         self.show_chat_delete_confirmation(&context);
@@ -13500,7 +14124,9 @@ fn draw_tile(
     ai_preview: Option<&AiTilePreview>,
     pile_member_count: usize,
     pile_controls_enabled: bool,
-    live_web_active: bool,
+    live_web_texture: Option<TextureId>,
+    live_web_pointer_captured: bool,
+    live_web_canvas_pointer_latched: bool,
     previews: &mut PreviewCache,
     structured_previews: &mut StructuredPreviewCache,
     live_sheet: Option<&(spreadsheet::Sheet, SheetFonts)>,
@@ -13518,6 +14144,23 @@ fn draw_tile(
 
     let is_pile = tile.kind() == TileKind::Pile;
     let is_free_text = tile.canvas_style == CanvasTileStyle::FreeText;
+    let live_surface =
+        live_web_texture.and_then(|_| live_web_surface_transform(tile, screen_rect, camera.zoom));
+    let live_page_rect = live_surface.map(|surface| point_rect(surface.content));
+    let live_uv = live_surface.map(|surface| point_rect(surface.uv));
+    let over_live_page = live_page_rect.is_some_and(|rect| ui.rect_contains_pointer(rect));
+    let command_down = ui.input(|input| input.modifiers.command);
+    let page_owns_pointer = live_web_page_owns_pointer(
+        over_live_page,
+        live_web_pointer_captured,
+        live_web_canvas_pointer_latched,
+        command_down,
+    );
+    let command_drag_override = over_live_page
+        && !live_web_pointer_captured
+        && (live_web_canvas_pointer_latched || command_down);
+    event.pointer_consumed = page_owns_pointer;
+    event.live_web_drag_override = command_drag_override;
     let pile_header = pile_header_rect(screen_rect, camera.zoom);
     let interaction_rect = if is_pile { pile_header } else { screen_rect };
     let interaction_sense = if (is_pile && !pile_controls_enabled) || (is_free_text && editing) {
@@ -13531,19 +14174,18 @@ fn draw_tile(
         interaction_sense,
     );
     if !is_pile || pile_controls_enabled {
-        // Over a live web tile's page area the native view owns the pointer,
-        // so the tile drag-grab cursor is wrong there — only the chrome (the
-        // title bar strip above the page) should read as draggable.
-        let over_live_page = live_web_active
-            && ui.rect_contains_pointer(website_page_rect(screen_rect, camera.zoom));
-        if !(is_free_text && editing) && !over_live_page {
+        // The browser texture owns its page area. Only Adam's surrounding
+        // chrome should select or drag the tile.
+        if !(is_free_text && editing) && !page_owns_pointer {
             response = response.on_hover_cursor(CursorIcon::Grab);
         }
-        event.clicked = response.clicked();
-        event.toggle = response.clicked() && ui.input(|input| input.modifiers.command);
-        event.double_clicked = response.double_clicked();
-        if response.drag_started_by(PointerButton::Primary) {
-            event.drag_started = response.interact_pointer_pos();
+        if !page_owns_pointer {
+            event.clicked = response.clicked();
+            event.toggle = response.clicked() && ui.input(|input| input.modifiers.command);
+            event.double_clicked = response.double_clicked();
+            if response.drag_started_by(PointerButton::Primary) {
+                event.drag_started = response.interact_pointer_pos();
+            }
         }
     }
 
@@ -13607,7 +14249,12 @@ fn draw_tile(
             // rendering that can show a live, unsaved workbook — and it
             // renders through the same styled engine as the lightbox, scaled
             // to the tile, so fills, fonts and borders match the spreadsheet.
-            if let Some((sheet, fonts)) = live_sheet {
+            if is_live_html_path(path)
+                && let (Some(texture), Some(page_rect), Some(uv)) =
+                    (live_web_texture, live_page_rect, live_uv)
+            {
+                painter.image(texture, page_rect, uv, Color32::WHITE);
+            } else if let Some((sheet, fonts)) = live_sheet {
                 let metrics = SheetMetrics::measure(sheet, 7.0);
                 let scale = if metrics.content.x > 0.0 && metrics.content.y > 0.0 {
                     (content_rect.width() / metrics.content.x)
@@ -13715,6 +14362,11 @@ fn draw_tile(
         }
         TileContent::Website { url } => {
             draw_website_preview(painter, content_rect, url, accent, colors, camera.zoom);
+            if let (Some(texture), Some(page_rect), Some(uv)) =
+                (live_web_texture, live_page_rect, live_uv)
+            {
+                painter.image(texture, page_rect, uv, Color32::WHITE);
+            }
         }
         TileContent::Pile { .. } => {
             draw_pile_header(
@@ -13851,12 +14503,13 @@ fn draw_tile(
     if !editing && !is_free_text && screen_rect.width() >= 22.0 && screen_rect.height() >= 18.0 {
         let show_grips = selected || (response.hovered() && pile_controls_enabled);
         let handle_size = RESIZE_HANDLE_SIZE;
-        let corner_hit_size = RESIZE_CORNER_HIT_SIZE;
-        for (handle, name, corner, cursor, inset) in [
+        let resize_hits = tile_resize_hit_rects(screen_rect);
+        for (handle, name, corner, handle_rect, cursor, inset) in [
             (
                 ResizeHandle::NorthWest,
                 "nw",
                 screen_rect.left_top(),
+                resize_hits[0].1,
                 CursorIcon::ResizeNwSe,
                 vec2(2.5, 2.5),
             ),
@@ -13864,6 +14517,7 @@ fn draw_tile(
                 ResizeHandle::NorthEast,
                 "ne",
                 screen_rect.right_top(),
+                resize_hits[1].1,
                 CursorIcon::ResizeNeSw,
                 vec2(-2.5, 2.5),
             ),
@@ -13871,6 +14525,7 @@ fn draw_tile(
                 ResizeHandle::SouthWest,
                 "sw",
                 screen_rect.left_bottom(),
+                resize_hits[2].1,
                 CursorIcon::ResizeNeSw,
                 vec2(2.5, -2.5),
             ),
@@ -13878,11 +14533,11 @@ fn draw_tile(
                 ResizeHandle::SouthEast,
                 "se",
                 screen_rect.right_bottom(),
+                resize_hits[3].1,
                 CursorIcon::ResizeNwSe,
                 vec2(-2.5, -2.5),
             ),
         ] {
-            let handle_rect = Rect::from_center_size(corner, Vec2::splat(corner_hit_size));
             let handle_sense = if is_pile && !pile_controls_enabled {
                 Sense::hover()
             } else {
@@ -13914,23 +14569,11 @@ fn draw_tile(
             }
         }
 
-        let edge_inset_x = (corner_hit_size * 0.55).min(screen_rect.width() * 0.28);
-        let edge_inset_y = (corner_hit_size * 0.55).min(screen_rect.height() * 0.28);
-        let edge_thickness = RESIZE_EDGE_HIT_THICKNESS;
         for (handle, name, handle_rect, cursor, marker) in [
             (
                 ResizeHandle::North,
                 "n",
-                Rect::from_min_max(
-                    pos2(
-                        screen_rect.left() + edge_inset_x,
-                        screen_rect.top() - edge_thickness * 0.5,
-                    ),
-                    pos2(
-                        screen_rect.right() - edge_inset_x,
-                        screen_rect.top() + edge_thickness * 0.5,
-                    ),
-                ),
+                resize_hits[4].1,
                 CursorIcon::ResizeVertical,
                 [
                     pos2(screen_rect.center().x - 8.0, screen_rect.top() + 2.5),
@@ -13940,16 +14583,7 @@ fn draw_tile(
             (
                 ResizeHandle::East,
                 "e",
-                Rect::from_min_max(
-                    pos2(
-                        screen_rect.right() - edge_thickness * 0.5,
-                        screen_rect.top() + edge_inset_y,
-                    ),
-                    pos2(
-                        screen_rect.right() + edge_thickness * 0.5,
-                        screen_rect.bottom() - edge_inset_y,
-                    ),
-                ),
+                resize_hits[5].1,
                 CursorIcon::ResizeHorizontal,
                 [
                     pos2(screen_rect.right() - 2.5, screen_rect.center().y - 8.0),
@@ -13959,16 +14593,7 @@ fn draw_tile(
             (
                 ResizeHandle::South,
                 "s",
-                Rect::from_min_max(
-                    pos2(
-                        screen_rect.left() + edge_inset_x,
-                        screen_rect.bottom() - edge_thickness * 0.5,
-                    ),
-                    pos2(
-                        screen_rect.right() - edge_inset_x,
-                        screen_rect.bottom() + edge_thickness * 0.5,
-                    ),
-                ),
+                resize_hits[6].1,
                 CursorIcon::ResizeVertical,
                 [
                     pos2(screen_rect.center().x - 8.0, screen_rect.bottom() - 2.5),
@@ -13978,16 +14603,7 @@ fn draw_tile(
             (
                 ResizeHandle::West,
                 "w",
-                Rect::from_min_max(
-                    pos2(
-                        screen_rect.left() - edge_thickness * 0.5,
-                        screen_rect.top() + edge_inset_y,
-                    ),
-                    pos2(
-                        screen_rect.left() + edge_thickness * 0.5,
-                        screen_rect.bottom() - edge_inset_y,
-                    ),
-                ),
+                resize_hits[7].1,
                 CursorIcon::ResizeHorizontal,
                 [
                     pos2(screen_rect.left() + 2.5, screen_rect.center().y - 8.0),
@@ -14021,7 +14637,7 @@ fn draw_tile(
         }
     }
 
-    if is_pile && !pile_controls_enabled {
+    if (is_pile && !pile_controls_enabled) || over_live_page {
         return event;
     }
 
@@ -21510,6 +22126,76 @@ fn truncate(value: &str, max_characters: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_web_pointer_owner_stays_latched_for_the_whole_gesture() {
+        assert!(live_web_page_owns_pointer(true, false, false, false));
+        assert!(!live_web_page_owns_pointer(true, false, false, true));
+        assert!(
+            live_web_page_owns_pointer(true, true, true, true),
+            "an existing browser capture must win even if Command is pressed later"
+        );
+        assert!(
+            !live_web_page_owns_pointer(true, false, true, false),
+            "Adam must keep a Command-started drag after Command is released"
+        );
+        assert!(!live_web_page_owns_pointer(false, false, false, false));
+    }
+
+    #[test]
+    fn live_web_releases_only_the_page_and_button_that_received_the_press() {
+        let page = Uuid::from_u128(1);
+        let other_page = Uuid::from_u128(2);
+        assert_eq!(
+            live_web_button_target(false, None, None, Some(page)),
+            None,
+            "hovering a page at mouse-up must not create an unmatched browser release"
+        );
+        assert_eq!(
+            live_web_button_target(true, None, None, Some(page)),
+            Some(page)
+        );
+        assert_eq!(
+            live_web_button_target(true, Some(page), None, Some(other_page)),
+            Some(page),
+            "a captured browser gesture keeps its original page"
+        );
+        assert_eq!(
+            live_web_button_target(false, Some(other_page), Some(page), Some(other_page)),
+            Some(page),
+            "release routing is keyed to the matching captured button"
+        );
+
+        let mut buttons = Vec::new();
+        capture_live_web_button(&mut buttons, PointerButton::Primary);
+        capture_live_web_button(&mut buttons, PointerButton::Secondary);
+        release_live_web_button(&mut buttons, PointerButton::Secondary);
+        assert_eq!(buttons, vec![PointerButton::Primary]);
+        release_live_web_button(&mut buttons, PointerButton::Primary);
+        assert!(buttons.is_empty());
+    }
+
+    #[test]
+    fn live_web_input_excludes_the_exact_tile_resize_hit_areas() {
+        let outer = Rect::from_min_size(pos2(100.0, 100.0), vec2(400.0, 300.0));
+        let controls = tile_resize_hit_rects(outer).map(|(_, rect)| rect);
+        let region = LiveWebInputRegion {
+            tile_id: Uuid::new_v4(),
+            content: outer,
+            clip: outer.expand(32.0),
+            exclude: None,
+            adam_controls: controls,
+            scale: 1.0,
+        };
+
+        assert!(region.contains(outer.center()));
+        for control in controls {
+            assert!(
+                !region.contains(control.center()),
+                "a resize press must never be delivered to CEF"
+            );
+        }
+    }
 
     #[test]
     fn permanent_delete_discloses_xai_retention_without_overstating_local_providers() {
