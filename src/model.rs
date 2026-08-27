@@ -654,10 +654,10 @@ pub fn infer_file_kind(path: &Path) -> FileKind {
         "aac" | "aif" | "aiff" | "flac" | "m4a" | "mp3" | "ogg" | "opus" | "wav" => FileKind::Audio,
         "avi" | "m4v" | "mkv" | "mov" | "mp4" | "mpeg" | "mpg" | "webm" | "wmv" => FileKind::Video,
         "7z" | "bz2" | "dmg" | "gz" | "rar" | "tar" | "tgz" | "xz" | "zip" => FileKind::Archive,
-        "c" | "cc" | "cpp" | "css" | "fish" | "go" | "h" | "hpp" | "html" | "ipynb" | "java"
-        | "js" | "json" | "jsx" | "kt" | "kts" | "lock" | "lua" | "m" | "mm" | "php" | "plist"
-        | "py" | "rb" | "rs" | "scss" | "sh" | "sql" | "swift" | "toml" | "ts" | "tsx" | "xml"
-        | "yaml" | "yml" | "zsh" => FileKind::Code,
+        "c" | "cc" | "cpp" | "css" | "fish" | "go" | "h" | "hpp" | "html" | "htm" | "ipynb"
+        | "java" | "js" | "json" | "jsx" | "kt" | "kts" | "lock" | "lua" | "m" | "mm" | "php"
+        | "plist" | "py" | "rb" | "rs" | "scss" | "sh" | "sql" | "swift" | "toml" | "ts"
+        | "tsx" | "xml" | "yaml" | "yml" | "zsh" => FileKind::Code,
         "log" | "md" | "text" | "txt" => FileKind::File,
         _ => FileKind::Other,
     }

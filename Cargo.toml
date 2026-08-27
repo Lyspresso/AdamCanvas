@@ -5,10 +5,18 @@ edition = "2024"
 rust-version = "1.92"
 description = "A fast, local-first spatial canvas for macOS"
 license = "MIT"
+default-run = "Adam"
 
 [[bin]]
 name = "Adam"
 path = "src/main.rs"
+
+[[bin]]
+name = "adam-cef-helper"
+path = "src/bin/adam_cef_helper.rs"
+
+[package.metadata.cef.bundle]
+helper_name = "adam-cef-helper"
 
 [dependencies]
 anyhow = "1.0"
@@ -46,14 +54,20 @@ ureq = { version = "3.3", features = ["json"] }
 url = "2.5"
 uuid = { version = "1.18", features = ["serde", "v4"] }
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+base64 = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", default-features = false, features = ["std"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
     "NSAccessibility",
+    "NSApplication",
+    "NSEvent",
     "NSPasteboard",
     "NSWorkspace",
+    "NSResponder",
+    "NSView",
+    "objc2-quartz-core",
 ] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
     "std",
@@ -68,11 +82,16 @@ objc2-core-graphics = { version = "0.3", default-features = false, features = [
     "CGColorSpace",
     "CGContext",
     "CGImage",
+    "CGPath",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSArray",
+    "NSObject",
+    "NSRunLoop",
     "NSString",
+    "NSThread",
+    "NSTimer",
     "NSURL",
 ] }
 objc2-image-io = { version = "0.3", default-features = false, features = [
@@ -92,6 +111,12 @@ objc2-vision = { version = "0.3", default-features = false, features = [
     "objc2-core-foundation",
 ] }
 winit = { version = "0.30", default-features = false }
+# Current CEF is intentionally used without its `accelerated_osr` feature:
+# Adam/eframe is on wgpu 29 while CEF 151's importer is on wgpu 30. The host
+# starts with the safe software paint callback and keeps that producer behind
+# a frame interface so IOSurface import can replace it after the live path is
+# visually proven.
+cef = { version = "=151.6.0", default-features = false, features = ["sandbox"] }
 
 [dev-dependencies]
 rust_xlsxwriter = "0.97.0"

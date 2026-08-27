@@ -3,6 +3,9 @@
 fn main() -> eframe::Result {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
+    let cef_runtime = adam_canvas::cef_runtime::CefRuntime::initialize()
+        .map_err(|error| eframe::Error::AppCreation(Box::new(std::io::Error::other(error))))?;
+
     let mut wgpu_options = eframe::WgpuConfiguration {
         surface: eframe::SurfaceConfig::LOW_LATENCY,
         ..Default::default()
@@ -31,6 +34,10 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Adam",
         options,
-        Box::new(|creation| Ok(Box::new(adam_canvas::app::AdamApp::new(creation)))),
+        Box::new(move |creation| {
+            let mut app = adam_canvas::app::AdamApp::new(creation);
+            app.install_cef_runtime(cef_runtime);
+            Ok(Box::new(app))
+        }),
     )
 }
